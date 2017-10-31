@@ -17,11 +17,12 @@ from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_dimensions import create_uncompressed_text_dimension
-from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.util.filesystem_utils import get_fs_path
 
 
 @SkipIfS3.hive
+@SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 class TestRefreshPartition(ImpalaTestSuite):
@@ -39,32 +40,9 @@ class TestRefreshPartition(ImpalaTestSuite):
     super(TestRefreshPartition, cls).add_test_dimensions()
 
     # There is no reason to run these tests using all dimensions.
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
-    cls.TestMatrix.add_dimension(
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(
         create_uncompressed_text_dimension(cls.get_workload()))
-
-  def impala_partition_names(self, table_name):
-    """
-    Find the names of the partitions of a table, as Impala sees them.
-    The return format is a list of lists of strings. Each string represents
-    a partition value of a given column.
-    """
-    rows = self.client.execute('show partitions %s' %
-                               table_name).get_data().split('\n')
-    """
-    According to the output of 'show partitions' query, the first (n-8)
-    columns are the columns on which the table is partitioned
-    """
-    return [row.split('\t')[0:-8] for row in rows[:-1]]
-
-  def hive_partition_names(self, table_name):
-    """
-    Find the names of the partitions of a table, as Hive sees them.
-    The return format is a list of strings. Each string represents a partition
-    value of a given column in a format like 'column1=7/column2=8'.
-    """
-    return self.run_stmt_in_hive(
-        'show partitions %s' % table_name).split('\n')[1:-1]
 
   def test_add_hive_partition_and_refresh(self, vector, unique_database):
     """
@@ -75,14 +53,14 @@ class TestRefreshPartition(ImpalaTestSuite):
     self.client.execute(
         'create table %s (x int) partitioned by (y int, z int)' %
         table_name)
-    assert [] == self.impala_partition_names(table_name)
+    assert [] == self.get_impala_partition_info(table_name, 'y', 'z')
     self.run_stmt_in_hive(
         'alter table %s add partition (y=333, z=5309)' % table_name)
     # Make sure Impala can't see the partition yet
-    assert [] == self.impala_partition_names(table_name)
+    assert [] == self.get_impala_partition_info(table_name, 'y', 'z')
     self.client.execute('refresh %s partition (y=333, z=5309)' % table_name)
     # Impala can see the partition
-    assert [['333', '5309']] == self.impala_partition_names(table_name)
+    assert [('333', '5309')] == self.get_impala_partition_info(table_name, 'y', 'z')
     # Impala's refresh didn't alter Hive's knowledge of the partition
     assert ['y=333/z=5309'] == self.hive_partition_names(table_name)
 
@@ -97,14 +75,14 @@ class TestRefreshPartition(ImpalaTestSuite):
         table_name)
     self.client.execute(
         'alter table %s add partition (y=333, z=5309)' % table_name)
-    assert [['333', '5309']] == self.impala_partition_names(table_name)
+    assert [('333', '5309')] == self.get_impala_partition_info(table_name, 'y', 'z')
     self.run_stmt_in_hive(
         'alter table %s drop partition (y=333, z=5309)' % table_name)
     # Make sure Impala can still see the partition
-    assert [['333', '5309']] == self.impala_partition_names(table_name)
+    assert [('333', '5309')] == self.get_impala_partition_info(table_name, 'y', 'z')
     self.client.execute('refresh %s partition (y=333, z=5309)' % table_name)
     # Impala can see the partition is not there anymore
-    assert [] == self.impala_partition_names(table_name)
+    assert [] == self.get_impala_partition_info(table_name, 'y', 'z')
     # Impala's refresh didn't alter Hive's knowledge of the partition
     assert [] == self.hive_partition_names(table_name)
 
@@ -142,10 +120,10 @@ class TestRefreshPartition(ImpalaTestSuite):
         table_name)
     self.client.execute(
         'alter table %s add partition (y=333, z=5309)' % table_name)
-    assert [['333', '5309']] == self.impala_partition_names(table_name)
+    assert [('333', '5309')] == self.get_impala_partition_info(table_name, 'y', 'z')
     assert ['y=333/z=5309'] == self.hive_partition_names(table_name)
     self.client.execute('refresh %s partition (y=71, z=8857)' % table_name)
-    assert [['333', '5309']] == self.impala_partition_names(table_name)
+    assert [('333', '5309')] == self.get_impala_partition_info(table_name, 'y', 'z')
     assert ['y=333/z=5309'] == self.hive_partition_names(table_name)
 
   def test_remove_data_and_refresh(self, vector, unique_database):
@@ -166,10 +144,12 @@ class TestRefreshPartition(ImpalaTestSuite):
 
     self.run_stmt_in_hive(
         'alter table %s drop partition (y=333, z=5309)' % table_name)
-        # Query the table and check for expected error.
+
+    # Query the table. With file handle caching, this may not produce an error,
+    # because the file handles are still open in the cache. If the system does
+    # produce an error, it should be the expected error.
     try:
       self.client.execute("select * from %s" % table_name)
-      assert False, "Query was expected to fail"
     except ImpalaBeeswaxException as e:
       assert expected_error in str(e)
 

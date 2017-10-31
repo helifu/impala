@@ -19,7 +19,9 @@
 #ifndef IMPALA_UTIL_CPU_INFO_H
 #define IMPALA_UTIL_CPU_INFO_H
 
+#include <memory>
 #include <string>
+#include <vector>
 #include <boost/cstdint.hpp>
 
 #include "common/logging.h"
@@ -50,8 +52,7 @@ class CpuInfo {
   /// Initialize CpuInfo.
   static void Init();
 
-  /// Determine if the CPU meets the minimum CPU requirements and if not, issue an error
-  /// and terminate.
+  /// Determine if the CPU meets the minimum CPU requirements and if not, log an error.
   static void VerifyCpuRequirements();
 
   /// Determine if the CPU scaling governor is set to 'performance' and if not, issue an
@@ -83,10 +84,59 @@ class CpuInfo {
     return cycles_per_ms_;
   }
 
-  /// Returns the number of cores (including hyper-threaded) on this machine.
+  /// Returns the number of cores (including hyper-threaded) on this machine that are
+  /// available for use by Impala (either the number of online cores or the value of
+  /// the --num_cores command-line flag).
   static int num_cores() {
     DCHECK(initialized_);
     return num_cores_;
+  }
+
+  /// Returns the maximum number of cores that will be online in the system, including
+  /// any offline cores or cores that could be added via hot-plugging.
+  static int GetMaxNumCores() { return max_num_cores_; }
+
+  /// Returns the core that the current thread is running on. Always in range
+  /// [0, GetMaxNumCores()). Note that the thread may be migrated to a different core
+  /// at any time by the scheduler, so the caller should not assume the answer will
+  /// remain stable.
+  static int GetCurrentCore();
+
+  /// Returns the maximum number of NUMA nodes that will be online in the system,
+  /// including any that may be offline or disabled.
+  static int GetMaxNumNumaNodes() { return max_num_numa_nodes_; }
+
+  /// Returns the NUMA node of the core provided. 'core' must be in the range
+  /// [0, GetMaxNumCores()).
+  static int GetNumaNodeOfCore(int core) {
+    DCHECK_LE(0, core);
+    DCHECK_LT(core, max_num_cores_);
+    return core_to_numa_node_[core];
+  }
+
+  /// Returns the cores in a NUMA node. 'node' must be in the range
+  /// [0, GetMaxNumNumaNodes()).
+  static const std::vector<int>& GetCoresOfNumaNode(int node) {
+    DCHECK_LE(0, node);
+    DCHECK_LT(node, max_num_numa_nodes_);
+    return numa_node_to_cores_[node];
+  }
+
+  /// Returns the cores in the same NUMA node as 'core'. 'core' must be in the range
+  /// [0, GetMaxNumCores()).
+  static const std::vector<int>& GetCoresOfSameNumaNode(int core) {
+    DCHECK_LE(0, core);
+    DCHECK_LT(core, max_num_cores_);
+    return GetCoresOfNumaNode(GetNumaNodeOfCore(core));
+  }
+
+  /// Returns the index of the given core within the vector returned by
+  /// GetCoresOfNumaNode() and GetCoresOfSameNumaNode(). 'core' must be in the range
+  /// [0, GetMaxNumCores()).
+  static int GetNumaNodeCoreIdx(int core) {
+    DCHECK_LE(0, core);
+    DCHECK_LT(core, max_num_cores_);
+    return numa_node_core_idx_[core];
   }
 
   /// Returns the model name of the cpu (e.g. Intel i7-2600)
@@ -126,7 +176,23 @@ class CpuInfo {
     bool reenable_;
   };
 
+ protected:
+  friend class CpuTestUtil;
+
+  /// Setup fake NUMA info to simulate NUMA for backend tests. Sets up CpuInfo to
+  /// simulate 'max_num_numa_nodes' with 'core_to_numa_node' specifying the NUMA node
+  /// of each core in [0, GetMaxNumCores()).
+  static void InitFakeNumaForTest(
+      int max_num_numa_nodes, const std::vector<int>& core_to_numa_node);
+
  private:
+  /// Initialize NUMA-related state - called from Init();
+  static void InitNuma();
+
+  /// Initialize 'numa_node_to_cores_' based on 'max_num_numa_nodes_' and
+  /// 'core_to_numa_node_'. Called from InitNuma();
+  static void InitNumaNodeToCores();
+
   /// Populates the arguments with information about this machine's caches.
   /// The values returned are not reliable in some environments, e.g. RHEL5 on EC2, so
   /// so we will keep this as a private method.
@@ -138,8 +204,22 @@ class CpuInfo {
   static int64_t original_hardware_flags_;
   static int64_t cycles_per_ms_;
   static int num_cores_;
+  static int max_num_cores_;
   static std::string model_name_;
-};
 
+  /// Maximum possible number of NUMA nodes.
+  static int max_num_numa_nodes_;
+
+  /// Array with 'max_num_cores_' entries, each of which is the NUMA node of that core.
+  static std::unique_ptr<int[]> core_to_numa_node_;
+
+  /// Vector with 'max_num_numa_nodes_' entries, each of which is a vector of the cores
+  /// belonging to that NUMA node.
+  static std::vector<std::vector<int>> numa_node_to_cores_;
+
+  /// Array with 'max_num_cores_' entries, each of which is the index of that core in its
+  /// NUMA node.
+  static std::vector<int> numa_node_core_idx_;
+};
 }
 #endif

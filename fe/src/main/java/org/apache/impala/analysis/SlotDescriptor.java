@@ -55,6 +55,8 @@ public class SlotDescriptor {
   private boolean isMaterialized_ = false;
 
   // if false, this slot cannot be NULL
+  // Note: it is still possible that a SlotRef pointing to this descriptor could have a
+  // NULL value if the entire tuple is NULL, for example as the result of an outer join.
   private boolean isNullable_ = true;
 
   // physical layout parameters
@@ -218,6 +220,20 @@ public class SlotDescriptor {
     setStats(ColumnStats.fromExpr(expr));
     Preconditions.checkState(expr.getType().isValid());
     setType(expr.getType());
+  }
+
+  /**
+   * Return true if the physical layout of this descriptor matches the physical layout
+   * of the other descriptor, but not necessarily ids.
+   */
+  public boolean LayoutEquals(SlotDescriptor other) {
+    if (!getType().equals(other.getType())) return false;
+    if (isNullable_ != other.isNullable_) return false;
+    if (getByteSize() != other.getByteSize()) return false;
+    if (getByteOffset() != other.getByteOffset()) return false;
+    if (getNullIndicatorByte() != other.getNullIndicatorByte()) return false;
+    if (getNullIndicatorBit() != other.getNullIndicatorBit()) return false;
+    return true;
   }
 
   public TSlotDescriptor toThrift() {

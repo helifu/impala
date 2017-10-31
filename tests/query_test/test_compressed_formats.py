@@ -23,9 +23,9 @@ from os.path import join
 from subprocess import call
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
-from tests.common.test_vector import TestDimension
+from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
 
 # (file extension, table suffix) pairs
@@ -40,6 +40,7 @@ compression_formats = [
 # Missing Coverage: Compressed data written by Hive is queriable by Impala on a non-hdfs
 # filesystem.
 @SkipIfS3.hive
+@SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 class TestCompressedFormats(ImpalaTestSuite):
@@ -55,15 +56,15 @@ class TestCompressedFormats(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestCompressedFormats, cls).add_test_dimensions()
-    cls.TestMatrix.clear()
-    cls.TestMatrix.add_dimension(\
-        TestDimension('file_format', *['rc', 'seq', 'text']))
-    cls.TestMatrix.add_dimension(\
-        TestDimension('compression_format', *compression_formats))
+    cls.ImpalaTestMatrix.clear()
+    cls.ImpalaTestMatrix.add_dimension(\
+        ImpalaTestDimension('file_format', *['rc', 'seq', 'text']))
+    cls.ImpalaTestMatrix.add_dimension(\
+        ImpalaTestDimension('compression_format', *compression_formats))
     if cls.exploration_strategy() == 'core':
       # Don't run on core.  This test is very slow and we are unlikely
       # to regress here.
-      cls.TestMatrix.add_constraint(lambda v: False);
+      cls.ImpalaTestMatrix.add_constraint(lambda v: False);
 
   @pytest.mark.execute_serially
   def test_compressed_formats(self, vector):
@@ -136,26 +137,61 @@ class TestTableWriters(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTableWriters, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # This class tests many formats, but doesn't use the contraints
     # Each format is tested within one test file, we constrain to text/none
     # as each test file only needs to be run once.
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         (v.get_value('table_format').file_format =='text' and
         v.get_value('table_format').compression_codec == 'none'))
 
-  def test_seq_writer(self, vector):
-    # TODO debug this test, same as seq writer.
-    # This caused by a zlib failure. Suspected cause is too small a buffer
-    # passed to zlib for compression; similar to IMPALA-424
-    pytest.skip()
-    self.run_test_case('QueryTest/seq-writer', vector)
+  def test_seq_writer(self, vector, unique_database):
+    self.run_test_case('QueryTest/seq-writer', vector, unique_database)
+
+  @SkipIfS3.hive
+  @SkipIfADLS.hive
+  @SkipIfIsilon.hive
+  @SkipIfLocal.hive
+  def test_seq_writer_hive_compatibility(self, vector, unique_database):
+    self.client.execute('set ALLOW_UNSUPPORTED_FORMATS=1')
+    # Write sequence files with different compression codec/compression mode and then read
+    # it back in Impala and Hive.
+    # Note that we don't test snappy here as the snappy codec used by Impala does not seem
+    # to be fully compatible with the snappy codec used by Hive.
+    for comp_codec, comp_mode in [('NONE', 'RECORD'), ('NONE', 'BLOCK'),
+                                  ('DEFAULT', 'RECORD'), ('DEFAULT', 'BLOCK'),
+                                  ('GZIP', 'RECORD'), ('GZIP', 'BLOCK')]:
+      table_name = '%s.seq_tbl_%s_%s' % (unique_database, comp_codec, comp_mode)
+      self.client.execute('set COMPRESSION_CODEC=%s' % comp_codec)
+      self.client.execute('set SEQ_COMPRESSION_MODE=%s' % comp_mode)
+      self.client.execute('create table %s like functional.zipcode_incomes stored as '
+          'sequencefile' % table_name)
+      # Write sequence file of size greater than 4K
+      self.client.execute('insert into %s select * from functional.zipcode_incomes where '
+          'zip >= "5"' % table_name)
+      # Write sequence file of size less than 4K
+      self.client.execute('insert into %s select * from functional.zipcode_incomes where '
+          'zip="00601"' % table_name)
+
+      count_query = 'select count(*) from %s' % table_name
+
+      # Read it back in Impala
+      output = self.client.execute(count_query)
+      assert '16541' == output.get_data()
+      # Read it back in Hive
+      # Note that username is passed in for the sake of remote cluster tests. The default
+      # HDFS user is typically 'hdfs', and this is needed to run a count() operation using
+      # hive. For local mini clusters, the usename can be anything. See IMPALA-5413.
+      output = self.run_stmt_in_hive(count_query, username='hdfs')
+      assert '16541' == output.split('\n')[1]
 
   def test_avro_writer(self, vector):
     self.run_test_case('QueryTest/avro-writer', vector)
 
   def test_text_writer(self, vector):
-    # TODO debug this test, same as seq writer.
+    # TODO debug this test.
+    # This caused by a zlib failure. Suspected cause is too small a buffer
+    # passed to zlib for compression; similar to IMPALA-424
     pytest.skip()
     self.run_test_case('QueryTest/text-writer', vector)
 
@@ -189,7 +225,7 @@ class TestLargeCompressedFile(ImpalaTestSuite):
 
     if cls.exploration_strategy() != 'exhaustive':
       pytest.skip("skipping if it's not exhaustive test.")
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         (v.get_value('table_format').file_format =='text' and
         v.get_value('table_format').compression_codec == 'snap'))
 
@@ -267,9 +303,9 @@ class TestBzip2Streaming(ImpalaTestSuite):
 
     if cls.exploration_strategy() != 'exhaustive':
       pytest.skip("skipping if it's not exhaustive test.")
-    cls.TestMatrix.add_dimension(
-        TestDimension('max_scan_range_length', *cls.MAX_SCAN_RANGE_LENGTHS))
-    cls.TestMatrix.add_constraint(lambda v:\
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('max_scan_range_length', *cls.MAX_SCAN_RANGE_LENGTHS))
+    cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('table_format').file_format == 'text' and\
         v.get_value('table_format').compression_codec == 'bzip')
 

@@ -55,11 +55,18 @@ class HBaseScanNode;
 /// be overridden by the query option hbase_caching. FE will also suggest a max value such
 /// that it won't put too much memory pressure on the region server.
 //
-/// HBase version compatibility: Starting from HBase 0.95.2 result rows are represented by
-/// Cells instead of KeyValues (prior HBase versions). To mitigate this API
-/// incompatibility the Cell class and its methods are replaced with corresponding
-/// KeyValue equivalents if the Cell is not found in the classpath. The HBase version
-/// detection and KeyValue/Cell replacements are performed in Init().
+/// HBase version compatibility: This code supports HBase 1.0 and HBase 2.0 APIs. It
+/// uses the Cell class for result rows rather than the older KeyValue class, which
+/// limits support to HBase >= 0.95.2. The code handles some minor incompatibilities
+/// across versions:
+/// 1. Scan.setCaching() and Scan.setCacheBlocks() tolerate the older void return value
+///    as well as the newer Scan return value (See HBASE-10841).
+/// 2. ScannerTimeoutException has been removed in HBase 2.0, as HBase has a heartbeat
+///    to prevent timeout. HBase 2.0 will reset the scanner and retry rather than
+///    throwing an exception. See HBASE-16266 and HBASE-17809.
+///    If ScannerTimeoutException does not exist, then HandleResultScannerTimeout()
+///    simply checks for an exception and returns any error via status.
+/// Both are detected and handled in Init().
 //
 /// Note: When none of the requested family/qualifiers exist in a particular row,
 /// HBase will not return the row at all, leading to "missing" NULL values.
@@ -78,7 +85,7 @@ class HBaseTableScanner {
 
   /// JNI setup. Create global references to classes,
   /// and find method ids.
-  static Status Init();
+  static Status Init() WARN_UNUSED_RESULT;
 
   /// HBase scan range; "" means unbounded
   class ScanRange {
@@ -107,33 +114,34 @@ class HBaseTableScanner {
   /// If start_/stop_key is not empty, is used for the corresponding role in the scan.
   /// Note: scan_range_vector cannot be modified for the duration of the scan.
   Status StartScan(JNIEnv* env, const TupleDescriptor* tuple_desc,
-                   const ScanRangeVector& scan_range_vector,
-                   const std::vector<THBaseFilter>& filters);
+      const ScanRangeVector& scan_range_vector,
+      const std::vector<THBaseFilter>& filters) WARN_UNUSED_RESULT;
 
   /// Position cursor to next row. Sets has_next to true if more rows exist, false
   /// otherwise.
   /// Returns non-ok status if an error occurred.
-  Status Next(JNIEnv* env, bool* has_next);
+  Status Next(JNIEnv* env, bool* has_next) WARN_UNUSED_RESULT;
 
   /// Get the current HBase row key.
-  Status GetRowKey(JNIEnv* env, void** key, int* key_length);
+  Status GetRowKey(JNIEnv* env, void** key, int* key_length) WARN_UNUSED_RESULT;
 
   /// Write the current HBase row key into the tuple slot.
   /// This is used for retrieving binary encoded data directly into the tuple.
-  Status GetRowKey(JNIEnv* env, const SlotDescriptor* slot_desc, Tuple* tuple);
+  Status GetRowKey(
+      JNIEnv* env, const SlotDescriptor* slot_desc, Tuple* tuple) WARN_UNUSED_RESULT;
 
   /// Used to fetch HBase values in order of family/qualifier.
   /// Fetch the next value matching family and qualifier into value/value_length.
   /// If there is no match, value is set to NULL and value_length to 0.
   Status GetValue(JNIEnv* env, const std::string& family, const std::string& qualifier,
-      void** value, int* value_length);
+      void** value, int* value_length) WARN_UNUSED_RESULT;
 
   /// Used to fetch HBase values in order of family/qualifier.
   /// Fetch the next value matching family and qualifier into the tuple slot.
   /// If there is no match, the tuple slot is set to null.
   /// This is used for retrieving binary encoded data directly into the tuple.
   Status GetValue(JNIEnv* env, const std::string& family, const std::string& qualifier,
-      const SlotDescriptor* slot_desc, Tuple* tuple);
+      const SlotDescriptor* slot_desc, Tuple* tuple) WARN_UNUSED_RESULT;
 
   /// Close HTable and ResultScanner.
   void Close(JNIEnv* env);
@@ -153,14 +161,15 @@ class HBaseTableScanner {
   static jclass scan_cl_;
   static jclass resultscanner_cl_;
   static jclass result_cl_;
-  /// Cell or KeyValue class depending on HBase version (see class comment).
   static jclass cell_cl_;
   static jclass hconstants_cl_;
   static jclass filter_list_cl_;
   static jclass filter_list_op_cl_;
   static jclass single_column_value_filter_cl_;
   static jclass compare_op_cl_;
-  /// Exception thrown when a ResultScanner times out
+  /// Exception thrown when a ResultScanner times out. ScannerTimeoutException was
+  /// removed in HBase 2.0. In this case, scanner_timeout_ex_cl_ is null and HBase
+  /// will not throw this exception.
   static jclass scanner_timeout_ex_cl_;
 
   static jmethodID scan_ctor_;
@@ -251,9 +260,10 @@ class HBaseTableScanner {
   /// ResultScanner times out. If a timeout occurs, the ResultScanner is re-created
   /// (with the scan range adjusted if some results have already been returned) and
   /// the exception is cleared. If any other exception is thrown, the error message
-  /// is returned in the status.
+  /// is returned in the status. In HBase 2.0, ScannerTimeoutException no longer
+  /// exists and the error message is returned in the status.
   /// 'timeout' is true if a ScannerTimeoutException was thrown, false otherwise.
-  Status HandleResultScannerTimeout(JNIEnv* env, bool* timeout);
+  Status HandleResultScannerTimeout(JNIEnv* env, bool* timeout) WARN_UNUSED_RESULT;
 
   /// Lexicographically compares s with the string in data having given length.
   /// Returns a value > 0 if s is greater, a value < 0 if s is smaller,
@@ -261,39 +271,46 @@ class HBaseTableScanner {
   int CompareStrings(const std::string& s, void* data, int length);
 
   /// Turn strings into Java byte array.
-  Status CreateByteArray(JNIEnv* env, const std::string& s, jbyteArray* bytes);
+  Status CreateByteArray(
+      JNIEnv* env, const std::string& s, jbyteArray* bytes) WARN_UNUSED_RESULT;
 
   /// First time scanning the table, do some setup
   Status ScanSetup(JNIEnv* env, const TupleDescriptor* tuple_desc,
-                   const std::vector<THBaseFilter>& filters);
+      const std::vector<THBaseFilter>& filters) WARN_UNUSED_RESULT;
 
   /// Initialize the scan to the given range
-  Status InitScanRange(JNIEnv* env, const ScanRange& scan_range);
+  Status InitScanRange(JNIEnv* env, const ScanRange& scan_range) WARN_UNUSED_RESULT;
   /// Initialize the scan range to the scan range specified by the start and end byte
   /// arrays
-  Status InitScanRange(JNIEnv* env, jbyteArray start_bytes, jbyteArray end_bytes);
+  Status InitScanRange(
+      JNIEnv* env, jbyteArray start_bytes, jbyteArray end_bytes) WARN_UNUSED_RESULT;
 
   /// Copies the row key of cell into value_pool_ and returns it via *data and *length.
   /// Returns error status if memory limit is exceeded.
-  inline Status GetRowKey(JNIEnv* env, jobject cell, void** data, int* length);
+  inline Status GetRowKey(
+      JNIEnv* env, jobject cell, void** data, int* length) WARN_UNUSED_RESULT;
 
   /// Copies the column family of cell into value_pool_ and returns it
   /// via *data and *length. Returns error status if memory limit is exceeded.
-  inline Status GetFamily(JNIEnv* env, jobject cell, void** data, int* length);
+  inline Status GetFamily(
+      JNIEnv* env, jobject cell, void** data, int* length) WARN_UNUSED_RESULT;
 
   /// Copies the column qualifier of cell into value_pool_ and returns it
   /// via *data and *length. Returns error status if memory limit is exceeded.
-  inline Status GetQualifier(JNIEnv* env, jobject cell, void** data, int* length);
+  inline Status GetQualifier(
+      JNIEnv* env, jobject cell, void** data, int* length) WARN_UNUSED_RESULT;
 
   /// Copies the value of cell into value_pool_ and returns it via *data and *length.
   /// Returns error status if memory limit is exceeded.
-  inline Status GetValue(JNIEnv* env, jobject cell, void** data, int* length);
+  inline Status GetValue(
+      JNIEnv* env, jobject cell, void** data, int* length) WARN_UNUSED_RESULT;
 
   /// Returns the current value of cells_[cell_index_] in *data and *length
   /// if its family/qualifier match the given family/qualifier.
   /// Otherwise, sets *is_null to true indicating a mismatch in family or qualifier.
   inline Status GetCurrentValue(JNIEnv* env, const std::string& family,
-      const std::string& qualifier, void** data, int* length, bool* is_null);
+      const std::string& qualifier, void** data, int* length,
+      bool* is_null) WARN_UNUSED_RESULT;
 
   /// Write to a tuple slot with the given hbase binary formatted data, which is in
   /// big endian.

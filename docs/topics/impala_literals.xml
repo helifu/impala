@@ -34,7 +34,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">literals</indexterm>
+      <indexterm audience="hidden">literals</indexterm>
       Each of the Impala data types has corresponding notation for literal values of that type. You specify literal
       values in SQL statements, such as in the <codeph>SELECT</codeph> list or <codeph>WHERE</codeph> clause of a
       query, or as an argument to a function call. See <xref href="impala_datatypes.xml#datatypes"/> for a complete
@@ -51,7 +51,7 @@ under the License.
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">numeric literals</indexterm>
+        <indexterm audience="hidden">numeric literals</indexterm>
         To write literals for the integer types (<codeph>TINYINT</codeph>, <codeph>SMALLINT</codeph>,
         <codeph>INT</codeph>, and <codeph>BIGINT</codeph>), use a sequence of digits with optional leading zeros.
       </p>
@@ -146,7 +146,7 @@ under the License.
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">string literals</indexterm>
+        <indexterm audience="hidden">string literals</indexterm>
         String literals are quoted using either single or double quotation marks. You can use either kind of quotes
         for string literals, even both kinds for different literals within the same statement.
       </p>
@@ -299,7 +299,7 @@ select case bool_col when true then 'yes' when false 'no' else 'null' end from t
 
       <p>
         You can also use <codeph>INTERVAL</codeph> expressions to add or subtract from timestamp literal values,
-        such as <codeph>'1966-07-30' + INTERVAL 5 YEARS + INTERVAL 3 DAYS</codeph>. See
+        such as <codeph>CAST('1966-07-30' AS TIMESTAMP) + INTERVAL 5 YEARS + INTERVAL 3 DAYS</codeph>. See
         <xref href="impala_timestamp.xml#timestamp"/> for details.
       </p>
 
@@ -320,7 +320,7 @@ select case bool_col when true then 'yes' when false 'no' else 'null' end from t
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">NULL</indexterm>
+        <indexterm audience="hidden">NULL</indexterm>
         The notion of <codeph>NULL</codeph> values is familiar from all kinds of database systems, but each SQL
         dialect can have its own behavior and restrictions on <codeph>NULL</codeph> values. For Big Data
         processing, the precise semantics of <codeph>NULL</codeph> values are significant: any misunderstanding
@@ -397,6 +397,24 @@ insert into t1 partition(x=NULL, y) select c1, c3  from some_other_table;</codeb
         <codeph>nullifzero()</codeph>, and <codeph>zeroifnull()</codeph>. See
         <xref href="impala_conditional_functions.xml#conditional_functions"/> for details.
       </p>
+
+      <p conref="../shared/impala_common.xml#common/kudu_blurb"/>
+      <p rev="kudu">
+        Columns in Kudu tables have an attribute that specifies whether or not they can contain
+        <codeph>NULL</codeph> values. A column with a <codeph>NULL</codeph> attribute can contain
+        nulls. A column with a <codeph>NOT NULL</codeph> attribute cannot contain any nulls, and
+        an <codeph>INSERT</codeph>, <codeph>UPDATE</codeph>, or <codeph>UPSERT</codeph> statement
+        will skip any row that attempts to store a null in a column designated as <codeph>NOT NULL</codeph>.
+        Kudu tables default to the <codeph>NULL</codeph> setting for each column, except columns that
+        are part of the primary key.
+      </p>
+      <p rev="kudu">
+        In addition to columns with the <codeph>NOT NULL</codeph> attribute, Kudu tables also have
+        restrictions on <codeph>NULL</codeph> values in columns that are part of the primary key for
+        a table. No column that is part of the primary key in a Kudu table can contain any
+        <codeph>NULL</codeph> values.
+      </p>
+
     </conbody>
   </concept>
 </concept>

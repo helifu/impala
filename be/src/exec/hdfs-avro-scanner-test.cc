@@ -17,6 +17,7 @@
 
 #include "exec/hdfs-avro-scanner.h"
 
+#include <algorithm>
 #include <limits.h>
 
 #include "exec/read-write-util.h"
@@ -24,6 +25,8 @@
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "testutil/gtest-util.h"
+
+#include "common/names.h"
 
 // TODO: IMPALA-3658: complete CHAR unit tests.
 // TODO: IMPALA-3658: complete VARCHAR unit tests.
@@ -148,14 +151,8 @@ class HdfsAvroScannerTest : public testing::Test {
     char slot[max<int>(sizeof(StringValue), max_len)];
     bool success = scanner_.ReadAvroChar(TYPE_CHAR, max_len, &new_data, data + data_len,
         true, slot, NULL);
-    StringValue value;
-    if (max_len <= ColumnType::MAX_CHAR_INLINE_LENGTH) {
-      // Convert to non-inlined string value for comparison.
-      value.len = max_len;
-      value.ptr = slot;
-    } else {
-      value = *reinterpret_cast<StringValue*>(slot);
-    }
+    // Convert to non-inlined string value for comparison.
+    StringValue value(slot, max_len);
     CheckReadResult(expected_val, expected_encoded_len, expected_error, value, success,
         new_data - data);
   }

@@ -73,6 +73,7 @@ import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduScanToken;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
+import org.junit.Before;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -98,10 +99,6 @@ public class PlannerTestBase extends FrontendTestBase {
 
   @BeforeClass
   public static void setUp() throws Exception {
-    // Use 8 cores for resource estimation.
-    RuntimeEnv.INSTANCE.setNumCores(8);
-    // Set test env to control the explain level.
-    RuntimeEnv.INSTANCE.setTestEnv(true);
     // Mimic the 3 node test mini-cluster.
     TUpdateMembershipRequest updateReq = new TUpdateMembershipRequest();
     updateReq.setIp_addresses(Sets.newHashSet("127.0.0.1"));
@@ -112,6 +109,16 @@ public class PlannerTestBase extends FrontendTestBase {
     if (RuntimeEnv.INSTANCE.isKuduSupported()) {
       kuduClient_ = new KuduClient.KuduClientBuilder("127.0.0.1:7051").build();
     }
+  }
+
+  @Before
+  public void setUpTest() throws Exception {
+    // Reset the RuntimeEnv - individual tests may change it.
+    RuntimeEnv.INSTANCE.reset();
+    // Use 8 cores for resource estimation.
+    RuntimeEnv.INSTANCE.setNumCores(8);
+    // Set test env to control the explain level.
+    RuntimeEnv.INSTANCE.setTestEnv(true);
   }
 
   @AfterClass
@@ -390,7 +397,8 @@ public class PlannerTestBase extends FrontendTestBase {
    * of 'testCase'.
    */
   private void runTestCase(TestCase testCase, StringBuilder errorLog,
-      StringBuilder actualOutput, String dbName, TQueryOptions options)
+      StringBuilder actualOutput, String dbName, TQueryOptions options,
+      boolean ignoreExplainHeader)
       throws CatalogException {
     if (options == null) {
       options = defaultQueryOptions();
@@ -406,18 +414,20 @@ public class PlannerTestBase extends FrontendTestBase {
     }
     TQueryCtx queryCtx = TestUtils.createQueryContext(
         dbName, System.getProperty("user.name"));
-    queryCtx.request.query_options = options;
+    queryCtx.client_request.query_options = options;
     // Test single node plan, scan range locations, and column lineage.
-    TExecRequest singleNodeExecRequest =
-        testPlan(testCase, Section.PLAN, queryCtx, errorLog, actualOutput);
+    TExecRequest singleNodeExecRequest = testPlan(testCase, Section.PLAN, queryCtx,
+        ignoreExplainHeader, errorLog, actualOutput);
     validateTableIds(singleNodeExecRequest);
     checkScanRangeLocations(testCase, singleNodeExecRequest, errorLog, actualOutput);
     checkColumnLineage(testCase, singleNodeExecRequest, errorLog, actualOutput);
     checkLimitCardinality(query, singleNodeExecRequest, errorLog);
     // Test distributed plan.
-    testPlan(testCase, Section.DISTRIBUTEDPLAN, queryCtx, errorLog, actualOutput);
+    testPlan(testCase, Section.DISTRIBUTEDPLAN, queryCtx, ignoreExplainHeader, errorLog,
+        actualOutput);
     // test parallel plans
-    testPlan(testCase, Section.PARALLELPLANS, queryCtx, errorLog, actualOutput);
+    testPlan(testCase, Section.PARALLELPLANS, queryCtx, ignoreExplainHeader, errorLog,
+        actualOutput);
   }
 
   /**
@@ -471,20 +481,27 @@ public class PlannerTestBase extends FrontendTestBase {
    *
    * Returns the produced exec request or null if there was an error generating
    * the plan.
+   *
+   * If ignoreExplainHeader is true, the explain header with warnings and resource
+   * estimates is stripped out.
    */
   private TExecRequest testPlan(TestCase testCase, Section section,
-      TQueryCtx queryCtx, StringBuilder errorLog, StringBuilder actualOutput) {
+      TQueryCtx queryCtx, boolean ignoreExplainHeader,
+      StringBuilder errorLog, StringBuilder actualOutput) {
     String query = testCase.getQuery();
-    queryCtx.request.setStmt(query);
+    queryCtx.client_request.setStmt(query);
+    TQueryOptions queryOptions = queryCtx.client_request.getQuery_options();
     if (section == Section.PLAN) {
-      queryCtx.request.getQuery_options().setNum_nodes(1);
+      queryOptions.setNum_nodes(1);
     } else {
       // for distributed and parallel execution we want to run on all available nodes
-      queryCtx.request.getQuery_options().setNum_nodes(
+      queryOptions.setNum_nodes(
           ImpalaInternalServiceConstants.NUM_NODES_ALL);
     }
-    if (section == Section.PARALLELPLANS) {
-      queryCtx.request.query_options.setMt_dop(2);
+    if (section == Section.PARALLELPLANS
+        && (!queryOptions.isSetMt_dop() || queryOptions.getMt_dop() == 0)) {
+      // Set mt_dop to force production of parallel plans.
+      queryCtx.client_request.query_options.setMt_dop(2);
     }
     ArrayList<String> expectedPlan = testCase.getSectionContents(section);
     boolean sectionExists = expectedPlan != null && !expectedPlan.isEmpty();
@@ -507,7 +524,8 @@ public class PlannerTestBase extends FrontendTestBase {
     // Failed to produce an exec request.
     if (execRequest == null) return null;
 
-    String explainStr = removeExplainHeader(explainBuilder.toString());
+    String explainStr = explainBuilder.toString();
+    if (ignoreExplainHeader) explainStr = removeExplainHeader(explainStr);
     actualOutput.append(explainStr);
     LOG.info(section.toString() + ":" + explainStr);
     if (expectedErrorMsg != null) {
@@ -537,14 +555,14 @@ public class PlannerTestBase extends FrontendTestBase {
     StringBuilder explainBuilder = new StringBuilder();
     TExecRequest execRequest = null;
     TExplainLevel origExplainLevel =
-        queryCtx.request.getQuery_options().getExplain_level();
+        queryCtx.client_request.getQuery_options().getExplain_level();
     try {
-      queryCtx.request.getQuery_options().setExplain_level(TExplainLevel.VERBOSE);
+      queryCtx.client_request.getQuery_options().setExplain_level(TExplainLevel.VERBOSE);
       execRequest = frontend_.createExecRequest(queryCtx, explainBuilder);
     } catch (ImpalaException e) {
       return ExceptionUtils.getStackTrace(e);
     } finally {
-      queryCtx.request.getQuery_options().setExplain_level(origExplainLevel);
+      queryCtx.client_request.getQuery_options().setExplain_level(origExplainLevel);
     }
     Preconditions.checkNotNull(execRequest);
     String explainStr = removeExplainHeader(explainBuilder.toString());
@@ -702,10 +720,16 @@ public class PlannerTestBase extends FrontendTestBase {
   }
 
   protected void runPlannerTestFile(String testFile, TQueryOptions options) {
-    runPlannerTestFile(testFile, "default", options);
+    runPlannerTestFile(testFile, options, true);
   }
 
-  private void runPlannerTestFile(String testFile, String dbName, TQueryOptions options) {
+  protected void runPlannerTestFile(String testFile, TQueryOptions options,
+      boolean ignoreExplainHeader) {
+    runPlannerTestFile(testFile, "default", options, ignoreExplainHeader);
+  }
+
+  private void runPlannerTestFile(String testFile, String dbName, TQueryOptions options,
+      boolean ignoreExplainHeader) {
     String fileName = testDir_ + "/" + testFile + ".test";
     TestFileParser queryFileParser = new TestFileParser(fileName);
     StringBuilder actualOutput = new StringBuilder();
@@ -716,7 +740,8 @@ public class PlannerTestBase extends FrontendTestBase {
       actualOutput.append(testCase.getSectionAsString(Section.QUERY, true, "\n"));
       actualOutput.append("\n");
       try {
-        runTestCase(testCase, errorLog, actualOutput, dbName, options);
+        runTestCase(testCase, errorLog, actualOutput, dbName, options,
+                ignoreExplainHeader);
       } catch (CatalogException e) {
         errorLog.append(String.format("Failed to plan query\n%s\n%s",
             testCase.getQuery(), e.getMessage()));
@@ -743,10 +768,10 @@ public class PlannerTestBase extends FrontendTestBase {
   }
 
   protected void runPlannerTestFile(String testFile) {
-    runPlannerTestFile(testFile, "default", null);
+    runPlannerTestFile(testFile, "default", null, true);
   }
 
   protected void runPlannerTestFile(String testFile, String dbName) {
-    runPlannerTestFile(testFile, dbName, null);
+    runPlannerTestFile(testFile, dbName, null, true);
   }
 }

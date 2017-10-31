@@ -4,9 +4,6 @@
 
 #include <stddef.h>
 #include <stdlib.h>
-#include <ext/hash_map>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_map;
 #include <string>
 using std::string;
 #include <utility>
@@ -14,6 +11,8 @@ using std::make_pair;
 using std::pair;
 #include <vector>
 using std::vector;
+#include <unordered_map>
+using std::unordered_map;
 
 #include "gutil/casts.h"
 #include "gutil/integral_types.h"
@@ -221,11 +220,10 @@ int64 ReverseOrderedStringToInt64(const StringPiece& key) {
 //   and commas to separate entries.
 // --------------------------------------------------------------------------
 
-string DictionaryInt32Encode(const hash_map<string, int32>* dictionary) {
+string DictionaryInt32Encode(const unordered_map<string, int32>* dictionary) {
   vector<string> entries;
-  for (hash_map<string, int32>::const_iterator iter = dictionary->begin();
-       iter != dictionary->end(); ++iter) {
-    entries.push_back(StringPrintf("%s:%d", iter->first.c_str(), iter->second));
+  for (const auto& entry : *dictionary) {
+    entries.push_back(StringPrintf("%s:%d", entry.first.c_str(), entry.second));
   }
 
   string result;
@@ -233,12 +231,11 @@ string DictionaryInt32Encode(const hash_map<string, int32>* dictionary) {
   return result;
 }
 
-string DictionaryInt64Encode(const hash_map<string, int64>* dictionary) {
+string DictionaryInt64Encode(const unordered_map<string, int64>* dictionary) {
   vector<string> entries;
-  for (hash_map<string, int64>::const_iterator iter = dictionary->begin();
-       iter != dictionary->end(); ++iter) {
-    entries.push_back(StringPrintf("%s:%" GG_LL_FORMAT "d",
-                                   iter->first.c_str(), iter->second));
+  for (const auto& entry : *dictionary) {
+    entries.push_back(StringPrintf("%s:%" PRId64,
+                                   entry.first.c_str(), entry.second));
   }
 
   string result;
@@ -246,11 +243,10 @@ string DictionaryInt64Encode(const hash_map<string, int64>* dictionary) {
   return result;
 }
 
-string DictionaryDoubleEncode(const hash_map<string, double>* dictionary) {
+string DictionaryDoubleEncode(const unordered_map<string, double>* dictionary) {
   vector<string> entries;
-  for (hash_map<string, double>::const_iterator iter = dictionary->begin();
-       iter != dictionary->end(); ++iter) {
-    entries.push_back(StringPrintf("%s:%g", iter->first.c_str(), iter->second));
+  for (const auto& entry : *dictionary) {
+    entries.push_back(StringPrintf("%s:%g", entry.first.c_str(), entry.second));
   }
 
   string result;
@@ -259,12 +255,12 @@ string DictionaryDoubleEncode(const hash_map<string, double>* dictionary) {
 }
 
 bool DictionaryParse(const string& encoded_str,
-                      vector<pair<string, string> >* items) {
+                     vector<pair<string, string> >* items) {
   vector<string> entries;
   SplitStringUsing(encoded_str, ",", &entries);
-  for (int i = 0; i < entries.size(); ++i) {
+  for (const auto& entry : entries) {
     vector<string> fields;
-    SplitStringAllowEmpty(entries[i], ":", &fields);
+    SplitStringAllowEmpty(entry, ":", &fields);
     if (fields.size() != 2)  // parsing error
       return false;
     items->push_back(make_pair(fields[0], fields[1]));
@@ -272,60 +268,60 @@ bool DictionaryParse(const string& encoded_str,
   return true;
 }
 
-bool DictionaryInt32Decode(hash_map<string, int32>* dictionary,
+bool DictionaryInt32Decode(unordered_map<string, int32>* dictionary,
                            const string& encoded_str) {
   vector<pair<string, string> > items;
   if (!DictionaryParse(encoded_str, &items))
     return false;
 
   dictionary->clear();
-  for (int i = 0; i < items.size(); ++i) {
-    char *error = NULL;
-    const int32 value = strto32(items[i].second.c_str(), &error, 0);
-    if (error == items[i].second.c_str() || *error != '\0') {
+  for (const auto& item : items) {
+    char *error = nullptr;
+    const int32 value = strto32(item.second.c_str(), &error, 0);
+    if (error == item.second.c_str() || *error != '\0') {
       // parsing error
       return false;
     }
-    (*dictionary)[items[i].first] = value;
+    (*dictionary)[item.first] = value;
   }
   return true;
 }
 
-bool DictionaryInt64Decode(hash_map<string, int64>* dictionary,
+bool DictionaryInt64Decode(unordered_map<string, int64>* dictionary,
                            const string& encoded_str) {
   vector<pair<string, string> > items;
   if (!DictionaryParse(encoded_str, &items))
     return false;
 
   dictionary->clear();
-  for (int i = 0; i < items.size(); ++i) {
-    char *error = NULL;
-    const int64 value = strto64(items[i].second.c_str(), &error, 0);
-    if (error == items[i].second.c_str() || *error != '\0')  {
+  for (const auto& item : items) {
+    char *error = nullptr;
+    const int64 value = strto64(item.second.c_str(), &error, 0);
+    if (error == item.second.c_str() || *error != '\0')  {
       // parsing error
       return false;
     }
-    (*dictionary)[items[i].first] = value;
+    (*dictionary)[item.first] = value;
   }
   return true;
 }
 
 
-bool DictionaryDoubleDecode(hash_map<string, double>* dictionary,
+bool DictionaryDoubleDecode(unordered_map<string, double>* dictionary,
                             const string& encoded_str) {
   vector<pair<string, string> > items;
   if (!DictionaryParse(encoded_str, &items))
     return false;
 
   dictionary->clear();
-  for (int i = 0; i < items.size(); ++i) {
-    char *error = NULL;
-    const double value = strtod(items[i].second.c_str(), &error);
-    if (error == items[i].second.c_str() || *error != '\0') {
+  for (const auto& item : items) {
+    char *error = nullptr;
+    const double value = strtod(item.second.c_str(), &error);
+    if (error == item.second.c_str() || *error != '\0') {
       // parsing error
       return false;
     }
-    (*dictionary)[items[i].first] = value;
+    (*dictionary)[item.first] = value;
   }
   return true;
 }

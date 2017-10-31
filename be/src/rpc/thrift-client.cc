@@ -23,6 +23,7 @@
 #include <thrift/Thrift.h>
 #include <gutil/strings/substitute.h>
 
+#include "util/network-util.h"
 #include "util/time.h"
 
 #include "common/names.h"
@@ -32,11 +33,25 @@ using namespace apache::thrift;
 using namespace strings;
 
 DECLARE_string(ssl_client_ca_certificate);
+DECLARE_string(ssl_cipher_list);
+DECLARE_string(ssl_minimum_version);
 
 namespace impala {
 
+ThriftClientImpl::ThriftClientImpl(const std::string& ipaddress, int port, bool ssl)
+  : address_(MakeNetworkAddress(ipaddress, port)), ssl_(ssl) {
+  if (ssl_) {
+    SSLProtocol version;
+    init_status_ =
+        SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &version);
+    if (!init_status_.ok()) return;
+    ssl_factory_.reset(new TSSLSocketFactory(version));
+  }
+  init_status_ = CreateSocket();
+}
+
 Status ThriftClientImpl::Open() {
-  if (!socket_create_status_.ok()) return socket_create_status_;
+  RETURN_IF_ERROR(init_status_);
   try {
     if (!transport_->isOpen()) {
       transport_->open();
@@ -56,7 +71,7 @@ Status ThriftClientImpl::Open() {
 
 Status ThriftClientImpl::OpenWithRetry(uint32_t num_tries, uint64_t wait_ms) {
   // Socket creation failures are not recoverable.
-  if (!socket_create_status_.ok()) return socket_create_status_;
+  RETURN_IF_ERROR(init_status_);
 
   uint32_t try_count = 0L;
   while (true) {
@@ -100,6 +115,7 @@ Status ThriftClientImpl::CreateSocket() {
     socket_.reset(new TSocket(address_.hostname, address_.port));
   } else {
     try {
+      if (!FLAGS_ssl_cipher_list.empty()) ssl_factory_->ciphers(FLAGS_ssl_cipher_list);
       ssl_factory_->loadTrustedCertificates(FLAGS_ssl_client_ca_certificate.c_str());
       socket_ = ssl_factory_->createSocket(address_.hostname, address_.port);
     } catch (const TException& e) {

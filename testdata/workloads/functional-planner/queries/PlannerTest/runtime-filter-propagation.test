@@ -159,12 +159,12 @@ PLAN-ROOT SINK
 |
 02:HASH JOIN [INNER JOIN]
 |  hash predicates: t1.id = t2.id
-|  other predicates: t1.year + t2.smallint_col = t2.tinyint_col, t1.year = t1.month + t2.int_col, t1.year + t2.int_col = t1.month + t2.tinyint_col
+|  other predicates: t1.year = t1.month + t2.int_col, t2.tinyint_col = t1.year + t2.smallint_col, t1.year + t2.int_col = t1.month + t2.tinyint_col
 |  runtime filters: RF000 <- t2.id
 |
 |--01:SCAN HDFS [functional.alltypesnopart t2]
 |     partitions=1/1 files=0 size=0B
-|     predicates: 1 = t2.bigint_col
+|     predicates: t2.bigint_col = 1
 |
 00:SCAN HDFS [functional.alltypesagg t1]
    partitions=11/11 files=11 size=814.73KB
@@ -714,6 +714,7 @@ PLAN-ROOT SINK
 |     predicates: t3.bool_col = FALSE
 |
 00:UNION
+|  pass-through-operands: all
 |
 |--02:SCAN HDFS [functional.alltypestiny t2]
 |     partitions=4/4 files=4 size=460B
@@ -748,6 +749,7 @@ PLAN-ROOT SINK
 |     predicates: b.int_col = 1
 |
 00:UNION
+|  pass-through-operands: all
 |
 |--03:SCAN HDFS [functional.alltypes]
 |     partitions=24/24 files=24 size=478.45KB
@@ -789,6 +791,7 @@ PLAN-ROOT SINK
 |  group by: month, year
 |
 00:UNION
+|  pass-through-operands: all
 |
 |--03:SCAN HDFS [functional.alltypes]
 |     partitions=24/24 files=24 size=478.45KB
@@ -1360,14 +1363,14 @@ PLAN-ROOT SINK
 |
 |--11:HASH JOIN [INNER JOIN]
 |  |  hash predicates: a.bigint_col = b.bigint_col, a.bool_col = b.bool_col, a.double_col = b.double_col, a.float_col = b.float_col, a.id = b.id, a.int_col = b.int_col, a.smallint_col = b.smallint_col, a.tinyint_col = b.tinyint_col
-|  |  runtime filters: RF017 <- b.bool_col, RF016 <- b.bigint_col, RF019 <- b.float_col, RF018 <- b.double_col, RF021 <- b.int_col, RF020 <- b.id, RF023 <- b.tinyint_col, RF022 <- b.smallint_col
+|  |  runtime filters: RF016 <- b.bigint_col, RF017 <- b.bool_col, RF018 <- b.double_col, RF019 <- b.float_col, RF020 <- b.id, RF021 <- b.int_col, RF022 <- b.smallint_col, RF023 <- b.tinyint_col
 |  |
 |  |--10:SCAN HDFS [functional.alltypestiny b]
 |  |     partitions=4/4 files=4 size=460B
 |  |
 |  09:SCAN HDFS [functional.alltypes a]
 |     partitions=24/24 files=24 size=478.45KB
-|     runtime filters: RF017 -> a.bool_col, RF016 -> a.bigint_col, RF019 -> a.float_col, RF018 -> a.double_col, RF021 -> a.int_col, RF020 -> a.id, RF023 -> a.tinyint_col, RF022 -> a.smallint_col
+|     runtime filters: RF016 -> a.bigint_col, RF017 -> a.bool_col, RF018 -> a.double_col, RF019 -> a.float_col, RF020 -> a.id, RF021 -> a.int_col, RF022 -> a.smallint_col, RF023 -> a.tinyint_col
 |
 30:NESTED LOOP JOIN [CROSS JOIN]
 |
@@ -1415,7 +1418,7 @@ PLAN-ROOT SINK
 |
 04:NESTED LOOP JOIN [LEFT OUTER JOIN]
 |  join predicates: b.id IS DISTINCT FROM c.id
-|  predicates: b.int_col + b.bigint_col = c.int_col
+|  predicates: c.int_col = b.int_col + b.bigint_col
 |
 |--02:SCAN HDFS [functional.alltypes c]
 |     partitions=24/24 files=24 size=478.45KB

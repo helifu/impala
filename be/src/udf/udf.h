@@ -19,9 +19,20 @@
 #ifndef IMPALA_UDF_UDF_H
 #define IMPALA_UDF_UDF_H
 
+// THIS FILE IS USED BY THE STANDALONE IMPALA UDF DEVELOPMENT KIT.
+// IT MUST BE BUILDABLE WITH C++98 AND WITHOUT ANY INTERNAL IMPALA HEADERS.
+
 #include <assert.h>
 #include <boost/cstdint.hpp>
 #include <string.h>
+
+// Only use noexcept if the compiler supports C++11 (some system compilers may not
+// or may have it disabled by default).
+#if __cplusplus >= 201103L
+#define NOEXCEPT noexcept
+#else
+#define NOEXCEPT
+#endif
 
 /// This is the only Impala header required to develop UDFs and UDAs. This header
 /// contains the types that need to be used and the FunctionContext object. The context
@@ -66,9 +77,12 @@ class FunctionContext {
     TYPE_DOUBLE,
     TYPE_TIMESTAMP,
     TYPE_STRING,
+    // Not used - maps to CHAR(N), which is not supported for UDFs and UDAs.
     TYPE_FIXED_BUFFER,
     TYPE_DECIMAL,
-    TYPE_VARCHAR
+    TYPE_VARCHAR,
+    // A fixed-size buffer, passed as a StringVal.
+    TYPE_FIXED_UDA_INTERMEDIATE
   };
 
   struct TypeDesc {
@@ -78,7 +92,8 @@ class FunctionContext {
     int precision;
     int scale;
 
-    /// Only valid if type == TYPE_FIXED_BUFFER || type == TYPE_VARCHAR
+    /// Only valid if type is one of TYPE_FIXED_BUFFER, TYPE_FIXED_UDA_INTERMEDIATE or
+    /// TYPE_VARCHAR.
     int len;
   };
 
@@ -97,7 +112,7 @@ class FunctionContext {
     /// concurrently on a single host if the UDF will be evaluated in multiple plan
     /// fragments on that host. In general, read-only state that doesn't need to be
     /// recomputed for every UDF call should be fragment-local.
-    /// TODO: not yet implemented
+    /// TODO: Move FRAGMENT_LOCAL states to query_state for multi-threading.
     FRAGMENT_LOCAL,
 
     /// Indicates that the function state is local to the execution thread. This state
@@ -144,7 +159,7 @@ class FunctionContext {
   /// If Allocate() fails or causes the memory limit to be exceeded, the error will be
   /// set in this object causing the query to fail.
   /// TODO: 'byte_size' should be 64-bit. See IMPALA-2756.
-  uint8_t* Allocate(int byte_size) noexcept;
+  uint8_t* Allocate(int byte_size) NOEXCEPT;
 
   /// Wrapper around Allocate() to allocate a buffer of the given type "T".
   template<typename T>
@@ -160,10 +175,10 @@ class FunctionContext {
   ///
   /// This should be used for buffers that constantly get appended to.
   /// TODO: 'byte_size' should be 64-bit. See IMPALA-2756.
-  uint8_t* Reallocate(uint8_t* ptr, int byte_size) noexcept;
+  uint8_t* Reallocate(uint8_t* ptr, int byte_size) NOEXCEPT;
 
   /// Frees a buffer returned from Allocate() or Reallocate()
-  void Free(uint8_t* buffer) noexcept;
+  void Free(uint8_t* buffer) NOEXCEPT;
 
   /// For allocations that cannot use the Allocate() API provided by this
   /// object, TrackAllocation()/Free() can be used to just keep count of the
@@ -189,21 +204,25 @@ class FunctionContext {
   const TypeDesc& GetIntermediateType() const;
 
   /// Returns the number of arguments to this function (not including the FunctionContext*
-  /// argument).
+  /// argument or the output of a UDA).
+  /// For UDAs, returns the number of logical arguments of the aggregate function, not
+  /// the number of arguments of the C++ function being executed.
   int GetNumArgs() const;
 
   /// Returns the type information for the arg_idx-th argument (0-indexed, not including
   /// the FunctionContext* argument). Returns NULL if arg_idx is invalid.
+  /// For UDAs, returns the logical argument types of the aggregate function, not the
+  /// argument types of the C++ function being executed.
   const TypeDesc* GetArgType(int arg_idx) const;
 
-  /// Returns true if the arg_idx-th input argument (0 indexed, not including the
-  /// FunctionContext* argument) is a constant (e.g. 5, "string", 1 + 1).
+  /// Returns true if the arg_idx-th input argument (indexed in the same way as
+  /// GetArgType()) is a constant (e.g. 5, "string", 1 + 1).
   bool IsArgConstant(int arg_idx) const;
 
-  /// Returns a pointer to the value of the arg_idx-th input argument (0 indexed, not
-  /// including the FunctionContext* argument). Returns NULL if the argument is not
-  /// constant. This function can be used to obtain user-specified constants in a UDF's
-  /// Init() or Close() functions.
+  /// Returns a pointer to the value of the arg_idx-th input argument (indexed in the
+  /// same way as GetArgType()). Returns NULL if the argument is not constant. This
+  /// function can be used to obtain user-specified constants in a UDF's Init() or
+  /// Close() functions.
   AnyVal* GetConstantArg(int arg_idx) const;
 
   /// TODO: Do we need to add arbitrary key/value metadata. This would be plumbed
@@ -322,10 +341,8 @@ typedef void (*UdfClose)(FunctionContext* context,
 /// The UDA is registered with three types: the result type, the input type and
 /// the intermediate type.
 ///
-/// If the UDA needs a fixed byte width intermediate buffer, the type should be
-/// TYPE_FIXED_BUFFER and Impala will allocate the buffer. If the UDA needs an unknown
-/// sized buffer, it should use TYPE_STRING and allocate it from the FunctionContext
-/// manually.
+/// If the UDA needs a variable-sized buffer, it should use TYPE_STRING and allocate it
+/// from the FunctionContext manually.
 /// For UDAs that need a complex data structure as the intermediate state, the
 /// intermediate type should be string and the UDA can cast the ptr to the structure
 /// it is using.
@@ -389,6 +406,9 @@ typedef ResultType (*UdaFinalize)(FunctionContext* context, const IntermediateTy
 //-------------Implementation of the *Val structs ----------------------------
 //----------------------------------------------------------------------------
 struct AnyVal {
+  // Whether this value is NULL. If true, all other fields contain arbitrary values.
+  // UDF code should *not* assume that other fields of a NULL *Val struct have any
+  // particular value (e.g. 0 or -1).
   bool is_null;
   AnyVal(bool is_null = false) : is_null(is_null) {}
 };
@@ -413,9 +433,10 @@ struct BooleanVal : public AnyVal {
 };
 
 struct TinyIntVal : public AnyVal {
-  int8_t val;
+  typedef int8_t underlying_type_t;
+  underlying_type_t val;
 
-  TinyIntVal(int8_t val = 0) : val(val) { }
+  TinyIntVal(underlying_type_t val = 0) : val(val) { }
 
   static TinyIntVal null() {
     TinyIntVal result;
@@ -432,9 +453,10 @@ struct TinyIntVal : public AnyVal {
 };
 
 struct SmallIntVal : public AnyVal {
-  int16_t val;
+  typedef int16_t underlying_type_t;
+  underlying_type_t val;
 
-  SmallIntVal(int16_t val = 0) : val(val) { }
+  SmallIntVal(underlying_type_t val = 0) : val(val) { }
 
   static SmallIntVal null() {
     SmallIntVal result;
@@ -451,9 +473,10 @@ struct SmallIntVal : public AnyVal {
 };
 
 struct IntVal : public AnyVal {
-  int32_t val;
+  typedef int32_t underlying_type_t;
+  underlying_type_t val;
 
-  IntVal(int32_t val = 0) : val(val) { }
+  IntVal(underlying_type_t val = 0) : val(val) { }
 
   static IntVal null() {
     IntVal result;
@@ -470,9 +493,10 @@ struct IntVal : public AnyVal {
 };
 
 struct BigIntVal : public AnyVal {
-  int64_t val;
+  typedef int64_t underlying_type_t;
+  underlying_type_t val;
 
-  BigIntVal(int64_t val = 0) : val(val) { }
+  BigIntVal(underlying_type_t val = 0) : val(val) { }
 
   static BigIntVal null() {
     BigIntVal result;
@@ -549,6 +573,7 @@ struct TimestampVal : public AnyVal {
   bool operator!=(const TimestampVal& other) const { return !(*this == other); }
 };
 
+/// A String value represented as a buffer + length.
 /// Note: there is a difference between a NULL string (is_null == true) and an
 /// empty string (len == 0).
 struct StringVal : public AnyVal {
@@ -557,7 +582,12 @@ struct StringVal : public AnyVal {
   // in case of overflow.
   static const unsigned MAX_LENGTH = (1 << 30);
 
+  // The length of the string buffer in bytes.
   int len;
+
+  // Pointer to the start of the string buffer. The buffer is not aligned and is not
+  // null-terminated. Functions must not read or write past the end of the buffer.
+  // I.e.  accessing ptr[i] where i >= len is invalid.
   uint8_t* ptr;
 
   /// Construct a StringVal from ptr/len. Note: this does not make a copy of ptr
@@ -578,7 +608,21 @@ struct StringVal : public AnyVal {
   /// If the memory allocation fails, e.g. because the intermediate value would be too
   /// large, the constructor will construct a NULL string and set an error on the function
   /// context.
-  StringVal(FunctionContext* context, int len) noexcept;
+  ///
+  /// The memory backing this StringVal is a local allocation, and so doesn't need
+  /// to be explicitly freed.
+  StringVal(FunctionContext* context, int len) NOEXCEPT;
+
+  /// Reallocate a StringVal that is backed by a local allocation so that it as
+  /// at least as large as len.  May shrink or / expand the string.  If the
+  /// string is expanded, the content of the new space is undefined.
+  ///
+  /// If the resize fails, the original StringVal remains in place.  Callers do not
+  /// otherwise need to be concerned with backing storage, which is allocated from a
+  /// local allocation.
+  ///
+  /// Returns true on success, false on failure.
+  bool Resize(FunctionContext* context, int len) NOEXCEPT;
 
   /// Will create a new StringVal with the given dimension and copy the data from the
   /// parameters. In case of an error will return a NULL string and set an error on the
@@ -587,7 +631,8 @@ struct StringVal : public AnyVal {
   /// Note that the memory for the buffer of the new StringVal is managed by Impala.
   /// Impala will handle freeing it. Callers should not call Free() on the 'ptr' of
   /// the StringVal returned.
-  static StringVal CopyFrom(FunctionContext* ctx, const uint8_t* buf, size_t len) noexcept;
+  static StringVal CopyFrom(FunctionContext* ctx, const uint8_t* buf, size_t len)
+      NOEXCEPT;
 
   static StringVal null() {
     StringVal sv;

@@ -18,22 +18,20 @@
 package org.apache.impala.catalog;
 
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.log4j.Logger;
-
 import org.apache.impala.analysis.TableName;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -43,6 +41,8 @@ import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.HdfsCachingUtil;
+import org.apache.log4j.Logger;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -59,20 +59,23 @@ import com.google.common.collect.Maps;
 public abstract class Table implements CatalogObject {
   private static final Logger LOG = Logger.getLogger(Table.class);
 
+  // Catalog version assigned to this table
   private long catalogVersion_ = Catalog.INITIAL_CATALOG_VERSION;
   protected org.apache.hadoop.hive.metastore.api.Table msTable_;
 
   protected final Db db_;
   protected final String name_;
   protected final String owner_;
-  protected TTableDescriptor tableDesc_;
   protected TAccessLevel accessLevel_ = TAccessLevel.READ_WRITE;
+  // Lock protecting this table
+  private final ReentrantLock tableLock_ = new ReentrantLock();
 
   // Number of clustering columns.
   protected int numClusteringCols_;
 
-  // estimated number of rows in table; -1: unknown.
-  protected long numRows_ = -1;
+  // Contains the estimated number of rows and optional file bytes. Non-null. Member
+  // values of -1 indicate an unknown statistic.
+  protected TTableStats tableStats_;
 
   // colsByPos[i] refers to the ith column in the table. The first numClusteringCols are
   // the clustering columns.
@@ -87,9 +90,8 @@ public abstract class Table implements CatalogObject {
   // The lastDdlTime for this table; -1 if not set
   protected long lastDdlTime_;
 
-  // Set of supported table types.
-  protected static EnumSet<TableType> SUPPORTED_TABLE_TYPES = EnumSet.of(
-      TableType.EXTERNAL_TABLE, TableType.MANAGED_TABLE, TableType.VIRTUAL_VIEW);
+  // True if this object is stored in an Impalad catalog cache.
+  protected boolean storedInImpaladCatalogCache_ = false;
 
   protected Table(org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
@@ -99,11 +101,21 @@ public abstract class Table implements CatalogObject {
     owner_ = owner;
     lastDdlTime_ = (msTable_ != null) ?
         CatalogServiceCatalog.getLastDdlTime(msTable_) : -1;
+    tableStats_ = new TTableStats(-1);
+    tableStats_.setTotal_file_bytes(-1);
   }
 
+  public ReentrantLock getLock() { return tableLock_; }
   public abstract TTableDescriptor toThriftDescriptor(
       int tableId, Set<Long> referencedPartitions);
   public abstract TCatalogObjectType getCatalogObjectType();
+
+  // Returns true if this table reference comes from the impalad catalog cache or if it
+  // is loaded from the testing framework. Returns false if this table reference points
+  // to a table stored in the catalog server.
+  public boolean isStoredInImpaladCatalogCache() {
+    return storedInImpaladCatalogCache_ || RuntimeEnv.INSTANCE.isTestEnv();
+  }
 
   /**
    * Populate members of 'this' from metastore info. If 'reuseMetadata' is true, reuse
@@ -111,6 +123,14 @@ public abstract class Table implements CatalogObject {
    */
   public abstract void load(boolean reuseMetadata, IMetaStoreClient client,
       org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException;
+
+  /**
+   * Sets 'tableStats_' by extracting the table statistics from the given HMS table.
+   */
+  public void setTableStats(org.apache.hadoop.hive.metastore.api.Table msTbl) {
+    tableStats_ = new TTableStats(getRowCount(msTbl.getParameters()));
+    tableStats_.setTotal_file_bytes(getRawDataSize(msTbl.getParameters()));
+  }
 
   public void addColumn(Column col) {
     colsByPos_.add(col);
@@ -190,11 +210,19 @@ public abstract class Table implements CatalogObject {
    * Returns the value of the ROW_COUNT constant, or -1 if not found.
    */
   protected static long getRowCount(Map<String, String> parameters) {
+    return getLongParam(StatsSetupConst.ROW_COUNT, parameters);
+  }
+
+  protected static long getRawDataSize(Map<String, String> parameters) {
+    return getLongParam(StatsSetupConst.RAW_DATA_SIZE, parameters);
+  }
+
+  private static long getLongParam(String key, Map<String, String> parameters) {
     if (parameters == null) return -1;
-    String numRowsStr = parameters.get(StatsSetupConst.ROW_COUNT);
-    if (numRowsStr == null) return -1;
+    String value = parameters.get(key);
+    if (value == null) return -1;
     try {
-      return Long.valueOf(numRowsStr);
+      return Long.valueOf(value);
     } catch (NumberFormatException exc) {
       // ignore
     }
@@ -270,14 +298,13 @@ public abstract class Table implements CatalogObject {
     }
 
     numClusteringCols_ = thriftTable.getClustering_columns().size();
-
-    // Estimated number of rows
-    numRows_ = thriftTable.isSetTable_stats() ?
-        thriftTable.getTable_stats().getNum_rows() : -1;
+    if (thriftTable.isSetTable_stats()) tableStats_ = thriftTable.getTable_stats();
 
     // Default to READ_WRITE access if the field is not set.
     accessLevel_ = thriftTable.isSetAccess_level() ? thriftTable.getAccess_level() :
         TAccessLevel.READ_WRITE;
+
+    storedInImpaladCatalogCache_ = true;
   }
 
   /**
@@ -293,7 +320,22 @@ public abstract class Table implements CatalogObject {
     }
   }
 
+  /**
+   * Must be called with 'tableLock_' held to protect against concurrent modifications
+   * while producing the TTable result.
+   */
   public TTable toThrift() {
+    // It would be simple to acquire and release the lock in this function.
+    // However, in most cases toThrift() is called after modifying a table for which
+    // the table lock should already be held, and we want the toThrift() to be consistent
+    // with the modification. So this check helps us identify places where the lock
+    // acquisition is probably missing entirely.
+    if (!tableLock_.isHeldByCurrentThread()) {
+      throw new IllegalStateException(
+          "Table.toThrift() called without holding the table lock: " +
+              getFullName() + " " + getClass().getName());
+    }
+
     TTable table = new TTable(db_.getName(), name_);
     table.setAccess_level(accessLevel_);
 
@@ -311,10 +353,7 @@ public abstract class Table implements CatalogObject {
     }
 
     table.setMetastore_table(getMetaStoreTable());
-    if (numRows_ != -1) {
-      table.setTable_stats(new TTableStats());
-      table.getTable_stats().setNum_rows(numRows_);
-    }
+    table.setTable_stats(tableStats_);
     return table;
   }
 
@@ -358,19 +397,12 @@ public abstract class Table implements CatalogObject {
     return new TableName(db_ != null ? db_.getName() : null, name_);
   }
 
-  public String getOwner() { return owner_; }
   public ArrayList<Column> getColumns() { return colsByPos_; }
 
   /**
    * Returns a list of the column names ordered by position.
    */
-  public List<String> getColumnNames() {
-    List<String> colNames = Lists.<String>newArrayList();
-    for (Column col: colsByPos_) {
-      colNames.add(col.getName());
-    }
-    return colNames;
-  }
+  public List<String> getColumnNames() { return Column.toColumnNames(colsByPos_); }
 
   /**
    * Returns a list of thrift column descriptors ordered by position.
@@ -443,7 +475,19 @@ public abstract class Table implements CatalogObject {
   }
 
   public int getNumClusteringCols() { return numClusteringCols_; }
-  public long getNumRows() { return numRows_; }
+
+  /**
+   * Sets the number of clustering columns. This method should only be used for tests and
+   * the caller must make sure that the value matches any columns that were added to the
+   * table.
+   */
+  public void setNumClusteringCols(int n) {
+    Preconditions.checkState(RuntimeEnv.INSTANCE.isTestEnv());
+    numClusteringCols_ = n;
+  }
+
+  public long getNumRows() { return tableStats_.num_rows; }
+  public TTableStats getTTableStats() { return tableStats_; }
   public ArrayType getType() { return type_; }
 
   @Override

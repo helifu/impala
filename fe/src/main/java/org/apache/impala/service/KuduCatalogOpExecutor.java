@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.TableNotFoundException;
@@ -52,6 +53,7 @@ import org.apache.log4j.Logger;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * This is a helper for the CatalogOpExecutor to provide Kudu related DDL functionality
@@ -74,7 +76,8 @@ public class KuduCatalogOpExecutor {
       LOG.trace(String.format("Creating table '%s' in master '%s'", kuduTableName,
           masterHosts));
     }
-    try (KuduClient kudu = KuduUtil.createKuduClient(masterHosts)) {
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    try {
       // TODO: The IF NOT EXISTS case should be handled by Kudu to ensure atomicity.
       // (see KUDU-1710).
       if (kudu.tableExists(kuduTableName)) {
@@ -91,6 +94,38 @@ public class KuduCatalogOpExecutor {
     }
   }
 
+  private static ColumnSchema createColumnSchema(TColumn column, boolean isKey)
+      throws ImpalaRuntimeException {
+    Type type = Type.fromThrift(column.getColumnType());
+    Preconditions.checkState(type != null);
+    org.apache.kudu.Type kuduType = KuduUtil.fromImpalaType(type);
+
+    ColumnSchemaBuilder csb = new ColumnSchemaBuilder(column.getColumnName(), kuduType);
+    csb.key(isKey);
+    if (column.isSetIs_nullable()) {
+      // If nullability is explicitly set and the column is a key, it must have been
+      // set as NOT NULL. This is the default, but it is also valid to specify it.
+      Preconditions.checkArgument(!isKey || !column.isIs_nullable());
+      csb.nullable(column.isIs_nullable());
+    } else {
+      // Non-key columns are by default nullable unless the user explicitly sets its
+      // nullability. Key columns are not nullable.
+      csb.nullable(!isKey);
+    }
+    if (column.isSetDefault_value()) {
+      csb.defaultValue(KuduUtil.getKuduDefaultValue(column.getDefault_value(), kuduType,
+            column.getColumnName()));
+    }
+    if (column.isSetBlock_size()) csb.desiredBlockSize(column.getBlock_size());
+    if (column.isSetEncoding()) {
+      csb.encoding(KuduUtil.fromThrift(column.getEncoding()));
+    }
+    if (column.isSetCompression()) {
+      csb.compressionAlgorithm(KuduUtil.fromThrift(column.getCompression()));
+    }
+    return csb.build();
+  }
+
   /**
    * Creates the schema of a new Kudu table.
    */
@@ -100,33 +135,8 @@ public class KuduCatalogOpExecutor {
     Preconditions.checkState(!keyColNames.isEmpty());
     List<ColumnSchema> colSchemas = new ArrayList<>(params.getColumnsSize());
     for (TColumn column: params.getColumns()) {
-      Type type = Type.fromThrift(column.getColumnType());
-      Preconditions.checkState(type != null);
-      org.apache.kudu.Type kuduType = KuduUtil.fromImpalaType(type);
-      // Create the actual column and check if the column is a key column
-      ColumnSchemaBuilder csb =
-          new ColumnSchemaBuilder(column.getColumnName(), kuduType);
       boolean isKey = keyColNames.contains(column.getColumnName());
-      csb.key(isKey);
-      if (column.isSetIs_nullable()) {
-        csb.nullable(column.isIs_nullable());
-      } else if (!isKey) {
-        // Non-key columns are by default nullable unless the user explicitly sets their
-        // nullability.
-        csb.nullable(true);
-      }
-      if (column.isSetDefault_value()) {
-        csb.defaultValue(KuduUtil.getKuduDefaultValue(column.getDefault_value(), kuduType,
-            column.getColumnName()));
-      }
-      if (column.isSetBlock_size()) csb.desiredBlockSize(column.getBlock_size());
-      if (column.isSetEncoding()) {
-        csb.encoding(KuduUtil.fromThrift(column.getEncoding()));
-      }
-      if (column.isSetCompression()) {
-        csb.compressionAlgorithm(KuduUtil.fromThrift(column.getCompression()));
-      }
-      colSchemas.add(csb.build());
+      colSchemas.add(createColumnSchema(column, isKey));
     }
     return new Schema(colSchemas);
   }
@@ -171,6 +181,10 @@ public class KuduCatalogOpExecutor {
       if (!hasRangePartitioning) {
         tableOpts.setRangePartitionColumns(Collections.<String>emptyList());
       }
+    } else {
+      // This table is unpartitioned, which Kudu represents as a table range partitioned
+      // on no columns.
+      tableOpts.setRangePartitionColumns(Collections.<String>emptyList());
     }
 
     // Set the number of table replicas, if specified.
@@ -204,7 +218,8 @@ public class KuduCatalogOpExecutor {
       LOG.trace(String.format("Dropping table '%s' from master '%s'", tableName,
           masterHosts));
     }
-    try (KuduClient kudu = KuduUtil.createKuduClient(masterHosts)) {
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    try {
       Preconditions.checkState(!Strings.isNullOrEmpty(tableName));
       // TODO: The IF EXISTS case should be handled by Kudu to ensure atomicity.
       // (see KUDU-1710).
@@ -235,7 +250,8 @@ public class KuduCatalogOpExecutor {
       LOG.trace(String.format("Loading schema of table '%s' from master '%s'",
           kuduTableName, masterHosts));
     }
-    try (KuduClient kudu = KuduUtil.createKuduClient(masterHosts)) {
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    try {
       if (!kudu.tableExists(kuduTableName)) {
         throw new ImpalaRuntimeException(String.format("Table does not exist in Kudu: " +
             "'%s'", kuduTableName));
@@ -244,7 +260,13 @@ public class KuduCatalogOpExecutor {
       // Replace the columns in the Metastore table with the columns from the recently
       // accessed Kudu schema.
       cols.clear();
+      Set<String> lowerCaseColNames = Sets.newHashSet();
       for (ColumnSchema colSchema : kuduTable.getSchema().getColumns()) {
+        if (!lowerCaseColNames.add(colSchema.getName().toLowerCase())) {
+          throw new ImpalaRuntimeException(String.format(
+              "Error loading Kudu table: Impala does not support column names that " +
+              "differ only in casing '%s'", colSchema.getName()));
+        }
         Type type = KuduUtil.toImpalaType(colSchema.getType());
         cols.add(new FieldSchema(colSchema.getName(), type.toSql().toLowerCase(), null));
       }
@@ -271,7 +293,8 @@ public class KuduCatalogOpExecutor {
     Preconditions.checkState(!Strings.isNullOrEmpty(masterHosts));
     String kuduTableName = properties.get(KuduTable.KEY_TABLE_NAME);
     Preconditions.checkState(!Strings.isNullOrEmpty(kuduTableName));
-    try (KuduClient kudu = KuduUtil.createKuduClient(masterHosts)) {
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    try {
       kudu.tableExists(kuduTableName);
     } catch (Exception e) {
       // TODO: This is misleading when there are other errors, e.g. timeouts.
@@ -290,7 +313,8 @@ public class KuduCatalogOpExecutor {
     alterTableOptions.renameTable(newName);
     String errMsg = String.format("Error renaming Kudu table " +
         "%s to %s", tbl.getKuduTableName(), newName);
-    try (KuduClient client = KuduUtil.createKuduClient(tbl.getKuduMasterHosts())) {
+    KuduClient client = KuduUtil.getKuduClient(tbl.getKuduMasterHosts());
+    try {
       client.alterTable(tbl.getKuduTableName(), alterTableOptions);
       if (!client.isAlterTableDone(newName)) {
         throw new ImpalaRuntimeException(errMsg + ": Kudu operation timed out");
@@ -332,13 +356,20 @@ public class KuduCatalogOpExecutor {
 
   private static List<Pair<PartialRow, RangePartitionBound>> getRangePartitionBounds(
       TRangePartition rangePartition, KuduTable tbl) throws ImpalaRuntimeException {
+    List<String> rangePartitioningColNames = tbl.getRangePartitioningColNames();
+    List<String> rangePartitioningKuduColNames =
+      Lists.newArrayListWithCapacity(rangePartitioningColNames.size());
+    for (String colName : rangePartitioningColNames) {
+      rangePartitioningKuduColNames.add(((KuduColumn)tbl.getColumn(colName)).getKuduName());
+    }
     return getRangePartitionBounds(rangePartition, tbl.getKuduSchema(),
-        tbl.getRangePartitioningColNames());
+        rangePartitioningKuduColNames);
   }
 
   /**
    * Returns the bounds of a range partition in two <PartialRow, RangePartitionBound>
    * pairs to be used in Kudu API calls for ALTER and CREATE TABLE statements.
+   * 'rangePartitioningColNames' must be specified in Kudu case.
    */
   private static List<Pair<PartialRow, RangePartitionBound>> getRangePartitionBounds(
       TRangePartition rangePartition, Schema schema,
@@ -369,32 +400,7 @@ public class KuduCatalogOpExecutor {
       throws ImpalaRuntimeException {
     AlterTableOptions alterTableOptions = new AlterTableOptions();
     for (TColumn column: columns) {
-      Type type = Type.fromThrift(column.getColumnType());
-      Preconditions.checkState(type != null);
-      org.apache.kudu.Type kuduType = KuduUtil.fromImpalaType(type);
-      boolean isNullable = !column.isSetIs_nullable() ? true : column.isIs_nullable();
-      if (isNullable) {
-        if (column.isSetDefault_value()) {
-          // See KUDU-1747
-          throw new ImpalaRuntimeException(String.format("Error adding nullable " +
-              "column to Kudu table %s. Cannot specify a default value for a nullable " +
-              "column", tbl.getKuduTableName()));
-        }
-        alterTableOptions.addNullableColumn(column.getColumnName(), kuduType);
-      } else {
-        Object defaultValue = null;
-        if (column.isSetDefault_value()) {
-          defaultValue = KuduUtil.getKuduDefaultValue(column.getDefault_value(), kuduType,
-              column.getColumnName());
-        }
-        try {
-          alterTableOptions.addColumn(column.getColumnName(), kuduType, defaultValue);
-        } catch (IllegalArgumentException e) {
-          // TODO: Remove this when KUDU-1747 is fixed
-          throw new ImpalaRuntimeException("Error adding non-nullable column to " +
-              "Kudu table " + tbl.getKuduTableName(), e);
-        }
-      }
+      alterTableOptions.addColumn(createColumnSchema(column, false));
     }
     String errMsg = "Error adding columns to Kudu table " + tbl.getName();
     alterKuduTable(tbl, alterTableOptions, errMsg);
@@ -406,24 +412,68 @@ public class KuduCatalogOpExecutor {
   public static void dropColumn(KuduTable tbl, String colName)
       throws ImpalaRuntimeException {
     Preconditions.checkState(!Strings.isNullOrEmpty(colName));
+    KuduColumn col = (KuduColumn) tbl.getColumn(colName);
     AlterTableOptions alterTableOptions = new AlterTableOptions();
-    alterTableOptions.dropColumn(colName);
+    alterTableOptions.dropColumn(col.getKuduName());
     String errMsg = String.format("Error dropping column %s from " +
         "Kudu table %s", colName, tbl.getName());
     alterKuduTable(tbl, alterTableOptions, errMsg);
   }
 
   /**
-   * Changes the name of column.
+   * Updates the column matching 'colName' to have the name and options specified in
+   * 'newCol'. Setting comments or updating the type, primary key status, or nullability
+   * are not currently supported by Kudu.
+   *
+   * For the storage attrbiutes - encoding, compression, and block size - Kudu does not
+   * rewrite old rowsets to have these attributes during the alter. They are applied to
+   * new rowsets as they are written out, and possibly to old rowsets if they are
+   * compacted into new rowsets depending on cost based decisions Kudu makes.
    */
-  public static void renameColumn(KuduTable tbl, String oldName, TColumn newCol)
+  public static void alterColumn(KuduTable tbl, String colName, TColumn newCol)
       throws ImpalaRuntimeException {
-    Preconditions.checkState(!Strings.isNullOrEmpty(oldName));
+    Preconditions.checkState(!Strings.isNullOrEmpty(colName));
     Preconditions.checkNotNull(newCol);
+    Preconditions.checkState(!newCol.isSetComment());
+    Preconditions.checkState(!newCol.isIs_key());
+    Preconditions.checkState(!newCol.isSetIs_nullable());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace(
+          String.format("Altering column '%s' to '%s'", colName, newCol.toString()));
+    }
+    KuduColumn col = (KuduColumn) tbl.getColumn(colName);
+    String kuduColName = col.getKuduName();
     AlterTableOptions alterTableOptions = new AlterTableOptions();
-    alterTableOptions.renameColumn(oldName, newCol.getColumnName());
-    String errMsg = String.format("Error renaming column %s to %s " +
-        "for Kudu table %s", oldName, newCol.getColumnName(), tbl.getName());
+
+    if (newCol.isSetDefault_value()) {
+      org.apache.kudu.Type kuduType =
+          KuduUtil.fromImpalaType(Type.fromThrift(newCol.getColumnType()));
+      Object defaultValue = KuduUtil.getKuduDefaultValue(
+          newCol.getDefault_value(), kuduType, newCol.getColumnName());
+      if (defaultValue == null) {
+        alterTableOptions.removeDefault(kuduColName);
+      } else {
+        alterTableOptions.changeDefault(kuduColName, defaultValue);
+      }
+    }
+    if (newCol.isSetBlock_size()) {
+      alterTableOptions.changeDesiredBlockSize(kuduColName, newCol.getBlock_size());
+    }
+    if (newCol.isSetEncoding()) {
+      alterTableOptions.changeEncoding(
+          kuduColName, KuduUtil.fromThrift(newCol.getEncoding()));
+    }
+    if (newCol.isSetCompression()) {
+      alterTableOptions.changeCompressionAlgorithm(
+          kuduColName, KuduUtil.fromThrift(newCol.getCompression()));
+    }
+    String newColName = newCol.getColumnName();
+    if (!newColName.toLowerCase().equals(colName.toLowerCase())) {
+      alterTableOptions.renameColumn(kuduColName, newColName);
+    }
+
+    String errMsg = String.format(
+        "Error altering column %s in Kudu table %s", colName, tbl.getName());
     alterKuduTable(tbl, alterTableOptions, errMsg);
   }
 
@@ -434,7 +484,8 @@ public class KuduCatalogOpExecutor {
    */
   public static void alterKuduTable(KuduTable tbl, AlterTableOptions ato, String errMsg)
       throws ImpalaRuntimeException {
-    try (KuduClient client = KuduUtil.createKuduClient(tbl.getKuduMasterHosts())) {
+    KuduClient client = KuduUtil.getKuduClient(tbl.getKuduMasterHosts());
+    try {
       client.alterTable(tbl.getKuduTableName(), ato);
       if (!client.isAlterTableDone(tbl.getKuduTableName())) {
         throw new ImpalaRuntimeException(errMsg + ": Kudu operation timed out");

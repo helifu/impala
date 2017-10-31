@@ -16,85 +16,81 @@
 // under the License.
 
 #include "runtime/test-env.h"
-#include "util/disk-info.h"
-#include "util/impalad-metrics.h"
 
-#include "gutil/strings/substitute.h"
-
+#include <limits>
 #include <memory>
 
+#include "runtime/query-exec-mgr.h"
+#include "runtime/tmp-file-mgr.h"
+#include "runtime/query-state.h"
+#include "util/disk-info.h"
+#include "util/impalad-metrics.h"
+#include "gutil/strings/substitute.h"
 #include "common/names.h"
 
 using boost::scoped_ptr;
+using std::numeric_limits;
 
 namespace impala {
 
 scoped_ptr<MetricGroup> TestEnv::static_metrics_;
 
-TestEnv::TestEnv() {
+TestEnv::TestEnv()
+  : have_tmp_file_mgr_args_(false),
+    buffer_pool_min_buffer_len_(64 * 1024),
+    buffer_pool_capacity_(0) {}
+
+Status TestEnv::Init() {
   if (static_metrics_ == NULL) {
     static_metrics_.reset(new MetricGroup("test-env-static-metrics"));
     ImpaladMetrics::CreateMetrics(static_metrics_.get());
   }
+
   exec_env_.reset(new ExecEnv);
-  exec_env_->InitForFeTests();
-  io_mgr_tracker_.reset(new MemTracker(-1));
-  exec_env_->disk_io_mgr()->Init(io_mgr_tracker_.get());
-  InitMetrics();
-  tmp_file_mgr_.reset(new TmpFileMgr);
-  tmp_file_mgr_->Init(metrics_.get());
+  // Populate the ExecEnv state that the backend tests need.
+  exec_env_->mem_tracker_.reset(new MemTracker(-1, "Process"));
+  RETURN_IF_ERROR(exec_env_->disk_io_mgr()->Init(exec_env_->process_mem_tracker()));
+  exec_env_->metrics_.reset(new MetricGroup("test-env-metrics"));
+  exec_env_->tmp_file_mgr_.reset(new TmpFileMgr);
+  if (have_tmp_file_mgr_args_) {
+    RETURN_IF_ERROR(
+        tmp_file_mgr()->InitCustom(tmp_dirs_, one_tmp_dir_per_device_, metrics()));
+  } else {
+    RETURN_IF_ERROR(tmp_file_mgr()->Init(metrics()));
+  }
+  exec_env_->InitBufferPool(buffer_pool_min_buffer_len_, buffer_pool_capacity_,
+      static_cast<int64_t>(0.1 * buffer_pool_capacity_));
+  return Status::OK();
 }
 
-void TestEnv::InitMetrics() {
-  metrics_.reset(new MetricGroup("test-env-metrics"));
+void TestEnv::SetTmpFileMgrArgs(
+    const std::vector<std::string>& tmp_dirs, bool one_dir_per_device) {
+  have_tmp_file_mgr_args_ = true;
+  tmp_dirs_ = tmp_dirs;
+  one_tmp_dir_per_device_ = one_dir_per_device;
 }
 
-void TestEnv::InitTmpFileMgr(const vector<string>& tmp_dirs, bool one_dir_per_device) {
-  // Need to recreate metrics to avoid error when registering metric twice.
-  InitMetrics();
-  tmp_file_mgr_.reset(new TmpFileMgr);
-  tmp_file_mgr_->InitCustom(tmp_dirs, one_dir_per_device, metrics_.get());
+void TestEnv::SetBufferPoolArgs(int64_t min_buffer_len, int64_t capacity) {
+  buffer_pool_min_buffer_len_ = min_buffer_len;
+  buffer_pool_capacity_ = capacity;
 }
 
 TestEnv::~TestEnv() {
   // Queries must be torn down first since they are dependent on global state.
-  TearDownRuntimeStates();
+  TearDownQueries();
+  // tear down exec env state to avoid leaks
   exec_env_.reset();
-  io_mgr_tracker_.reset();
-  tmp_file_mgr_.reset();
-  metrics_.reset();
 }
 
-Status TestEnv::CreatePerQueryState(int64_t query_id, int max_buffers, int block_size,
-    RuntimeState** runtime_state, TQueryOptions* query_options) {
-  // Enforce invariant that each query ID can be registered at most once.
-  if (runtime_states_.find(query_id) != runtime_states_.end()) {
-    return Status(Substitute("Duplicate query id found: $0", query_id));
-  }
-
-  TExecPlanFragmentParams plan_params = TExecPlanFragmentParams();
-  if (query_options != NULL) plan_params.query_ctx.request.query_options = *query_options;
-  plan_params.query_ctx.query_id.hi = 0;
-  plan_params.query_ctx.query_id.lo = query_id;
-
-  *runtime_state = new RuntimeState(plan_params, exec_env_.get());
-  (*runtime_state)->InitMemTrackers(TUniqueId(), NULL, -1);
-
-  shared_ptr<BufferedBlockMgr> mgr;
-  RETURN_IF_ERROR(BufferedBlockMgr::Create(*runtime_state,
-      (*runtime_state)->query_mem_tracker(), (*runtime_state)->runtime_profile(),
-      tmp_file_mgr_.get(), CalculateMemLimit(max_buffers, block_size), block_size, &mgr));
-  (*runtime_state)->set_block_mgr(mgr);
-
-  runtime_states_[query_id] = shared_ptr<RuntimeState>(*runtime_state);
-  return Status::OK();
-}
-
-void TestEnv::TearDownRuntimeStates() {
-  for (auto& runtime_state : runtime_states_) runtime_state.second->ReleaseResources();
+void TestEnv::TearDownQueries() {
+  for (RuntimeState* runtime_state : runtime_states_) runtime_state->ReleaseResources();
   runtime_states_.clear();
+  for (QueryState* query_state : query_states_) {
+    query_state->ReleaseInitialReservationRefcount();
+    exec_env_->query_exec_mgr()->ReleaseQueryState(query_state);
+  }
+  query_states_.clear();
 }
-
 
 int64_t TestEnv::CalculateMemLimit(int max_buffers, int block_size) {
   DCHECK_GE(max_buffers, -1);
@@ -104,9 +100,40 @@ int64_t TestEnv::CalculateMemLimit(int max_buffers, int block_size) {
 
 int64_t TestEnv::TotalQueryMemoryConsumption() {
   int64_t total = 0;
-  for (const auto& runtime_state : runtime_states_) {
-    total += runtime_state.second->query_mem_tracker()->consumption();
+  for (QueryState* query_state : query_states_) {
+    total += query_state->query_mem_tracker()->consumption();
   }
   return total;
+}
+
+Status TestEnv::CreateQueryState(
+    int64_t query_id, const TQueryOptions* query_options, RuntimeState** runtime_state) {
+  TQueryCtx query_ctx;
+  if (query_options != nullptr) query_ctx.client_request.query_options = *query_options;
+  query_ctx.query_id.hi = 0;
+  query_ctx.query_id.lo = query_id;
+  query_ctx.request_pool = "test-pool";
+
+  // CreateQueryState() enforces the invariant that 'query_id' must be unique.
+  QueryState* qs = exec_env_->query_exec_mgr()->CreateQueryState(query_ctx);
+  query_states_.push_back(qs);
+  // make sure to initialize data structures unrelated to the TExecQueryFInstancesParams
+  // param
+  TExecQueryFInstancesParams rpc_params;
+  // create dummy -Ctx fields, we need them for FragmentInstance-/RuntimeState
+  rpc_params.__set_coord_state_idx(0);
+  rpc_params.__set_query_ctx(TQueryCtx());
+  rpc_params.__set_fragment_ctxs(vector<TPlanFragmentCtx>({TPlanFragmentCtx()}));
+  rpc_params.__set_fragment_instance_ctxs(
+      vector<TPlanFragmentInstanceCtx>({TPlanFragmentInstanceCtx()}));
+  RETURN_IF_ERROR(qs->Init(rpc_params));
+  FragmentInstanceState* fis = qs->obj_pool()->Add(
+      new FragmentInstanceState(qs, qs->rpc_params().fragment_ctxs[0], qs->rpc_params().fragment_instance_ctxs[0]));
+  RuntimeState* rs = qs->obj_pool()->Add(
+      new RuntimeState(qs, fis->fragment_ctx(), fis->instance_ctx(), exec_env_.get()));
+  runtime_states_.push_back(rs);
+
+  *runtime_state = rs;
+  return Status::OK();
 }
 }

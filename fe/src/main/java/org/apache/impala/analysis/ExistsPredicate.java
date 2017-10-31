@@ -28,8 +28,6 @@ import com.google.common.base.Preconditions;
  * Class representing a [NOT] EXISTS predicate.
  */
 public class ExistsPredicate extends Predicate {
-  private final static Logger LOG = LoggerFactory.getLogger(
-      ExistsPredicate.class);
   private boolean notExists_ = false;
 
   public boolean isNotExists() { return notExists_; }
@@ -54,12 +52,6 @@ public class ExistsPredicate extends Predicate {
   public ExistsPredicate(ExistsPredicate other) {
     super(other);
     notExists_ = other.notExists_;
-  }
-
-  @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (isAnalyzed_) return;
-    super.analyze(analyzer);
   }
 
   @Override

@@ -43,4 +43,40 @@
 /// decision, e.g. not inlining a small function on a hot path.
 #define ALWAYS_INLINE __attribute__((always_inline))
 
+/// Clang is pedantic about __restrict__ (e.g. never allows calling a non-__restrict__)
+/// member function from a __restrict__-ed memory function and has some apparent bugs
+/// (e.g. can't convert a __restrict__ reference to a const& __restrict__ reference).
+/// Just disable it.
+#ifdef __clang__
+#define RESTRICT
+#else
+#define RESTRICT __restrict__
+#endif
+
+/// GCC 5+ and Clang 3.6+ support __has_cpp_attribute(). Always return false on compilers
+/// that don't know about __has_cpp_attribute().
+#if !defined(__GNUC__) || __GNUC__ >= 5
+#define HAS_CPP_ATTRIBUTE(attr) __has_cpp_attribute(attr)
+#else
+#define HAS_CPP_ATTRIBUTE(attr) 0
+#endif
+
+// Use [[nodiscard]] specifier if supported by our compiler.
+#if HAS_CPP_ATTRIBUTE(nodiscard)
+#define NODISCARD [[nodiscard]]
+#else
+#define NODISCARD
+#endif
+
+// Suppress warnings when ignoring the return value from a function annotated with
+// WARN_UNUSED_RESULT. Based on ignore_result() in gutil/basictypes.h.
+template<typename T>
+inline void discard_result(const T&) {}
+
+namespace impala {
+
+/// The size of an L1 cache line in bytes on x86-64.
+constexpr int CACHE_LINE_SIZE = 64;
+
+}
 #endif

@@ -25,17 +25,30 @@
 
 #include "gen-cpp/Types_types.h"  // for TUniqueId
 #include "util/debug-util.h"
-#include "common/names.h"
 
 namespace impala {
 
-/// This function must be called 'hash_value' to be picked up by boost.
-inline std::size_t hash_value(const impala::TUniqueId& id) {
+inline std::size_t hash_value(const TUniqueId& id) {
   std::size_t seed = 0;
   boost::hash_combine(seed, id.lo);
   boost::hash_combine(seed, id.hi);
   return seed;
 }
+
+}
+
+/// Hash function for std:: containers
+namespace std {
+
+template<> struct hash<impala::TUniqueId> {
+  std::size_t operator()(const impala::TUniqueId& id) const {
+    return impala::hash_value(id);
+  }
+};
+
+}
+
+namespace impala {
 
 inline void UUIDToTUniqueId(const boost::uuids::uuid& uuid, TUniqueId* unique_id) {
   memcpy(&(unique_id->hi), &uuid.data[0], 8);
@@ -63,6 +76,10 @@ inline TUniqueId GetQueryId(const TUniqueId& fragment_instance_id) {
 
 inline int32_t GetInstanceIdx(const TUniqueId& fragment_instance_id) {
   return fragment_instance_id.lo & FRAGMENT_IDX_MASK;
+}
+
+inline bool IsValidFInstanceId(const TUniqueId& fragment_instance_id) {
+  return fragment_instance_id.hi != 0L;
 }
 
 inline TUniqueId CreateInstanceId(
@@ -94,8 +111,8 @@ inline string GenerateUUIDString() {
 inline TUniqueId GenerateUUID() {
   const string& u = GenerateUUIDString();
   TUniqueId uid;
-  memcpy(&uid.hi, &u[0], sizeof(int64_t));
-  memcpy(&uid.lo, &u[0] + sizeof(int64_t), sizeof(int64_t));
+  memcpy(&uid.hi, u.data(), sizeof(int64_t));
+  memcpy(&uid.lo, u.data() + sizeof(int64_t), sizeof(int64_t));
   return uid;
 }
 

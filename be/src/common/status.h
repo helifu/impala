@@ -19,6 +19,7 @@
 #ifndef IMPALA_COMMON_STATUS_H
 #define IMPALA_COMMON_STATUS_H
 
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -79,7 +80,7 @@ namespace impala {
 /// TODO: macros:
 /// RETURN_IF_ERROR(status) << "msg"
 /// MAKE_ERROR() << "msg"
-class Status {
+class NODISCARD Status {
  public:
   typedef strings::internal::SubstituteArg ArgType;
 
@@ -90,6 +91,7 @@ class Status {
 
   // Return a MEM_LIMIT_EXCEEDED error status.
   static Status MemLimitExceeded();
+  static Status MemLimitExceeded(const std::string& details);
 
   static const Status CANCELLED;
   static const Status DEPRECATED_RPC;
@@ -105,7 +107,7 @@ class Status {
 
   /// Status using only the error code as a parameter. This can be used for error messages
   /// that don't take format parameters.
-  Status(TErrorCode::type code);
+  explicit Status(TErrorCode::type code);
 
   /// These constructors are used if the caller wants to indicate a non-successful
   /// execution and supply a client-facing error message. This is the preferred way of
@@ -138,12 +140,20 @@ class Status {
 
   /// Used when the ErrorMsg is created as an intermediate value that is either passed to
   /// the Status or to the RuntimeState.
-  Status(const ErrorMsg& e);
+  explicit Status(const ErrorMsg& e);
 
   /// This constructor creates a Status with a default error code of GENERAL and is not
   /// intended for statuses that might be client-visible.
   /// TODO: deprecate
-  Status(const std::string& error_msg);
+  explicit Status(const std::string& error_msg);
+
+  /// "Copy" c'tor from TStatus.
+  /// Retains the TErrorCode value and the message
+  explicit Status(const TStatus& status);
+
+  /// "Copy c'tor from HS2 TStatus.
+  /// Retains the TErrorCode value and the message
+  explicit Status(const apache::hive::service::cli::thrift::TStatus& hs2_status);
 
   /// Create a status instance that represents an expected error and will not be logged
   static Status Expected(const ErrorMsg& e);
@@ -174,19 +184,9 @@ class Status {
     if (UNLIKELY(msg_ != NULL)) FreeMessage();
   }
 
-  /// "Copy" c'tor from TStatus.
-  /// Retains the TErrorCode value and the message
-  Status(const TStatus& status);
-
-  /// same as previous c'tor
   /// Retains the TErrorCode value and the message
   Status& operator=(const TStatus& status);
 
-  /// "Copy c'tor from HS2 TStatus.
-  /// Retains the TErrorCode value and the message
-  Status(const apache::hive::service::cli::thrift::TStatus& hs2_status);
-
-  /// same as previous c'tor
   /// Retains the TErrorCode value and the message
   Status& operator=(const apache::hive::service::cli::thrift::TStatus& hs2_status);
 
@@ -251,21 +251,32 @@ class Status {
   // A non-inline function for freeing status' message.
   void FreeMessage() noexcept;
 
+  /// A non-inline function for unwrapping a TStatus object.
+  void FromThrift(const TStatus& status);
+
   /// Status uses a naked pointer to ensure the size of an instance on the stack is only
   /// the sizeof(ErrorMsg*). Every Status owns its ErrorMsg instance.
   ErrorMsg* msg_;
 };
 
+/// for debugging
+std::ostream& operator<<(std::ostream& os, const Status& status);
+
 /// some generally useful macros
 #define RETURN_IF_ERROR(stmt)                          \
   do {                                                 \
-    Status __status__ = (stmt);                        \
+    ::impala::Status __status__ = (stmt);              \
     if (UNLIKELY(!__status__.ok())) return __status__; \
+  } while (false)
+
+#define RETURN_VOID_IF_ERROR(stmt)                     \
+  do {                                                 \
+    if (UNLIKELY(!(stmt).ok())) return;                \
   } while (false)
 
 #define ABORT_IF_ERROR(stmt) \
   do { \
-    Status __status__ = (stmt); \
+    ::impala::Status __status__ = (stmt); \
     if (UNLIKELY(!__status__.ok())) { \
       ABORT_WITH_ERROR(__status__.GetDetail()); \
     } \
@@ -289,6 +300,11 @@ class Status {
     exit(1); \
   } while (false)
 
+/// This macro can be appended to a function definition to generate a compiler warning
+/// if the result is ignored.
+/// TODO: when we upgrade gcc from 4.9.2, we may be able to apply this to the Status
+/// type to get this automatically for all Status-returning functions.
+#define WARN_UNUSED_RESULT __attribute__((warn_unused_result))
 }
 
 #endif

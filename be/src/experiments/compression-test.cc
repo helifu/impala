@@ -69,16 +69,18 @@ void TestCompression(int num, int min_len, int max_len, THdfsCompression::type c
   }
 
   scoped_ptr<Codec> compressor;
-  Codec::CreateCompressor(NULL, false, codec, &compressor);
+  Status status = Codec::CreateCompressor(NULL, false, codec, &compressor);
+  DCHECK(status.ok());
 
   int64_t compressed_len = compressor->MaxOutputLen(offset);
   uint8_t* compressed_buffer = (uint8_t*)malloc(compressed_len);
-  compressor->ProcessBlock(true, offset, buffer, &compressed_len, &compressed_buffer);
+  ABORT_IF_ERROR(
+      compressor->ProcessBlock(true, offset, buffer, &compressed_len, &compressed_buffer));
 
   int64_t sorted_compressed_len = compressor->MaxOutputLen(offset);
   uint8_t* sorted_compressed_buffer = (uint8_t*)malloc(sorted_compressed_len);
-  compressor->ProcessBlock(true, offset, sorted_buffer, &sorted_compressed_len,
-                           &sorted_compressed_buffer);
+  ABORT_IF_ERROR(compressor->ProcessBlock(true, offset, sorted_buffer,
+        &sorted_compressed_len, &sorted_compressed_buffer));
 
   cout << "NumStrings=" << num << " MinLen=" << min_len << " MaxLen=" << max_len
        << " Codec=" << codec << endl;
@@ -102,4 +104,3 @@ int main(int argc, char **argv) {
   impala::TestCompression(1000000, 5, 15, impala::THdfsCompression::GZIP);
   return 0;
 }
-

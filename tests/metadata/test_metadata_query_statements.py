@@ -22,7 +22,7 @@ import re
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfIsilon, SkipIfS3, SkipIfLocal
+from tests.common.skip import SkipIfIsilon, SkipIfS3, SkipIfADLS, SkipIfLocal
 from tests.common.test_dimensions import ALL_NODES_ONLY
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_dimensions import create_uncompressed_text_dimension
@@ -51,12 +51,13 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
       # Cut down on test runtime by only running with SYNC_DDL=0
       sync_ddl_opts = [0]
 
-    cls.TestMatrix.add_dimension(create_exec_option_dimension(
+    cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
         cluster_sizes=ALL_NODES_ONLY,
         disable_codegen_options=[False],
         batch_sizes=[0],
         sync_ddl=sync_ddl_opts))
-    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
 
   def test_use(self, vector):
     self.run_test_case('QueryTest/use', vector)
@@ -74,6 +75,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
   # data doesn't reside in hdfs.
   @SkipIfIsilon.hive
   @SkipIfS3.hive
+  @SkipIfADLS.hive
   @SkipIfLocal.hive
   def test_describe_formatted(self, vector, unique_database):
     # For describe formmated, we try to match Hive's output as closely as possible.
@@ -147,6 +149,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
       self.client.execute(self.CREATE_DATA_SRC_STMT % (name,))
 
   @SkipIfS3.hive
+  @SkipIfADLS.hive
   @SkipIfIsilon.hive
   @SkipIfLocal.hive
   @pytest.mark.execute_serially # because of invalidate metadata

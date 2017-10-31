@@ -17,6 +17,7 @@
 
 #include "udf/udf.h"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <assert.h>
@@ -82,7 +83,12 @@ class RuntimeState {
     assert(false);
   }
 
-  bool abort_on_error() {
+  bool abort_on_error() const {
+    assert(false);
+    return false;
+  }
+
+  bool decimal_v2() const {
     assert(false);
     return false;
   }
@@ -93,12 +99,13 @@ class RuntimeState {
   }
 
   const std::string connected_user() const { return ""; }
-  const std::string effective_user() const { return ""; }
+  const std::string GetEffectiveUser() const { return ""; }
 };
 
 }
 
 #else
+#include "exprs/anyval-util.h"
 #include "runtime/free-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/runtime-state.h"
@@ -114,6 +121,8 @@ using std::pair;
 const int FunctionContextImpl::VARARGS_BUFFER_ALIGNMENT;
 const char* FunctionContextImpl::LLVM_FUNCTIONCONTEXT_NAME =
     "class.impala_udf::FunctionContext";
+const char* FunctionContextImpl::GET_CONST_FN_ATTR_SYMBOL =
+    "_ZN6impala19FunctionContextImpl14GetConstFnAttrENS0_11ConstFnAttrEi";
 
 static const int MAX_WARNINGS = 1000;
 
@@ -249,7 +258,7 @@ const char* FunctionContext::user() const {
 
 const char* FunctionContext::effective_user() const {
   if (impl_->state_ == NULL) return NULL;
-  return impl_->state_->effective_user().c_str();
+  return impl_->state_->GetEffectiveUser().c_str();
 }
 
 FunctionContext::UniqueId FunctionContext::query_id() const {
@@ -404,7 +413,6 @@ bool FunctionContext::AddWarning(const char* warning_msg) {
     // In case of the SDK build, we simply, forward this call to a dummy method
     return impl_->state_->LogError(ss.str());
 #endif
-
   } else {
     cerr << ss.str() << endl;
     return true;
@@ -441,6 +449,29 @@ uint8_t* FunctionContextImpl::AllocateLocal(int64_t byte_size) noexcept {
   return buffer;
 }
 
+uint8_t* FunctionContextImpl::ReallocateLocal(uint8_t* ptr, int64_t byte_size) noexcept {
+  assert(!closed_);
+  uint8_t* new_ptr  = pool_->Reallocate(ptr, byte_size);
+  if (UNLIKELY(!CheckAllocResult("FunctionContextImpl::ReallocateLocal",
+      new_ptr, byte_size))) {
+    return NULL;
+  }
+  if (new_ptr != ptr) {
+    auto v = std::find(local_allocations_.rbegin(), local_allocations_.rend(), ptr);
+    assert(v != local_allocations_.rend());
+    // Avoid perf issue; move to end of local allocations on any reallocation and
+    // always start the search from there.
+    if (v != local_allocations_.rbegin()) {
+      *v = *local_allocations_.rbegin();
+    }
+    *local_allocations_.rbegin() = new_ptr;
+  }
+  VLOG_ROW << "Reallocate Local: FunctionContext=" << context_
+           << " ptr=" << reinterpret_cast<void*>(ptr) << " size=" << byte_size
+           << " result=" << reinterpret_cast<void*>(new_ptr);
+  return new_ptr;
+}
+
 void FunctionContextImpl::FreeLocalAllocations() noexcept {
   assert(!closed_);
   if (VLOG_ROW_IS_ON) {
@@ -462,8 +493,7 @@ void FunctionContextImpl::SetConstantArgs(vector<AnyVal*>&& constant_args) {
   constant_args_ = constant_args;
 }
 
-void FunctionContextImpl::SetNonConstantArgs(
-    vector<pair<Expr*, AnyVal*>>&& non_constant_args) {
+void FunctionContextImpl::SetNonConstantArgs(NonConstantArgsVector&& non_constant_args) {
   non_constant_args_ = non_constant_args;
 }
 
@@ -471,7 +501,6 @@ void FunctionContextImpl::SetNonConstantArgs(
 // expr-ir.cc. This could probably use further investigation.
 StringVal::StringVal(FunctionContext* context, int len) noexcept : len(len), ptr(NULL) {
   if (UNLIKELY(len > StringVal::MAX_LENGTH)) {
-    std::cout << "MAX_LENGTH, Trying to allocate " << len;
     context->SetError("String length larger than allowed limit of "
                       "1 GB character data.");
     len = 0;
@@ -496,8 +525,74 @@ StringVal StringVal::CopyFrom(FunctionContext* ctx, const uint8_t* buf, size_t l
   return result;
 }
 
+bool StringVal::Resize(FunctionContext* ctx, int new_len) noexcept {
+  if (UNLIKELY(new_len > StringVal::MAX_LENGTH)) {
+    ctx->SetError("String length larger than allowed limit of 1 GB character data.");
+    len = 0;
+    is_null = true;
+    return false;
+  }
+  auto* new_ptr = ctx->impl()->ReallocateLocal(ptr, new_len);
+  if (new_ptr != nullptr) {
+    ptr = new_ptr;
+    len = new_len;
+    return true;
+  }
+  return false;
+}
+
 // TODO: why doesn't libudasample.so build if this in udf-ir.cc?
 const FunctionContext::TypeDesc* FunctionContext::GetArgType(int arg_idx) const {
   if (arg_idx < 0 || arg_idx >= impl_->arg_types_.size()) return NULL;
   return &impl_->arg_types_[arg_idx];
+}
+
+static int GetTypeByteSize(const FunctionContext::TypeDesc& type) {
+#if defined(IMPALA_UDF_SDK_BUILD) && IMPALA_UDF_SDK_BUILD
+  return 0;
+#else
+  return AnyValUtil::TypeDescToColumnType(type).GetByteSize();
+#endif
+}
+
+int FunctionContextImpl::GetConstFnAttr(FunctionContextImpl::ConstFnAttr t, int i) {
+  return GetConstFnAttr(state_, return_type_, arg_types_, t, i);
+}
+
+int FunctionContextImpl::GetConstFnAttr(const RuntimeState* state,
+    const FunctionContext::TypeDesc& return_type,
+    const vector<FunctionContext::TypeDesc>& arg_types,
+    ConstFnAttr t, int i) {
+  switch (t) {
+    case RETURN_TYPE_SIZE:
+      assert(i == -1);
+      return GetTypeByteSize(return_type);
+    case RETURN_TYPE_PRECISION:
+      assert(i == -1);
+      assert(return_type.type == FunctionContext::TYPE_DECIMAL);
+      return return_type.precision;
+    case RETURN_TYPE_SCALE:
+      assert(i == -1);
+      assert(return_type.type == FunctionContext::TYPE_DECIMAL);
+      return return_type.scale;
+    case ARG_TYPE_SIZE:
+      assert(i >= 0);
+      assert(i < arg_types.size());
+      return GetTypeByteSize(arg_types[i]);
+    case ARG_TYPE_PRECISION:
+      assert(i >= 0);
+      assert(i < arg_types.size());
+      assert(arg_types[i].type == FunctionContext::TYPE_DECIMAL);
+      return arg_types[i].precision;
+    case ARG_TYPE_SCALE:
+      assert(i >= 0);
+      assert(i < arg_types.size());
+      assert(arg_types[i].type == FunctionContext::TYPE_DECIMAL);
+      return arg_types[i].scale;
+    case DECIMAL_V2:
+      return state->decimal_v2();
+    default:
+      assert(false);
+      return -1;
+  }
 }

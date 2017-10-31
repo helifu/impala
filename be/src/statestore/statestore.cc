@@ -24,9 +24,11 @@
 
 #include "common/status.h"
 #include "gen-cpp/StatestoreService_types.h"
-#include "statestore/failure-detector.h"
 #include "rpc/thrift-util.h"
+#include "statestore/failure-detector.h"
+#include "statestore/statestore-subscriber-client-wrapper.h"
 #include "util/debug-util.h"
+#include "util/logging-support.h"
 #include "util/time.h"
 #include "util/uid-util.h"
 #include "util/webserver.h"
@@ -99,7 +101,7 @@ const int32_t STATESTORE_MAX_SUBSCRIBERS = 10000;
 // Updates or heartbeats that miss their deadline by this much are logged.
 const uint32_t DEADLINE_MISS_THRESHOLD_MS = 2000;
 
-typedef ClientConnection<StatestoreSubscriberClient> StatestoreSubscriberConnection;
+typedef ClientConnection<StatestoreSubscriberClientWrapper> StatestoreSubscriberConn;
 
 class StatestoreThriftIf : public StatestoreServiceIf {
  public:
@@ -223,12 +225,14 @@ Statestore::Statestore(MetricGroup* metrics)
         FLAGS_statestore_num_heartbeat_threads,
         STATESTORE_MAX_SUBSCRIBERS,
         bind<void>(mem_fn(&Statestore::DoSubscriberUpdate), this, true, _1, _2)),
-    update_state_client_cache_(new ClientCache<StatestoreSubscriberClient>(1, 0,
+    update_state_client_cache_(new StatestoreSubscriberClientCache(1, 0,
         FLAGS_statestore_update_tcp_timeout_seconds * 1000,
-        FLAGS_statestore_update_tcp_timeout_seconds * 1000)),
-    heartbeat_client_cache_(new ClientCache<StatestoreSubscriberClient>(1, 0,
+        FLAGS_statestore_update_tcp_timeout_seconds * 1000, "",
+        EnableInternalSslConnections())),
+    heartbeat_client_cache_(new StatestoreSubscriberClientCache(1, 0,
         FLAGS_statestore_heartbeat_tcp_timeout_seconds * 1000,
-        FLAGS_statestore_heartbeat_tcp_timeout_seconds * 1000)),
+        FLAGS_statestore_heartbeat_tcp_timeout_seconds * 1000, "",
+        EnableInternalSslConnections())),
     thrift_iface_(new StatestoreThriftIf(this)),
     failure_detector_(new MissedHeartbeatFailureDetector(
         FLAGS_statestore_max_missed_heartbeats,
@@ -262,6 +266,8 @@ void Statestore::RegisterWebpages(Webserver* webserver) {
       bind<void>(&Statestore::SubscribersHandler, this, _1, _2);
   webserver->RegisterUrlCallback("/subscribers", "statestore_subscribers.tmpl",
       subscribers_callback);
+
+  RegisterLogLevelCallbacks(webserver, false);
 }
 
 void Statestore::TopicsHandler(const Webserver::ArgumentMap& args,
@@ -417,13 +423,13 @@ Status Statestore::SendTopicUpdate(Subscriber* subscriber, bool* update_skipped)
 
   // Second: try and send it
   Status status;
-  StatestoreSubscriberConnection client(update_state_client_cache_.get(),
+  StatestoreSubscriberConn client(update_state_client_cache_.get(),
       subscriber->network_address(), &status);
   RETURN_IF_ERROR(status);
 
   TUpdateStateResponse response;
   RETURN_IF_ERROR(client.DoRpc(
-      &StatestoreSubscriberClient::UpdateState, update_state_request, &response));
+      &StatestoreSubscriberClientWrapper::UpdateState, update_state_request, &response));
 
   status = Status(response.status);
   if (!status.ok()) {
@@ -513,23 +519,19 @@ void Statestore::GatherTopicUpdates(const Subscriber& subscriber,
       topic_delta.is_delta = last_processed_version > Subscriber::TOPIC_INITIAL_VERSION;
       topic_delta.__set_from_version(last_processed_version);
 
-      if (!topic_delta.is_delta &&
-          topic.last_version() > Subscriber::TOPIC_INITIAL_VERSION) {
-        int64_t topic_size =
-            topic.total_key_size_bytes() + topic.total_value_size_bytes();
-        VLOG_QUERY << "Preparing initial " << topic_delta.topic_name
-                   << " topic update for " << subscriber.id() << ". Size = "
-                   << PrettyPrinter::Print(topic_size, TUnit::BYTES);
-      }
-
       TopicUpdateLog::const_iterator next_update =
           topic.topic_update_log().upper_bound(last_processed_version);
 
+      int64_t deleted_key_size_bytes = 0;
       for (; next_update != topic.topic_update_log().end(); ++next_update) {
         TopicEntryMap::const_iterator itr = topic.entries().find(next_update->second);
         DCHECK(itr != topic.entries().end());
         const TopicEntry& topic_entry = itr->second;
         if (topic_entry.value() == Statestore::TopicEntry::NULL_VALUE) {
+          if (!topic_delta.is_delta) {
+            deleted_key_size_bytes += itr->first.size();
+            continue;
+          }
           topic_delta.topic_deletions.push_back(itr->first);
         } else {
           topic_delta.topic_entries.push_back(TTopicItem());
@@ -538,6 +540,15 @@ void Statestore::GatherTopicUpdates(const Subscriber& subscriber,
           // TODO: Does this do a needless copy?
           topic_item.value = topic_entry.value();
         }
+      }
+
+      if (!topic_delta.is_delta &&
+          topic.last_version() > Subscriber::TOPIC_INITIAL_VERSION) {
+        int64_t topic_size = topic.total_key_size_bytes() - deleted_key_size_bytes
+            + topic.total_value_size_bytes();
+        VLOG_QUERY << "Preparing initial " << topic_delta.topic_name
+                   << " topic update for " << subscriber.id() << ". Size = "
+                   << PrettyPrinter::Print(topic_size, TUnit::BYTES);
       }
 
       if (topic.topic_update_log().size() > 0) {
@@ -597,7 +608,7 @@ Status Statestore::SendHeartbeat(Subscriber* subscriber) {
   sw.Start();
 
   Status status;
-  StatestoreSubscriberConnection client(heartbeat_client_cache_.get(),
+  StatestoreSubscriberConn client(heartbeat_client_cache_.get(),
       subscriber->network_address(), &status);
   RETURN_IF_ERROR(status);
 
@@ -605,7 +616,7 @@ Status Statestore::SendHeartbeat(Subscriber* subscriber) {
   THeartbeatResponse response;
   request.__set_registration_id(subscriber->registration_id());
   RETURN_IF_ERROR(
-      client.DoRpc(&StatestoreSubscriberClient::Heartbeat, request, &response));
+      client.DoRpc(&StatestoreSubscriberClientWrapper::Heartbeat, request, &response));
 
   heartbeat_duration_metric_->Update(sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
   return Status::OK();
@@ -709,8 +720,13 @@ void Statestore::DoSubscriberUpdate(bool is_heartbeat, int thread_id,
       // Schedule the next message.
       VLOG(3) << "Next " << (is_heartbeat ? "heartbeat" : "update") << " deadline for: "
               << subscriber->id() << " is in " << deadline_ms << "ms";
-      OfferUpdate(make_pair(deadline_ms, subscriber->id()), is_heartbeat ?
+      status = OfferUpdate(make_pair(deadline_ms, subscriber->id()), is_heartbeat ?
           &subscriber_heartbeat_threadpool_ : &subscriber_topic_update_threadpool_);
+      if (!status.ok()) {
+        LOG(INFO) << "Unable to send next " << (is_heartbeat ? "heartbeat" : "update")
+                  << " message to subscriber '" << subscriber->id() << "': "
+                  << status.GetDetail();
+      }
     }
   }
 }
@@ -744,7 +760,6 @@ void Statestore::UnregisterSubscriber(Subscriber* subscriber) {
   subscribers_.erase(subscriber->id());
 }
 
-Status Statestore::MainLoop() {
+void Statestore::MainLoop() {
   subscriber_topic_update_threadpool_.Join();
-  return Status::OK();
 }

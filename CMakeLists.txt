@@ -15,11 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.2.3)
+
+# This is a Kudu-specific flag that disables Kudu targets that are test-only.
+set(NO_TESTS 1)
+# Kudu-specific, disable NVM support so that libvmem is not a dependency.
+set(NO_NVM_SUPPORT 1)
 
 # Explicitly define project() to allow modifying the compiler before the project is
 # initialized.
 project(Impala)
+
+include(cmake_modules/kudu_cmake_fns.txt)
 
 if (NOT DEFINED BUILD_SHARED_LIBS)
   set(BUILD_SHARED_LIBS OFF)
@@ -70,23 +77,28 @@ set_dep_root(AVRO)
 set_dep_root(BOOST)
 set_dep_root(BREAKPAD)
 set_dep_root(BZIP2)
+set_dep_root(CRCUTIL)
+set_dep_root(FLATBUFFERS)
 set_dep_root(GCC)
 set_dep_root(GFLAGS)
 set_dep_root(GLOG)
 set_dep_root(GPERFTOOLS)
 set_dep_root(GTEST)
+set_dep_root(LIBEV)
 set_dep_root(LLVM)
 set(LLVM_DEBUG_ROOT $ENV{IMPALA_TOOLCHAIN}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION})
 set_dep_root(LZ4)
 set_dep_root(OPENLDAP)
+set_dep_root(PROTOBUF)
 set_dep_root(RE2)
 set_dep_root(RAPIDJSON)
 set_dep_root(SNAPPY)
 set_dep_root(THRIFT)
 set_dep_root(ZLIB)
-if (APPLE)
-  set_dep_root(OPENSSL)
-endif()
+
+# The boost-cmake project hasn't been maintained for years. Let's make sure we
+# don't accidentally use it if it can be found.
+set(Boost_NO_BOOST_CMAKE ON)
 
 set(Boost_USE_STATIC_LIBS NOT ${BUILD_SHARED_LIBS})
 set(Boost_USE_STATIC_RUNTIME ON)
@@ -108,82 +120,86 @@ if (CMAKE_DEBUG)
   set(Boost_DEBUG TRUE)
 endif()
 
-find_package(Boost $ENV{IMPALA_BOOST_VERSION} REQUIRED
-  COMPONENTS thread regex system filesystem date_time)
-include_directories(${Boost_INCLUDE_DIRS})
-set(LIBS ${LIBS} ${Boost_LIBRARIES})
+# Adds a third-party library with name ${NAME}. If BUILD_SHARED_LIBS is true, the new
+# library refers to ${SHARED_LIB}; otherwise it refers to ${STATIC_LIB}. If only one
+# library (static or shared) is provided, it is used regardless of BUILD_SHARED_LIBS. The
+# library's headers are added to the system include path.
+function(IMPALA_ADD_THIRDPARTY_LIB NAME HEADER STATIC_LIB SHARED_LIB)
+  message(STATUS "----------> Adding thirdparty library ${NAME}. <----------")
+  if (HEADER)
+    include_directories(SYSTEM ${HEADER})
+    message(STATUS "Header files: ${HEADER}")
+  endif()
+  if (NOT STATIC_LIB AND NOT SHARED_LIB)
+    message(FATAL_ERROR "Library '${NAME}' has neither shared nor static library files")
+    return ()
+  endif()
+
+  if ((BUILD_SHARED_LIBS AND SHARED_LIB) OR NOT STATIC_LIB)
+    ADD_THIRDPARTY_LIB(${NAME} SHARED_LIB ${SHARED_LIB})
+  else()
+    ADD_THIRDPARTY_LIB(${NAME} STATIC_LIB ${STATIC_LIB})
+  endif()
+endfunction()
+
+
+find_package(Boost REQUIRED COMPONENTS thread regex filesystem system date_time)
+# Mark Boost as a system header to avoid compile warnings.
+include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIRS})
 message(STATUS "Boost libraries: " ${Boost_LIBRARIES})
 
-find_package(OpenSSL REQUIRED)
-include_directories(${OPENSSL_INCLUDE_DIR})
-set(OPENSSL_LIBS ${OPENSSL_SSL} ${OPENSSL_CRYPTO})
-message(STATUS "OpenSSL: ${OPENSSL_LIBS}")
+# If at all possible, try to link with system OpenSSL in an attempt to match what the
+# platform that this build might ultimately be deployed on. If no suitable OpenSSL is
+# found, use the toolchain version - but beware that Impala will then fail to start if
+# deployed on a system with a lower version.
+find_package(OpenSSL 1.0.0 QUIET)
+if (NOT ${OPENSSL_FOUND})
+  set_dep_root(OPENSSL)
+  set(OPENSSL_FOUND ON)
+  set(OPENSSL_INCLUDE_DIR ${OPENSSL_ROOT}/include)
+  set(OPENSSL_SSL_LIBRARY ${OPENSSL_ROOT}/lib/libssl.so)
+  set(OPENSSL_CRYPTO_LIBRARY ${OPENSSL_ROOT}/lib/libcrypto.so)
+  set(OPENSSL_VERSION $ENV{IMPALA_OPENSSL_VERSION})
+  message(STATUS "System OpenSSL not found. Defaulting to toolchain version in"
+    " ${OPENSSL_ROOT_DIR}")
+endif()
+
+# OpenSSL, being a security dependency, is always dynamically linked.
+IMPALA_ADD_THIRDPARTY_LIB(openssl_ssl ${OPENSSL_INCLUDE_DIR} "" ${OPENSSL_SSL_LIBRARY})
+IMPALA_ADD_THIRDPARTY_LIB(openssl_crypto "" "" ${OPENSSL_CRYPTO_LIBRARY})
 
 find_package(Bzip2 REQUIRED)
-include_directories(${BZIP2_INCLUDE_DIR})
+IMPALA_ADD_THIRDPARTY_LIB(bzip2 ${BZIP2_INCLUDE_DIR} ${BZIP2_STATIC_LIBRARIES} "")
 
 find_package(Zlib REQUIRED)
-include_directories(${ZLIB_INCLUDE_DIR})
-
-if(NOT BUILD_SHARED_LIBS)
-  # Panic if we cannot find the static libraries as they are supposed to be
-  # in the toolchain.
-  if (NOT BZIP2_STATIC_FOUND)
-    message(FATAL_ERROR "bzip2 static library libbz2.a not found in $ENV{IMPALA_TOOLCHAIN}")
-  endif()
-  if (NOT ZLIB_STATIC_FOUND)
-    message(FATAL_ERROR "zlib static library libz.a not found in $ENV{IMPALA_TOOLCHAIN}")
-  endif()
-
-  set(LIBBZ2 BZIP2_STATIC)
-  set(LIBZ ZLIB_STATIC)
-else()
-  set(LIBBZ2 ${BZIP2_LIBRARIES})
-  set(LIBZ ${ZLIB_LIBRARIES})
-endif ()
+IMPALA_ADD_THIRDPARTY_LIB(zlib ${ZLIB_INCLUDE_DIR} ${ZLIB_STATIC_LIBRARIES}
+  ${ZLIB_SHARED_LIBRARIES})
 
 # find HDFS headers and libs
+set(HDFS_FIND_QUIETLY TRUE)
 find_package(HDFS REQUIRED)
-include_directories(${HDFS_INCLUDE_DIR})
-
-if(BUILD_SHARED_LIBS)
-  set(LIBS ${LIBS} ${HDFS_LIBRARIES})
-  set(HDFS_LIB ${HDFS_LIBRARIES})
-else()
-  set(LIBS ${LIBS} HDFS_STATIC)
-  set(HDFS_LIB HDFS_STATIC)
-endif()
+IMPALA_ADD_THIRDPARTY_LIB(hdfs ${HDFS_INCLUDE_DIR} ${HDFS_STATIC_LIB} ${HDFS_SHARED_LIB})
 
 # find GLog headers and libs.  Must include glog headers before the other
 # google libraries.  They all have a config.h and we want glog's to be picked
 # up first.
 find_package(GLog REQUIRED)
-include_directories(${GLOG_INCLUDE_DIR})
-set(LIBS ${LIBS} ${GLOG_LIBS})
-message(STATUS "GLog include dir: " ${GLOG_INCLUDE_DIR})
+IMPALA_ADD_THIRDPARTY_LIB(glog ${GLOG_INCLUDE_DIR} ${GLOG_STATIC_LIB} ${GLOG_SHARED_LIB})
 
-# find GFlags headers and libs (needed for GLog)
+# find GFlags headers and libs
 find_package(GFlags REQUIRED)
-include_directories(${GFLAGS_INCLUDE_DIR})
-set(LIBS ${LIBS} ${GFLAGS_LIBS})
-message(STATUS "GFlags include dir: " ${GFLAGS_INCLUDE_DIR})
-message(STATUS "GFlags lib dir: " ${GFLAGS_LIBS})
+IMPALA_ADD_THIRDPARTY_LIB(gflags ${GFLAGS_INCLUDE_DIR} ${GFLAGS_STATIC_LIB}
+  ${GFLAGS_SHARED_LIB})
 
 # find PProf libs
 find_package(PProf REQUIRED)
-include_directories(${PPROF_INCLUDE_DIR})
-set (LIBS ${LIBS} ${PPROF_LIBRARIES})
-message(STATUS "PProf include dir: " ${PPROF_INCLUDE_DIR})
-message(STATUS "PProf static lib: " ${PPROF_STATIC_LIB})
+IMPALA_ADD_THIRDPARTY_LIB(pprof ${PPROF_INCLUDE_DIR} ${PPROF_STATIC_LIB} "")
 
 # find GTest headers and libs
+set (GTEST_FIND_QUIETLY TRUE)
 find_package(GTest REQUIRED)
-include_directories(${GTEST_INCLUDE_DIR})
-set(LIBS ${LIBS} ${GTEST_LIBRARIES})
-
-message(STATUS "GTest include dir: " ${GTEST_INCLUDE_DIR})
-message(STATUS "GTest library: " ${GTEST_LIBRARY})
+IMPALA_ADD_THIRDPARTY_LIB(gtest ${GTEST_INCLUDE_DIR} ${GTEST_STATIC_LIB} "")
 
 # Use LLVM release binaries.
 set(LLVM_BINARIES_ROOT ${LLVM_ROOT})
@@ -192,7 +208,8 @@ find_package(LlvmBinaries REQUIRED)
 # Find LLVM libraries to link against.
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
-    OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY")
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN")
   # Use the LLVM libaries with assertions for debug builds.
   set(LLVM_ROOT ${LLVM_DEBUG_ROOT})
 endif()
@@ -200,23 +217,16 @@ message(STATUS "LLVM_ROOT: " ${LLVM_ROOT})
 
 find_package(Llvm REQUIRED)
 include_directories(${LLVM_INCLUDE_DIR})
-set(LIBS ${LIBS} ${LLVM_MODULE_LIBS})
 
 # find Sasl
+set(SASL_FIND_QUIETLY TRUE)
 find_package(Sasl REQUIRED)
-include_directories(${SASL_INCLUDE_DIR})
-add_library(sasllib SHARED IMPORTED)
-set_target_properties(sasllib PROPERTIES IMPORTED_LOCATION ${SASL_SHARED_LIB})
-set(SASL_LIBRARY sasllib)
-message(STATUS "Sasl include dir: " ${SASL_INCLUDE_DIR})
-message(STATUS "Sasl library: " ${SASL_LIBRARY})
+IMPALA_ADD_THIRDPARTY_LIB(cyrus_sasl ${SASL_INCLUDE_DIR} "" ${SASL_SHARED_LIB})
 
 # find openldap
 find_package(Ldap REQUIRED)
-include_directories(${LDAP_INCLUDE_DIR})
-set(LDAP_LIBRARY ldapstatic)
-set(LBER_LIBRARY lberstatic)
-message(STATUS "LDAP: ${LDAP_INCLUDE_DIR}")
+IMPALA_ADD_THIRDPARTY_LIB(ldap ${LDAP_INCLUDE_DIR} ${LDAP_STATIC_LIBRARY} "")
+IMPALA_ADD_THIRDPARTY_LIB(lber "" ${LBER_STATIC_LIBRARY} "")
 
 # The environment variable $THRIFT_HOME is set in impala-config.sh
 # Make sure it's consistent with $THRIFT_ROOT.
@@ -225,35 +235,30 @@ if (NOT ($ENV{THRIFT_HOME} STREQUAL ${THRIFT_ROOT}))
       "variable THRIFT_HOME ($ENV{THRIFT_HOME}).")
 endif()
 # find thrift headers and libs
+set(THRIFT_FIND_QUIETLY TRUE)
 find_package(Thrift REQUIRED)
-include_directories(${THRIFT_INCLUDE_DIR})
-set(LIBS ${LIBS} ${THRIFT_LIBS})
-message(STATUS "Thrift include dir: ${THRIFT_INCLUDE_DIR}")
+IMPALA_ADD_THIRDPARTY_LIB(thrift ${THRIFT_INCLUDE_DIR} ${THRIFT_STATIC_LIB} "")
+message(STATUS "Thrift version: ${THRIFT_VERSION}")
 message(STATUS "Thrift contrib dir: ${THRIFT_CONTRIB_DIR}")
-message(STATUS "Thrift library path: ${THRIFT_LIBS}")
-message(STATUS "Thrift static library: ${THRIFT_STATIC_LIB}")
 message(STATUS "Thrift compiler: ${THRIFT_COMPILER}")
+
+# find flatbuffers headers, lib and compiler
+find_package(FlatBuffers REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(flatbuffers ${FLATBUFFERS_INCLUDE_DIR}
+  ${FLATBUFFERS_STATIC_LIB} "")
+message(STATUS "FlatBuffers compiler: ${FLATBUFFERS_COMPILER}")
 
 # find Snappy headers and libs
 find_package(Snappy REQUIRED)
-include_directories(${SNAPPY_INCLUDE_DIR})
-set(LIBS ${LIBS} ${SNAPPY_LIBRARIES})
-message(STATUS "Snappy include dir: " ${SNAPPY_INCLUDE_DIR})
-message(STATUS "Snappy library: " "${SNAPPY_STATIC_LIB}")
+IMPALA_ADD_THIRDPARTY_LIB(snappy ${SNAPPY_INCLUDE_DIR} ${SNAPPY_STATIC_LIB} "")
 
 # find lz4 lib
 find_package(Lz4 REQUIRED)
-include_directories(${LZ4_INCLUDE_DIR})
-set(LIBS ${LIBS} ${LZ4_LIBRARIES})
-message(STATUS "Lz4 include dir: " ${LZ4_INCLUDE_DIR})
-message(STATUS "Lz4 library: " "${LZ4_STATIC_LIB}")
+IMPALA_ADD_THIRDPARTY_LIB(lz4 ${LZ4_INCLUDE_DIR} ${LZ4_STATIC_LIB} "")
 
 # find re2 headers and libs
 find_package(Re2 REQUIRED)
-include_directories(${RE2_INCLUDE_DIR})
-set(LIBS ${LIBS} ${RE2_LIBRARIES})
-message(STATUS "Re2 include dir: " ${RE2_INCLUDE_DIR})
-message(STATUS "Re2 library: " ${RE2_STATIC_LIB})
+IMPALA_ADD_THIRDPARTY_LIB(re2 ${RE2_INCLUDE_DIR} ${RE2_STATIC_LIB} "")
 
 # find rapidjson headers
 find_package(RapidJson REQUIRED)
@@ -262,11 +267,59 @@ message(STATUS "RapidJson include dir: " ${RAPIDJSON_INCLUDE_DIR})
 
 # find Avro headers and libs
 find_package(Avro REQUIRED)
-include_directories(${AVRO_INCLUDE_DIR})
-set(LIBS ${LIBS} ${AVRO_STATIC_LIB})
-message(STATUS "Avro include dir: " ${AVRO_INCLUDE_DIR})
-message(STATUS "Avro static library: " ${AVRO_STATIC_LIB})
+IMPALA_ADD_THIRDPARTY_LIB(avro ${AVRO_INCLUDE_DIR} ${AVRO_STATIC_LIB} "")
 
+# find protobuf headers, libs and compiler
+find_package(Protobuf REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(protobuf ${PROTOBUF_INCLUDE_DIR} ${PROTOBUF_STATIC_LIBRARY}
+  ${PROTOBUF_SHARED_LIBRARY})
+IMPALA_ADD_THIRDPARTY_LIB(protoc ${PROTOBUF_INCLUDE_DIR} ${PROTOBUF_PROTOC_STATIC_LIBRARY}
+  ${PROTOBUF_PROTOC_SHARED_LIBRARY})
+
+# find libev headers and libs
+find_package(LibEv REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(libev ${LIBEV_INCLUDE_DIR} ${LIBEV_STATIC_LIB}
+  ${LIBEV_SHARED_LIB})
+
+# Find crcutil headers and libs
+find_package(Crcutil REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(crcutil ${CRCUTIL_INCLUDE_DIR} ${CRCUTIL_STATIC_LIB}
+  ${CRCUTIL_SHARED_LIB})
+
+# find jni headers and libs
+find_package(JNI REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(java_jvm "${JNI_INCLUDE_DIRS}" ${JAVA_JVM_LIBRARY} "")
+
+# find breakpad headers and libs
+find_package(Breakpad REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(breakpad_client ${BREAKPAD_INCLUDE_DIR} ${BREAKPAD_STATIC_LIB}
+  "")
+
+# Be careful with Kerberos: we do not statically link against it as it is a security
+# dependency.
+find_package(Kerberos REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(krb5 ${KERBEROS_INCLUDE_DIR} "" ${KERBEROS_LIBRARY})
+
+###################################################################
+
+# System dependencies
+if (NOT APPLE)
+  find_library(RT_LIB_PATH rt)
+  if(NOT RT_LIB_PATH)
+    message(FATAL_ERROR "Could not find librt on the system path")
+  endif()
+  ADD_THIRDPARTY_LIB(rt
+    SHARED_LIB "${RT_LIB_PATH}")
+
+  find_library(DL_LIB_PATH dl)
+  if(NOT DL_LIB_PATH)
+    message(FATAL_ERROR "Could not find libdl on the system path")
+  endif()
+  ADD_THIRDPARTY_LIB(dl
+    SHARED_LIB "${DL_LIB_PATH}")
+endif()
+
+###################################################################
 # KuduClient can use GLOG
 add_definitions(-DKUDU_HEADERS_USE_GLOG)
 if(NOT $ENV{KUDU_CLIENT_DIR} EQUAL "")
@@ -281,44 +334,33 @@ else()
 endif()
 # When KUDU_IS_SUPPORTED is false, the Kudu client is expected to be a non-functional
 # stub. It's still needed to link though.
-find_package(kuduClient REQUIRED)
+find_package(kuduClient REQUIRED NO_DEFAULT_PATH)
 include_directories(SYSTEM ${KUDU_CLIENT_INCLUDE_DIR})
-
-# find jni headers and libs
-find_package(JNI REQUIRED)
-include_directories(${JNI_INCLUDE_DIRS})
-set(LIBS ${LIBS} ${JNI_LIBRARIES})
-message(STATUS "JNI_INCLUDE_DIRS: ${JNI_INCLUDE_DIRS}")
-message(STATUS "JNI_LIBRARIES: ${JNI_LIBRARIES}")
-
-# find breakpad headers and libs
-find_package(Breakpad REQUIRED)
-include_directories(${BREAKPAD_INCLUDE_DIR})
-set(LIBS ${LIBS} ${BREAKPAD_LIBRARIES})
-message(STATUS "Breakpad include dir: " ${BREAKPAD_INCLUDE_DIR})
-message(STATUS "Breakpad library: " ${BREAKPAD_STATIC_LIB})
 
 # compile these subdirs using their own CMakeLists.txt
 add_subdirectory(common/function-registry)
 add_subdirectory(common/thrift)
+add_subdirectory(common/fbs)
 add_subdirectory(be)
 add_subdirectory(fe)
 add_subdirectory(ext-data-source)
 
-# Run FE and BE tests
-add_custom_target(testall
-  COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR}/fe mvn test
-  COMMAND ${CMAKE_SOURCE_DIR}/bin/runbackendtests.sh
+add_custom_target(tarballs ALL DEPENDS shell_tarball)
+
+add_custom_target(shell_tarball DEPENDS thrift-deps
+  COMMAND "${CMAKE_SOURCE_DIR}/shell/make_shell_tarball.sh"
 )
 
-# Load test data
-add_custom_target(loadtestdata
-  COMMAND ${CMAKE_SOURCE_DIR}/bin/load-test-data.sh
+add_custom_target(cscope ALL
+  COMMAND "${CMAKE_SOURCE_DIR}/bin/gen-cscope.sh"
 )
 
-add_custom_target(benchmark_run
-  COMMAND ${CMAKE_SOURCE_DIR}/be/bin/run_hive_benchmark.py
-)
+if (DEFINED ENV{IMPALA_LZO} AND EXISTS $ENV{IMPALA_LZO})
+  add_custom_target(impala-lzo ALL DEPENDS thrift-deps
+    COMMAND $ENV{IMPALA_LZO}/build.sh ${CMAKE_BUILD_TYPE} ${CMAKE_SOURCE_DIR}
+    $ENV{IMPALA_TOOLCHAIN}
+  )
+endif()
 
 # Dump include paths to a file
 if (DUMP_INCLUDE_PATHS)

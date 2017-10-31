@@ -26,12 +26,13 @@
 #endif
 
 #include <climits>
-
 #include <limits>
+#include <typeinfo>
 
 #include <boost/type_traits/make_unsigned.hpp>
 
 #include "common/compiler-util.h"
+#include "gutil/bits.h"
 #include "util/cpu-info.h"
 #include "util/sse-util.h"
 
@@ -43,6 +44,29 @@ using boost::make_unsigned;
 /// TODO: is this in boost or something else like that?
 class BitUtil {
  public:
+
+  /// Returns the width of the integer portion of the type, not counting the sign bit.
+  /// Not safe for use with unknown or non-native types, so make it undefined
+  template<typename T, typename CVR_REMOVED = typename std::decay<T>::type,
+      typename std::enable_if<std::is_integral<CVR_REMOVED>{} ||
+                              std::is_same<CVR_REMOVED, unsigned __int128>{} ||
+                              std::is_same<CVR_REMOVED, __int128>{}, int>::type = 0>
+  constexpr static inline int UnsignedWidth() {
+    return std::is_integral<CVR_REMOVED>::value ?
+        std::numeric_limits<CVR_REMOVED>::digits :
+        std::is_same<CVR_REMOVED, unsigned __int128>::value ? 128 :
+        std::is_same<CVR_REMOVED, __int128>::value ? 127 : -1;
+  }
+
+  /// Return an integer signifying the sign of the value, returning +1 for
+  /// positive integers (and zero), -1 for negative integers.
+  /// The extra shift is to silence GCC warnings about full width shift on
+  /// unsigned types.  It compiles out in optimized builds into the expected increment
+  template<typename T>
+  constexpr static inline T Sign(T value) {
+    return 1 | ((value >> (UnsignedWidth<T>() - 1)) >> 1);
+  }
+
   /// Returns the ceil of value/divisor
   constexpr static inline int64_t Ceil(int64_t value, int64_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -141,11 +165,10 @@ class BitUtil {
   }
 
   /// Returns the 'num_bits' least-significant bits of 'v'.
-  static inline uint64_t TrailingBits(uint64_t v, int num_bits) {
-    if (UNLIKELY(num_bits == 0)) return 0;
+  /// Force inlining - GCC does not always inline this into hot loops.
+  static ALWAYS_INLINE uint64_t TrailingBits(uint64_t v, int num_bits) {
     if (UNLIKELY(num_bits >= 64)) return v;
-    int n = 64 - num_bits;
-    return (v << n) >> n;
+    return ((1UL << num_bits) - 1) & v;
   }
 
   /// Swaps the byte order (i.e. endianess)
@@ -261,6 +284,55 @@ class BitUtil {
       unsigned long long v, int otherwise = sizeof(unsigned long long) * CHAR_BIT) {
     if (UNLIKELY(v == 0)) return otherwise;
     return __builtin_ctzll(v);
+  }
+
+  // Wrap the gutil/ version for convenience.
+  static inline int Log2Floor(uint32_t n) {
+    return Bits::Log2Floor(n);
+  }
+
+  // Wrap the gutil/ version for convenience.
+  static inline int Log2Floor64(uint64_t n) {
+    return Bits::Log2Floor64(n);
+  }
+
+  // Wrap the gutil/ version for convenience.
+  static inline int Log2FloorNonZero64(uint64_t n) {
+    return Bits::Log2FloorNonZero64(n);
+  }
+
+  /// More efficient version of similar functions found in gutil/
+  static inline int Log2Ceiling(uint32 n) {
+    int floor = Log2Floor(n);
+    // Check if zero or a power of two. This pattern is recognised by gcc and optimised
+    // into branch-free code.
+    if (0 == (n & (n - 1))) {
+      return floor;
+    } else {
+      return floor + 1;
+    }
+  }
+
+  static inline int Log2Ceiling64(uint64_t n) {
+    int floor = Log2Floor64(n);
+    // Check if zero or a power of two. This pattern is recognised by gcc and optimised
+    // into branch-free code.
+    if (0 == (n & (n - 1))) {
+      return floor;
+    } else {
+      return floor + 1;
+    }
+  }
+
+  static inline int Log2CeilingNonZero64(uint64_t n) {
+    int floor = Log2FloorNonZero64(n);
+    // Check if zero or a power of two. This pattern is recognised by gcc and optimised
+    // into branch-free code.
+    if (0 == (n & (n - 1))) {
+      return floor;
+    } else {
+      return floor + 1;
+    }
   }
 };
 

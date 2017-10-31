@@ -64,6 +64,11 @@ import com.google.common.collect.Sets;
  * on applicable conjuncts. It returns a list of partitions left after applying all
  * the conjuncts and also removes the conjuncts which have been fully evaluated with
  * the partition columns.
+ *
+ * The pruner does not update referenced partitions in the DescriptorTable because
+ * not all users of this class require the resulting partitions to be serialized, e.g.,
+ * DDL commands.
+ * It is up to the user of this class to mark referenced partitions as needed.
  */
 public class HdfsPartitionPruner {
 
@@ -89,7 +94,7 @@ public class HdfsPartitionPruner {
 
   /**
    * Return a list of partitions left after applying the conjuncts. Please note
-   * that conjunts used for filtering will be removed from the list 'conjuncts'.
+   * that conjuncts used for filtering will be removed from the list 'conjuncts'.
    * If 'allowEmpty' is False, empty partitions are not returned.
    */
   public List<HdfsPartition> prunePartitions(
@@ -108,7 +113,8 @@ public class HdfsPartitionPruner {
     Iterator<Expr> it = conjuncts.iterator();
     while (it.hasNext()) {
       Expr conjunct = it.next();
-      if (conjunct.isBoundBySlotIds(partitionSlots_)) {
+      if (conjunct.isBoundBySlotIds(partitionSlots_) &&
+          !conjunct.contains(Expr.IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE)) {
         // Check if the conjunct can be evaluated from the partition metadata.
         // Use a cloned conjunct to rewrite BetweenPredicates and allow
         // canEvalUsingPartitionMd() to fold constant expressions without modifying
@@ -153,10 +159,7 @@ public class HdfsPartitionPruner {
     for (Long id: matchingPartitionIds) {
       HdfsPartition partition = partitionMap.get(id);
       Preconditions.checkNotNull(partition);
-      if (partition.hasFileDescriptors() || allowEmpty) {
-        results.add(partition);
-        analyzer.getDescTbl().addReferencedPartition(tbl_, partition.getId());
-      }
+      if (partition.hasFileDescriptors() || allowEmpty) results.add(partition);
     }
     return results;
   }
@@ -179,6 +182,7 @@ public class HdfsPartitionPruner {
         return false;
       }
       BinaryPredicate bp = (BinaryPredicate)expr;
+      if (bp.getChild(0).isImplicitCast()) return false;
       SlotRef slot = bp.getBoundSlot();
       if (slot == null) return false;
       Expr bindingExpr = bp.getSlotBinding(slot.getSlotId());

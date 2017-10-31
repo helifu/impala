@@ -34,7 +34,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">troubleshooting</indexterm>
+      <indexterm audience="hidden">troubleshooting</indexterm>
       Troubleshooting for Impala requires being able to diagnose and debug problems
       with performance, network connectivity, out-of-memory conditions, disk space usage,
       and crash or hang conditions in any of the Impala-related daemons.
@@ -60,7 +60,7 @@ under the License.
       <ul>
         <li>
           If a query fails against both Impala and Hive, it is likely that there is a problem with your query or
-          other elements of your CDH environment:
+          other elements of your <keyword keyref="distro"/> environment:
           <ul>
             <li>
               Review the <xref href="impala_langref.xml#langref">Language Reference</xref> to ensure your query is
@@ -94,7 +94,7 @@ under the License.
     </conbody>
   </concept>
 
-  <concept id="trouble_io" rev="CDH-19201">
+  <concept id="trouble_io" rev="">
     <title>Troubleshooting I/O Capacity Problems</title>
     <conbody>
       <p>
@@ -112,7 +112,7 @@ under the License.
 $ sudo sysctl -w vm.drop_caches=3 vm.drop_caches=0
 vm.drop_caches = 3
 vm.drop_caches = 0
-$ sudo dd if=/dev/sda bs=1M of=/dev/null count=1k 
+$ sudo dd if=/dev/sda bs=1M of=/dev/null count=1k
 1024+0 records in
 1024+0 records out
 1073741824 bytes (1.1 GB) copied, 5.60373 s, 192 MB/s
@@ -342,7 +342,7 @@ $ sudo dd if=/dev/sdd bs=1M of=/dev/null count=1k
         </tgroup>
       </table>
 
-      <p audience="Cloudera">
+      <p audience="hidden">
         Some or all of these settings might also be useful.
 <codeblock>NUM_SCANNER_THREADS: 0
 ABORT_ON_DEFAULT_LIMIT_EXCEEDED: 0
@@ -363,7 +363,7 @@ MEM_LIMIT: 0
     </conbody>
   </concept>
 
-  <concept audience="Cloudera" id="core_dumps">
+  <concept audience="hidden" id="core_dumps">
 
     <title>Enabling Core Dumps for Impala</title>
 
@@ -371,15 +371,6 @@ MEM_LIMIT: 0
 
         <p>
           Fill in details, then unhide.
-        </p>
-
-        <p>
-          From Nong:
-        </p>
-
-        <p>
-          In a CM-managed cluster, search for "core" from the impala configuration page. You should see the "enable
-          core dump" config.
         </p>
 
         <p>
@@ -394,7 +385,7 @@ MEM_LIMIT: 0
     </conbody>
   </concept>
 
-  <concept audience="Cloudera" id="io_throughput">
+  <concept audience="hidden" id="io_throughput">
     <title>Verifying I/O Throughput</title>
     <conbody>
       <p>
@@ -412,8 +403,7 @@ MEM_LIMIT: 0
 
 <codeblock>
 <![CDATA[
-Useful test from beta at Visa.
-SME: Jayant@
+Useful test for I/O throughput of hardware.
 
 Symptoms:
 * Queries running slow

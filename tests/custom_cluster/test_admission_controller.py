@@ -33,7 +33,7 @@ from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
-from tests.common.test_vector import TestDimension
+from tests.common.test_vector import ImpalaTestDimension
 from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session
 from ImpalaService import ImpalaHiveServer2Service
 from TCLIService import TCLIService
@@ -84,7 +84,7 @@ _STATESTORED_ARGS = "-statestore_heartbeat_frequency_ms=%s "\
                     (STATESTORE_RPC_FREQUENCY_MS, STATESTORE_RPC_FREQUENCY_MS)
 
 # Key in the query profile for the query options.
-PROFILE_QUERY_OPTIONS_KEY = "Query Options (non default): "
+PROFILE_QUERY_OPTIONS_KEY = "Query Options (set by configuration): "
 
 def impalad_admission_ctrl_flags(max_requests, max_queued, pool_max_mem,
     proc_mem_limit = None):
@@ -129,9 +129,10 @@ class TestAdmissionControllerBase(CustomClusterTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestAdmissionControllerBase, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # There's no reason to test this on other file formats/compression codecs right now
-    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(
+      create_uncompressed_text_dimension(cls.get_workload()))
 
 class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
   def __check_pool_rejected(self, client, pool, expected_error_re):
@@ -143,8 +144,9 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
       assert re.search(expected_error_re, str(e))
 
   def __check_query_options(self, profile, expected_query_options):
-    """Validate that the per-pool query options were set on the specified profile.
-    expected_query_options is a list of "KEY=VALUE" strings, e.g. ["MEM_LIMIT=1", ...]"""
+    """Validate that the expected per-pool query options were set on the specified
+    profile. expected_query_options is a list of "KEY=VALUE" strings, e.g.
+    ["MEM_LIMIT=1", ...]"""
     confs = []
     for line in profile.split("\n"):
       if PROFILE_QUERY_OPTIONS_KEY in line:
@@ -295,7 +297,8 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_flags(1, 1, 1234, 1024 * 1024 * 1024),
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
+          pool_max_mem=10 * 1024 * 1024, proc_mem_limit=1024 * 1024 * 1024),
       statestored_args=_STATESTORED_ARGS)
   def test_trivial_coord_query_limits(self):
     """Tests that trivial coordinator only queries have negligible resource requirements.
@@ -310,7 +313,40 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
         "select * from functional.alltypestiny"]
     for query in non_trivial_queries:
       ex = self.execute_query_expect_failure(self.client, query)
-      assert "memory needed 4.00 GB is greater than pool max mem resources" in str(ex)
+      assert re.search("Rejected query from pool default-pool: request memory needed "
+          ".* is greater than pool max mem resources 10.00 MB", str(ex))
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
+          pool_max_mem=10 * 1024 * 1024, proc_mem_limit=1024 * 1024 * 1024),
+      statestored_args=_STATESTORED_ARGS)
+  def test_reject_min_reservation(self, vector):
+    """Test that the query will be rejected by admission control if:
+       a) the largest per-backend min buffer reservation is larger than the query mem
+          limit
+       b) the largest per-backend min buffer reservation is larger than the
+          buffer_pool_limit query option
+       c) the cluster-wide min-buffer reservation size is larger than the pool memory
+          resources.
+    """
+    self.run_test_case('QueryTest/admission-reject-min-reservation', vector)
+
+  # Process mem_limit used in test_mem_limit_upper_bound
+  PROC_MEM_TEST_LIMIT = 1024 * 1024 * 1024
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
+          pool_max_mem=10 * PROC_MEM_TEST_LIMIT, proc_mem_limit=PROC_MEM_TEST_LIMIT))
+  def test_mem_limit_upper_bound(self, vector):
+    """ Test to ensure that a query is admitted if the requested memory is equal to the
+    process mem limit"""
+    query = "select * from functional.alltypesagg limit 1"
+    exec_options = vector.get_value('exec_option')
+    # Setting requested memory equal to process memory limit
+    exec_options['mem_limit'] = self.PROC_MEM_TEST_LIMIT
+    self.execute_query_expect_success(self.client, query, exec_options)
 
 class TestAdmissionControllerStress(TestAdmissionControllerBase):
   """Submits a number of queries (parameterized) with some delay between submissions
@@ -343,11 +379,12 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
   @classmethod
   def add_test_dimensions(cls):
     super(TestAdmissionControllerStress, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(TestDimension('num_queries', *NUM_QUERIES))
-    cls.TestMatrix.add_dimension(
-        TestDimension('round_robin_submission', *ROUND_ROBIN_SUBMISSION))
-    cls.TestMatrix.add_dimension(
-        TestDimension('submission_delay_ms', *SUBMISSION_DELAY_MS))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('num_queries', *NUM_QUERIES))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('round_robin_submission', *ROUND_ROBIN_SUBMISSION))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('submission_delay_ms', *SUBMISSION_DELAY_MS))
 
     # Additional constraints for code coverage jobs and core.
     num_queries = None
@@ -356,12 +393,14 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
       num_queries = 15
     elif cls.exploration_strategy() == 'core':
       num_queries = 30
-      cls.TestMatrix.add_constraint(lambda v: v.get_value('submission_delay_ms') == 0)
-      cls.TestMatrix.add_constraint(\
+      cls.ImpalaTestMatrix.add_constraint(
+          lambda v: v.get_value('submission_delay_ms') == 0)
+      cls.ImpalaTestMatrix.add_constraint(\
           lambda v: v.get_value('round_robin_submission') == True)
 
     if num_queries is not None:
-      cls.TestMatrix.add_constraint(lambda v: v.get_value('num_queries') == num_queries)
+      cls.ImpalaTestMatrix.add_constraint(
+          lambda v: v.get_value('num_queries') == num_queries)
 
   def setup(self):
     # All threads are stored in this list and it's used just to make sure we clean up
@@ -731,8 +770,8 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_flags(MAX_NUM_CONCURRENT_QUERIES,
-        MAX_NUM_QUEUED_QUERIES, -1),
+      impalad_args=impalad_admission_ctrl_flags(max_requests=MAX_NUM_CONCURRENT_QUERIES,
+        max_queued=MAX_NUM_QUEUED_QUERIES, pool_max_mem=-1),
       statestored_args=_STATESTORED_ARGS)
   def test_admission_controller_with_flags(self, vector):
     self.pool_name = 'default-pool'
@@ -763,8 +802,9 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_flags(MAX_NUM_CONCURRENT_QUERIES * 30,
-        MAX_NUM_QUEUED_QUERIES, MEM_TEST_LIMIT, MEM_TEST_LIMIT),
+      impalad_args=impalad_admission_ctrl_flags(
+        max_requests=MAX_NUM_CONCURRENT_QUERIES * 30, max_queued=MAX_NUM_QUEUED_QUERIES,
+        pool_max_mem=MEM_TEST_LIMIT, proc_mem_limit=MEM_TEST_LIMIT),
       statestored_args=_STATESTORED_ARGS)
   def test_mem_limit(self, vector):
     # Impala may set the proc mem limit lower than we think depending on the overcommit

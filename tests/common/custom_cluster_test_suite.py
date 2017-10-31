@@ -30,6 +30,7 @@ from time import sleep
 
 IMPALA_HOME = os.environ['IMPALA_HOME']
 CLUSTER_SIZE = 3
+NUM_COORDINATORS = CLUSTER_SIZE
 # The number of statestore subscribers is CLUSTER_SIZE (# of impalad) + 1 (for catalogd).
 NUM_SUBSCRIBERS = CLUSTER_SIZE + 1
 
@@ -47,10 +48,18 @@ class CustomClusterTestSuite(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(CustomClusterTestSuite, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.add_custom_cluster_constraints()
+
+  @classmethod
+  def add_custom_cluster_constraints(cls):
+    # Defines constraints for custom cluster tests, called by add_test_dimensions.
+    # By default, custom cluster tests only run on text/none and with a limited set of
+    # exec options. Subclasses may override this to relax these default constraints.
+    super(CustomClusterTestSuite, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format == 'text' and
         v.get_value('table_format').compression_codec == 'none')
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('exec_option')['batch_size'] == 0 and
         v.get_value('exec_option')['disable_codegen'] == False and
         v.get_value('exec_option')['num_nodes'] == 0)
@@ -107,12 +116,15 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
   @classmethod
   def _start_impala_cluster(cls, options, log_dir=os.getenv('LOG_DIR', "/tmp/"),
-      cluster_size=CLUSTER_SIZE, log_level=1):
+      cluster_size=CLUSTER_SIZE, num_coordinators=NUM_COORDINATORS,
+      use_exclusive_coordinators=False, log_level=1):
     cls.impala_log_dir = log_dir
     cmd = [os.path.join(IMPALA_HOME, 'bin/start-impala-cluster.py'),
            '--cluster_size=%d' % cluster_size,
+           '--num_coordinators=%d' % num_coordinators,
            '--log_dir=%s' % log_dir,
            '--log_level=%s' % log_level]
+    if use_exclusive_coordinators: cmd.append("--use_exclusive_coordinators")
     try:
       check_call(cmd + options, close_fds=True)
     finally:
@@ -127,8 +139,11 @@ class CustomClusterTestSuite(ImpalaTestSuite):
 
   def assert_impalad_log_contains(self, level, line_regex, expected_count=1):
     """
-    Assert that impalad log with specified level (e.g. ERROR, WARNING, INFO)
-    contains expected_count lines with a substring matching the regex.
+    Assert that impalad log with specified level (e.g. ERROR, WARNING, INFO) contains
+    expected_count lines with a substring matching the regex. When using this method to
+    check log files of running processes, the caller should make sure that log buffering
+    has been disabled, for example by adding '-logbuflevel=-1' to the daemon startup
+    options.
     """
     pattern = re.compile(line_regex)
     found = 0
@@ -139,5 +154,6 @@ class CustomClusterTestSuite(ImpalaTestSuite):
       for line in log_file:
         if pattern.search(line):
           found += 1
-    assert found == expected_count, ("Expected %d lines in file %s matching regex '%s'"\
-        + ", but found %d lines") % (expected_count, log_file_path, line_regex, found)
+    assert found == expected_count, ("Expected %d lines in file %s matching regex '%s'"
+        + ", but found %d lines. Last line was: \n%s") % (expected_count, log_file_path,
+                                                          line_regex, found, line)

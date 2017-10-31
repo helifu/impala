@@ -20,9 +20,6 @@ package org.apache.impala.planner;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.AggregateInfo;
 import org.apache.impala.analysis.AnalysisContext;
 import org.apache.impala.analysis.Analyzer;
@@ -30,13 +27,17 @@ import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.QueryStmt;
+import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.planner.RuntimeFilterGenerator.RuntimeFilter;
+import org.apache.impala.util.KuduUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-
 
 /**
  * The distributed planner is responsible for creating an executable, distributed plan
@@ -78,12 +79,7 @@ public class DistributedPlanner {
       Preconditions.checkState(!queryStmt.hasOffset());
       isPartitioned = true;
     }
-    long perNodeMemLimit = ctx_.getQueryOptions().mem_limit;
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("create plan fragments");
-      LOG.trace("memlimit=" + Long.toString(perNodeMemLimit));
-    }
-    createPlanFragments(singleNodePlan, isPartitioned, perNodeMemLimit, fragments);
+    createPlanFragments(singleNodePlan, isPartitioned, fragments);
     return fragments;
   }
 
@@ -97,8 +93,7 @@ public class DistributedPlanner {
    * partitioned; the partition function is derived from the inputs.
    */
   private PlanFragment createPlanFragments(
-      PlanNode root, boolean isPartitioned,
-      long perNodeMemLimit, ArrayList<PlanFragment> fragments)
+      PlanNode root, boolean isPartitioned, ArrayList<PlanFragment> fragments)
       throws ImpalaException {
     ArrayList<PlanFragment> childFragments = Lists.newArrayList();
     for (PlanNode child: root.getChildren()) {
@@ -108,9 +103,7 @@ public class DistributedPlanner {
       boolean childIsPartitioned = !child.hasLimit();
       // Do not fragment the subplan of a SubplanNode since it is executed locally.
       if (root instanceof SubplanNode && child == root.getChild(1)) continue;
-      childFragments.add(
-          createPlanFragments(
-            child, childIsPartitioned, perNodeMemLimit, fragments));
+      childFragments.add(createPlanFragments(child, childIsPartitioned, fragments));
     }
 
     PlanFragment result = null;
@@ -119,14 +112,12 @@ public class DistributedPlanner {
       fragments.add(result);
     } else if (root instanceof HashJoinNode) {
       Preconditions.checkState(childFragments.size() == 2);
-      result = createHashJoinFragment(
-          (HashJoinNode) root, childFragments.get(1), childFragments.get(0),
-          perNodeMemLimit, fragments);
+      result = createHashJoinFragment((HashJoinNode) root,
+          childFragments.get(1), childFragments.get(0), fragments);
     } else if (root instanceof NestedLoopJoinNode) {
       Preconditions.checkState(childFragments.size() == 2);
-      result = createNestedLoopJoinFragment(
-          (NestedLoopJoinNode) root, childFragments.get(1), childFragments.get(0),
-          perNodeMemLimit, fragments);
+      result = createNestedLoopJoinFragment((NestedLoopJoinNode) root,
+          childFragments.get(1), childFragments.get(0), fragments);
     } else if (root instanceof SubplanNode) {
       Preconditions.checkState(childFragments.size() == 1);
       result = createSubplanNodeFragment((SubplanNode) root, childFragments.get(0));
@@ -152,8 +143,8 @@ public class DistributedPlanner {
       result = new PlanFragment(
           ctx_.getNextFragmentId(), root, DataPartition.UNPARTITIONED);
     } else {
-      throw new InternalException(
-          "Cannot create plan fragment for this node type: " + root.getExplainString());
+      throw new InternalException("Cannot create plan fragment for this node type: "
+          + root.getExplainString(ctx_.getQueryOptions()));
     }
     // move 'result' to end, it depends on all of its children
     fragments.remove(result);
@@ -202,15 +193,19 @@ public class DistributedPlanner {
     // Ignore constants for the sake of partitioning.
     Expr.removeConstants(partitionExprs);
 
-    // Do nothing if the input fragment is already appropriately partitioned.
+    // Do nothing if the input fragment is already appropriately partitioned. TODO: handle
+    // Kudu tables here (IMPALA-5254).
     DataPartition inputPartition = inputFragment.getDataPartition();
-    if (!partitionExprs.isEmpty() &&
-        analyzer.equivSets(inputPartition.getPartitionExprs(), partitionExprs)) {
+    if (!partitionExprs.isEmpty()
+        && analyzer.equivSets(inputPartition.getPartitionExprs(), partitionExprs)
+        && !(insertStmt.getTargetTable() instanceof KuduTable)) {
       return inputFragment;
     }
 
-    // Make a cost-based decision only if no user hint was supplied.
-    if (!insertStmt.hasShuffleHint()) {
+    // Make a cost-based decision only if no user hint was supplied and this is not a Kudu
+    // table. TODO: consider making a cost based decision for Kudu tables.
+    if (!insertStmt.hasShuffleHint()
+        && !(insertStmt.getTargetTable() instanceof KuduTable)) {
       // If the existing partition exprs are a subset of the table partition exprs, check
       // if it is distributed across all nodes. If so, don't repartition.
       if (Expr.isSubset(inputPartition.getPartitionExprs(), partitionExprs)) {
@@ -239,6 +234,9 @@ public class DistributedPlanner {
     DataPartition partition;
     if (partitionExprs.isEmpty()) {
       partition = DataPartition.UNPARTITIONED;
+    } else if (insertStmt.getTargetTable() instanceof KuduTable) {
+      partition = DataPartition.kuduPartitioned(
+          KuduUtil.createPartitionExpr(insertStmt, ctx_.getRootAnalyzer()));
     } else {
       partition = DataPartition.hashPartitioned(partitionExprs);
     }
@@ -296,8 +294,7 @@ public class DistributedPlanner {
    */
   private PlanFragment createNestedLoopJoinFragment(NestedLoopJoinNode node,
       PlanFragment rightChildFragment, PlanFragment leftChildFragment,
-      long perNodeMemLimit, ArrayList<PlanFragment> fragments)
-      throws ImpalaException {
+      ArrayList<PlanFragment> fragments) throws ImpalaException {
     node.setDistributionMode(DistributionMode.BROADCAST);
     node.setChild(0, leftChildFragment.getPlanRoot());
     connectChildFragment(node, 1, leftChildFragment, rightChildFragment);
@@ -313,7 +310,7 @@ public class DistributedPlanner {
       PlanFragment leftChildFragment, PlanFragment rightChildFragment,
       List<Expr> lhsJoinExprs, List<Expr> rhsJoinExprs,
       ArrayList<PlanFragment> fragments) throws ImpalaException {
-    node.setDistributionMode(HashJoinNode.DistributionMode.PARTITIONED);
+    Preconditions.checkState(node.getDistributionMode() == DistributionMode.PARTITIONED);
     // The lhs and rhs input fragments are already partitioned on the join exprs.
     // Combine the lhs/rhs input fragments into leftChildFragment by placing the join
     // node into leftChildFragment and setting its lhs/rhs children to the plan root of
@@ -407,20 +404,14 @@ public class DistributedPlanner {
   }
 
   /**
-   * Creates either a broadcast join or a repartitioning join, depending on the
-   * expected cost.
-   * If any of the inputs to the cost computation is unknown, it assumes the cost
-   * will be 0. Costs being equal, it'll favor partitioned over broadcast joins.
-   * If perNodeMemLimit > 0 and the size of the hash table for a broadcast join is
-   * expected to exceed that mem limit, switches to partitioned join instead.
-   * TODO: revisit the choice of broadcast as the default
+   * Creates either a broadcast join or a repartitioning join depending on the expected
+   * cost and various constraints. See computeDistributionMode() for more details.
    * TODO: don't create a broadcast join if we already anticipate that this will
    * exceed the query's memory budget.
    */
   private PlanFragment createHashJoinFragment(
       HashJoinNode node, PlanFragment rightChildFragment,
-      PlanFragment leftChildFragment, long perNodeMemLimit,
-      ArrayList<PlanFragment> fragments)
+      PlanFragment leftChildFragment, ArrayList<PlanFragment> fragments)
       throws ImpalaException {
     // For both join types, the total cost is calculated as the amount of data
     // sent over the network, plus the amount of data inserted into the hash table.
@@ -428,8 +419,8 @@ public class DistributedPlanner {
     // the leftChildFragment, and build a hash table with it on each node.
     Analyzer analyzer = ctx_.getRootAnalyzer();
     PlanNode rhsTree = rightChildFragment.getPlanRoot();
-    long rhsDataSize = 0;
-    long broadcastCost = Long.MAX_VALUE;
+    long rhsDataSize = -1;
+    long broadcastCost = -1;
     if (rhsTree.getCardinality() != -1) {
       rhsDataSize = Math.round(
           rhsTree.getCardinality() * ExchangeNode.getAvgSerializedRowSize(rhsTree));
@@ -447,7 +438,6 @@ public class DistributedPlanner {
     // repartition: both left- and rightChildFragment are partitioned on the
     // join exprs, and a hash table is built with the rightChildFragment's output.
     PlanNode lhsTree = leftChildFragment.getPlanRoot();
-    long partitionCost = Long.MAX_VALUE;
     List<Expr> lhsJoinExprs = Lists.newArrayList();
     List<Expr> rhsJoinExprs = Lists.newArrayList();
     for (Expr joinConjunct: node.getEqJoinConjuncts()) {
@@ -457,12 +447,14 @@ public class DistributedPlanner {
     }
     boolean lhsHasCompatPartition = false;
     boolean rhsHasCompatPartition = false;
+    long partitionCost = -1;
     if (lhsTree.getCardinality() != -1 && rhsTree.getCardinality() != -1) {
       lhsHasCompatPartition = analyzer.equivSets(lhsJoinExprs,
           leftChildFragment.getDataPartition().getPartitionExprs());
       rhsHasCompatPartition = analyzer.equivSets(rhsJoinExprs,
           rightChildFragment.getDataPartition().getPartitionExprs());
 
+      Preconditions.checkState(rhsDataSize != -1);
       double lhsNetworkCost = (lhsHasCompatPartition) ? 0.0 :
         Math.round(
             lhsTree.getCardinality() * ExchangeNode.getAvgSerializedRowSize(lhsTree));
@@ -475,42 +467,15 @@ public class DistributedPlanner {
           + Float.toString(lhsTree.getAvgRowSize()));
       LOG.trace("rhs card=" + Long.toString(rhsTree.getCardinality()) + " row_size="
           + Float.toString(rhsTree.getAvgRowSize()));
-      LOG.trace(rhsTree.getExplainString());
+      LOG.trace(rhsTree.getExplainString(ctx_.getQueryOptions()));
     }
 
-    boolean doBroadcast = false;
-    // we do a broadcast join if
-    // - we're explicitly told to do so
-    // - or if it's cheaper and we weren't explicitly told to do a partitioned join
-    // - and we're not doing a full outer or right outer/semi join (those require the
-    //   left-hand side to be partitioned for correctness)
-    // - and the expected size of the hash tbl doesn't exceed perNodeMemLimit
-    // - or we are doing a null-aware left anti join (broadcast is required for
-    //   correctness)
-    // we do a "<=" comparison of the costs so that we default to broadcast joins if
-    // we're unable to estimate the cost
-    if ((node.getJoinOp() != JoinOperator.RIGHT_OUTER_JOIN
-        && node.getJoinOp() != JoinOperator.FULL_OUTER_JOIN
-        && node.getJoinOp() != JoinOperator.RIGHT_SEMI_JOIN
-        && node.getJoinOp() != JoinOperator.RIGHT_ANTI_JOIN
-        // a broadcast join hint overides the check to see if the hash table
-        // size is less than the pernode memlimit
-        && (node.getDistributionModeHint() == DistributionMode.BROADCAST
-            || perNodeMemLimit == 0
-            || Math.round(rhsDataSize * PlannerContext.HASH_TBL_SPACE_OVERHEAD)
-                <= perNodeMemLimit)
-        // a broadcast join hint overrides the check to see if performing a broadcast
-        // join is more costly than a partitioned join
-        && (node.getDistributionModeHint() == DistributionMode.BROADCAST
-            || (node.getDistributionModeHint() != DistributionMode.PARTITIONED
-                && broadcastCost <= partitionCost)))
-        || node.getJoinOp().isNullAwareLeftAntiJoin()) {
-      doBroadcast = true;
-    }
+    DistributionMode distrMode = computeJoinDistributionMode(
+        node, broadcastCost, partitionCost, rhsDataSize);
+    node.setDistributionMode(distrMode);
 
     PlanFragment hjFragment = null;
-    if (doBroadcast) {
-      node.setDistributionMode(HashJoinNode.DistributionMode.BROADCAST);
+    if (distrMode == DistributionMode.BROADCAST) {
       // Doesn't create a new fragment, but modifies leftChildFragment to execute
       // the join; the build input is provided by an ExchangeNode, which is the
       // destination of the rightChildFragment's output
@@ -525,7 +490,7 @@ public class DistributedPlanner {
     }
 
     for (RuntimeFilter filter: node.getRuntimeFilters()) {
-      filter.setIsBroadcast(doBroadcast);
+      filter.setIsBroadcast(distrMode == DistributionMode.BROADCAST);
       filter.computeHasLocalTargets();
       // Work around IMPALA-3450, where cardinalities might be wrong in single-node plans
       // with UNION and LIMITs.
@@ -533,6 +498,49 @@ public class DistributedPlanner {
       filter.computeNdvEstimate();
     }
     return hjFragment;
+ }
+
+ /**
+  * Determines and returns the distribution mode for the given join based on the expected
+  * costs and the right-hand size data size. Considers the following:
+  * - Some join types require a specific distribution strategy to run correctly.
+  * - Checks for join hints.
+  * - Uses the default join strategy (query option) when the costs are unknown or tied.
+  * - Returns broadcast if it is cheaper than partitioned and the expected hash table
+  *   size is within the query mem limit.
+  * - Otherwise, returns partitioned.
+  * For 'broadcastCost', 'partitionCost', and 'rhsDataSize' a value of -1 indicates
+  * unknown, e.g., due to missing stats.
+  */
+ private DistributionMode computeJoinDistributionMode(JoinNode node,
+     long broadcastCost, long partitionCost, long rhsDataSize) {
+   // Check join types that require a specific distribution strategy to run correctly.
+   JoinOperator op = node.getJoinOp();
+   if (op == JoinOperator.RIGHT_OUTER_JOIN || op == JoinOperator.RIGHT_SEMI_JOIN
+       || op == JoinOperator.RIGHT_ANTI_JOIN || op == JoinOperator.FULL_OUTER_JOIN) {
+     return DistributionMode.PARTITIONED;
+   }
+   if (op == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN) return DistributionMode.BROADCAST;
+
+   // Check join hints.
+   if (node.getDistributionModeHint() != DistributionMode.NONE) {
+     return node.getDistributionModeHint();
+   }
+
+   // Use the default mode when the costs are unknown or tied.
+   if (broadcastCost == -1 || partitionCost == -1 || broadcastCost == partitionCost) {
+     return DistributionMode.fromThrift(
+         ctx_.getQueryOptions().getDefault_join_distribution_mode());
+   }
+
+   // Decide the distribution mode based on the estimated costs and the mem limit.
+   long htSize = Math.round(rhsDataSize * PlannerContext.HASH_TBL_SPACE_OVERHEAD);
+   long memLimit = ctx_.getQueryOptions().mem_limit;
+   if (broadcastCost <= partitionCost && (memLimit == 0 || htSize <= memLimit)) {
+     return DistributionMode.BROADCAST;
+   }
+   // Partitioned was cheaper or the broadcast HT would not fit within the mem limit.
+   return DistributionMode.PARTITIONED;
  }
 
   /**
@@ -678,7 +686,6 @@ public class DistributedPlanner {
         childFragment.setOutputPartition(DataPartition.RANDOM);
       }
     }
-    unionNode.reorderOperands(ctx_.getRootAnalyzer());
     unionNode.init(ctx_.getRootAnalyzer());
     return unionFragment;
   }
@@ -785,20 +792,23 @@ public class DistributedPlanner {
 
     DataPartition parentPartition = null;
     if (hasGrouping) {
-      // the parent fragment is partitioned on the grouping exprs;
-      // substitute grouping exprs to reference the *output* of the agg, not the input
       List<Expr> partitionExprs = node.getAggInfo().getPartitionExprs();
       if (partitionExprs == null) partitionExprs = groupingExprs;
-      partitionExprs = Expr.substituteList(partitionExprs,
-          node.getAggInfo().getIntermediateSmap(), ctx_.getRootAnalyzer(), false);
       boolean childHasCompatPartition = ctx_.getRootAnalyzer().equivSets(partitionExprs,
             childFragment.getDataPartition().getPartitionExprs());
-      if (childHasCompatPartition) {
-        // The data is already partitioned on the required expressions, we can just do
-        // the aggregation in the child fragment without an extra merge step.
+      if (childHasCompatPartition && !childFragment.refsNullableTupleId(partitionExprs)) {
+        // The data is already partitioned on the required expressions. We can do the
+        // aggregation in the child fragment without an extra merge step.
+        // An exchange+merge step is required if the grouping exprs reference a tuple
+        // that is made nullable in 'childFragment' to bring NULLs from outer-join
+        // non-matches together.
         childFragment.addPlanRoot(node);
         return childFragment;
       }
+      // the parent fragment is partitioned on the grouping exprs;
+      // substitute grouping exprs to reference the *output* of the agg, not the input
+      partitionExprs = Expr.substituteList(partitionExprs,
+          node.getAggInfo().getIntermediateSmap(), ctx_.getRootAnalyzer(), false);
       parentPartition = DataPartition.hashPartitioned(partitionExprs);
     } else {
       // the parent fragment is unpartitioned
@@ -845,98 +855,87 @@ public class DistributedPlanner {
 
   /**
    * Returns a fragment that materialises the final result of a distinct aggregation
-   * where 'childFragment' is a partitioned fragment with the first phase aggregation
-   * as its root and 'node' is the second phase of the distinct aggregation.
+   * where 'childFragment' is a partitioned fragment with the phase-1 aggregation
+   * as its root.
    */
-  private PlanFragment createPhase2DistinctAggregationFragment(AggregationNode node,
-      PlanFragment childFragment, ArrayList<PlanFragment> fragments)
-      throws ImpalaException {
-    ArrayList<Expr> groupingExprs = node.getAggInfo().getGroupingExprs();
-    boolean hasGrouping = !groupingExprs.isEmpty();
+  private PlanFragment createPhase2DistinctAggregationFragment(
+      AggregationNode phase2AggNode, PlanFragment childFragment,
+      ArrayList<PlanFragment> fragments) throws ImpalaException {
+    // The phase-1 aggregation node is already in the child fragment.
+    Preconditions.checkState(phase2AggNode.getChild(0) == childFragment.getPlanRoot());
 
-    // The first-phase aggregation node is already in the child fragment.
-    Preconditions.checkState(node.getChild(0) == childFragment.getPlanRoot());
+    AggregateInfo phase1AggInfo = ((AggregationNode) phase2AggNode.getChild(0))
+        .getAggInfo();
+    // We need to do
+    // - child fragment:
+    //   * phase-1 aggregation
+    // - first merge fragment, hash-partitioned on grouping and distinct exprs:
+    //   * merge agg of phase-1
+    //   * phase-2 agg
+    // - second merge fragment, partitioned on grouping exprs or unpartitioned
+    //   without grouping exprs
+    //   * merge agg of phase-2
+    // With grouping, the output partition exprs of the child are the (input) grouping
+    // exprs of the parent. The grouping exprs reference the output tuple of phase-1
+    // but the partitioning happens on the intermediate tuple of the phase-1.
+    ArrayList<Expr> partitionExprs = Expr.substituteList(
+        phase1AggInfo.getGroupingExprs(), phase1AggInfo.getIntermediateSmap(),
+        ctx_.getRootAnalyzer(), false);
 
-    AggregateInfo firstPhaseAggInfo = ((AggregationNode) node.getChild(0)).getAggInfo();
-    List<Expr> partitionExprs = null;
-    if (hasGrouping) {
-      // We need to do
-      // - child fragment:
-      //   * phase-1 aggregation
-      // - merge fragment, hash-partitioned on grouping exprs:
-      //   * merge agg of phase 1
-      //   * phase 2 agg
-      // The output partition exprs of the child are the (input) grouping exprs of the
-      // parent. The grouping exprs reference the output tuple of the 1st phase, but the
-      // partitioning happens on the intermediate tuple of the 1st phase.
-      partitionExprs = Expr.substituteList(
-          groupingExprs, firstPhaseAggInfo.getOutputToIntermediateSmap(),
-          ctx_.getRootAnalyzer(), false);
-    } else {
-      // We need to do
-      // - child fragment:
-      //   * phase-1 aggregation
-      // - merge fragment 1, hash-partitioned on distinct exprs:
-      //   * merge agg of phase 1
-      //   * phase 2 agg
-      // - merge fragment 2, unpartitioned:
-      //   * merge agg of phase 2
-      partitionExprs = Expr.substituteList(firstPhaseAggInfo.getGroupingExprs(),
-          firstPhaseAggInfo.getIntermediateSmap(), ctx_.getRootAnalyzer(), false);
-    }
-
-    PlanFragment mergeFragment = null;
+    PlanFragment firstMergeFragment;
     boolean childHasCompatPartition = ctx_.getRootAnalyzer().equivSets(partitionExprs,
         childFragment.getDataPartition().getPartitionExprs());
     if (childHasCompatPartition) {
       // The data is already partitioned on the required expressions, we can skip the
-      // phase 1 merge step.
-      childFragment.addPlanRoot(node);
-      mergeFragment = childFragment;
+      // phase-1 merge step.
+      childFragment.addPlanRoot(phase2AggNode);
+      firstMergeFragment = childFragment;
     } else {
       DataPartition mergePartition = DataPartition.hashPartitioned(partitionExprs);
       // Convert the existing node to a preaggregation.
-      AggregationNode preaggNode = (AggregationNode)node.getChild(0);
+      AggregationNode preaggNode = (AggregationNode)phase2AggNode.getChild(0);
       preaggNode.setIsPreagg(ctx_);
 
-      // place a merge aggregation step for the 1st phase in a new fragment
-      mergeFragment = createParentFragment(childFragment, mergePartition);
-      AggregateInfo phase1MergeAggInfo = firstPhaseAggInfo.getMergeAggInfo();
+      // place phase-1 merge aggregation step in a new fragment
+      firstMergeFragment = createParentFragment(childFragment, mergePartition);
+      AggregateInfo phase1MergeAggInfo = phase1AggInfo.getMergeAggInfo();
       AggregationNode phase1MergeAggNode =
           new AggregationNode(ctx_.getNextNodeId(), preaggNode, phase1MergeAggInfo);
       phase1MergeAggNode.init(ctx_.getRootAnalyzer());
       phase1MergeAggNode.unsetNeedsFinalize();
       phase1MergeAggNode.setIntermediateTuple();
-      mergeFragment.addPlanRoot(phase1MergeAggNode);
+      firstMergeFragment.addPlanRoot(phase1MergeAggNode);
 
-      // the 2nd-phase aggregation consumes the output of the merge agg;
-      // if there is a limit, it had already been placed with the 2nd aggregation
+      // the phase-2 aggregation consumes the output of the phase-1 merge agg;
+      // if there is a limit, it had already been placed with the phase-2 aggregation
       // step (which is where it should be)
-      mergeFragment.addPlanRoot(node);
+      firstMergeFragment.addPlanRoot(phase2AggNode);
+      fragments.add(firstMergeFragment);
     }
+    phase2AggNode.unsetNeedsFinalize();
+    phase2AggNode.setIntermediateTuple();
+    // Limit should be applied at the final merge aggregation node
+    long limit = phase2AggNode.getLimit();
+    phase2AggNode.unsetLimit();
 
-    if (!hasGrouping) {
-      // place the merge aggregation of the 2nd phase in an unpartitioned fragment;
-      // add preceding merge fragment at end
-      if (mergeFragment != childFragment) fragments.add(mergeFragment);
-
-      node.unsetNeedsFinalize();
-      node.setIntermediateTuple();
-      // Any limit should be placed in the final merge aggregation node
-      long limit = node.getLimit();
-      node.unsetLimit();
-      mergeFragment = createParentFragment(mergeFragment, DataPartition.UNPARTITIONED);
-      AggregateInfo phase2MergeAggInfo = node.getAggInfo().getMergeAggInfo();
-      AggregationNode phase2MergeAggNode = new AggregationNode(ctx_.getNextNodeId(), node,
-          phase2MergeAggInfo);
-      phase2MergeAggNode.init(ctx_.getRootAnalyzer());
-      // Transfer having predicates. If hasGrouping == true, the predicates should
-      // instead be evaluated by the 2nd phase agg (the predicates are already there).
-      node.transferConjuncts(phase2MergeAggNode);
-      phase2MergeAggNode.setLimit(limit);
-      mergeFragment.addPlanRoot(phase2MergeAggNode);
+    DataPartition mergePartition;
+    if (phase2AggNode.getAggInfo().getGroupingExprs().isEmpty()) {
+      mergePartition = DataPartition.UNPARTITIONED;
+    } else {
+      phase2AggNode.setIsPreagg(ctx_);
+      mergePartition = DataPartition.hashPartitioned(
+          phase2AggNode.getAggInfo().getMergeAggInfo().getGroupingExprs());
     }
-    return mergeFragment;
+    PlanFragment secondMergeFragment =
+        createParentFragment(firstMergeFragment, mergePartition);
+    AggregationNode phase2MergeAggNode = new AggregationNode(ctx_.getNextNodeId(),
+        phase2AggNode, phase2AggNode.getAggInfo().getMergeAggInfo());
+    phase2MergeAggNode.init(ctx_.getRootAnalyzer());
+    phase2MergeAggNode.setLimit(limit);
+    // Transfer having predicates to final merge agg node
+    phase2AggNode.transferConjuncts(phase2MergeAggNode);
+    secondMergeFragment.addPlanRoot(phase2MergeAggNode);
+    return secondMergeFragment;
   }
 
   /**
@@ -973,12 +972,16 @@ public class DistributedPlanner {
     Preconditions.checkState(sortNode.isAnalyticSort());
     PlanFragment analyticFragment = childFragment;
     if (sortNode.getInputPartition() != null) {
-      // make sure the childFragment's output is partitioned as required by the sortNode
       sortNode.getInputPartition().substitute(
           childFragment.getPlanRoot().getOutputSmap(), ctx_.getRootAnalyzer());
-      if (!childFragment.getDataPartition().equals(sortNode.getInputPartition())) {
-        analyticFragment =
-            createParentFragment(childFragment, sortNode.getInputPartition());
+      // Make sure the childFragment's output is partitioned as required by the sortNode.
+      // Even if the fragment and the sort partition exprs are equal, an exchange is
+      // required if the sort partition exprs reference a tuple that is made nullable in
+      // 'childFragment' to bring NULLs from outer-join non-matches together.
+      DataPartition sortPartition = sortNode.getInputPartition();
+      if (!childFragment.getDataPartition().equals(sortPartition)
+          || childFragment.refsNullableTupleId(sortPartition.getPartitionExprs())) {
+        analyticFragment = createParentFragment(childFragment, sortPartition);
       }
     }
     analyticFragment.addPlanRoot(sortNode);

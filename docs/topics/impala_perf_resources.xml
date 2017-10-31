@@ -41,7 +41,7 @@ under the License.
       Sometimes, balancing raw query performance against scalability requires limiting the amount of resources,
       such as memory or CPU, used by a single query or group of queries. Impala can use several mechanisms that
       help to smooth out the load during heavy concurrent usage, resulting in faster overall query times and
-      sharing of resources across Impala queries, MapReduce jobs, and other kinds of workloads across a CDH
+      sharing of resources across Impala queries, MapReduce jobs, and other kinds of workloads across a <keyword keyref="distro"/>
       cluster:
     </p>
 
@@ -51,8 +51,8 @@ under the License.
         limits on the number of concurrent queries or the amount of memory used. The queries are queued, and
         executed as other queries finish and resources become available. You can control the concurrency limits,
         and specify different limits for different groups of users to divide cluster resources according to the
-        priorities of different classes of users. This feature is new in Impala 1.3, and works with both CDH 4 and
-        CDH 5. See <xref href="impala_admission.xml#admission_control"/> for details.
+        priorities of different classes of users. This feature is new in Impala 1.3.
+        See <xref href="impala_admission.xml#admission_control"/> for details.
       </li>
 
       <li>
@@ -67,10 +67,8 @@ under the License.
 
       <li>
         <p>
-          For production deployment, <ph rev="upstream">Cloudera</ph> recommends that you implement resource isolation using mechanisms
-          such as cgroups, which you can configure using Cloudera Manager. For details, see the
-          <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cm_mc_service_pools.html" scope="external" format="html">Static
-          Resource Pools</xref> in the Cloudera Manager documentation.
+          For production deployments, implement resource isolation using your cluster management
+          tool.
         </p>
       </li>
     </ul>

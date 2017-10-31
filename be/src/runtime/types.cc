@@ -30,6 +30,13 @@ using namespace llvm;
 
 namespace impala {
 
+const int ColumnType::MAX_PRECISION;
+const int ColumnType::MAX_SCALE;
+const int ColumnType::MIN_ADJUSTED_SCALE;
+
+const int ColumnType::MAX_DECIMAL4_PRECISION;
+const int ColumnType::MAX_DECIMAL8_PRECISION;
+
 const char* ColumnType::LLVM_CLASS_NAME = "struct.impala::ColumnType";
 
 ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
@@ -42,7 +49,8 @@ ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
       DCHECK(node.__isset.scalar_type);
       const TScalarType scalar_type = node.scalar_type;
       type = ThriftToType(scalar_type.type);
-      if (type == TYPE_CHAR || type == TYPE_VARCHAR) {
+      if (type == TYPE_CHAR || type == TYPE_VARCHAR
+          || type == TYPE_FIXED_UDA_INTERMEDIATE) {
         DCHECK(scalar_type.__isset.len);
         len = scalar_type.len;
       } else if (type == TYPE_DECIMAL) {
@@ -101,6 +109,7 @@ PrimitiveType ThriftToType(TPrimitiveType::type ttype) {
     case TPrimitiveType::BINARY: return TYPE_BINARY;
     case TPrimitiveType::DECIMAL: return TYPE_DECIMAL;
     case TPrimitiveType::CHAR: return TYPE_CHAR;
+    case TPrimitiveType::FIXED_UDA_INTERMEDIATE: return TYPE_FIXED_UDA_INTERMEDIATE;
     default: return INVALID_TYPE;
   }
 }
@@ -124,6 +133,7 @@ TPrimitiveType::type ToThrift(PrimitiveType ptype) {
     case TYPE_BINARY: return TPrimitiveType::BINARY;
     case TYPE_DECIMAL: return TPrimitiveType::DECIMAL;
     case TYPE_CHAR: return TPrimitiveType::CHAR;
+    case TYPE_FIXED_UDA_INTERMEDIATE: return TPrimitiveType::FIXED_UDA_INTERMEDIATE;
     case TYPE_STRUCT:
     case TYPE_ARRAY:
     case TYPE_MAP:
@@ -151,6 +161,7 @@ string TypeToString(PrimitiveType t) {
     case TYPE_BINARY: return "BINARY";
     case TYPE_DECIMAL: return "DECIMAL";
     case TYPE_CHAR: return "CHAR";
+    case TYPE_FIXED_UDA_INTERMEDIATE: return "FIXED_UDA_INTERMEDIATE";
     case TYPE_STRUCT: return "STRUCT";
     case TYPE_ARRAY: return "ARRAY";
     case TYPE_MAP: return "MAP";
@@ -181,6 +192,10 @@ string TypeToOdbcString(PrimitiveType t) {
     case TYPE_STRUCT: return "struct";
     case TYPE_ARRAY: return "array";
     case TYPE_MAP: return "map";
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      // This type is not exposed to clients and should not be returned.
+      DCHECK(false);
+      break;
   };
   return "unknown";
 }
@@ -210,7 +225,8 @@ void ColumnType::ToThrift(TColumnType* thrift_type) const {
     node.__set_scalar_type(TScalarType());
     TScalarType& scalar_type = node.scalar_type;
     scalar_type.__set_type(impala::ToThrift(type));
-    if (type == TYPE_CHAR || type == TYPE_VARCHAR) {
+    if (type == TYPE_CHAR || type == TYPE_VARCHAR
+        || type == TYPE_FIXED_UDA_INTERMEDIATE) {
       DCHECK_NE(len, -1);
       scalar_type.__set_len(len);
     } else if (type == TYPE_DECIMAL) {
@@ -286,7 +302,8 @@ TTypeEntry ColumnType::ToHs2Type() const {
       break;
     }
     default:
-      // HiveServer2 does not have a type for invalid, date and datetime.
+      // HiveServer2 does not have a type for invalid, date, datetime or
+      // fixed_uda_intermediate.
       DCHECK(false) << "bad TypeToTValueType() type: " << DebugString();
       type_entry.__set_type(TTypeId::STRING_TYPE);
   };
@@ -303,11 +320,23 @@ string ColumnType::DebugString() const {
       ss << "CHAR(" << len << ")";
       return ss.str();
     case TYPE_DECIMAL:
-      ss << "DECIMAL(" << precision << ", " << scale << ")";
+      ss << "DECIMAL(" << precision << "," << scale << ")";
+      return ss.str();
+    case TYPE_VARCHAR:
+      ss << "VARCHAR(" << len << ")";
+      return ss.str();
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      ss << "FIXED_UDA_INTERMEDIATE(" << len << ")";
       return ss.str();
     default:
       return TypeToString(type);
   }
+}
+
+vector<ColumnType> ColumnType::FromThrift(const vector<TColumnType>& ttypes) {
+  vector<ColumnType> types;
+  for (const TColumnType& ttype : ttypes) types.push_back(FromThrift(ttype));
+  return types;
 }
 
 ostream& operator<<(ostream& os, const ColumnType& type) {

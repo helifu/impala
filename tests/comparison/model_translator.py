@@ -20,17 +20,19 @@ from logging import getLogger
 from re import sub
 from sqlparse import format
 
-from common import StructColumn, CollectionColumn
-from db_types import (
+from tests.comparison.common import StructColumn, CollectionColumn
+from tests.comparison.db_types import (
     Char,
     Decimal,
+    Double,
     Float,
     Int,
     String,
     Timestamp,
+    TinyInt,
     VarChar)
-from query import InsertStatement, Query
-from query_flattener import QueryFlattener
+from tests.comparison.query import InsertClause, Query
+from tests.comparison.query_flattener import QueryFlattener
 
 LOG = getLogger(__name__)
 
@@ -314,6 +316,12 @@ class SqlWriter(object):
   def _write_cast(self, arg, type):
     return 'CAST(%s AS %s)' % (self._write(arg), type)
 
+  def _write_cast_func(self, func):
+    val_expr = func.args[0]
+    type_ = func.args[1]
+    return 'CAST({val_expr} AS {type_})'.format(
+        val_expr=self._write(val_expr), type_=self._write(type_))
+
   def _write_date_add_year(self, func):
     return "%s + INTERVAL %s YEAR" \
         % (self._write(func.args[0]), self._write(func.args[1]))
@@ -399,11 +407,17 @@ class SqlWriter(object):
     return sql
 
   def _write_data_type_metaclass(self, data_type_class):
-    '''Write a data type class such as Int or Boolean.'''
-    aliases = getattr(data_type_class, self.DIALECT, None)
-    if aliases:
-      return aliases[0]
-    return data_type_class.__name__.upper()
+    '''Write a data type class such as Int, Boolean, or Decimal(4, 2).'''
+    if data_type_class == Char:
+      return 'CHAR({0})'.format(data_type_class.MAX)
+    elif data_type_class == VarChar:
+      return 'VARCHAR({0})'.format(data_type_class.MAX)
+    elif data_type_class == Decimal:
+      return 'DECIMAL({scale},{precision})'.format(
+          scale=data_type_class.MAX_DIGITS,
+          precision=data_type_class.MAX_FRACTIONAL_DIGITS)
+    else:
+      return data_type_class.__name__.upper()
 
   def _write_subquery(self, subquery):
     return '({0})'.format(self._write(subquery.query))
@@ -449,9 +463,9 @@ class SqlWriter(object):
     """
     Return a string representing the VALUES clause of an INSERT query.
     """
-    return 'VALUES {values_rows}'.format(
-        values_rows=', '.join([self._write(values_row)
-                               for values_row in values_clause.values_rows]))
+    return 'VALUES\n{values_rows}'.format(
+        values_rows=',\n'.join([self._write(values_row)
+                                for values_row in values_clause.values_rows]))
 
   def _write(self, object_):
     '''Return a sql string representation of the given object.'''
@@ -513,6 +527,20 @@ class ImpalaSqlWriter(SqlWriter):
       # TRIM is a temporary workaround for IMPALA-1652
       result = 'TRIM(%s)' % result
     return result
+
+  def _write_insert_clause(self, insert_clause):
+    sql = super(ImpalaSqlWriter, self)._write_insert_clause(insert_clause)
+    if insert_clause.conflict_action == InsertClause.CONFLICT_ACTION_UPDATE:
+      # The value of sql at this point would be something like:
+      #
+      # INSERT INTO <table name> [(column list)]
+      #
+      # If it happens that the table name or column list contains the text INSERT in an
+      # identifier, we want to ensure that the replace() call below does not alter their
+      # names but instead only modifiers the INSERT keyword to UPSERT.
+      return sql.replace('INSERT', 'UPSERT', 1)
+    else:
+      return sql
 
 
 class OracleSqlWriter(SqlWriter):
@@ -629,10 +657,19 @@ class PostgresqlSqlWriter(SqlWriter):
 
   def _write_insert_statement(self, insert_statement):
     sql = SqlWriter._write_insert_statement(self, insert_statement)
-    if insert_statement.conflict_action == InsertStatement.CONFLICT_ACTION_DEFAULT:
+    if insert_statement.conflict_action == InsertClause.CONFLICT_ACTION_DEFAULT:
       pass
-    elif insert_statement.conflict_action == InsertStatement.CONFLICT_ACTION_IGNORE:
+    elif insert_statement.conflict_action == InsertClause.CONFLICT_ACTION_IGNORE:
       sql += '\nON CONFLICT DO NOTHING'
+    elif insert_statement.conflict_action == InsertClause.CONFLICT_ACTION_UPDATE:
+      if insert_statement.updatable_column_names:
+        primary_keys = insert_statement.primary_key_string
+        columns = ',\n'.join('{name} = EXCLUDED.{name}'.format(name=name) for name in
+                             insert_statement.updatable_column_names)
+        sql += '\nON CONFLICT {primary_keys}\nDO UPDATE SET\n{columns}'.format(
+            primary_keys=primary_keys, columns=columns)
+      else:
+        sql += '\nON CONFLICT DO NOTHING'
     else:
       raise Exception('InsertStatement has unsupported conflict_action: {0}'.format(
           insert_statement.conflict_action))
@@ -694,9 +731,18 @@ class PostgresqlSqlWriter(SqlWriter):
 
   def _write_data_type_metaclass(self, data_type_class):
     '''Write a data type class such as Int or Boolean.'''
-    if data_type_class in (Char, String, VarChar):
+    if data_type_class == Double:
+      return 'DOUBLE PRECISION'
+    elif data_type_class == Float:
+      return 'REAL'
+    elif data_type_class == String:
       return 'VARCHAR(%s)' % data_type_class.MAX
-    return data_type_class.__name__.upper()
+    elif data_type_class == Timestamp:
+      return 'TIMESTAMP WITHOUT TIME ZONE'
+    elif data_type_class == TinyInt:
+      return 'SMALLINT'
+    else:
+      return super(PostgresqlSqlWriter, self)._write_data_type_metaclass(data_type_class)
 
   def _write_order_by_clause(self, order_by_clause):
     sql = 'ORDER BY '

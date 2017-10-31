@@ -36,7 +36,7 @@ struct HdfsFileDesc;
 /// This scanner handles text files split across multiple blocks/scan ranges. Note that
 /// the split can occur anywhere in the file, e.g. in the middle of a row. Each scanner
 /// starts materializing tuples right after the first row delimiter found in the scan
-/// range, and stops at the first row delimiter occuring past the end of the scan
+/// range, and stops at the first row delimiter occurring past the end of the scan
 /// range. If no delimiter is found in the scan range, the scanner doesn't materialize
 /// anything. This scheme ensures that every row is materialized by exactly one scanner.
 ///
@@ -51,19 +51,18 @@ class HdfsTextScanner : public HdfsScanner {
   virtual ~HdfsTextScanner();
 
   /// Implementation of HdfsScanner interface.
-  virtual Status Open(ScannerContext* context);
-  virtual Status ProcessSplit();
+  virtual Status Open(ScannerContext* context) WARN_UNUSED_RESULT;
   virtual void Close(RowBatch* row_batch);
 
   /// Issue io manager byte ranges for 'files'.
   static Status IssueInitialRanges(HdfsScanNodeBase* scan_node,
-                                   const std::vector<HdfsFileDesc*>& files);
+      const std::vector<HdfsFileDesc*>& files) WARN_UNUSED_RESULT;
 
   /// Codegen WriteAlignedTuples(). Stores the resulting function in
-  /// 'write_aligned_tuples_fn' if codegen was successful or NULL otherwise.
+  /// 'write_aligned_tuples_fn' if codegen was successful or nullptr otherwise.
   static Status Codegen(HdfsScanNodeBase* node,
-      const std::vector<ExprContext*>& conjunct_ctxs,
-      llvm::Function** write_aligned_tuples_fn);
+      const std::vector<ScalarExpr*>& conjuncts,
+      llvm::Function** write_aligned_tuples_fn) WARN_UNUSED_RESULT;
 
   /// Suffix for lzo index files.
   const static std::string LZO_INDEX_SUFFIX;
@@ -71,9 +70,11 @@ class HdfsTextScanner : public HdfsScanner {
   static const char* LLVM_CLASS_NAME;
 
  protected:
+  virtual Status GetNextInternal(RowBatch* row_batch) WARN_UNUSED_RESULT;
+
   /// Reset the scanner.  This clears any partial state that needs to
   /// be cleared when starting or when restarting after an error.
-  Status ResetScanner();
+  Status ResetScanner() WARN_UNUSED_RESULT;
 
   /// Current position in byte buffer.
   char* byte_buffer_ptr_;
@@ -90,57 +91,79 @@ class HdfsTextScanner : public HdfsScanner {
  private:
   const static int NEXT_BLOCK_READ_SIZE = 64 * 1024; //bytes
 
+  /// The text scanner transitions through these states exactly in order.
+  enum TextScanState {
+    CONSTRUCTED,
+    SCAN_RANGE_INITIALIZED,
+    FIRST_TUPLE_FOUND,
+    PAST_SCAN_RANGE,
+    DONE
+  };
+
   /// Initializes this scanner for this context.  The context maps to a single
-  /// scan range.
-  virtual Status InitNewRange();
+  /// scan range. Advances the scan state to SCAN_RANGE_INITIALIZED.
+  virtual Status InitNewRange() WARN_UNUSED_RESULT;
 
   /// Finds the start of the first tuple in this scan range and initializes
-  /// byte_buffer_ptr to be the next character (the start of the first tuple).  If
-  /// there are no tuples starts in the entire range, *tuple_found is set to false
-  /// and no more processing needs to be done in this range (i.e. there are really large
-  /// columns)
-  Status FindFirstTuple(bool* tuple_found);
+  /// 'byte_buffer_ptr_' to point to the start of first tuple. Advances the scan state
+  /// to FIRST_TUPLE_FOUND, if successful. Otherwise, consumes the whole scan range
+  /// and does not update the scan state (e.g. if there are really large columns).
+  /// Only valid to call in scan state SCAN_RANGE_INITIALIZED.
+  Status FindFirstTuple(MemPool* pool) WARN_UNUSED_RESULT;
 
-  /// Process the entire scan range, reading bytes from context and appending
-  /// materialized row batches to the scan node.  *num_tuples returns the
-  /// number of tuples parsed.  past_scan_range is true if this is processing
-  /// beyond the end of the scan range and this function should stop after
-  /// finding one tuple.
-  Status ProcessRange(int* num_tuples, bool past_scan_range);
+  /// When in scan state FIRST_TUPLE_FOUND, starts or continues processing the scan range
+  /// by reading bytes from 'context_'. Adds materialized tuples that pass the conjuncts
+  /// to 'row_batch', and returns when 'row_batch' is at capacity.
+  /// When in scan state PAST_SCAN_RANGE, this function returns after parsing one tuple,
+  /// regardless of whether it passed the conjuncts.
+  /// *num_tuples returns the total number of tuples parsed, including tuples that did
+  /// not pass conjuncts.
+  /// Advances the scan state to PAST_SCAN_RANGE if all bytes in the scan range have been
+  /// processed.
+  /// Only valid to call in scan state FIRST_TUPLE_FOUND or PAST_SCAN_RANGE.
+  Status ProcessRange(RowBatch* row_batch, int* num_tuples) WARN_UNUSED_RESULT;
 
-  /// Reads past the end of the scan range for the next tuple end.
-  Status FinishScanRange();
+  /// Reads past the end of the scan range for the next tuple end. If successful,
+  /// advances the scan state to DONE. Only valid to call in state PAST_SCAN_RANGE.
+  Status FinishScanRange(RowBatch* row_batch) WARN_UNUSED_RESULT;
 
   /// Fills the next byte buffer from the context.  This will block if there are no bytes
   /// ready.  Updates byte_buffer_ptr_, byte_buffer_end_ and byte_buffer_read_size_.
   /// If num_bytes is 0, the scanner will read whatever is the io mgr buffer size,
   /// otherwise it will just read num_bytes. If we are reading compressed text, num_bytes
-  /// must be 0.
-  virtual Status FillByteBuffer(bool* eosr, int num_bytes = 0);
+  /// must be 0. Internally, calls the appropriate streaming or non-streaming
+  /// decompression functions FillByteBufferCompressedFile/Stream().
+  /// If applicable, attaches decompression buffers from previous calls that might still
+  /// be referenced by returned batches to 'pool'. If 'pool' is nullptr the buffers are
+  /// freed instead.
+  virtual Status FillByteBuffer(MemPool* pool, bool* eosr, int num_bytes = 0)
+      WARN_UNUSED_RESULT;
 
   /// Fills the next byte buffer from the compressed data in stream_ by reading the entire
   /// file, decompressing it, and setting the byte_buffer_ptr_ to the decompressed buffer.
-  Status FillByteBufferCompressedFile(bool* eosr);
+  Status FillByteBufferCompressedFile(bool* eosr) WARN_UNUSED_RESULT;
 
   /// Fills the next byte buffer from the compressed data in stream_. Unlike
   /// FillByteBufferCompressedFile(), the entire file does not need to be read at once.
   /// Buffers from stream_ are decompressed as they are read and byte_buffer_ptr_ is set
   /// to available decompressed data.
-  Status FillByteBufferCompressedStream(bool* eosr);
+  /// Attaches decompression buffers from previous calls that might still be referenced
+  /// by returned batches to 'pool'. If 'pool' is nullptr the buffers are freed instead.
+  Status FillByteBufferCompressedStream(MemPool* pool, bool* eosr) WARN_UNUSED_RESULT;
 
   /// Used by FillByteBufferCompressedStream() to decompress data from 'stream_'.
   /// Returns COMPRESSED_FILE_DECOMPRESSOR_NO_PROGRESS if it needs more input.
   /// If bytes_to_read > 0, will read specified size.
   /// If bytes_to_read = -1, will call GetBuffer().
   Status DecompressBufferStream(int64_t bytes_to_read, uint8_t** decompressed_buffer,
-      int64_t* decompressed_len, bool *eosr);
+      int64_t* decompressed_len, bool *eosr) WARN_UNUSED_RESULT;
 
   /// Checks if the current buffer ends with a row delimiter spanning this and the next
   /// buffer (i.e. a "\r\n" delimiter). Does not modify byte_buffer_ptr_, etc. Always
   /// returns false if the table's row delimiter is not '\n'. This can only be called
   /// after the buffer has been fully parsed, i.e. when byte_buffer_ptr_ ==
   /// byte_buffer_end_.
-  Status CheckForSplitDelimiter(bool* split_delimiter);
+  Status CheckForSplitDelimiter(bool* split_delimiter) WARN_UNUSED_RESULT;
 
   /// Prepends field data that was from the previous file buffer (This field straddled two
   /// file buffers). 'data' already contains the pointer/len from the current file buffer,
@@ -148,32 +171,43 @@ class HdfsTextScanner : public HdfsScanner {
   /// This function will allocate a new string from the tuple pool, concatenate the
   /// two pieces and update 'data' to contain the new pointer/len. Return error status if
   /// memory limit is exceeded when allocating a new string.
-  Status CopyBoundaryField(FieldLocation* data, MemPool* pool);
+  Status CopyBoundaryField(FieldLocation* data, MemPool* pool) WARN_UNUSED_RESULT;
 
-  /// Writes the intermediate parsed data into slots, outputting
-  /// tuples to row_batch as they complete.
+  /// Writes intermediate parsed data into 'tuple_', evaluates conjuncts, and appends
+  /// surviving rows to 'row'. Advances 'tuple_' and 'row' as necessary.
   /// Input Parameters:
-  ///  mempool: MemPool to allocate from for field data
   ///  num_fields: Total number of fields contained in parsed_data_
   ///  num_tuples: Number of tuples in parsed_data_. This includes the potential
   ///    partial tuple at the beginning of 'field_locations_'.
-  /// Returns the number of tuples added to the row batch.
-  int WriteFields(MemPool*, TupleRow* tuple_row_mem, int num_fields, int num_tuples);
+  ///  pool: MemPool to allocate from for field data
+  /// Returns the number of rows added to the row batch.
+  int WriteFields(int num_fields, int num_tuples, MemPool* pool, TupleRow* row);
 
-  /// Utility function to write out 'num_fields' to 'tuple_'.  This is used to parse
-  /// partial tuples. If copy_strings is true, strings from fields will be copied into
-  /// the boundary pool.
-  void WritePartialTuple(FieldLocation*, int num_fields, bool copy_strings);
+  /// Utility function to parse 'num_fields' and materialize the resulting slots into
+  /// 'partial_tuple_'.  The data of var-len fields is copied into 'boundary_pool_'.
+  void WritePartialTuple(FieldLocation*, int num_fields);
 
-  /// Mem pool for boundary_row_ and boundary_column_.
+  /// Deep copies the partial tuple into 'tuple_'.  The deep copy is done to simplify
+  /// memory ownership.  Also clears the boundary pool to prevent the accumulation of
+  /// variable length data in it.
+  void CopyAndClearPartialTuple(MemPool* pool);
+
+  /// Current state of this scanner.  Advances through the states exactly in order.
+  TextScanState scan_state_;
+
+  /// Mem pool for boundary_row_, boundary_column_, partial_tuple_ and any variable length
+  /// data that is pointed at by the partial tuple.  Does not hold any tuple data
+  /// of returned batches, because the data is always deep-copied into the output batch.
   boost::scoped_ptr<MemPool> boundary_pool_;
 
-  /// Helper string for dealing with input rows that span file blocks.
-  /// We keep track of a whole line that spans file blocks to be able to report
-  /// the line as erroneous in case of parsing errors.
+  /// Helper string for dealing with input rows that span file blocks.  We keep track of
+  /// a whole line that spans file blocks to be able to report the line as erroneous in
+  /// case of parsing errors.  Does not hold any tuple data of returned batches.
   StringBuffer boundary_row_;
 
-  /// Helper string for dealing with columns that span file blocks.
+  /// Helper string for dealing with columns that span file blocks.  Does not hold any
+  /// tuple data of returned batches, because the data is always deep-copied into the
+  /// output batch.  Memory comes from boundary_pool_.
   StringBuffer boundary_column_;
 
   /// Index into materialized_slots_ for the next slot to output for the current tuple.
@@ -199,14 +233,10 @@ class HdfsTextScanner : public HdfsScanner {
   /// logged.
   bool error_in_row_;
 
-  /// Memory to store partial tuples split across buffers.  Memory comes from
-  /// boundary_pool_.  There is only one tuple allocated for this object and reused
-  /// for boundary tuples.
+  /// Memory to store partial tuples split across buffers.  Does not hold any tuple data
+  /// of returned batches, because the data is always deep-copied into the output batch.
+  /// Memory comes from boundary_pool_.
   Tuple* partial_tuple_;
-
-  /// If false, there is a tuple that is partially materialized (i.e. partial_tuple_
-  /// contains data)
-  bool partial_tuple_empty_;
 
   /// Time parsing text files
   RuntimeProfile::Counter* parse_delimiter_timer_;

@@ -37,7 +37,7 @@ under the License.
   <conbody>
 
     <p rev="2.3.0">
-      <indexterm audience="Cloudera">TRUNCATE TABLE statement</indexterm>
+      <indexterm audience="hidden">TRUNCATE TABLE statement</indexterm>
       Removes the data from an Impala table while leaving the table itself.
     </p>
 
@@ -96,11 +96,14 @@ under the License.
     <p conref="../shared/impala_common.xml#common/cancel_blurb_no"/>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
-    <p rev="CDH-19187">
+    <p rev="">
       The user ID that the <cmdname>impalad</cmdname> daemon runs under,
       typically the <codeph>impala</codeph> user, must have write
       permission for all the files and directories that make up the table.
     </p>
+
+    <p conref="../shared/impala_common.xml#common/kudu_blurb"/>
+    <p conref="../shared/impala_common.xml#common/kudu_no_truncate_table"/>
 
     <p conref="../shared/impala_common.xml#common/example_blurb"/>
 

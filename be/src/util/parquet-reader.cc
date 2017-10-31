@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <snappy.h>
 #include <iostream>
 #include <sstream>
 #include <vector>
 #include <gflags/gflags.h>
-#include <snappy.h>
 #include "gen-cpp/parquet_types.h"
 
 // TCompactProtocol requires some #defines to work right.
@@ -28,10 +28,10 @@
 #define ARITHMETIC_RIGHT_SHIFT 1
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wstring-plus-int"
-#include <thrift/protocol/TCompactProtocol.h>
-#include <thrift/protocol/TBinaryProtocol.h>
-#include <thrift/protocol/TDebugProtocol.h>
 #include <thrift/TApplicationException.h>
+#include <thrift/protocol/TBinaryProtocol.h>
+#include <thrift/protocol/TCompactProtocol.h>
+#include <thrift/protocol/TDebugProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
 #pragma clang diagnostic pop
 
@@ -68,8 +68,8 @@ boost::shared_ptr<TProtocol> CreateDeserializeProtocol(
 // all the bytes needed to store the thrift message.  On return, len will be
 // set to the actual length of the header.
 template <class T>
-bool DeserializeThriftMsg(uint8_t* buf, uint32_t* len, bool compact,
-    T* deserialized_msg) {
+bool DeserializeThriftMsg(
+    uint8_t* buf, uint32_t* len, bool compact, T* deserialized_msg) {
   // Deserialize msg bytes into c++ thrift msg using memory transport.
   boost::shared_ptr<TMemoryBuffer> tmem_transport(new TMemoryBuffer(buf, *len));
   boost::shared_ptr<TProtocol> tproto =
@@ -86,26 +86,13 @@ bool DeserializeThriftMsg(uint8_t* buf, uint32_t* len, bool compact,
 }
 
 string TypeMapping(Type::type t) {
-  switch (t) {
-    case Type::BOOLEAN:
-      return "BOOLEAN";
-    case Type::INT32:
-      return "INT32";
-    case Type::INT64:
-      return "INT64";
-    case Type::FLOAT:
-      return "FLOAT";
-    case Type::DOUBLE:
-      return "DOUBLE";
-    case Type::BYTE_ARRAY:
-      return "BYTE_ARRAY";
-    default:
-      return "UNKNOWN";
-  }
+  auto it = _Type_VALUES_TO_NAMES.find(t);
+  if (it != _Type_VALUES_TO_NAMES.end()) return it->second;
+  return "UNKNOWN";
 }
 
-void AppendSchema(const vector<SchemaElement>& schema, int level,
-    int* idx, stringstream* ss) {
+void AppendSchema(
+    const vector<SchemaElement>& schema, int level, int* idx, stringstream* ss) {
   for (int i = 0; i < level; ++i) {
     (*ss) << "  ";
   }
@@ -135,8 +122,8 @@ string GetSchema(const FileMetaData& md) {
 // Inherit from RleDecoder to get access to repeat_count_, which is protected.
 class ParquetLevelReader : public impala::RleDecoder {
  public:
-  ParquetLevelReader(uint8_t* buffer, int buffer_len, int bit_width) :
-    RleDecoder(buffer, buffer_len, bit_width) {}
+  ParquetLevelReader(uint8_t* buffer, int buffer_len, int bit_width)
+    : RleDecoder(buffer, buffer_len, bit_width) {}
 
   uint32_t repeat_count() const { return repeat_count_; }
 };
@@ -148,21 +135,22 @@ class ParquetLevelReader : public impala::RleDecoder {
 //     def levels - with our RLE scheme it is not possible to determine how many values
 //     were actually written if the final run is a literal run, only if the final run is
 //     a repeated run (see util/rle-encoding.h for more details).
-void CheckDataPage(const ColumnChunk& col, const PageHeader& header,
-    const uint8_t* page) {
+// Returns the number of rows specified by the header.
+// Aborts the process if reading the file fails.
+int CheckDataPage(const ColumnChunk& col, const PageHeader& header, const uint8_t* page) {
   const uint8_t* data = page;
   std::vector<uint8_t> decompressed_buffer;
   if (col.meta_data.codec != parquet::CompressionCodec::UNCOMPRESSED) {
     decompressed_buffer.resize(header.uncompressed_page_size);
 
     boost::scoped_ptr<impala::Codec> decompressor;
-    impala::Codec::CreateDecompressor(NULL, false,
-        impala::PARQUET_TO_IMPALA_CODEC[col.meta_data.codec], &decompressor);
+    ABORT_IF_ERROR(impala::Codec::CreateDecompressor(NULL, false,
+        impala::PARQUET_TO_IMPALA_CODEC[col.meta_data.codec], &decompressor));
 
     uint8_t* buffer_ptr = decompressed_buffer.data();
     int uncompressed_page_size = header.uncompressed_page_size;
-    impala::Status s = decompressor->ProcessBlock32(true, header.compressed_page_size,
-        data, &uncompressed_page_size, &buffer_ptr);
+    impala::Status s = decompressor->ProcessBlock32(
+        true, header.compressed_page_size, data, &uncompressed_page_size, &buffer_ptr);
     if (!s.ok()) {
       cerr << "Error: Decompression failed: " << s.GetDetail() << " \n";
       exit(1);
@@ -191,6 +179,8 @@ void CheckDataPage(const ColumnChunk& col, const PageHeader& header,
       }
     }
   }
+
+  return header.data_page_header.num_values;
 }
 
 // Simple utility to read parquet files on local disk.  This utility validates the
@@ -217,16 +207,16 @@ int main(int argc, char** argv) {
 
   cerr << "File Length: " << file_len << endl;
 
-  uint8_t* buffer = reinterpret_cast<uint8_t*>(malloc(file_len));
+  vector<uint8_t> buffer_vector(file_len);
+  uint8_t* buffer = buffer_vector.data();
   size_t bytes_read = fread(buffer, 1, file_len, file);
   assert(bytes_read == file_len);
   (void)bytes_read;
 
   // Check file starts and ends with magic bytes
-  assert(
-      memcmp(buffer, PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER)) == 0);
+  assert(memcmp(buffer, PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER)) == 0);
   assert(memcmp(buffer + file_len - sizeof(PARQUET_VERSION_NUMBER),
-      PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER)) == 0);
+             PARQUET_VERSION_NUMBER, sizeof(PARQUET_VERSION_NUMBER)) == 0);
 
   // Get metadata
   uint8_t* metadata_len_ptr =
@@ -248,12 +238,14 @@ int main(int argc, char** argv) {
   int total_page_header_size = 0;
   int total_compressed_data_size = 0;
   int total_uncompressed_data_size = 0;
-  vector<int> column_sizes;
+  vector<int> column_byte_sizes;
+  vector<int> column_num_rows;
 
   for (int i = 0; i < file_metadata.row_groups.size(); ++i) {
     cerr << "Reading row group " << i << endl;
     RowGroup& rg = file_metadata.row_groups[i];
-    column_sizes.resize(rg.columns.size());
+    column_byte_sizes.resize(rg.columns.size());
+    column_num_rows.resize(rg.columns.size());
 
     for (int c = 0; c < rg.columns.size(); ++c) {
       cerr << "  Reading column " << c << endl;
@@ -262,7 +254,7 @@ int main(int argc, char** argv) {
       int first_page_offset = col.meta_data.data_page_offset;
       if (col.meta_data.__isset.dictionary_page_offset) {
         first_page_offset = ::min(first_page_offset,
-            (int)col.meta_data.dictionary_page_offset);
+            static_cast<int>(col.meta_data.dictionary_page_offset));
       }
       uint8_t* data = buffer + first_page_offset;
       uint8_t* col_end = data + col.meta_data.total_compressed_size;
@@ -278,21 +270,26 @@ int main(int argc, char** argv) {
         }
 
         data += header_size;
-        if (header.__isset.data_page_header) CheckDataPage(col, header, data);
+        if (header.__isset.data_page_header) {
+          column_num_rows[c] += CheckDataPage(col, header, data);
+        }
 
         total_page_header_size += header_size;
-        column_sizes[c] += header.compressed_page_size;
+        column_byte_sizes[c] += header.compressed_page_size;
         total_compressed_data_size += header.compressed_page_size;
         total_uncompressed_data_size += header.uncompressed_page_size;
         data += header.compressed_page_size;
         ++pages_read;
       }
-      // Check that we ended exactly where we should have
+      // Check that we ended exactly where we should have.
       assert(data == col_end);
+      // Check that all cols have the same number of rows.
+      assert(column_num_rows[0] == column_num_rows[c]);
     }
+    num_rows += column_num_rows[0];
   }
   double compression_ratio =
-      (double)total_uncompressed_data_size / total_compressed_data_size;
+      static_cast<double>(total_uncompressed_data_size) / total_compressed_data_size;
   stringstream ss;
   ss << "\nSummary:\n"
      << "  Rows: " << num_rows << endl
@@ -306,9 +303,9 @@ int main(int argc, char** argv) {
      << "(" << (total_compressed_data_size / (double)file_len) << ")" << endl;
   ss << "  Column uncompressed size: " << total_uncompressed_data_size
      << "(" << compression_ratio << ")" << endl;
-  for (int i = 0; i < column_sizes.size(); ++i) {
-    ss << "    " << "Col " << i << ": " << column_sizes[i]
-       << "(" << (column_sizes[i] / (double)file_len) << ")" << endl;
+  for (int i = 0; i < column_byte_sizes.size(); ++i) {
+    ss << "    " << "Col " << i << ": " << column_byte_sizes[i]
+       << "(" << (column_byte_sizes[i] / (double)file_len) << ")" << endl;
   }
   cerr << ss.str() << endl;
 

@@ -51,9 +51,6 @@ class NestedLoopJoinNode : public BlockingJoinNode {
   virtual Status Reset(RuntimeState* state);
   virtual void Close(RuntimeState* state);
 
- protected:
-  virtual Status ProcessBuildInput(RuntimeState* state);
-
  private:
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()
@@ -83,7 +80,8 @@ class NestedLoopJoinNode : public BlockingJoinNode {
   /////////////////////////////////////////
 
   /// Join conjuncts
-  std::vector<ExprContext*> join_conjunct_ctxs_;
+  std::vector<ScalarExpr*> join_conjuncts_;
+  std::vector<ScalarExprEvaluator*> join_conjunct_evals_;
 
   /// Optimized build for the case where the right child is a SingularRowSrcNode.
   Status ConstructSingularBuildSide(RuntimeState* state);

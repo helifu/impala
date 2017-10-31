@@ -22,14 +22,15 @@ NULL,NULL,NULL,NULL
 double, double, double, double
 ====
 ---- QUERY
-# exactly 1 tuple processed (variance & stddev are 0)
-SELECT variance(tinyint_col), stddev(smallint_col), variance_pop(int_col),
-stddev_pop(bigint_col)
+# exactly 1 tuple processed (variance_pop & stddev_pop are 0, stddev and variance
+# are NULL)
+SELECT variance(tinyint_col), variance_samp(smallint_col), variance_pop(int_col),
+stddev(smallint_col), stddev_samp(smallint_col), stddev_pop(bigint_col)
 from alltypesagg WHERE id = 1006
 ---- RESULTS
-0,0,0,0
+NULL,NULL,0,NULL,NULL,0
 ---- TYPES
-double, double, double, double
+double, double, double, double, double, double
 ====
 ---- QUERY
 # Includes one row which is null, and test the aliases for variance() as well
@@ -1159,6 +1160,8 @@ select histogram(timestamp_col) from functional.alltypestiny;
 STRING
 ====
 ---- QUERY
+# IMPALA-4787: appx_median() on a medium sized dataset. This should excercise merge() with
+# differently sized inputs in the Reservoir Sampling algorithm.
 select
 appx_median(bool_col),
 appx_median(tinyint_col),
@@ -1168,11 +1171,22 @@ appx_median(float_col),
 appx_median(double_col),
 appx_median(string_col),
 appx_median(timestamp_col)
-from alltypestiny
+from alltypes
 ---- RESULTS
-true,1,1,1,1.100000023841858,10.1,'1',2009-03-01 00:00:00
+true,5,5,5,5.5,50.5,'5',2010-01-01 00:00:00
 ---- TYPES
 BOOLEAN, TINYINT, SMALLINT, INT, FLOAT, DOUBLE, STRING, TIMESTAMP
+====
+---- QUERY
+# IMPALA-4787: appx_median on a large dataset. This requires several buffer resizes in the
+# Reservoir Sampling algorithm.
+select appx_median(l_returnflag)
+from tpch.lineitem
+where l_returnflag = "N"
+---- RESULTS
+'N'
+---- TYPES
+STRING
 ====
 ---- QUERY
 # IMPALA-1419: Agg fn containing arithmetic expr on NULL fails
@@ -1240,4 +1254,80 @@ where t2.int_col IN (t1.int_col_1, t1.int_col)
 ---- RESULTS
 ---- TYPES
 TIMESTAMP,BIGINT
+====
+---- QUERY
+# IMPALA-5036: Tests the correctness of the Parquet count(*) optimization.
+select count(1)
+from functional_parquet.alltypes
+---- RESULTS
+7300
+---- TYPES
+bigint
+=====
+---- QUERY
+# IMPALA-5036: Parquet count(*) optimization with predicates on the partition columns.
+select count(1)
+from functional_parquet.alltypes where year < 2010 and month > 8
+---- RESULTS
+1220
+---- TYPES
+bigint
+=====
+---- QUERY
+# IMPALA-5036: Parquet count(*) optimization with group by partition columns.
+select year, month, count(1)
+from functional_parquet.alltypes where month > 10 group by year, month
+---- RESULTS
+2009,11,300
+2009,12,310
+2010,11,300
+2010,12,310
+---- TYPES
+int, int, bigint
+=====
+---- QUERY
+# IMPALA-5036: Parquet count(*) optimization with both group by and predicates on
+# partition columns.
+select count(1)
+from functional_parquet.alltypes where year < 2010 and month > 8
+group by month
+---- RESULTS
+310
+300
+310
+300
+---- TYPES
+bigint
+=====
+---- QUERY
+# IMPALA-5036: Parquet count(*) optimization with the result of the going into a join.
+select x.bigint_col from functional.alltypes x
+  inner join (
+    select count(1) as a from functional_parquet.alltypes group by year
+  ) t on x.id = t.a;
+---- RESULTS
+0
+0
+---- TYPES
+bigint
+=====
+---- QUERY
+# IMPALA-5036: Parquet count(*) optimization with the agg function in the having clause.
+select 1 from functional_parquet.alltypes having count(*) > 1
+---- RESULTS
+1
+---- TYPES
+tinyint
+====
+---- QUERY
+# IMPALA-5855: pre-aggregation does not reserve enough memory with 2MB buffers.
+# The pre-aggregation in this query is estimated to consume enough memory for the planner
+# to use 2MB buffers.
+set debug_action="-1:PREPARE:SET_DENY_RESERVATION_PROBABILITY@1.0";
+select count(*) from (
+    select distinct l_orderkey, l_comment from tpch_parquet.lineitem) v
+---- RESULTS
+6001198
+---- TYPES
+bigint
 ====

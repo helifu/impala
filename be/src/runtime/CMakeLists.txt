@@ -24,13 +24,14 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 
 add_library(Runtime
-  buffered-block-mgr.cc
   buffered-tuple-stream.cc
   client-cache.cc
   coordinator.cc
+  coordinator-backend-state.cc
   data-stream-mgr.cc
-  data-stream-sender.cc
   data-stream-recvr.cc
+  data-stream-sender.cc
+  debug-options.cc
   descriptors.cc
   disk-io-mgr.cc
   disk-io-mgr-reader-context.cc
@@ -38,15 +39,20 @@ add_library(Runtime
   disk-io-mgr-stress.cc
   exec-env.cc
   free-pool.cc
+  fragment-instance-state.cc
   hbase-table.cc
   hbase-table-factory.cc
   hdfs-fs-cache.cc
+  initial-reservations.cc
+  krpc-data-stream-mgr.cc
+  krpc-data-stream-recvr.cc
   lib-cache.cc
   mem-tracker.cc
   mem-pool.cc
   multi-precision.cc
   parallel-executor.cc
-  plan-fragment-executor.cc
+  query-exec-mgr.cc
+  query-state.cc
   test-env.cc
   types.cc
   raw-value.cc
@@ -78,7 +84,6 @@ ADD_BE_TEST(string-buffer-test)
 ADD_BE_TEST(data-stream-test)
 ADD_BE_TEST(timestamp-test)
 ADD_BE_TEST(disk-io-mgr-test)
-ADD_BE_TEST(buffered-block-mgr-test)
 ADD_BE_TEST(parallel-executor-test)
 ADD_BE_TEST(raw-value-test)
 ADD_BE_TEST(string-compare-test)

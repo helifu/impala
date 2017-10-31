@@ -38,7 +38,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">DROP TABLE statement</indexterm>
+      <indexterm audience="hidden">DROP TABLE statement</indexterm>
       Removes an Impala table. Also removes the underlying HDFS data files for internal tables, although not for
       external tables.
     </p>
@@ -128,7 +128,7 @@ drop table temporary.trivial;</codeblock>
     <p conref="../shared/impala_common.xml#common/disk_space_blurb"/>
 
     <p conref="../shared/impala_common.xml#common/s3_blurb"/>
-    <p rev="2.6.0 CDH-39913 IMPALA-1878">
+    <p rev="2.6.0 IMPALA-1878">
       The <codeph>DROP TABLE</codeph> statement can remove data files from S3
       if the associated S3 table is an internal table.
       In <keyword keyref="impala26_full"/> and higher, as part of improved support for writing
@@ -144,7 +144,7 @@ drop table temporary.trivial;</codeblock>
     <p conref="../shared/impala_common.xml#common/cancel_blurb_no"/>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
-    <p rev="CDH-19187">
+    <p rev="">
       For an internal table, the user ID that the <cmdname>impalad</cmdname> daemon runs under,
       typically the <codeph>impala</codeph> user, must have write
       permission for all the files and directories that make up the table.
@@ -153,6 +153,15 @@ drop table temporary.trivial;</codeblock>
       For an external table, dropping the table only involves changes to metadata in the metastore database.
       Because Impala does not remove any HDFS files or directories when external tables are dropped,
       no particular permissions are needed for the associated HDFS files or directories.
+    </p>
+
+    <p rev="kudu" conref="../shared/impala_common.xml#common/kudu_blurb"/>
+    <p rev="kudu">
+      Kudu tables can be managed or external, the same as with HDFS-based
+      tables. For a managed table, the underlying Kudu table and its data
+      are removed by <codeph>DROP TABLE</codeph>. For an external table,
+      the underlying Kudu table and its data remain after a
+      <codeph>DROP TABLE</codeph>.
     </p>
 
     <p conref="../shared/impala_common.xml#common/related_info"/>

@@ -19,7 +19,6 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -56,10 +55,18 @@ import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.PrintUtils;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.planner.PlanNode;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
+import org.apache.impala.rewrite.EqualityDisjunctsToInRule;
+import org.apache.impala.rewrite.ExprRewriteRule;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.rewrite.ExtractCommonConjunctRule;
 import org.apache.impala.rewrite.FoldConstantsRule;
+import org.apache.impala.rewrite.NormalizeBinaryPredicatesRule;
+import org.apache.impala.rewrite.NormalizeCountStarRule;
+import org.apache.impala.rewrite.NormalizeExprsRule;
+import org.apache.impala.rewrite.SimplifyConditionalsRule;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -68,7 +75,6 @@ import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.DisjointSet;
-import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.TSessionStateUtil;
 import org.slf4j.Logger;
@@ -145,12 +151,15 @@ public class Analyzer {
   // Flag indicating whether this analyzer belongs to a WITH clause view.
   private boolean isWithClause_ = false;
 
-  // If set, when privilege requests are registered they will use this error
+  // If set, when masked privilege requests are registered they will use this error
   // error message.
   private String authErrorMsg_;
 
-  // If false, privilege requests will not be registered in the analyzer.
-  // Note: it's not the purpose of this flag to control if security is enabled in general.
+  // If true privilege requests are added in maskedPrivileReqs_. Otherwise, privilege
+  // requests are added to privilegeReqs_.
+  private boolean maskPrivChecks_ = false;
+
+  // If false, privilege requests are not registered.
   private boolean enablePrivChecks_ = true;
 
   // By default, all registered semi-joined tuples are invisible, i.e., their slots
@@ -165,13 +174,14 @@ public class Analyzer {
     isSubquery_ = true;
     globalState_.containsSubquery = true;
   }
-  public boolean isSubquery() { return isSubquery_; }
   public boolean setHasPlanHints() { return globalState_.hasPlanHints = true; }
   public boolean hasPlanHints() { return globalState_.hasPlanHints; }
   public void setIsWithClause() { isWithClause_ = true; }
   public boolean isWithClause() { return isWithClause_; }
 
-  // state shared between all objects of an Analyzer tree
+  // State shared between all objects of an Analyzer tree. We use LinkedHashMap and
+  // LinkedHashSet where applicable to preserve the iteration order and make the class
+  // behave identical across different implementations of the JVM.
   // TODO: Many maps here contain properties about tuples, e.g., whether
   // a tuple is outer/semi joined, etc. Remove the maps in favor of making
   // them properties of the tuple descriptor itself.
@@ -195,8 +205,9 @@ public class Analyzer {
     // True if at least one of the analyzers belongs to a subquery.
     public boolean containsSubquery = false;
 
-    // all registered conjuncts (map from expr id to conjunct)
-    public final Map<ExprId, Expr> conjuncts = Maps.newHashMap();
+    // all registered conjuncts (map from expr id to conjunct). We use a LinkedHashMap to
+    // preserve the order in which conjuncts are added.
+    public final LinkedHashMap<ExprId, Expr> conjuncts = Maps.newLinkedHashMap();
 
     // all registered conjuncts bound by a single tuple id; used in getBoundPredicates()
     public final ArrayList<ExprId> singleTidConjuncts = Lists.newArrayList();
@@ -270,6 +281,11 @@ public class Analyzer {
     public final LinkedHashMap<String, Integer> warnings =
         new LinkedHashMap<String, Integer>();
 
+    // Tracks whether the warnings have been retrieved from this analyzer. If set to true,
+    // adding new warnings will result in an error. This helps to make sure that no
+    // warnings are added which will not be displayed.
+    public boolean warningsRetrieved = false;
+
     public final IdGenerator<EquivalenceClassId> equivClassIdGenerator =
         EquivalenceClassId.createGenerator();
 
@@ -299,13 +315,12 @@ public class Analyzer {
     // TODO: Investigate what to do with other catalog objects.
     private final HashMap<TableName, Table> referencedTables_ = Maps.newHashMap();
 
-    // Expr rewriter for foldinc constants.
+    // Expr rewriter for folding constants.
     private final ExprRewriter constantFolder_ =
         new ExprRewriter(FoldConstantsRule.INSTANCE);
 
-    // Timeline of important events in the planning process, used for debugging /
-    // profiling
-    private final EventSequence timeline = new EventSequence("Planner Timeline");
+    // Expr rewriter for normalizing and rewriting expressions.
+    private final ExprRewriter exprRewriter_;
 
     public GlobalState(ImpaladCatalog catalog, TQueryCtx queryCtx,
         AuthorizationConfig authzConfig) {
@@ -313,18 +328,30 @@ public class Analyzer {
       this.queryCtx = queryCtx;
       this.authzConfig = authzConfig;
       this.lineageGraph = new ColumnLineageGraph();
+      List<ExprRewriteRule> rules = Lists.newArrayList();
+      // BetweenPredicates must be rewritten to be executable. Other non-essential
+      // expr rewrites can be disabled via a query option. When rewrites are enabled
+      // BetweenPredicates should be rewritten first to help trigger other rules.
+      rules.add(BetweenToCompoundRule.INSTANCE);
+      // Binary predicates must be rewritten to a canonical form for both Kudu predicate
+      // pushdown and Parquet row group pruning based on min/max statistics.
+      rules.add(NormalizeBinaryPredicatesRule.INSTANCE);
+      if (queryCtx.getClient_request().getQuery_options().enable_expr_rewrites) {
+        rules.add(FoldConstantsRule.INSTANCE);
+        rules.add(NormalizeExprsRule.INSTANCE);
+        rules.add(ExtractCommonConjunctRule.INSTANCE);
+        // Relies on FoldConstantsRule and NormalizeExprsRule.
+        rules.add(SimplifyConditionalsRule.INSTANCE);
+        rules.add(EqualityDisjunctsToInRule.INSTANCE);
+        rules.add(NormalizeCountStarRule.INSTANCE);
+      }
+      exprRewriter_ = new ExprRewriter(rules);
     }
   };
 
   private final GlobalState globalState_;
 
   public boolean containsSubquery() { return globalState_.containsSubquery; }
-
-  /**
-   * Helper function to reset the global state information about the existence of
-   * subqueries.
-   */
-  public void resetSubquery() { globalState_.containsSubquery = false; }
 
   // An analyzer stores analysis state for a single select block. A select block can be
   // a top level select statement, or an inline view select block.
@@ -390,6 +417,7 @@ public class Analyzer {
     user_ = parentAnalyzer.getUser();
     useHiveColLabels_ = parentAnalyzer.useHiveColLabels_;
     authErrorMsg_ = parentAnalyzer.authErrorMsg_;
+    maskPrivChecks_ = parentAnalyzer.maskPrivChecks_;
     enablePrivChecks_ = parentAnalyzer.enablePrivChecks_;
     isWithClause_ = parentAnalyzer.isWithClause_;
   }
@@ -435,8 +463,10 @@ public class Analyzer {
 
   /**
    * Returns a list of each warning logged, indicating if it was logged more than once.
+   * After this function has been called, no warning may be added to the Analyzer anymore.
    */
   public List<String> getWarnings() {
+    globalState_.warningsRetrieved = true;
     List<String> result = new ArrayList<String>();
     for (Map.Entry<String, Integer> e : globalState_.warnings.entrySet()) {
       String error = e.getKey();
@@ -573,7 +603,6 @@ public class Analyzer {
     Preconditions.checkNotNull(resolvedPath);
     if (resolvedPath.destTable() != null) {
       Table table = resolvedPath.destTable();
-      Preconditions.checkNotNull(table);
       if (table instanceof View) return new InlineViewRef((View) table, tableRef);
       // The table must be a base table.
       Preconditions.checkState(table instanceof HdfsTable ||
@@ -666,8 +695,10 @@ public class Analyzer {
     return globalState_.descTbl.getSlotDesc(id);
   }
 
+  public int getNumTableRefs() { return tableRefMap_.size(); }
   public TableRef getTableRef(TupleId tid) { return tableRefMap_.get(tid); }
   public ExprRewriter getConstantFolder() { return globalState_.constantFolder_; }
+  public ExprRewriter getExprRewriter() { return globalState_.exprRewriter_; }
 
   /**
    * Given a "table alias"."column alias", return the SlotDescriptor
@@ -930,6 +961,8 @@ public class Analyzer {
     // SlotRefs with a scalar type are registered against the slot's
     // fully-qualified lowercase path.
     String key = slotPath.toString();
+    Preconditions.checkState(key.equals(key.toLowerCase()),
+        "Slot paths should be lower case: " + key);
     SlotDescriptor existingSlotDesc = slotPathMap_.get(key);
     if (existingSlotDesc != null) return existingSlotDesc;
     SlotDescriptor result = addSlotDescriptor(slotPath.getRootDesc());
@@ -1060,6 +1093,9 @@ public class Analyzer {
           // analysis pass, so the conjunct may not have been rewritten yet.
           ExprRewriter rewriter = new ExprRewriter(BetweenToCompoundRule.INSTANCE);
           conjunct = rewriter.rewrite(conjunct, this);
+          // analyze this conjunct here: we know it can't contain references to select list
+          // aliases and having it analyzed is needed for the following EvalPredicate() call
+          conjunct.analyze(this);
         }
         if (!FeSupport.EvalPredicate(conjunct, globalState_.queryCtx)) {
           if (fromHavingClause) {
@@ -1589,35 +1625,6 @@ public class Analyzer {
   }
 
   /**
-   * Modifies the analysis state associated with the rhs table ref of an outer join
-   * to accomodate a join inversion that changes the rhs table ref of the join from
-   * oldRhsTbl to newRhsTbl.
-   * TODO: Revisit this function and how outer joins are inverted. This function
-   * should not be necessary because the semantics of an inverted outer join do
-   * not change. This function will naturally become obsolete when we can transform
-   * outer joins with otherPredicates into inner joins.
-   */
-  public void invertOuterJoinState(TableRef oldRhsTbl, TableRef newRhsTbl) {
-    Preconditions.checkState(oldRhsTbl.getJoinOp().isOuterJoin());
-    // Invert analysis state for an outer join.
-    List<ExprId> conjunctIds =
-        globalState_.conjunctsByOjClause.remove(oldRhsTbl.getId());
-    if (conjunctIds != null) {
-      globalState_.conjunctsByOjClause.put(newRhsTbl.getId(), conjunctIds);
-      for (ExprId eid: conjunctIds) {
-        globalState_.ojClauseByConjunct.put(eid, newRhsTbl);
-      }
-    } else {
-      // An outer join is allowed not to have an On-clause if the rhs table ref is
-      // correlated or relative.
-      Preconditions.checkState(oldRhsTbl.isCorrelated() || oldRhsTbl.isRelative());
-    }
-    for (Map.Entry<TupleId, TableRef> e: globalState_.outerJoinedTupleIds.entrySet()) {
-      if (e.getValue() == oldRhsTbl) e.setValue(newRhsTbl);
-    }
-  }
-
-  /**
    * For each equivalence class, adds/removes predicates from conjuncts such that it
    * contains a minimum set of <lhsSlot> = <rhsSlot> predicates that establish the known
    * equivalences between slots in lhsTids and rhsTids which must be disjoint.
@@ -1981,6 +1988,12 @@ public class Analyzer {
     globalState_.valueTransferGraph = new ValueTransferGraph();
     globalState_.valueTransferGraph.computeValueTransfers();
 
+    // Validate the value-transfer graph in single-node planner tests.
+    if (RuntimeEnv.INSTANCE.isTestEnv() && getQueryOptions().num_nodes == 1) {
+      Preconditions.checkState(validateValueTransferGraph(),
+          "Failed to validate value-transfer graph.");
+    }
+
     // we start out by assigning each slot to its own equiv class
     int numSlots = globalState_.descTbl.getMaxSlotId().asInt() + 1;
     for (int i = 0; i < numSlots; ++i) {
@@ -2081,11 +2094,6 @@ public class Analyzer {
     return globalState_.equivClassBySlotId.get(slotId);
   }
 
-  public Collection<SlotId> getEquivSlots(SlotId slotId) {
-    EquivalenceClassId classId = globalState_.equivClassBySlotId.get(slotId);
-    return globalState_.equivClassMembers.get(classId);
-  }
-
   public ExprSubstitutionMap getEquivClassSmap() { return globalState_.equivClassSmap; }
 
   /**
@@ -2113,27 +2121,6 @@ public class Analyzer {
   }
 
   /**
-   * Removes redundant expressions from exprs based on equivalence classes, as follows:
-   * First, normalizes the exprs using the canonical SlotRef representative of each
-   * equivalence class. Then retains the first original element of exprs that is
-   * non-redundant in the normalized exprs. Returns a new list with the unique exprs.
-   */
-  public List<Expr> removeRedundantExprs(List<Expr> exprs) {
-    List<Expr> result = Lists.newArrayList();
-    List<Expr> normalizedExprs =
-        Expr.substituteList(exprs, globalState_.equivClassSmap, this, false);
-    Preconditions.checkState(exprs.size() == normalizedExprs.size());
-    List<Expr> uniqueExprs = Lists.newArrayList();
-    for (int i = 0; i < normalizedExprs.size(); ++i) {
-      if (!uniqueExprs.contains(normalizedExprs.get(i))) {
-        uniqueExprs.add(normalizedExprs.get(i));
-        result.add(exprs.get(i).clone());
-      }
-    }
-    return result;
-  }
-
-  /**
    * Mark predicates as assigned.
    */
   public void markConjunctsAssigned(List<Expr> conjuncts) {
@@ -2150,10 +2137,6 @@ public class Analyzer {
     globalState_.assignedConjuncts.add(conjunct.getId());
   }
 
-  public boolean isConjunctAssigned(Expr conjunct) {
-    return globalState_.assignedConjuncts.contains(conjunct.getId());
-  }
-
   public Set<ExprId> getAssignedConjuncts() {
     return Sets.newHashSet(globalState_.assignedConjuncts);
   }
@@ -2163,25 +2146,12 @@ public class Analyzer {
   }
 
   /**
-   * Return true if there's at least one unassigned non-auxiliary conjunct.
-   */
-  public boolean hasUnassignedConjuncts() {
-    for (ExprId id: globalState_.conjuncts.keySet()) {
-      if (globalState_.assignedConjuncts.contains(id)) continue;
-      Expr e = globalState_.conjuncts.get(id);
-      if (e.isAuxExpr()) continue;
-      return true;
-    }
-    return false;
-  }
-
-  /**
    * Mark all slots that are referenced in exprs as materialized.
    */
   public void materializeSlots(List<Expr> exprs) {
     List<SlotId> slotIds = Lists.newArrayList();
     for (Expr e: exprs) {
-      Preconditions.checkState(e.isAnalyzed_);
+      Preconditions.checkState(e.isAnalyzed());
       e.getIds(null, slotIds);
     }
     globalState_.descTbl.markSlotsMaterialized(slotIds);
@@ -2189,7 +2159,7 @@ public class Analyzer {
 
   public void materializeSlots(Expr e) {
     List<SlotId> slotIds = Lists.newArrayList();
-    Preconditions.checkState(e.isAnalyzed_);
+    Preconditions.checkState(e.isAnalyzed());
     e.getIds(null, slotIds);
     globalState_.descTbl.markSlotsMaterialized(slotIds);
   }
@@ -2285,7 +2255,7 @@ public class Analyzer {
   public User getUser() { return user_; }
   public TQueryCtx getQueryCtx() { return globalState_.queryCtx; }
   public TQueryOptions getQueryOptions() {
-    return globalState_.queryCtx.getRequest().getQuery_options();
+    return globalState_.queryCtx.client_request.getQuery_options();
   }
   public AuthorizationConfig getAuthzConfig() { return globalState_.authzConfig; }
   public ListMap<TNetworkAddress> getHostIndex() { return globalState_.hostIndex; }
@@ -2481,10 +2451,6 @@ public class Analyzer {
     return tableName.isFullyQualified() ? tableName.getDb() : getDefaultDb();
   }
 
-  public String getTargetDbName(FunctionName fnName) {
-    return fnName.isFullyQualified() ? fnName.getDb() : getDefaultDb();
-  }
-
   /**
    * Returns the fully-qualified table name of tableName. If tableName
    * is already fully qualified, returns tableName.
@@ -2494,10 +2460,12 @@ public class Analyzer {
     return new TableName(getDefaultDb(), tableName.getTbl());
   }
 
-  public void setEnablePrivChecks(boolean value) {
-    enablePrivChecks_ = value;
+  public void setMaskPrivChecks(String errMsg) {
+    maskPrivChecks_ = true;
+    authErrorMsg_ = errMsg;
   }
-  public void setAuthErrMsg(String errMsg) { authErrorMsg_ = errMsg; }
+
+  public void setEnablePrivChecks(boolean value) { enablePrivChecks_ = value; }
   public void setIsStraightJoin() { isStraightJoin_ = true; }
   public boolean isStraightJoin() { return isStraightJoin_; }
   public void setIsExplain() { globalState_.isExplain = true; }
@@ -2513,12 +2481,6 @@ public class Analyzer {
 
   public List<Expr> getConjuncts() {
     return new ArrayList<Expr>(globalState_.conjuncts.values());
-  }
-  public Expr getConjunct(ExprId exprId) {
-    return globalState_.conjuncts.get(exprId);
-  }
-  public Map<TupleId, List<ExprId>> getEqJoinConjuncts() {
-    return globalState_.eqJoinConjuncts;
   }
 
   public int incrementCallDepth() { return ++callDepth_; }
@@ -2540,8 +2502,6 @@ public class Analyzer {
     return res;
   }
 
-  public EventSequence getTimeline() { return globalState_.timeline; }
-
   /**
    * Assign all remaining unassigned slots to their own equivalence classes.
    */
@@ -2560,9 +2520,11 @@ public class Analyzer {
   public Map<String, View> getLocalViews() { return localViews_; }
 
   /**
-   * Add a warning that will be displayed to the user. Ignores null messages.
+   * Add a warning that will be displayed to the user. Ignores null messages. Once
+   * getWarnings() has been called, no warning may be added to the Analyzer anymore.
    */
   public void addWarning(String msg) {
+    Preconditions.checkState(!globalState_.warningsRetrieved);
     if (msg == null) return;
     Integer count = globalState_.warnings.get(msg);
     if (count == null) count = 0;
@@ -2570,22 +2532,15 @@ public class Analyzer {
   }
 
   /**
-   * Registers a new PrivilegeRequest in the analyzer. If authErrorMsg_ is set,
-   * the privilege request will be added to the list of "masked" privilege requests,
-   * using authErrorMsg_ as the auth failure error message. Otherwise it will get
-   * added as a normal privilege request that will use the standard error message
-   * on authorization failure.
-   * If enablePrivChecks_ is false, the registration request will be ignored. This
-   * is used when analyzing catalog views since users should be able to query a view
-   * even if they do not have privileges on the underlying tables.
+   * Registers a new PrivilegeRequest in the analyzer.
    */
   public void registerPrivReq(PrivilegeRequest privReq) {
     if (!enablePrivChecks_) return;
-
-    if (Strings.isNullOrEmpty(authErrorMsg_)) {
-      globalState_.privilegeReqs.add(privReq);
+    if (maskPrivChecks_) {
+      globalState_.maskedPrivilegeReqs.add(
+          Pair.<PrivilegeRequest, String>create(privReq, authErrorMsg_));
     } else {
-      globalState_.maskedPrivilegeReqs.add(Pair.create(privReq, authErrorMsg_));
+      globalState_.privilegeReqs.add(privReq);
     }
   }
 
@@ -2945,7 +2900,7 @@ public class Analyzer {
       for (Pair<SlotId, SlotId> vt: valueTransfers) {
         expectedValueTransfer[vt.first.asInt()][vt.second.asInt()] = true;
       }
-      // Set registered value tranfers in expectedValueTransfer.
+      // Set registered value transfers in expectedValueTransfer.
       for (Pair<SlotId, SlotId> vt: globalState_.registeredValueTransfers) {
         expectedValueTransfer[vt.first.asInt()][vt.second.asInt()] = true;
       }

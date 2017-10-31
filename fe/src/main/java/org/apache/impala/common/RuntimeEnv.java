@@ -17,23 +17,20 @@
 
 package org.apache.impala.common;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.impala.service.FeSupport;
-
 /**
  * Contains runtime-specific parameters such as the number of CPU cores. Currently only
  * used in Plan cost estimation. The static RuntimeEnv members can be set so that tests
  * can rely on a machine-independent RuntimeEnv.
  */
 public class RuntimeEnv {
-  private final static Logger LOG = LoggerFactory.getLogger(RuntimeEnv.class);
-
   public static RuntimeEnv INSTANCE = new RuntimeEnv();
 
   private int numCores_;
 
+  // The minimum size of buffer spilled to disk by spilling nodes. Used in
+  // PlanNode.computeResourceProfile(). Currently the backend only support a single
+  // spillable buffer size, so this is equal to PlanNode.DEFAULT_SPILLABLE_BUFFER_BYTES,
+  // except in planner tests.
   // Indicates whether this is an environment for testing.
   private boolean isTestEnv_;
 

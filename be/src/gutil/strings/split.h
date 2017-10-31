@@ -28,12 +28,6 @@ using std::min;
 using std::reverse;
 using std::sort;
 using std::swap;
-#include <ext/hash_map>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_map;
-#include <ext/hash_set>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_set;
 #include <iterator>
 using std::back_insert_iterator;
 using std::iterator_traits;
@@ -50,9 +44,14 @@ using std::make_pair;
 using std::pair;
 #include <vector>
 using std::vector;
+#include <unordered_map>
+using std::unordered_map;
+#include <unordered_set>
+using std::unordered_set;
+
+#include <common/logging.h>
 
 #include "gutil/integral_types.h"
-#include <glog/logging.h>
 #include "gutil/logging-inl.h"
 #include "gutil/strings/charset.h"
 #include "gutil/strings/split_internal.h"
@@ -130,8 +129,8 @@ namespace strings {
 // string, StringPiece, Cord, or any object that has a constructor (explicit or
 // not) that takes a single StringPiece argument. This pattern works for all
 // standard STL containers including vector, list, deque, set, multiset, map,
-// and multimap, non-standard containers including hash_set and hash_map, and
-// even std::pair which is not actually a container.
+// multimap, unordered_set and unordered_map, and even std::pair which is not
+// actually a container.
 //
 // Splitting to std::pair is an interesting case because it can hold only two
 // elements and is not a collection type. When splitting to an std::pair the
@@ -400,7 +399,7 @@ template <typename Delimiter>
 class LimitImpl {
  public:
   LimitImpl(Delimiter delimiter, int limit)
-      : delimiter_(delimiter), limit_(limit), count_(0) {}
+      : delimiter_(std::move(delimiter)), limit_(limit), count_(0) {}
   StringPiece Find(StringPiece text) {
     if (count_++ == limit_) {
       return StringPiece(text.end(), 0);  // No more matches.
@@ -678,7 +677,7 @@ void SplitStringPieceToVector(const StringPiece& full,
 void SplitStringUsing(const string& full, const char* delimiters,
                       vector<string>* result);
 void SplitStringToHashsetUsing(const string& full, const char* delimiters,
-                               hash_set<string>* result);
+                               unordered_set<string>* result);
 void SplitStringToSetUsing(const string& full, const char* delimiters,
                            set<string>* result);
 // The even-positioned (0-based) components become the keys for the
@@ -689,7 +688,7 @@ void SplitStringToSetUsing(const string& full, const char* delimiters,
 void SplitStringToMapUsing(const string& full, const char* delim,
                            map<string, string>* result);
 void SplitStringToHashmapUsing(const string& full, const char* delim,
-                               hash_map<string, string>* result);
+                               unordered_map<string, string>* result);
 
 // ----------------------------------------------------------------------
 // SplitStringAllowEmpty()
@@ -743,7 +742,7 @@ void SplitStringWithEscapingToSet(const string& full,
                                   set<string>* result);
 void SplitStringWithEscapingToHashset(const string& full,
                                       const strings::CharSet& delimiters,
-                                      hash_set<string>* result);
+                                      unordered_set<string>* result);
 
 // ----------------------------------------------------------------------
 // SplitStringIntoNPiecesAllowEmpty()
@@ -1155,9 +1154,9 @@ bool SplitStringAndParseToInserter(
   vector<StringPiece> pieces = strings::Split(source,
                                               strings::delimiter::AnyOf(delim),
                                               strings::SkipEmpty());
-  for (size_t i = 0; i < pieces.size(); ++i) {
+  for (const auto& piece : pieces) {
     typename Container::value_type t;
-    if (parse(pieces[i].as_string(), &t)) {
+    if (parse(piece.as_string(), &t)) {
       insert_policy(result, t);
     } else {
       retval = false;

@@ -38,7 +38,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">SELECT statement</indexterm>
+      <indexterm audience="hidden">SELECT statement</indexterm>
       The <codeph>SELECT</codeph> statement performs queries, retrieving data from one or more tables and producing
       result sets consisting of rows and columns.
     </p>
@@ -60,11 +60,14 @@ FROM <i>table_reference</i> [, <i>table_reference</i> ...]
   JOIN <i>table_reference</i>
   [ON <i>join_equality_clauses</i> | USING (<varname>col1</varname>[, <varname>col2</varname> ...]] ...
 WHERE <i>conditions</i>
-GROUP BY { <i>column</i> | <i>expression</i> [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...] }
+GROUP BY { <i>column</i> | <i>expression</i> [, ...] }
 HAVING <codeph>conditions</codeph>
-GROUP BY { <i>column</i> | <i>expression</i> [ASC | DESC] [, ...] }
+ORDER BY { <i>column</i> | <i>expression</i> [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...] }
 LIMIT <i>expression</i> [OFFSET <i>expression</i>]
 [UNION [ALL] <i>select_statement</i>] ...]
+
+table_reference := { <varname>table_name</varname> | (<varname>subquery</varname>) }
+  <ph rev="IMPALA-5309">[ TABLESAMPLE SYSTEM(<varname>percentage</varname>) [REPEATABLE(<varname>seed</varname>)] ]</ph>
 </codeblock>
 
     <p>
@@ -166,6 +169,12 @@ LIMIT <i>expression</i> [OFFSET <i>expression</i>]
         <codeph>LIKE</codeph>, <codeph>IN</codeph>, <codeph>BETWEEN</codeph>, and <codeph>COALESCE</codeph>. Impala
         specifically supports built-ins described in <xref href="impala_functions.xml#builtins"/>.
       </li>
+
+      <li rev="IMPALA-5309">
+        In <keyword keyref="impala29_full"/> and higher, an optional <codeph>TABLESAMPLE</codeph>
+        clause immediately after a table reference, to specify that the query only processes a
+        specified percentage of the table data. See <xref keyref="tablesample"/> for details.
+      </li>
     </ul>
 
     <p conref="../shared/impala_common.xml#common/ignore_file_extensions"/>
@@ -179,7 +188,7 @@ LIMIT <i>expression</i> [OFFSET <i>expression</i>]
     <p conref="../shared/impala_common.xml#common/cancel_blurb_yes"/>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
-    <p rev="CDH-19187">
+    <p rev="">
       The user ID that the <cmdname>impalad</cmdname> daemon runs under,
       typically the <codeph>impala</codeph> user, must have read
       permissions for the files in all applicable directories in all source tables,
@@ -208,7 +217,7 @@ LIMIT <i>expression</i> [OFFSET <i>expression</i>]
     </p>
   </conbody>
 
-  <concept id="where" audience="Cloudera">
+  <concept id="where" audience="hidden">
 
 <!-- WHERE hidden for the moment until there's the chance to add some reasonably comprehensive content
 

@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.HashSet;
 import java.util.List;
 
 import org.apache.impala.catalog.Db;
@@ -31,11 +32,14 @@ import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * CASE and DECODE are represented using this class. The backend implementation is
- * always the "case" function.
+ * always the "case" function. CASE always returns the THEN corresponding to the leftmost
+ * WHEN that is TRUE, or the ELSE (or NULL if no ELSE is provided) if no WHEN is TRUE.
  *
  * The internal representation of
  *   CASE [expr] WHEN expr THEN expr [WHEN expr THEN expr ...] [ELSE expr] END
@@ -127,16 +131,17 @@ public class CaseExpr extends Expr {
         if (candidate.isNullLiteral()) {
           // An example case is DECODE(foo, NULL, bar), since NULLs are considered
           // equal, this becomes CASE WHEN foo IS NULL THEN bar END.
-          children_.add(encodedIsNull);
+          children_.add(encodedIsNull.clone());
         } else {
           children_.add(new BinaryPredicate(
-              BinaryPredicate.Operator.EQ, encoded, candidate));
+              BinaryPredicate.Operator.EQ, encoded.clone(), candidate));
         }
       } else {
         children_.add(new CompoundPredicate(CompoundPredicate.Operator.OR,
             new CompoundPredicate(CompoundPredicate.Operator.AND,
-                encodedIsNull, new IsNullPredicate(candidate, false)),
-            new BinaryPredicate(BinaryPredicate.Operator.EQ, encoded, candidate)));
+                encodedIsNull.clone(), new IsNullPredicate(candidate, false)),
+            new BinaryPredicate(BinaryPredicate.Operator.EQ, encoded.clone(),
+                candidate)));
       }
 
       // Add the value
@@ -148,6 +153,11 @@ public class CaseExpr extends Expr {
       hasElseExpr_ = true;
       children_.add(decodeExpr.getChild(childIdx));
     }
+
+    // Check that these exprs were cloned above, as reusing the same Expr object in
+    // different places can lead to bugs, eg. if the Expr has multiple parents, they may
+    // try to cast it to different types.
+    Preconditions.checkState(!contains(encoded) && !contains(encodedIsNull));
   }
 
   /**
@@ -222,10 +232,7 @@ public class CaseExpr extends Expr {
   }
 
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (isAnalyzed_) return;
-    super.analyze(analyzer);
-
+  protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     if (isDecode()) {
       Preconditions.checkState(!hasCaseExpr_);
       // decodeExpr_.analyze() would fail validating function existence. The complex
@@ -366,6 +373,65 @@ public class CaseExpr extends Expr {
     }
     if (hasChildCosts) {
       evalCost_ =  whenCosts + maxThenCost;
+    }
+  }
+
+  @Override
+  protected void computeNumDistinctValues() {
+    // Skip the first child if case expression
+    int loopStart = (hasCaseExpr_ ? 1 : 0);
+
+    // If all the outputs have a known number of distinct values (i.e. not -1), then
+    // sum the number of distinct constants with the maximum NDV for the non-constants.
+    //
+    // Otherwise, the number of distinct values is undetermined. The input cardinality
+    // (i.e. the when's) are not used.
+    boolean allOutputsKnown = true;
+    int numOutputConstants = 0;
+    long maxOutputNonConstNdv = -1;
+    HashSet<LiteralExpr> constLiteralSet = Sets.newHashSetWithExpectedSize(children_.size());
+
+    for (int i = loopStart; i < children_.size(); ++i) {
+      // The children follow this ordering:
+      // [optional first child] when1 then1 when2 then2 ... else
+      // After skipping optional first child, even indices are when expressions, except
+      // for the last child, which can be an else expression
+      if ((i - loopStart) % 2 == 0 && !(i == children_.size() - 1 && hasElseExpr_)) {
+        // This is a when expression
+        continue;
+      }
+
+      // This is an output expression (either then or else)
+      Expr outputExpr = children_.get(i);
+
+      if (outputExpr.isConstant()) {
+        if (outputExpr.isLiteral()) {
+          LiteralExpr outputLiteral = (LiteralExpr) outputExpr;
+          if (constLiteralSet.add(outputLiteral)) ++numOutputConstants;
+        } else {
+          ++numOutputConstants;
+        }
+      } else {
+        long outputNdv = outputExpr.getNumDistinctValues();
+        if (outputNdv == -1) allOutputsKnown = false;
+        maxOutputNonConstNdv = Math.max(maxOutputNonConstNdv, outputNdv);
+      }
+    }
+
+    // Else unspecified => NULL constant, which is not caught above
+    if (!hasElseExpr_) ++numOutputConstants;
+
+    if (allOutputsKnown) {
+      if (maxOutputNonConstNdv == -1) {
+        // All must be constant, because if we hit any SlotRef, this would be set
+        numDistinctValues_ = numOutputConstants;
+      } else {
+        numDistinctValues_ = numOutputConstants + maxOutputNonConstNdv;
+      }
+    } else {
+      // There is no correct answer when statistics are missing. Neither the
+      // known outputs nor the inputs provide information
+      numDistinctValues_ = -1;
     }
   }
 

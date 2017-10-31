@@ -18,30 +18,28 @@
 package org.apache.impala.planner;
 
 import java.util.List;
+import java.util.Set;
 
+import org.apache.impala.analysis.Analyzer;
+import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.TupleId;
+import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.InternalException;
+import org.apache.impala.common.PrintUtils;
+import org.apache.impala.common.TreeNode;
+import org.apache.impala.planner.JoinNode.DistributionMode;
+import org.apache.impala.planner.PlanNode.ExecPhaseResourceProfiles;
+import org.apache.impala.thrift.TExplainLevel;
+import org.apache.impala.thrift.TPartitionType;
+import org.apache.impala.thrift.TPlanFragment;
+import org.apache.impala.thrift.TPlanFragmentTree;
+import org.apache.impala.thrift.TQueryOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.impala.analysis.Analyzer;
-import org.apache.impala.analysis.BinaryPredicate;
-import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.JoinOperator;
-import org.apache.impala.analysis.SlotRef;
-import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.common.AnalysisException;
-import org.apache.impala.common.InternalException;
-import org.apache.impala.common.NotImplementedException;
-import org.apache.impala.common.TreeNode;
-import org.apache.impala.planner.JoinNode.DistributionMode;
-import org.apache.impala.thrift.TExplainLevel;
-import org.apache.impala.thrift.TPartitionType;
-import org.apache.impala.thrift.TPlan;
-import org.apache.impala.thrift.TPlanFragment;
-import org.apache.impala.thrift.TPlanFragmentTree;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * PlanFragments form a tree structure via their ExchangeNodes. A tree of fragments
@@ -106,6 +104,15 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   // if the output is UNPARTITIONED, it is being broadcast
   private DataPartition outputPartition_;
 
+  // Resource requirements and estimates for an instance of this plan fragment.
+  // Initialized with a dummy value. Gets set correctly in
+  // computeResourceProfile().
+  private ResourceProfile resourceProfile_ = ResourceProfile.invalid();
+
+  // The total of initial reservations (in bytes) that will be claimed over the lifetime
+  // of this fragment. Computed in computeResourceProfile().
+  private long initialReservationTotalClaims_ = -1;
+
   /**
    * C'tor for fragment with specific partition; the output is by default broadcast.
    */
@@ -130,11 +137,12 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   }
 
   /**
-   * Collect all PlanNodes that belong to the exec tree of this fragment.
+   * Collect and return all PlanNodes that belong to the exec tree of this fragment.
    */
-  public void collectPlanNodes(List<PlanNode> nodes) {
-    Preconditions.checkNotNull(nodes);
+  public List<PlanNode> collectPlanNodes() {
+    List<PlanNode> nodes = Lists.newArrayList();
     collectPlanNodesHelper(planRoot_, nodes);
+    return nodes;
   }
 
   private void collectPlanNodesHelper(PlanNode root, List<PlanNode> nodes) {
@@ -150,14 +158,13 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   public List<Expr> getOutputExprs() { return outputExprs_; }
 
   /**
-   * Finalize plan tree and create stream sink, if needed.
-   * If this fragment is hash partitioned, ensures that the corresponding partition
-   * exprs of all hash-partitioning senders are cast to identical types.
+   * Do any final work to set up the ExchangeNodes and DataStreamSinks for this fragment.
+   * If this fragment has partitioned joins, ensures that the corresponding partition
+   * exprs of all hash-partitioning senders are cast to appropriate types.
    * Otherwise, the hashes generated for identical partition values may differ
    * among senders if the partition-expr types are not identical.
    */
-  public void finalize(Analyzer analyzer)
-      throws InternalException, NotImplementedException {
+  public void finalizeExchanges(Analyzer analyzer) throws InternalException {
     if (destNode_ != null) {
       Preconditions.checkState(sink_ == null);
       // we're streaming to an exchange node
@@ -166,40 +173,85 @@ public class PlanFragment extends TreeNode<PlanFragment> {
       sink_ = streamSink;
     }
 
-    if (!dataPartition_.isHashPartitioned()) return;
+    // Must be called regardless of this fragment's data partition. This fragment might
+    // be RANDOM partitioned due to a union. The union could still have partitioned joins
+    // in its child subtrees for which casts on the exchange senders are needed.
+    castPartitionedJoinExchanges(planRoot_, analyzer);
+  }
 
-    // This fragment is hash partitioned. Gather all exchange nodes and ensure
-    // that all hash-partitioning senders hash on exprs-values of the same type.
-    List<ExchangeNode> exchNodes = Lists.newArrayList();
-    planRoot_.collect(Predicates.instanceOf(ExchangeNode.class), exchNodes);
+  /**
+   * Recursively traverses the plan tree rooted at 'node' and casts the partition exprs
+   * of all senders feeding into a series of partitioned joins to compatible types.
+   */
+  private void castPartitionedJoinExchanges(PlanNode node, Analyzer analyzer) {
+    if (node instanceof HashJoinNode
+        && ((JoinNode) node).getDistributionMode() == DistributionMode.PARTITIONED) {
+      // Contains all exchange nodes in this fragment below the current join node.
+      List<ExchangeNode> exchNodes = Lists.newArrayList();
+      node.collect(ExchangeNode.class, exchNodes);
 
-    // Contains partition-expr lists of all hash-partitioning sender fragments.
-    List<List<Expr>> senderPartitionExprs = Lists.newArrayList();
-    for (ExchangeNode exchNode: exchNodes) {
-      Preconditions.checkState(!exchNode.getChildren().isEmpty());
-      PlanFragment senderFragment = exchNode.getChild(0).getFragment();
-      Preconditions.checkNotNull(senderFragment);
-      if (!senderFragment.getOutputPartition().isHashPartitioned()) continue;
-      List<Expr> partExprs = senderFragment.getOutputPartition().getPartitionExprs();
-      // All hash-partitioning senders must have compatible partition exprs, otherwise
-      // this fragment's data partition must not be hash partitioned.
-      Preconditions.checkState(
-          partExprs.size() == dataPartition_.getPartitionExprs().size());
-      senderPartitionExprs.add(partExprs);
-    }
+      // Contains partition-expr lists of all hash-partitioning sender fragments.
+      List<List<Expr>> senderPartitionExprs = Lists.newArrayList();
+      for (ExchangeNode exchNode: exchNodes) {
+        Preconditions.checkState(!exchNode.getChildren().isEmpty());
+        PlanFragment senderFragment = exchNode.getChild(0).getFragment();
+        Preconditions.checkNotNull(senderFragment);
+        if (!senderFragment.getOutputPartition().isHashPartitioned()) continue;
+        List<Expr> partExprs = senderFragment.getOutputPartition().getPartitionExprs();
+        senderPartitionExprs.add(partExprs);
+      }
 
-    // Cast all corresponding hash partition exprs of all hash-partitioning senders
-    // to their compatible types. Also cast the data partition's exprs for consistency,
-    // although not strictly necessary. They should already be type identical to the
-    // exprs of one of the senders and they are not directly used for hashing in the BE.
-    senderPartitionExprs.add(dataPartition_.getPartitionExprs());
-    try {
-      analyzer.castToUnionCompatibleTypes(senderPartitionExprs);
-    } catch (AnalysisException e) {
-      // Should never happen. Analysis should have ensured type compatibility already.
-      throw new IllegalStateException(e);
+      // Cast partition exprs of all hash-partitioning senders to their compatible types.
+      try {
+        analyzer.castToUnionCompatibleTypes(senderPartitionExprs);
+      } catch (AnalysisException e) {
+        // Should never happen. Analysis should have ensured type compatibility already.
+        throw new IllegalStateException(e);
+      }
+    } else {
+      // Recursively traverse plan nodes in this fragment.
+      for (PlanNode child: node.getChildren()) {
+        if (child.getFragment() == this) castPartitionedJoinExchanges(child, analyzer);
+      }
     }
   }
+
+  /**
+   * Compute the peak resource profile for an instance of this fragment. Must
+   * be called after all the plan nodes and sinks are added to the fragment and resource
+   * profiles of all children fragments are computed.
+   */
+  public void computeResourceProfile(Analyzer analyzer) {
+    // Compute resource profiles for all plan nodes and sinks in the fragment.
+    sink_.computeResourceProfile(analyzer.getQueryOptions());
+    for (PlanNode node: collectPlanNodes()) {
+      node.computeNodeResourceProfile(analyzer.getQueryOptions());
+    }
+
+    if (sink_ instanceof JoinBuildSink) {
+      // Resource consumption of fragments with join build sinks is included in the
+      // parent fragment because the join node blocks waiting for the join build to
+      // finish - see JoinNode.computeTreeResourceProfiles().
+      resourceProfile_ = ResourceProfile.invalid();
+      return;
+    }
+
+    ExecPhaseResourceProfiles planTreeProfile =
+        planRoot_.computeTreeResourceProfiles(analyzer.getQueryOptions());
+    // The sink is opened after the plan tree.
+    ResourceProfile fInstancePostOpenProfile =
+        planTreeProfile.postOpenProfile.sum(sink_.getResourceProfile());
+    resourceProfile_ =
+        planTreeProfile.duringOpenProfile.max(fInstancePostOpenProfile);
+
+    initialReservationTotalClaims_ = sink_.getResourceProfile().getMinReservationBytes();
+    for (PlanNode node: collectPlanNodes()) {
+      initialReservationTotalClaims_ +=
+          node.getNodeResourceProfile().getMinReservationBytes();
+    }
+  }
+
+  public ResourceProfile getResourceProfile() { return resourceProfile_; }
 
   /**
    * Return the number of nodes on which the plan fragment will execute.
@@ -209,18 +261,40 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     return dataPartition_ == DataPartition.UNPARTITIONED ? 1 : planRoot_.getNumNodes();
   }
 
- /**
-   * Estimates the per-node number of distinct values of exprs based on the data
-   * partition of this fragment and its number of nodes. Returns -1 for an invalid
-   * estimate, e.g., because getNumDistinctValues() failed on one of the exprs.
+  /**
+   * Return the number of instances of this fragment per host that it executes on.
+   * invalid: -1
    */
-  public long getNumDistinctValues(List<Expr> exprs) {
+  public int getNumInstancesPerHost(int mt_dop) {
+    Preconditions.checkState(mt_dop >= 0);
+    if (dataPartition_ == DataPartition.UNPARTITIONED) return 1;
+    return mt_dop == 0 ? 1 : mt_dop;
+  }
+
+  /**
+   * Return the total number of instances of this fragment across all hosts.
+   * invalid: -1
+   */
+  public int getNumInstances(int mt_dop) {
+    if (dataPartition_ == DataPartition.UNPARTITIONED) return 1;
+    int numNodes = planRoot_.getNumNodes();
+    if (numNodes == -1) return -1;
+    return getNumInstancesPerHost(mt_dop) * numNodes;
+  }
+
+  /**
+    * Estimates the number of distinct values of exprs per fragment instance based on the
+    * data partition of this fragment, the number of nodes, and the degree of parallelism.
+    * Returns -1 for an invalid estimate, e.g., because getNumDistinctValues() failed on
+    * one of the exprs.
+    */
+  public long getPerInstanceNdv(int mt_dop, List<Expr> exprs) {
     Preconditions.checkNotNull(dataPartition_);
     long result = 1;
-    int numNodes = getNumNodes();
-    Preconditions.checkState(numNodes >= 0);
+    int numInstances = getNumInstances(mt_dop);
+    Preconditions.checkState(numInstances >= 0);
     // The number of nodes is zero for empty tables.
-    if (numNodes == 0) return 0;
+    if (numInstances == 0) return 0;
     for (Expr expr: exprs) {
       long numDistinct = expr.getNumDistinctValues();
       if (numDistinct == -1) {
@@ -228,9 +302,9 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         break;
       }
       if (dataPartition_.getPartitionExprs().contains(expr)) {
-        numDistinct = (long)Math.max((double) numDistinct / (double) numNodes, 1L);
+        numDistinct = (long)Math.max((double) numDistinct / (double) numInstances, 1L);
       }
-      result = PlanNode.multiplyCardinalities(result, numDistinct);
+      result = PlanNode.checkedMultiply(result, numDistinct);
     }
     return result;
   }
@@ -244,6 +318,14 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     }
     if (sink_ != null) result.setOutput_sink(sink_.toThrift());
     result.setPartition(dataPartition_.toThrift());
+    if (resourceProfile_.isValid()) {
+      Preconditions.checkArgument(initialReservationTotalClaims_ > -1);
+      result.setMin_reservation_bytes(resourceProfile_.getMinReservationBytes());
+      result.setInitial_reservation_total_claims(initialReservationTotalClaims_);
+    } else {
+      result.setMin_reservation_bytes(0);
+      result.setInitial_reservation_total_claims(0);
+    }
     return result;
   }
 
@@ -260,8 +342,8 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     }
   }
 
-  public String getExplainString(TExplainLevel detailLevel) {
-    return getExplainString("", "", detailLevel);
+  public String getExplainString(TQueryOptions queryOptions, TExplainLevel detailLevel) {
+    return getExplainString("", "", queryOptions, detailLevel);
   }
 
   /**
@@ -269,7 +351,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
    * output will be prefixed by prefix.
    */
   protected final String getExplainString(String rootPrefix, String prefix,
-      TExplainLevel detailLevel) {
+      TQueryOptions queryOptions, TExplainLevel detailLevel) {
     StringBuilder str = new StringBuilder();
     Preconditions.checkState(dataPartition_ != null);
     String detailPrefix = prefix + "|  ";  // sink detail
@@ -278,17 +360,23 @@ public class PlanFragment extends TreeNode<PlanFragment> {
       prefix = "  ";
       rootPrefix = "  ";
       detailPrefix = prefix + "|  ";
-      str.append(String.format("%s:PLAN FRAGMENT [%s]\n", fragmentId_.toString(),
-          dataPartition_.getExplainString()));
+      str.append(getFragmentHeaderString("", "", queryOptions.getMt_dop()));
       if (sink_ != null && sink_ instanceof DataStreamSink) {
-        str.append(sink_.getExplainString(rootPrefix, prefix, detailLevel) + "\n");
+        str.append(
+            sink_.getExplainString(rootPrefix, detailPrefix, queryOptions, detailLevel));
       }
+    } else if (detailLevel == TExplainLevel.EXTENDED) {
+      // Print a fragment prefix displaying the # nodes and # instances
+      str.append(
+          getFragmentHeaderString(rootPrefix, detailPrefix, queryOptions.getMt_dop()));
+      rootPrefix = prefix;
     }
 
     String planRootPrefix = rootPrefix;
     // Always print sinks other than DataStreamSinks.
     if (sink_ != null && !(sink_ instanceof DataStreamSink)) {
-      str.append(sink_.getExplainString(rootPrefix, detailPrefix, detailLevel));
+      str.append(
+          sink_.getExplainString(rootPrefix, detailPrefix, queryOptions, detailLevel));
       if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
         str.append(prefix + "|\n");
       }
@@ -296,9 +384,33 @@ public class PlanFragment extends TreeNode<PlanFragment> {
       planRootPrefix = prefix;
     }
     if (planRoot_ != null) {
-      str.append(planRoot_.getExplainString(planRootPrefix, prefix, detailLevel));
+      str.append(
+          planRoot_.getExplainString(planRootPrefix, prefix, queryOptions, detailLevel));
     }
     return str.toString();
+  }
+
+  /**
+   * Get a header string for a fragment in an explain plan.
+   */
+  public String getFragmentHeaderString(String firstLinePrefix, String detailPrefix,
+      int mt_dop) {
+    StringBuilder builder = new StringBuilder();
+    builder.append(String.format("%s%s:PLAN FRAGMENT [%s]", firstLinePrefix,
+        fragmentId_.toString(), dataPartition_.getExplainString()));
+    builder.append(PrintUtils.printNumHosts(" ", getNumNodes()));
+    builder.append(PrintUtils.printNumInstances(" ", getNumInstances(mt_dop)));
+    builder.append("\n");
+    builder.append(detailPrefix);
+    builder.append("Per-Host Resources: ");
+    if (sink_ instanceof JoinBuildSink) {
+      builder.append("included in parent fragment");
+    } else {
+      builder.append(resourceProfile_.multiply(getNumInstancesPerHost(mt_dop))
+          .getExplainString());
+    }
+    builder.append("\n");
+    return builder.toString();
   }
 
   /** Returns true if this fragment is partitioned. */
@@ -363,8 +475,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
    */
   public void verifyTree() {
     // PlanNode.fragment_ is set correctly
-    List<PlanNode> nodes = Lists.newArrayList();
-    collectPlanNodes(nodes);
+    List<PlanNode> nodes = collectPlanNodes();
     List<PlanNode> exchNodes = Lists.newArrayList();
     for (PlanNode node: nodes) {
       if (node instanceof ExchangeNode) exchNodes.add(node);
@@ -384,5 +495,24 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     Preconditions.checkState(getChildren().containsAll(childFragments));
 
     for (PlanFragment child: getChildren()) child.verifyTree();
+  }
+
+  /**
+   * Returns true if 'exprs' reference a tuple that is made nullable in this fragment,
+   * but not in any of its input fragments.
+   */
+  public boolean refsNullableTupleId(List<Expr> exprs) {
+    Preconditions.checkNotNull(planRoot_);
+    List<TupleId> tids = Lists.newArrayList();
+    for (Expr e: exprs) e.getIds(tids, null);
+    Set<TupleId> nullableTids = Sets.newHashSet(planRoot_.getNullableTupleIds());
+    // Remove all tuple ids that were made nullable in an input fragment.
+    List<ExchangeNode> exchNodes = Lists.newArrayList();
+    planRoot_.collect(ExchangeNode.class, exchNodes);
+    for (ExchangeNode exchNode: exchNodes) {
+      nullableTids.removeAll(exchNode.getNullableTupleIds());
+    }
+    for (TupleId tid: tids) if (nullableTids.contains(tid)) return true;
+    return false;
   }
 }

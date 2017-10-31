@@ -261,10 +261,10 @@ Status impala::SetQueryOption(const string& key, const string& value,
       case TImpalaQueryOptions::QUERY_TIMEOUT_S:
         query_options->__set_query_timeout_s(atoi(value.c_str()));
         break;
-      case TImpalaQueryOptions::MAX_BLOCK_MGR_MEMORY: {
+      case TImpalaQueryOptions::BUFFER_POOL_LIMIT: {
         int64_t mem;
-        RETURN_IF_ERROR(ParseMemValue(value, "block mgr memory limit", &mem));
-        query_options->__set_max_block_mgr_memory(mem);
+        RETURN_IF_ERROR(ParseMemValue(value, "buffer pool limit", &mem));
+        query_options->__set_buffer_pool_limit(mem);
         break;
       }
       case TImpalaQueryOptions::APPX_COUNT_DISTINCT: {
@@ -366,8 +366,7 @@ Status impala::SetQueryOption(const string& key, const string& value,
         StringParser::ParseResult status;
         int val = StringParser::StringToInt<int>(value.c_str(), value.size(), &status);
         if (status != StringParser::PARSE_SUCCESS) {
-          return Status(Substitute("Invalid number of runtime filters: '$0'.",
-              value.c_str()));
+          return Status(Substitute("Invalid number of runtime filters: '$0'.", value));
         }
         if (val < 0) {
           return Status(Substitute("Invalid number of runtime filters: '$0'. "
@@ -393,6 +392,26 @@ Status impala::SetQueryOption(const string& key, const string& value,
         } else {
           return Status(Substitute("Invalid PARQUET_FALLBACK_SCHEMA_RESOLUTION option: "
               "'$0'. Valid options are 'POSITION' and 'NAME'.", value));
+        }
+        break;
+      }
+      case TImpalaQueryOptions::PARQUET_ARRAY_RESOLUTION: {
+        if (iequals(value, "three_level") ||
+            value == to_string(TParquetArrayResolution::THREE_LEVEL)) {
+          query_options->__set_parquet_array_resolution(
+              TParquetArrayResolution::THREE_LEVEL);
+        } else if (iequals(value, "two_level") ||
+            value == to_string(TParquetArrayResolution::TWO_LEVEL)) {
+          query_options->__set_parquet_array_resolution(
+              TParquetArrayResolution::TWO_LEVEL);
+        } else if (iequals(value, "two_level_then_three_level") ||
+            value == to_string(TParquetArrayResolution::TWO_LEVEL_THEN_THREE_LEVEL)) {
+          query_options->__set_parquet_array_resolution(
+              TParquetArrayResolution::TWO_LEVEL_THEN_THREE_LEVEL);
+        } else {
+          return Status(Substitute("Invalid PARQUET_ARRAY_RESOLUTION option: '$0'. "
+              "Valid options are 'THREE_LEVEL', 'TWO_LEVEL' and "
+              "'TWO_LEVEL_THEN_THREE_LEVEL'.", value));
         }
         break;
       }
@@ -444,6 +463,78 @@ Status impala::SetQueryOption(const string& key, const string& value,
       case TImpalaQueryOptions::ENABLE_EXPR_REWRITES: {
         query_options->__set_enable_expr_rewrites(
             iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::DECIMAL_V2: {
+        query_options->__set_decimal_v2(iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::PARQUET_DICTIONARY_FILTERING: {
+        query_options->__set_parquet_dictionary_filtering(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::PARQUET_READ_STATISTICS: {
+        query_options->__set_parquet_read_statistics(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::DEFAULT_JOIN_DISTRIBUTION_MODE: {
+        if (iequals(value, "BROADCAST") || iequals(value, "0")) {
+          query_options->__set_default_join_distribution_mode(
+              TJoinDistributionMode::BROADCAST);
+        } else if (iequals(value, "SHUFFLE") || iequals(value, "1")) {
+          query_options->__set_default_join_distribution_mode(
+              TJoinDistributionMode::SHUFFLE);
+        } else {
+          return Status(Substitute("Invalid default_join_distribution_mode '$0'. "
+              "Valid values are BROADCAST or SHUFFLE", value));
+        }
+        break;
+      }
+      case TImpalaQueryOptions::DISABLE_CODEGEN_ROWS_THRESHOLD: {
+        StringParser::ParseResult status;
+        int val = StringParser::StringToInt<int>(value.c_str(), value.size(), &status);
+        if (status != StringParser::PARSE_SUCCESS) {
+          return Status(Substitute("Invalid threshold: '$0'.", value));
+        }
+        if (val < 0) {
+          return Status(Substitute(
+              "Invalid threshold: '$0'. Only positive values are allowed.", val));
+        }
+        query_options->__set_disable_codegen_rows_threshold(val);
+        break;
+      }
+      case TImpalaQueryOptions::DEFAULT_SPILLABLE_BUFFER_SIZE: {
+        int64_t buffer_size_bytes;
+        RETURN_IF_ERROR(
+            ParseMemValue(value, "Default spillable buffer size", &buffer_size_bytes));
+        if (!BitUtil::IsPowerOf2(buffer_size_bytes)) {
+          return Status(
+              Substitute("Buffer size must be a power of two: $0", buffer_size_bytes));
+        }
+        query_options->__set_default_spillable_buffer_size(buffer_size_bytes);
+        break;
+      }
+      case TImpalaQueryOptions::MIN_SPILLABLE_BUFFER_SIZE: {
+        int64_t buffer_size_bytes;
+        RETURN_IF_ERROR(
+            ParseMemValue(value, "Minimum spillable buffer size", &buffer_size_bytes));
+        if (!BitUtil::IsPowerOf2(buffer_size_bytes)) {
+          return Status(
+              Substitute("Buffer size must be a power of two: $0", buffer_size_bytes));
+        }
+        query_options->__set_min_spillable_buffer_size(buffer_size_bytes);
+        break;
+      }
+      case TImpalaQueryOptions::MAX_ROW_SIZE: {
+        int64_t max_row_size_bytes;
+        RETURN_IF_ERROR(ParseMemValue(value, "Max row size", &max_row_size_bytes));
+        if (max_row_size_bytes <= 0) {
+          return Status(Substitute(
+              "Max row size must be a positive number of bytes: $0", value));
+        }
+        query_options->__set_max_row_size(max_row_size_bytes);
         break;
       }
       default:

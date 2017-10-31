@@ -25,6 +25,7 @@ import java.net.URISyntaxException;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -186,7 +187,7 @@ public class TestRequestPoolService {
     checkPoolConfigResult("root", -1, 200, -1);
   }
 
-  @Test
+  @Ignore("IMPALA-4868") @Test
   public void testUpdatingConfigs() throws Exception {
     // Tests updating the config files and then checking the pool resolution, ACLs, and
     // pool limit configs. This tests all three together rather than separating into
@@ -198,12 +199,23 @@ public class TestRequestPoolService {
     Thread.sleep(1000L);
     Files.copy(getClasspathFile(ALLOCATION_FILE_MODIFIED), allocationConfFile_);
     Files.copy(getClasspathFile(LLAMA_CONFIG_FILE_MODIFIED), llamaConfFile_);
-    // Wait at least 1 second more than the time it will take for the
-    // AllocationFileLoaderService to update the file. The FileWatchService does not
-    // have that additional wait time, so it will be updated within 'CHECK_INTERVAL_MS'
-    Thread.sleep(1000L + CHECK_INTERVAL_MS +
-        AllocationFileLoaderService.ALLOC_RELOAD_WAIT_MS);
-    checkModifiedConfigResults();
+
+    // Need to wait for the YARN AllocationFileLoaderService (for the
+    // allocationConfFile_) as well as the FileWatchService (for the llamaConfFile_). If
+    // the system is busy this may take even longer, so we need to try a few times.
+    Thread.sleep(CHECK_INTERVAL_MS + AllocationFileLoaderService.ALLOC_RELOAD_WAIT_MS);
+
+    int numAttempts = 20;
+    while (true) {
+      try {
+        checkModifiedConfigResults();
+        break;
+      } catch (AssertionError e) {
+        if (numAttempts == 0) throw e;
+        --numAttempts;
+        Thread.sleep(1000L);
+      }
+    }
   }
 
   @Test

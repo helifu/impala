@@ -42,8 +42,12 @@ DECLARE_int32(beeswax_port);
 // that doesn't depend upon being rescheduled in a timely fashion.
 
 TEST(SessionTest, TestExpiry) {
+  const int NUM_CLIENTS = 5;
+  const int MAX_IDLE_TIMEOUT_MS = 4000;
   FLAGS_idle_session_timeout = 1;
-  InProcessImpalaServer* impala = InProcessImpalaServer::StartWithEphemeralPorts();
+  InProcessStatestore* ips = InProcessStatestore::StartWithEphemeralPorts();
+  InProcessImpalaServer* impala =
+      InProcessImpalaServer::StartWithEphemeralPorts("localhost", ips->port());
   IntCounter* expired_metric =
       impala->metrics()->FindMetricForTesting<IntCounter>(
           ImpaladMetricKeys::NUM_SESSIONS_EXPIRED);
@@ -58,11 +62,11 @@ TEST(SessionTest, TestExpiry) {
   EXPECT_EQ(beeswax_session_metric->value(), 0L);
 
   {
-    scoped_ptr<ThriftClient<ImpalaServiceClient>> beeswax_clients[5];
-    scoped_ptr<ThriftClient<ImpalaHiveServer2ServiceClient>> hs2_clients[5];
+    scoped_ptr<ThriftClient<ImpalaServiceClient>> beeswax_clients[NUM_CLIENTS];
+    scoped_ptr<ThriftClient<ImpalaHiveServer2ServiceClient>> hs2_clients[NUM_CLIENTS];
 
     // Create five Beeswax clients and five HS2 clients (each HS2 gets one session each)
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < NUM_CLIENTS; ++i) {
       beeswax_clients[i].reset(new ThriftClient<ImpalaServiceClient>(
               "localhost", impala->beeswax_port()));
       EXPECT_OK(beeswax_clients[i]->Open());
@@ -76,7 +80,7 @@ TEST(SessionTest, TestExpiry) {
     }
 
     int64_t start = UnixMillis();
-    while (expired_metric->value() != 10 && UnixMillis() - start < 5000) {
+    while (expired_metric->value() != 10 && UnixMillis() - start < MAX_IDLE_TIMEOUT_MS) {
       SleepForMs(100);
     }
 

@@ -89,7 +89,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT
 )
@@ -97,7 +97,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month
+       timestamp_col, year, month
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -167,7 +167,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT
 )
@@ -175,7 +175,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month
+       timestamp_col, year, month
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -226,7 +226,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT
 )
@@ -234,7 +234,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT INTO TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month
+       timestamp_col, year, month
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -561,7 +561,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name}_idx (
   double_col DOUBLE NULL,
   date_string_col STRING NULL,
   string_col STRING NULL,
-  timestamp_col STRING NULL,
+  timestamp_col TIMESTAMP NULL,
   year INT NULL,
   month INT NULL,
   day INT NULL
@@ -576,7 +576,7 @@ INSERT into TABLE {db_name}{db_suffix}.{table_name}_idx
 SELECT row_number() over (order by year, month, id, day),
        id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col,
        double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month, day
+       timestamp_col, year, month, day
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -640,7 +640,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT,
   day INT
@@ -650,7 +650,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col,
        double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month, day
+       timestamp_col, year, month, day
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -1078,6 +1078,9 @@ int_col int
 bigint_col bigint
 float_col float
 double_col double
+decimal0_col DECIMAL(13,4)
+decimal1_col DECIMAL(38,0)
+decimal2_col DECIMAL(38,38)
 ---- ROW_FORMAT
 delimited fields terminated by ','  escaped by '\\'
 ---- LOAD
@@ -1244,6 +1247,13 @@ string_col string
 id int
 ---- ALTER
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (string_col = "partition1");
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (string_col = "2009-01-01 00:00:00");
+---- LOAD
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.dynamic.partition=true;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(string_col)
+SELECT id, timestamp_col as string_col from functional.alltypestiny
+WHERE timestamp_col = "2009-01-01 00:00:00";
 ====
 ---- DATASET
 functional
@@ -2085,6 +2095,8 @@ delimited fields terminated by ','  escaped by '\\'
 ALTER TABLE {table_name} SET TBLPROPERTIES('skip.header.line.count'='1');
 ---- LOAD
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header.csv' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header.gz' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2099,6 +2111,8 @@ delimited fields terminated by ','  escaped by '\\'
 ALTER TABLE {table_name} SET TBLPROPERTIES('skip.header.line.count'='2');
 ---- LOAD
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header_2.csv' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header_2.gz' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional

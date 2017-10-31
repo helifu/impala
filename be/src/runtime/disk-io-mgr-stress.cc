@@ -71,8 +71,8 @@ DiskIoMgrStress::DiskIoMgrStress(int num_disks, int num_threads_per_disk,
   LOG(INFO) << "Running with rand seed: " << rand_seed;
   srand(rand_seed);
 
-  io_mgr_.reset(new DiskIoMgr(
-      num_disks, num_threads_per_disk, MIN_READ_BUFFER_SIZE, MAX_READ_BUFFER_SIZE));
+  io_mgr_.reset(new DiskIoMgr(num_disks, num_threads_per_disk, num_threads_per_disk,
+      MIN_READ_BUFFER_SIZE, MAX_READ_BUFFER_SIZE));
   Status status = io_mgr_->Init(&mem_tracker_);
   CHECK(status.ok());
 
@@ -111,7 +111,7 @@ void DiskIoMgrStress::ClientThread(int client_id) {
       if (range == NULL) break;
 
       while (true) {
-        DiskIoMgr::BufferDescriptor* buffer;
+        unique_ptr<DiskIoMgr::BufferDescriptor> buffer;
         status = range->GetNext(&buffer);
         CHECK(status.ok() || status.IsCancelled());
         if (buffer == NULL) break;
@@ -133,8 +133,7 @@ void DiskIoMgrStress::ClientThread(int client_id) {
 
         // Copy the bytes from this read into the result buffer.
         memcpy(read_buffer + file_offset, buffer->buffer(), buffer->len());
-        buffer->Return();
-        buffer = NULL;
+        io_mgr_->ReturnBuffer(move(buffer));
         bytes_read += len;
 
         CHECK_GE(bytes_read, 0);
@@ -238,8 +237,7 @@ void DiskIoMgrStress::NewClient(int i) {
   }
 
   client_mem_trackers_[i].reset(new MemTracker(-1, "", &mem_tracker_));
-  Status status = io_mgr_->RegisterContext(&client.reader, client_mem_trackers_[i].get());
-  CHECK(status.ok());
-  status = io_mgr_->AddScanRanges(client.reader, client.scan_ranges);
+  io_mgr_->RegisterContext(&client.reader, client_mem_trackers_[i].get());
+  Status status = io_mgr_->AddScanRanges(client.reader, client.scan_ranges);
   CHECK(status.ok());
 }

@@ -39,7 +39,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">COMPUTE STATS statement</indexterm>
+      <indexterm audience="hidden">COMPUTE STATS statement</indexterm>
       Gathers information about volume and distribution of data in a table and all associated columns and
       partitions. The information is stored in the metastore database, and used by Impala to help optimize queries.
       For example, if Impala can determine that a table is large or small, or has many or few distinct values it
@@ -52,7 +52,11 @@ under the License.
 <codeblock rev="2.1.0">COMPUTE STATS [<varname>db_name</varname>.]<varname>table_name</varname>
 COMPUTE INCREMENTAL STATS [<varname>db_name</varname>.]<varname>table_name</varname> [PARTITION (<varname>partition_spec</varname>)]
 
-<varname>partition_spec</varname> ::= <varname>partition_col</varname>=<varname>constant_value</varname>
+<varname>partition_spec</varname> ::= <varname>simple_partition_spec</varname> | <ph rev="IMPALA-1654"><varname>complex_partition_spec</varname></ph>
+
+<varname>simple_partition_spec</varname> ::= <varname>partition_col</varname>=<varname>constant_value</varname>
+
+<ph rev="IMPALA-1654"><varname>complex_partition_spec</varname> ::= <varname>comparison_expression_on_partition_col</varname></ph>
 </codeblock>
 
     <p conref="../shared/impala_common.xml#common/incremental_partition_spec"/>
@@ -105,8 +109,86 @@ COMPUTE INCREMENTAL STATS [<varname>db_name</varname>.]<varname>table_name</varn
           The statistics help Impala to achieve high concurrency, full utilization of available memory, and avoid
           contention with workloads from other Hadoop components.
         </li>
+        <li rev="IMPALA-4572">
+          In <keyword keyref="impala28_full"/> and higher, when you run the
+          <codeph>COMPUTE STATS</codeph> or <codeph>COMPUTE INCREMENTAL STATS</codeph>
+          statement against a Parquet table, Impala automatically applies the query
+          option setting <codeph>MT_DOP=4</codeph> to increase the amount of intra-node
+          parallelism during this CPU-intensive operation. See <xref keyref="mt_dop"/>
+          for details about what this query option does and how to use it with
+          CPU-intensive <codeph>SELECT</codeph> statements.
+        </li>
       </ul>
     </note>
+
+    <p rev="IMPALA-1654">
+      <b>Computing stats for groups of partitions:</b>
+    </p>
+
+    <p rev="IMPALA-1654">
+      In <keyword keyref="impala28_full"/> and higher, you can run <codeph>COMPUTE INCREMENTAL STATS</codeph>
+      on multiple partitions, instead of the entire table or one partition at a time. You include
+      comparison operators other than <codeph>=</codeph> in the <codeph>PARTITION</codeph> clause,
+      and the <codeph>COMPUTE INCREMENTAL STATS</codeph> statement applies to all partitions that
+      match the comparison expression.
+    </p>
+
+    <p rev="IMPALA-1654">
+      For example, the <codeph>INT_PARTITIONS</codeph> table contains 4 partitions.
+      The following <codeph>COMPUTE INCREMENTAL STATS</codeph> statements affect some but not all
+      partitions, as indicated by the <codeph>Updated <varname>n</varname> partition(s)</codeph>
+      messages. The partitions that are affected depend on values in the partition key column <codeph>X</codeph>
+      that match the comparison expression in the <codeph>PARTITION</codeph> clause.
+    </p>
+
+<codeblock rev="IMPALA-1654"><![CDATA[
+show partitions int_partitions;
++-------+-------+--------+------+--------------+-------------------+---------+...
+| x     | #Rows | #Files | Size | Bytes Cached | Cache Replication | Format  |...
++-------+-------+--------+------+--------------+-------------------+---------+...
+| 99    | -1    | 0      | 0B   | NOT CACHED   | NOT CACHED        | PARQUET |...
+| 120   | -1    | 0      | 0B   | NOT CACHED   | NOT CACHED        | TEXT    |...
+| 150   | -1    | 0      | 0B   | NOT CACHED   | NOT CACHED        | TEXT    |...
+| 200   | -1    | 0      | 0B   | NOT CACHED   | NOT CACHED        | TEXT    |...
+| Total | -1    | 0      | 0B   | 0B           |                   |         |...
++-------+-------+--------+------+--------------+-------------------+---------+...
+
+compute incremental stats int_partitions partition (x < 100);
++-----------------------------------------+
+| summary                                 |
++-----------------------------------------+
+| Updated 1 partition(s) and 1 column(s). |
++-----------------------------------------+
+
+compute incremental stats int_partitions partition (x in (100, 150, 200));
++-----------------------------------------+
+| summary                                 |
++-----------------------------------------+
+| Updated 2 partition(s) and 1 column(s). |
++-----------------------------------------+
+
+compute incremental stats int_partitions partition (x between 100 and 175);
++-----------------------------------------+
+| summary                                 |
++-----------------------------------------+
+| Updated 2 partition(s) and 1 column(s). |
++-----------------------------------------+
+
+compute incremental stats int_partitions partition (x in (100, 150, 200) or x < 100);
++-----------------------------------------+
+| summary                                 |
++-----------------------------------------+
+| Updated 3 partition(s) and 1 column(s). |
++-----------------------------------------+
+
+compute incremental stats int_partitions partition (x != 150);
++-----------------------------------------+
+| summary                                 |
++-----------------------------------------+
+| Updated 3 partition(s) and 1 column(s). |
++-----------------------------------------+
+]]>
+</codeblock>
 
     <p conref="../shared/impala_common.xml#common/complex_types_blurb"/>
 
@@ -377,7 +459,7 @@ show table stats item_partitioned;
     </p>
 
     <p>
-      The <codeph>COMPUTE STATS</codeph> statement works with Avro tables without restriction in CDH 5.4 / Impala 2.2
+      The <codeph>COMPUTE STATS</codeph> statement works with Avro tables without restriction in <keyword keyref="impala22_full"/>
       and higher. In earlier releases, <codeph>COMPUTE STATS</codeph> worked only for Avro tables created through Hive,
       and required the <codeph>CREATE TABLE</codeph> statement to use SQL-style column names and types rather than an
       Avro-style schema specification.
@@ -405,8 +487,6 @@ show table stats item_partitioned;
 
     <p conref="../shared/impala_common.xml#common/restrictions_blurb"/>
 
-    <p conref="../shared/impala_common.xml#common/decimal_no_stats"/>
-
     <note conref="../shared/impala_common.xml#common/compute_stats_nulls"/>
 
     <p conref="../shared/impala_common.xml#common/internals_blurb"/>
@@ -425,7 +505,7 @@ show table stats item_partitioned;
     </p>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
-    <p rev="CDH-19187">
+    <p rev="">
       The user ID that the <cmdname>impalad</cmdname> daemon runs under,
       typically the <codeph>impala</codeph> user, must have read
       permission for all affected files in the source directory:
@@ -438,6 +518,17 @@ show table stats item_partitioned;
       (Essentially, <codeph>COMPUTE STATS</codeph> requires the
       same permissions as the underlying <codeph>SELECT</codeph> queries it runs
       against the table.)
+    </p>
+
+    <p rev="kudu" conref="../shared/impala_common.xml#common/kudu_blurb"/>
+
+    <p rev="IMPALA-2830">
+      The <codeph>COMPUTE STATS</codeph> statement applies to Kudu tables.
+      Impala does not compute the number of rows for each partition for
+      Kudu tables. Therefore, you do not need to re-run the operation when
+      you see -1 in the <codeph># Rows</codeph> column of the output from
+      <codeph>SHOW TABLE STATS</codeph>. That column always shows -1 for
+      all Kudu tables.
     </p>
 
     <p conref="../shared/impala_common.xml#common/related_info"/>

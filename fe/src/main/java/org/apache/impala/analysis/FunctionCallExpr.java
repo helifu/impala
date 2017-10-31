@@ -30,6 +30,7 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.thrift.TAggregateExpr;
+import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TFunctionBinaryType;
@@ -45,10 +46,12 @@ public class FunctionCallExpr extends Expr {
   private boolean isAnalyticFnCall_ = false;
   private boolean isInternalFnCall_ = false;
 
-  // Indicates whether this is a merge aggregation function that should use the merge
-  // instead of the update symbol. This flag also affects the behavior of
-  // resetAnalysisState() which is used during expr substitution.
-  private final boolean isMergeAggFn_;
+  // Non-null iff this is an aggregation function that executes the Merge() step. This
+  // is an analyzed clone of the FunctionCallExpr that executes the Update() function
+  // feeding into this Merge(). This is stored so that we can access the types of the
+  // original input argument exprs. Note that the nullness affects the behaviour of
+  // resetAnalysisState(), which is used during expr substitution.
+  private FunctionCallExpr mergeAggInputFn_;
 
   // Printed in toSqlImpl(), if set. Used for merge agg fns.
   private String label_;
@@ -62,15 +65,16 @@ public class FunctionCallExpr extends Expr {
   }
 
   public FunctionCallExpr(FunctionName fnName, FunctionParams params) {
-    this(fnName, params, false);
+    this(fnName, params, null);
   }
 
-  private FunctionCallExpr(
-      FunctionName fnName, FunctionParams params, boolean isMergeAggFn) {
+  private FunctionCallExpr(FunctionName fnName, FunctionParams params,
+      FunctionCallExpr mergeAggInputFn) {
     super();
     fnName_ = fnName;
     params_ = params;
-    isMergeAggFn_ = isMergeAggFn;
+    mergeAggInputFn_ =
+        mergeAggInputFn == null ? null : (FunctionCallExpr)mergeAggInputFn.clone();
     if (params.exprs() != null) children_ = Lists.newArrayList(params_.exprs());
   }
 
@@ -87,6 +91,17 @@ public class FunctionCallExpr extends Expr {
             && fnName.getFnNamePath().get(1).equalsIgnoreCase("decode")) {
       return new CaseExpr(functionCallExpr);
     }
+    if (fnName.getFnNamePath().size() == 1
+            && fnName.getFnNamePath().get(0).equalsIgnoreCase("nvl2")
+        || fnName.getFnNamePath().size() == 2
+            && fnName.getFnNamePath().get(0).equalsIgnoreCase(Catalog.BUILTINS_DB)
+            && fnName.getFnNamePath().get(1).equalsIgnoreCase("nvl2")) {
+      List<Expr> plist = Lists.newArrayList(params.exprs());
+      if (!plist.isEmpty()) {
+        plist.set(0, new IsNullPredicate(plist.get(0), true));
+      }
+      return new FunctionCallExpr("if", plist);
+    }
     return functionCallExpr;
   }
 
@@ -96,15 +111,19 @@ public class FunctionCallExpr extends Expr {
    */
   public static FunctionCallExpr createMergeAggCall(
       FunctionCallExpr agg, List<Expr> params) {
-    Preconditions.checkState(agg.isAnalyzed_);
+    Preconditions.checkState(agg.isAnalyzed());
     Preconditions.checkState(agg.isAggregateFunction());
+    // If the input aggregate function is already a merge aggregate function (due to
+    // 2-phase aggregation), its input types will be the intermediate value types. The
+    // original input argument exprs are in 'agg.mergeAggInputFn_' so use it instead.
+    FunctionCallExpr mergeAggInputFn = agg.isMergeAggFn() ? agg.mergeAggInputFn_ : agg;
     FunctionCallExpr result = new FunctionCallExpr(
-        agg.fnName_, new FunctionParams(false, params), true);
+        agg.fnName_, new FunctionParams(false, params), mergeAggInputFn);
     // Inherit the function object from 'agg'.
     result.fn_ = agg.fn_;
     result.type_ = agg.type_;
     // Set an explicit label based on the input agg.
-    if (agg.isMergeAggFn_) {
+    if (agg.isMergeAggFn()) {
       result.label_ = agg.label_;
     } else {
       // fn(input) becomes fn:merge(input).
@@ -123,28 +142,30 @@ public class FunctionCallExpr extends Expr {
     fnName_ = other.fnName_;
     isAnalyticFnCall_ = other.isAnalyticFnCall_;
     isInternalFnCall_ = other.isInternalFnCall_;
-    isMergeAggFn_ = other.isMergeAggFn_;
+    mergeAggInputFn_ = other.mergeAggInputFn_ == null ?
+        null : (FunctionCallExpr)other.mergeAggInputFn_.clone();
     // Clone the params in a way that keeps the children_ and the params.exprs()
     // in sync. The children have already been cloned in the super c'tor.
     if (other.params_.isStar()) {
       Preconditions.checkState(children_.isEmpty());
       params_ = FunctionParams.createStarParam();
     } else {
-      params_ = new FunctionParams(other.params_.isDistinct(), children_);
+      params_ = new FunctionParams(other.params_.isDistinct(),
+          other.params_.isIgnoreNulls(), children_);
     }
     label_ = other.label_;
   }
 
-  public boolean isMergeAggFn() { return isMergeAggFn_; }
+  public boolean isMergeAggFn() { return mergeAggInputFn_ != null; }
 
   @Override
   public void resetAnalysisState() {
-    isAnalyzed_ = false;
+    super.resetAnalysisState();
     // Resolving merge agg functions after substitution may fail e.g., if the
     // intermediate agg type is not the same as the output type. Preserve the original
     // fn_ such that analyze() hits the special-case code for merge agg fns that
     // handles this case.
-    if (!isMergeAggFn_) fn_ = null;
+    if (!isMergeAggFn()) fn_ = null;
   }
 
   @Override
@@ -153,6 +174,7 @@ public class FunctionCallExpr extends Expr {
     FunctionCallExpr o = (FunctionCallExpr)obj;
     return fnName_.equals(o.fnName_) &&
            params_.isDistinct() == o.params_.isDistinct() &&
+           params_.isIgnoreNulls() == o.params_.isIgnoreNulls() &&
            params_.isStar() == o.params_.isStar();
   }
 
@@ -160,12 +182,14 @@ public class FunctionCallExpr extends Expr {
   public String toSqlImpl() {
     if (label_ != null) return label_;
     // Merge agg fns should have an explicit label.
-    Preconditions.checkState(!isMergeAggFn_);
+    Preconditions.checkState(!isMergeAggFn());
     StringBuilder sb = new StringBuilder();
     sb.append(fnName_).append("(");
     if (params_.isStar()) sb.append("*");
     if (params_.isDistinct()) sb.append("DISTINCT ");
-    sb.append(Joiner.on(", ").join(childrenToSql())).append(")");
+    sb.append(Joiner.on(", ").join(childrenToSql()));
+    if (params_.isIgnoreNulls()) sb.append(" IGNORE NULLS");
+    sb.append(")");
     return sb.toString();
   }
 
@@ -175,6 +199,7 @@ public class FunctionCallExpr extends Expr {
         .add("name", fnName_)
         .add("isStar", params_.isStar())
         .add("isDistinct", params_.isDistinct())
+        .add("isIgnoreNulls", params_.isIgnoreNulls())
         .addValue(super.debugString())
         .toString();
   }
@@ -222,24 +247,48 @@ public class FunctionCallExpr extends Expr {
   public void setIsAnalyticFnCall(boolean v) { isAnalyticFnCall_ = v; }
   public void setIsInternalFnCall(boolean v) { isInternalFnCall_ = v; }
 
+  static boolean isNondeterministicBuiltinFnName(String fnName) {
+    if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
+        || fnName.equalsIgnoreCase("uuid")) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Returns true if function is a non-deterministic builtin function, i.e. for a fixed
+   * input, it may not always produce the same output for every invocation.
+   * Functions that use randomness or variable runtime state are non-deterministic.
+   * This only applies to builtin functions, and does not provide any information
+   * about user defined functions.
+   */
+  public boolean isNondeterministicBuiltinFn() {
+    String fnName = fnName_.getFunction();
+    return isNondeterministicBuiltinFnName(fnName);
+  }
+
   @Override
   protected void toThrift(TExprNode msg) {
     if (isAggregateFunction() || isAnalyticFnCall_) {
       msg.node_type = TExprNodeType.AGGREGATE_EXPR;
-      if (!isAnalyticFnCall_) msg.setAgg_expr(new TAggregateExpr(isMergeAggFn_));
+      List<TColumnType> aggFnArgTypes = Lists.newArrayList();
+      FunctionCallExpr inputAggFn = isMergeAggFn() ? mergeAggInputFn_ : this;
+      for (Expr child: inputAggFn.children_) {
+        aggFnArgTypes.add(child.getType().toThrift());
+      }
+      msg.setAgg_expr(new TAggregateExpr(isMergeAggFn(), aggFnArgTypes));
     } else {
       msg.node_type = TExprNodeType.FUNCTION_CALL;
     }
   }
 
-  /**
-   * Needs to be kept in sync with the BE understanding of constness in
-   * scalar-fn-call.h/cc.
-   */
   @Override
-  public boolean isConstant() {
+  protected boolean isConstantImpl() {
+    // TODO: we can't correctly determine const-ness before analyzing 'fn_'. We should
+    // rework logic so that we do not call this function on unanalyzed exprs.
     // Aggregate functions are never constant.
     if (fn_ instanceof AggregateFunction) return false;
+
     String fnName = fnName_.getFunction();
     if (fnName == null) {
       // This expr has not been analyzed yet, get the function name from the path.
@@ -247,13 +296,12 @@ public class FunctionCallExpr extends Expr {
       fnName = path.get(path.size() - 1);
     }
     // Non-deterministic functions are never constant.
-    if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
-        || fnName.equalsIgnoreCase("uuid")) {
+    if (isNondeterministicBuiltinFnName(fnName)) {
       return false;
     }
     // Sleep is a special function for testing.
     if (fnName.equalsIgnoreCase("sleep")) return false;
-    return super.isConstant();
+    return super.isConstantImpl();
   }
 
   // Provide better error message for some aggregate builtins. These can be
@@ -322,7 +370,21 @@ public class FunctionCallExpr extends Expr {
 
     int digitsBefore = childType.decimalPrecision() - childType.decimalScale();
     int digitsAfter = childType.decimalScale();
-    if (fnName_.getFunction().equalsIgnoreCase("ceil") ||
+    if (fnName_.getFunction().equalsIgnoreCase("avg") &&
+        analyzer.getQueryOptions().isDecimal_v2()) {
+      // AVG() always gets at least MIN_ADJUSTED_SCALE decimal places since it performs
+      // an implicit divide. The output type isn't always the same as SUM()/COUNT().
+      // Scale is set the same as MS SQL Server, which takes the max of the input scale
+      // and MIN_ADJUST_SCALE. For precision, MS SQL always sets it to 38. We choose to
+      // trim it down to the size that's needed because the absolute value of the result
+      // is less than the absolute value of the largest input. Using a smaller precision
+      // allows for better DECIMAL types to be chosen for the overall expression when
+      // AVG() is a subexpression. For DECIMAL_V1, we set the output type to be the same
+      // as the input type.
+      int resultScale = Math.max(ScalarType.MIN_ADJUSTED_SCALE, digitsAfter);
+      int resultPrecision = digitsBefore + resultScale;
+      return ScalarType.createAdjustedDecimalType(resultPrecision, resultScale);
+    } else if (fnName_.getFunction().equalsIgnoreCase("ceil") ||
                fnName_.getFunction().equalsIgnoreCase("ceiling") ||
                fnName_.getFunction().equals("floor") ||
                fnName_.getFunction().equals("dfloor")) {
@@ -332,6 +394,7 @@ public class FunctionCallExpr extends Expr {
       digitsAfter = 0;
     } else if (fnName_.getFunction().equalsIgnoreCase("truncate") ||
                fnName_.getFunction().equalsIgnoreCase("dtrunc") ||
+               fnName_.getFunction().equalsIgnoreCase("trunc") ||
                fnName_.getFunction().equalsIgnoreCase("round") ||
                fnName_.getFunction().equalsIgnoreCase("dround")) {
       if (children_.size() > 1) {
@@ -377,16 +440,14 @@ public class FunctionCallExpr extends Expr {
       }
     }
     Preconditions.checkState(returnType.isDecimal() && !returnType.isWildcardDecimal());
-    return ScalarType.createDecimalTypeInternal(digitsBefore + digitsAfter, digitsAfter);
+    return ScalarType.createClippedDecimalType(digitsBefore + digitsAfter, digitsAfter);
   }
 
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (isAnalyzed_) return;
-    super.analyze(analyzer);
+  protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     fnName_.analyze(analyzer);
 
-    if (isMergeAggFn_) {
+    if (isMergeAggFn()) {
       // This is the function call expr after splitting up to a merge aggregation.
       // The function has already been analyzed so just do the minimal sanity
       // check here.
@@ -513,6 +574,9 @@ public class FunctionCallExpr extends Expr {
     if (hasChildCosts()) evalCost_ = getChildCosts() + FUNCTION_CALL_COST;
   }
 
+  public FunctionCallExpr getMergeAggInputFn() { return mergeAggInputFn_; }
+  public void setMergeAggInputFn(FunctionCallExpr fn) { mergeAggInputFn_ = fn; }
+
   /**
    * Checks that no special aggregate params are included in 'params' that would be
    * invalid for a scalar function. Analysis of the param exprs is not done.
@@ -527,6 +591,43 @@ public class FunctionCallExpr extends Expr {
     }
   }
 
+  /**
+   * Validate that the internal state, specifically types, is consistent between the
+   * the Update() and Merge() aggregate functions.
+   */
+  void validateMergeAggFn(FunctionCallExpr inputAggFn) {
+    Preconditions.checkState(isMergeAggFn());
+    List<Expr> copiedInputExprs = mergeAggInputFn_.getChildren();
+    List<Expr> inputExprs = inputAggFn.isMergeAggFn() ?
+        inputAggFn.mergeAggInputFn_.getChildren() : inputAggFn.getChildren();
+    Preconditions.checkState(copiedInputExprs.size() == inputExprs.size());
+    for (int i = 0; i < inputExprs.size(); ++i) {
+      Type copiedInputType = copiedInputExprs.get(i).getType();
+      Type inputType = inputExprs.get(i).getType();
+      Preconditions.checkState(copiedInputType.equals(inputType),
+          String.format("Copied expr %s arg type %s differs from input expr type %s " +
+            "in original expr %s", toSql(), copiedInputType.toSql(),
+            inputType.toSql(), inputAggFn.toSql()));
+    }
+  }
+
   @Override
   public Expr clone() { return new FunctionCallExpr(this); }
+
+  @Override
+  protected Expr substituteImpl(ExprSubstitutionMap smap, Analyzer analyzer)
+      throws AnalysisException {
+    Expr e = super.substituteImpl(smap, analyzer);
+    if (!(e instanceof FunctionCallExpr)) return e;
+    FunctionCallExpr fn = (FunctionCallExpr) e;
+    FunctionCallExpr mergeFn = fn.getMergeAggInputFn();
+    if (mergeFn != null) {
+      // The merge function needs to be substituted as well.
+      Expr substitutedFn = mergeFn.substitute(smap, analyzer, true);
+      Preconditions.checkState(substitutedFn instanceof FunctionCallExpr);
+      fn.setMergeAggInputFn((FunctionCallExpr) substitutedFn);
+    }
+    return e;
+  }
+
 }

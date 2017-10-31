@@ -38,6 +38,7 @@ import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlan;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.BitUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,9 +65,6 @@ import com.google.common.math.LongMath;
  */
 abstract public class PlanNode extends TreeNode<PlanNode> {
   private final static Logger LOG = LoggerFactory.getLogger(PlanNode.class);
-
-  // TODO: Retrieve from the query options instead of using a default.
-  protected final static int DEFAULT_BATCH_SIZE = 1024;
 
   // String used for this node in getExplainString().
   protected String displayName_;
@@ -95,7 +93,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   // assigned to a fragment. Set and maintained by enclosing PlanFragment.
   protected PlanFragment fragment_;
 
-  // if set, needs to be applied by parent node to reference this node's output
+  // If set, needs to be applied by parent node to reference this node's output. The
+  // entries need to be propagated all the way to the root node.
   protected ExprSubstitutionMap outputSmap_;
 
   // global state of planning wrt conjunct assignment; used by planner as a shortcut
@@ -113,12 +112,13 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   // set in computeStats(); invalid: -1
   protected int numNodes_;
 
+  // resource requirements and estimates for this plan node.
+  // Initialized with a dummy value. Gets set correctly in
+  // computeResourceProfile().
+  protected ResourceProfile nodeResourceProfile_ = ResourceProfile.invalid();
+
   // sum of tupleIds_' avgSerializedSizes; set in computeStats()
   protected float avgRowSize_;
-
-  // estimated per-host memory requirement for this node;
-  // set in computeCosts(); invalid: -1
-  protected long perHostMemCost_ = -1;
 
   // If true, disable codegen for this plan node.
   protected boolean disableCodegen_;
@@ -190,9 +190,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   }
   public long getLimit() { return limit_; }
   public boolean hasLimit() { return limit_ > -1; }
-  public long getPerHostMemCost() { return perHostMemCost_; }
   public long getCardinality() { return cardinality_; }
   public int getNumNodes() { return numNodes_; }
+  public ResourceProfile getNodeResourceProfile() { return nodeResourceProfile_; }
   public float getAvgRowSize() { return avgRowSize_; }
   public void setFragment(PlanFragment fragment) { fragment_ = fragment; }
   public PlanFragment getFragment() { return fragment_; }
@@ -207,7 +207,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   /**
    * Set the limit_ to the given limit_ only if the limit_ hasn't been set, or the new limit_
    * is lower.
-   * @param limit_
    */
   public void setLimit(long limit) {
     if (limit_ == -1 || (limit != -1 && limit_ > limit)) limit_ = limit;
@@ -238,8 +237,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     conjuncts_.clear();
   }
 
-  public String getExplainString() {
-    return getExplainString("", "", TExplainLevel.VERBOSE);
+  public String getExplainString(TQueryOptions queryOptions) {
+    return getExplainString("", "", queryOptions, TExplainLevel.VERBOSE);
   }
 
   protected void setDisplayName(String s) { displayName_ = s; }
@@ -272,7 +271,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    * output will be prefixed by prefix.
    */
   protected final String getExplainString(String rootPrefix, String prefix,
-      TExplainLevel detailLevel) {
+      TQueryOptions queryOptions, TExplainLevel detailLevel) {
     StringBuilder expBuilder = new StringBuilder();
     String detailPrefix = prefix;
     String filler;
@@ -305,11 +304,12 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     // Output cardinality, cost estimates and tuple Ids only when explain plan level
     // is extended or above.
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
-      // Print estimated output cardinality and memory cost.
-      expBuilder.append(PrintUtils.printHosts(detailPrefix, numNodes_));
-      expBuilder.append(PrintUtils.printMemCost(" ", perHostMemCost_) + "\n");
+      // Print resource profile.
+      expBuilder.append(detailPrefix);
+      expBuilder.append(nodeResourceProfile_.getExplainString());
+      expBuilder.append("\n");
 
-      // Print tuple ids and row size.
+      // Print tuple ids, row size and cardinality.
       expBuilder.append(detailPrefix + "tuple-ids=");
       for (int i = 0; i < tupleIds_.size(); ++i) {
         TupleId tupleId = tupleIds_.get(i);
@@ -334,15 +334,21 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
           // we're crossing a fragment boundary
           expBuilder.append(
               child.fragment_.getExplainString(
-                childHeadlinePrefix, childDetailPrefix, detailLevel));
+                childHeadlinePrefix, childDetailPrefix, queryOptions, detailLevel));
         } else {
-          expBuilder.append(
-              child.getExplainString(childHeadlinePrefix, childDetailPrefix,
-                  detailLevel));
+          expBuilder.append(child.getExplainString(childHeadlinePrefix,
+              childDetailPrefix, queryOptions, detailLevel));
         }
         if (printFiller) expBuilder.append(filler + "\n");
       }
-      expBuilder.append(children_.get(0).getExplainString(prefix, prefix, detailLevel));
+      PlanFragment childFragment = children_.get(0).fragment_;
+      if (fragment_ != childFragment && detailLevel == TExplainLevel.EXTENDED) {
+        // we're crossing a fragment boundary - print the fragment header.
+        expBuilder.append(childFragment.getFragmentHeaderString(prefix, prefix,
+            queryOptions.getMt_dop()));
+      }
+      expBuilder.append(
+          children_.get(0).getExplainString(prefix, prefix, queryOptions, detailLevel));
     }
     return expBuilder.toString();
   }
@@ -382,7 +388,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
     TExecStats estimatedStats = new TExecStats();
     estimatedStats.setCardinality(cardinality_);
-    estimatedStats.setMemory_used(perHostMemCost_);
+    estimatedStats.setMemory_used(nodeResourceProfile_.getMemEstimateBytes());
     msg.setLabel(getDisplayLabel());
     msg.setLabel_detail(getDisplayLabelDetail());
     msg.setEstimated_stats(estimatedStats);
@@ -402,6 +408,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
       msg.addToRuntime_filters(filter.toThrift());
     }
     msg.setDisable_codegen(disableCodegen_);
+    Preconditions.checkState(nodeResourceProfile_.isValid());
+    msg.resource_profile = nodeResourceProfile_.toThrift();
     toThrift(msg);
     container.addToNodes(msg);
     // For the purpose of the BE consider ExchangeNodes to have no children.
@@ -575,14 +583,14 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   }
 
   /**
-   * Computes and returns the sum of two cardinalities. If an overflow occurs,
+   * Computes and returns the sum of two long values. If an overflow occurs,
    * the maximum Long value is returned (Long.MAX_VALUE).
    */
-  public static long addCardinalities(long a, long b) {
+  public static long checkedAdd(long a, long b) {
     try {
       return LongMath.checkedAdd(a, b);
     } catch (ArithmeticException e) {
-      LOG.warn("overflow when adding cardinalities: " + a + ", " + b);
+      LOG.warn("overflow when adding longs: " + a + ", " + b);
       return Long.MAX_VALUE;
     }
   }
@@ -591,11 +599,11 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    * Computes and returns the product of two cardinalities. If an overflow
    * occurs, the maximum Long value is returned (Long.MAX_VALUE).
    */
-  public static long multiplyCardinalities(long a, long b) {
+  public static long checkedMultiply(long a, long b) {
     try {
       return LongMath.checkedMultiply(a, b);
     } catch (ArithmeticException e) {
-      LOG.warn("overflow when multiplying cardinalities: " + a + ", " + b);
+      LOG.warn("overflow when multiplying longs: " + a + ", " + b);
       return Long.MAX_VALUE;
     }
   }
@@ -608,12 +616,75 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   public boolean isBlockingNode() { return false; }
 
   /**
-   * Estimates the cost of executing this PlanNode. Currently only sets perHostMemCost_.
-   * May only be called after this PlanNode has been placed in a PlanFragment because
-   * the cost computation is dependent on the enclosing fragment's data partition.
+   * Compute peak resources consumed when executing this PlanNode, initializing
+   * 'nodeResourceProfile_'. May only be called after this PlanNode has been placed in
+   * a PlanFragment because the cost computation is dependent on the enclosing fragment's
+   * data partition.
    */
-  public void computeCosts(TQueryOptions queryOptions) {
-    perHostMemCost_ = 0;
+  public abstract void computeNodeResourceProfile(TQueryOptions queryOptions);
+
+  /**
+   * Wrapper class to represent resource profiles during different phases of execution.
+   */
+  public static class ExecPhaseResourceProfiles {
+    public ExecPhaseResourceProfiles(
+        ResourceProfile duringOpenProfile, ResourceProfile postOpenProfile) {
+      this.duringOpenProfile = duringOpenProfile;
+      this.postOpenProfile = postOpenProfile;
+    }
+
+    /** Peak resources consumed while Open() is executing for this subtree */
+    public final ResourceProfile duringOpenProfile;
+
+    /**
+     * Peak resources consumed for this subtree from the time when ExecNode::Open()
+     * returns until the time when ExecNode::Close() returns.
+     */
+    public final ResourceProfile postOpenProfile;
+  }
+
+  /**
+   * Recursive function used to compute the peak resources consumed by this subtree of
+   * the plan within a fragment instance. The default implementation of this function
+   * is correct for streaming and blocking PlanNodes with a single child. PlanNodes
+   * that don't meet this description must override this function.
+   *
+   * Not called for PlanNodes inside a subplan: the root SubplanNode is responsible for
+   * computing the peak resources for the entire subplan.
+   *
+   * computeNodeResourceProfile() must be called on all plan nodes in this subtree before
+   * calling this function.
+   */
+  public ExecPhaseResourceProfiles computeTreeResourceProfiles(
+      TQueryOptions queryOptions) {
+    Preconditions.checkState(
+        children_.size() <= 1, "Plan nodes with > 1 child must override");
+    if (children_.isEmpty()) {
+      return new ExecPhaseResourceProfiles(nodeResourceProfile_, nodeResourceProfile_);
+    }
+    ExecPhaseResourceProfiles childResources =
+        getChild(0).computeTreeResourceProfiles(queryOptions);
+    if (isBlockingNode()) {
+      // This does not consume resources until after child's Open() returns. The child is
+      // then closed before Open() of this node returns.
+      ResourceProfile duringOpenProfile = childResources.duringOpenProfile.max(
+          childResources.postOpenProfile.sum(nodeResourceProfile_));
+      return new ExecPhaseResourceProfiles(duringOpenProfile, nodeResourceProfile_);
+    } else {
+      // Streaming node: this node, child and ancestor execute concurrently.
+      return new ExecPhaseResourceProfiles(
+          childResources.duringOpenProfile.sum(nodeResourceProfile_),
+          childResources.postOpenProfile.sum(nodeResourceProfile_));
+    }
+  }
+
+  /**
+   * Compute the buffer size that will be used to fit the maximum-sized row - either the
+   * default buffer size provided or the smallest buffer that fits a maximum-sized row.
+   */
+  protected static long computeMaxSpillableBufferSize(long defaultBufferSize,
+      long maxRowSize) {
+    return Math.max(defaultBufferSize, BitUtil.roundUpToPowerOf2(maxRowSize));
   }
 
   /**
@@ -625,7 +696,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     for(PlanNode p : children_) {
       long tmp = p.getCardinality();
       if (tmp == -1) return -1;
-      sum = addCardinalities(sum, tmp);
+      sum = checkedAdd(sum, tmp);
     }
     return sum;
   }

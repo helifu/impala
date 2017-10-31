@@ -52,7 +52,7 @@ class ThreadPool : public CacheLineAligned {
     for (int i = 0; i < num_threads; ++i) {
       std::stringstream threadname;
       threadname << thread_prefix << "(" << i + 1 << ":" << num_threads << ")";
-      threads_.AddThread(new Thread(group, threadname.str(),
+      threads_.AddThread(std::make_unique<Thread>(group, threadname.str(),
           boost::bind<void>(boost::mem_fn(&ThreadPool<T>::WorkerThread), this, i)));
     }
   }
@@ -75,8 +75,9 @@ class ThreadPool : public CacheLineAligned {
   //
   /// Returns true if the work item was successfully added to the queue, false otherwise
   /// (which typically means that the thread pool has already been shut down).
-  bool Offer(const T& work) {
-    return work_queue_.BlockingPut(work);
+  template <typename V>
+  bool Offer(V&& work) {
+    return work_queue_.BlockingPut(std::forward<V>(work));
   }
 
   /// Shuts the thread pool down, causing the work queue to cease accepting offered work

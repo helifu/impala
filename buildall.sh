@@ -59,7 +59,9 @@ CODE_COVERAGE=0
 BUILD_ASAN=0
 BUILD_FE_ONLY=0
 BUILD_TIDY=0
-MAKE_CMD=make
+BUILD_UBSAN=0
+# Export MAKE_CMD so it is visible in scripts that invoke make, e.g. copy-udfs-udas.sh
+export MAKE_CMD=make
 LZO_CMAKE_ARGS=
 
 # Defaults that can be picked up from the environment, but are overridable through the
@@ -113,11 +115,16 @@ do
     -tidy)
       BUILD_TIDY=1
       ;;
+    -ubsan)
+      BUILD_UBSAN=1
+      ;;
     -testpairwise)
       EXPLORATION_STRATEGY=pairwise
       ;;
     -testexhaustive)
       EXPLORATION_STRATEGY=exhaustive
+      # See bin/run-all-tests.sh and IMPALA-3947 for more information on
+      # what this means.
       ;;
     -snapshot_file)
       SNAPSHOT_FILE="${2-}"
@@ -171,7 +178,7 @@ do
       echo "[-noclean] : Omits cleaning all packages before building. Will not kill"\
            "running Hadoop services unless any -format* is True"
       echo "[-format] : Format the minicluster, metastore db, and sentry policy db"\
-           " [Default: False]"
+           "[Default: False]"
       echo "[-format_cluster] : Format the minicluster [Default: False]"
       echo "[-format_metastore] : Format the metastore db [Default: False]"
       echo "[-format_sentry_policy_db] : Format the Sentry policy db [Default: False]"
@@ -179,19 +186,21 @@ do
       echo "[-codecoverage] : Build with code coverage [Default: False]"
       echo "[-asan] : Address sanitizer build [Default: False]"
       echo "[-tidy] : clang-tidy build [Default: False]"
+      echo "[-ubsan] : Undefined behavior build [Default: False]"
       echo "[-skiptests] : Skips execution of all tests"
       echo "[-notests] : Skips building and execution of all tests"
       echo "[-start_minicluster] : Start test cluster including Impala and all"\
-            " its dependencies. If already running, all services are restarted."\
-            " Regenerates test cluster config files. [Default: True if running "\
-            " tests or loading data, False otherwise]"
+           "its dependencies. If already running, all services are restarted."\
+           "Regenerates test cluster config files. [Default: True if running"\
+           "tests or loading data, False otherwise]"
       echo "[-start_impala_cluster] : Start Impala minicluster after build"\
-           " [Default: False]"
+           "[Default: False]"
       echo "[-testpairwise] : Run tests in 'pairwise' mode (increases"\
            "test execution time)"
-      echo "[-testexhaustive] : Run tests in 'exhaustive' mode (significantly increases"\
-           "test execution time)"
-      echo "[-testdata] : Loads test data. Implied as true if -snapshot_file is "\
+      echo "[-testexhaustive] : Run tests in 'exhaustive' mode, which significantly"\
+           "increases test execution time. ONLY APPLIES to suites with workloads:"\
+           "functional-query, targeted-stress"
+      echo "[-testdata] : Loads test data. Implied as true if -snapshot_file is"\
            "specified. If -snapshot_file is not specified, data will be regenerated."
       echo "[-snapshot_file <file name>] : Load test data from a snapshot file"
       echo "[-metastore_snapshot_file <file_name>]: Load the hive metastore snapshot"
@@ -256,6 +265,9 @@ fi
 if [[ ${BUILD_TIDY} -eq 1 ]]; then
   CMAKE_BUILD_TYPE=TIDY
 fi
+if [[ ${BUILD_UBSAN} -eq 1 ]]; then
+  CMAKE_BUILD_TYPE=UBSAN
+fi
 
 MAKE_IMPALA_ARGS+=" -build_type=${CMAKE_BUILD_TYPE}"
 
@@ -286,6 +298,23 @@ if [[ $TESTS_ACTION -eq 1 || $TESTDATA_ACTION -eq 1 || $FORMAT_CLUSTER -eq 1 ||
   NEED_MINICLUSTER=1
 fi
 
+create_log_dirs() {
+  # Create all of the log directories.
+  mkdir -p $IMPALA_ALL_LOGS_DIRS
+
+  # Create symlinks Testing/Temporary and be/Testing/Temporary that point to the BE test
+  # log dir to capture the all logs of BE unit tests. Gtest has Testing/Temporary
+  # hardwired in its code, so we cannot change the output dir by configuration.
+  # We create two symlinks to capture the logs when running ctest either from
+  # ${IMPALA_HOME} or ${IMPALA_HOME}/be.
+  rm -rf "${IMPALA_HOME}/Testing"
+  mkdir -p "${IMPALA_HOME}/Testing"
+  ln -fs "${IMPALA_BE_TEST_LOGS_DIR}" "${IMPALA_HOME}/Testing/Temporary"
+  rm -rf "${IMPALA_HOME}/be/Testing"
+  mkdir -p "${IMPALA_HOME}/be/Testing"
+  ln -fs "${IMPALA_BE_TEST_LOGS_DIR}" "${IMPALA_HOME}/be/Testing/Temporary"
+}
+
 bootstrap_dependencies() {
   # Populate necessary thirdparty components unless it's set to be skipped.
   if [[ "${SKIP_TOOLCHAIN_BOOTSTRAP}" = true ]]; then
@@ -310,37 +339,20 @@ bootstrap_dependencies() {
 
 # Build the Impala frontend and its dependencies.
 build_fe() {
-  "$IMPALA_HOME/bin/make_impala.sh" ${MAKE_IMPALA_ARGS} -cmake_only
-  "${MAKE_CMD}" fe
+  "$IMPALA_HOME/bin/make_impala.sh" ${MAKE_IMPALA_ARGS} -fe_only
 }
 
 # Build all components.
 build_all_components() {
-  # Build common and backend. This also sets up the CMake files.
-  echo "Calling make_impala.sh ${MAKE_IMPALA_ARGS}"
-  "$IMPALA_HOME/bin/make_impala.sh" ${MAKE_IMPALA_ARGS}
-
+  # Build the Impala frontend, backend and external data source API.
+  MAKE_IMPALA_ARGS+=" -fe -cscope -tarballs"
   if [[ -e "$IMPALA_LZO" ]]
   then
-    pushd "$IMPALA_LZO"
-    LZO_CMAKE_ARGS+=" -DCMAKE_TOOLCHAIN_FILE=./cmake_modules/toolchain.cmake"
-    rm -f CMakeCache.txt
-    cmake ${LZO_CMAKE_ARGS}
-    "${MAKE_CMD}"
-    popd
+    MAKE_IMPALA_ARGS+=" -impala-lzo"
   fi
 
-  # Build the Java components (fe and external data source API).
-  pushd "$IMPALA_HOME"
-  "${MAKE_CMD}" ext-data-source fe
-  popd
-
-  # Build the shell tarball
-  echo "Creating shell tarball"
-  "${IMPALA_HOME}/shell/make_shell_tarball.sh"
-
-  # Generate list of files for Cscope to index
-  "$IMPALA_HOME/bin/gen-cscope.sh"
+  echo "Running make_impala.sh ${MAKE_IMPALA_ARGS}"
+  "$IMPALA_HOME/bin/make_impala.sh" ${MAKE_IMPALA_ARGS}
 }
 
 # Do any configuration of the test cluster required by the script arguments.
@@ -425,6 +437,8 @@ run_all_tests() {
 if [[ "$CLEAN_ACTION" -eq 1 ]]; then
   "$IMPALA_HOME/bin/clean.sh"
 fi
+
+create_log_dirs
 
 bootstrap_dependencies
 

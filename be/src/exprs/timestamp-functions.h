@@ -22,9 +22,20 @@
 #include "common/status.h"
 #include "udf/udf.h"
 
-using namespace impala_udf;
-
 namespace impala {
+
+using impala_udf::FunctionContext;
+using impala_udf::AnyVal;
+using impala_udf::BooleanVal;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
 
 class Expr;
 class OpcodeRegistry;
@@ -35,19 +46,24 @@ class TupleRow;
 /// TODO: Reconsider whether this class needs to exist.
 class TimestampFunctions {
  public:
-  // To workaround IMPALA-1675 (boost doesn't throw an error for very large intervals),
-  // define the max intervals.
-  static const int64_t MAX_YEAR;
-  static const int64_t MIN_YEAR;
-  static const int64_t MAX_YEAR_INTERVAL;
-  static const int64_t MAX_MONTH_INTERVAL;
-  static const int64_t MAX_WEEK_INTERVAL;
-  static const int64_t MAX_DAY_INTERVAL;
-  static const int64_t MAX_HOUR_INTERVAL;
-  static const int64_t MAX_MINUTE_INTERVAL;
-  static const int64_t MAX_SEC_INTERVAL;
-  static const int64_t MAX_MILLI_INTERVAL;
-  static const int64_t MAX_MICRO_INTERVAL;
+  /// To workaround a boost bug (where adding very large intervals to ptimes causes the
+  /// value to wrap around instead or throwing an exception -- the root cause of
+  /// IMPALA-1675), max interval value are defined below. Some values below are less than
+  /// the minimum interval needed to trigger IMPALA-1675 but the values are greater or
+  /// equal to the interval that would definitely result in an out of bounds value. The
+  /// min and max year are also defined for manual error checking. The min / max years
+  /// are derived from date(min_date_time).year() / date(max_date_time).year().
+  static const int64_t MAX_YEAR = 9999;
+  static const int64_t MIN_YEAR = 1400;
+  static const int64_t MAX_YEAR_INTERVAL = MAX_YEAR - MIN_YEAR;
+  static const int64_t MAX_MONTH_INTERVAL = MAX_YEAR_INTERVAL * 12;
+  static const int64_t MAX_WEEK_INTERVAL = MAX_YEAR_INTERVAL * 53;
+  static const int64_t MAX_DAY_INTERVAL = MAX_YEAR_INTERVAL * 366;
+  static const int64_t MAX_HOUR_INTERVAL = MAX_DAY_INTERVAL * 24;
+  static const int64_t MAX_MINUTE_INTERVAL = MAX_HOUR_INTERVAL * 60;
+  static const int64_t MAX_SEC_INTERVAL = MAX_MINUTE_INTERVAL * 60;
+  static const int64_t MAX_MILLI_INTERVAL = MAX_SEC_INTERVAL * 1000;
+  static const int64_t MAX_MICRO_INTERVAL = MAX_MILLI_INTERVAL * 1000;
 
   /// Parse and initialize format string if it is a constant. Raise error if invalid.
   static void UnixAndFromUnixPrepare(FunctionContext* context,
@@ -56,12 +72,26 @@ class TimestampFunctions {
       FunctionContext::FunctionStateScope scope);
 
   /// Parses 'string_val' based on the format 'fmt'.
+  /// The time zone interpretation of the parsed timestamp is determined by
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context, const StringVal& string_val,
       const StringVal& fmt);
-  /// Converts 'tv_val' to a unix time_t
+
+  /// Converts 'tv_val' to a unix time_t.
+  /// The time zone interpretation of the specified timestamp is determined by
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context, const TimestampVal& tv_val);
+
   /// Returns the current time.
+  /// The time zone interpretation of the current time is determined by
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context);
+
+  /// Interpret 'tv_val' as a timestamp in UTC and convert to unix time in microseconds.
+  static BigIntVal UtcToUnixMicros(FunctionContext* context, const TimestampVal& tv_val);
 
   // Functions to convert to and from TimestampVal type
   static TimestampVal ToTimestamp(FunctionContext* context, const BigIntVal& bigint_val);
@@ -82,6 +112,10 @@ class TimestampFunctions {
   template <class TIME>
   static StringVal FromUnix(FunctionContext* context, const TIME& unix_time,
       const StringVal& fmt);
+
+  /// Return a timestamp in UTC from a unix time in microseconds.
+  static TimestampVal UnixMicrosToUtcTimestamp(FunctionContext* context,
+      const BigIntVal& unix_time_micros);
 
   /// Convert a timestamp to or from a particular timezone based time.
   static TimestampVal FromUtc(FunctionContext* context,
@@ -106,6 +140,7 @@ class TimestampFunctions {
 
   /// Date/time functions.
   static TimestampVal Now(FunctionContext* context);
+  static TimestampVal UtcTimestamp(FunctionContext* context);
   static StringVal ToDate(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DateDiff(FunctionContext* context, const TimestampVal& ts_val1,
       const TimestampVal& ts_val2);
@@ -176,6 +211,15 @@ class TimestampFunctions {
   static TimestampVal AddSub(FunctionContext* context, const TimestampVal& timestamp,
       const AnyIntVal& num_interval_units);
 
+  /// Return the last date in the month of a specified input date.
+  /// The TIMESTAMP argument requires a date component,
+  /// it may or may not have a time component.
+  /// The function will return a NULL TimestampVal when:
+  ///   1) The TIMESTAMP argument is missing a date component.
+  ///   2) The TIMESTAMP argument is outside of the supported range:
+  ///         between 1400-01-31 00:00:00 and 9999-12-31 23:59:59
+  static TimestampVal LastDay(FunctionContext* context, const TimestampVal& ts);
+
   /// Helper function to check date/time format strings.
   /// TODO: eventually return format converted from Java to Boost.
   static StringValue* CheckFormat(StringValue* format);
@@ -185,8 +229,6 @@ class TimestampFunctions {
       const StringVal& format, bool is_error);
 
  private:
-  static std::string ToIsoExtendedString(const TimestampValue& ts_value);
-
   /// Static result values for DayName() function.
   static const char* MONDAY;
   static const char* TUESDAY;
@@ -195,6 +237,10 @@ class TimestampFunctions {
   static const char* FRIDAY;
   static const char* SATURDAY;
   static const char* SUNDAY;
+
+  /// Static result values for ShortDayName() and ShortMonthName() functions.
+  static const std::string DAY_ARRAY[7];
+  static const std::string MONTH_ARRAY[12];
 };
 
 } // namespace impala

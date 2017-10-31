@@ -24,6 +24,7 @@
 #include "util/collection-metrics.h"
 #include "util/memory-metrics.h"
 #include "util/metrics.h"
+#include "util/histogram-metric.h"
 #include "util/thread.h"
 
 #include "common/names.h"
@@ -103,6 +104,27 @@ TEST_F(MetricsTest, GaugeMetrics) {
   IntGauge* int_gauge_with_units =
       metrics.AddGauge<int64_t>("gauge_with_units", 10);
   AssertValue(int_gauge_with_units, 10, "10s000ms");
+}
+
+TEST_F(MetricsTest, SumGauge) {
+  MetricGroup metrics("SumGauge");
+  AddMetricDef("gauge1", TMetricKind::GAUGE, TUnit::NONE);
+  AddMetricDef("gauge2", TMetricKind::GAUGE, TUnit::NONE);
+  AddMetricDef("sum", TMetricKind::GAUGE, TUnit::NONE);
+  IntGauge* gauge1 = metrics.AddGauge<int64_t>("gauge1", 0);
+  IntGauge* gauge2 = metrics.AddGauge<int64_t>("gauge2", 0);
+
+  vector<IntGauge*> gauges({gauge1, gauge2});
+  IntGauge* sum_gauge =
+      metrics.RegisterMetric(new SumGauge<int64_t>(MetricDefs::Get("sum"), gauges));
+
+  AssertValue(sum_gauge, 0, "0");
+  gauge1->Increment(1);
+  AssertValue(sum_gauge, 1, "1");
+  gauge2->Increment(-1);
+  AssertValue(sum_gauge, 0, "0");
+  gauge2->Increment(100);
+  AssertValue(sum_gauge, 100, "100");
 }
 
 TEST_F(MetricsTest, PropertyMetrics) {
@@ -195,10 +217,10 @@ TEST_F(MetricsTest, StatsMetricsSingle) {
 TEST_F(MetricsTest, MemMetric) {
 #ifndef ADDRESS_SANITIZER
   MetricGroup metrics("MemMetrics");
-  RegisterMemoryMetrics(&metrics, false);
+  ASSERT_OK(RegisterMemoryMetrics(&metrics, false, nullptr, nullptr));
   // Smoke test to confirm that tcmalloc metrics are returning reasonable values.
-  UIntGauge* bytes_in_use =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.bytes-in-use");
+  IntGauge* bytes_in_use =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.bytes-in-use");
   ASSERT_TRUE(bytes_in_use != NULL);
 
   uint64_t cur_in_use = bytes_in_use->value();
@@ -210,31 +232,31 @@ TEST_F(MetricsTest, MemMetric) {
   scoped_ptr<vector<uint64_t>> chunk(new vector<uint64_t>(100 * 1024 * 1024));
   EXPECT_GT(bytes_in_use->value(), cur_in_use);
 
-  UIntGauge* total_bytes_reserved =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.total-bytes-reserved");
+  IntGauge* total_bytes_reserved =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.total-bytes-reserved");
   ASSERT_TRUE(total_bytes_reserved != NULL);
   ASSERT_GT(total_bytes_reserved->value(), 0);
 
-  UIntGauge* pageheap_free_bytes =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.pageheap-free-bytes");
+  IntGauge* pageheap_free_bytes =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.pageheap-free-bytes");
   ASSERT_TRUE(pageheap_free_bytes != NULL);
 
-  UIntGauge* pageheap_unmapped_bytes =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.pageheap-unmapped-bytes");
+  IntGauge* pageheap_unmapped_bytes =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.pageheap-unmapped-bytes");
   EXPECT_TRUE(pageheap_unmapped_bytes != NULL);
 #endif
 }
 
 TEST_F(MetricsTest, JvmMetrics) {
   MetricGroup metrics("JvmMetrics");
-  RegisterMemoryMetrics(&metrics, true);
-  UIntGauge* jvm_total_used =
-      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<UIntGauge>(
+  ASSERT_OK(RegisterMemoryMetrics(&metrics, true, nullptr, nullptr));
+  IntGauge* jvm_total_used =
+      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<IntGauge>(
           "jvm.total.current-usage-bytes");
   ASSERT_TRUE(jvm_total_used != NULL);
   EXPECT_GT(jvm_total_used->value(), 0);
-  UIntGauge* jvm_peak_total_used =
-      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<UIntGauge>(
+  IntGauge* jvm_peak_total_used =
+      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<IntGauge>(
           "jvm.total.peak-current-usage-bytes");
   ASSERT_TRUE(jvm_peak_total_used != NULL);
   EXPECT_GT(jvm_peak_total_used->value(), 0);
@@ -324,6 +346,37 @@ TEST_F(MetricsTest, StatsMetricsJson) {
   EXPECT_EQ(stats_val["max"].GetDouble(), 20.0);
   EXPECT_EQ(stats_val["mean"].GetDouble(), 15.0);
   EXPECT_EQ(stats_val["stddev"].GetDouble(), 5.0);
+}
+
+TEST_F(MetricsTest, HistogramMetrics) {
+  MetricGroup metrics("HistoMetrics");
+  TMetricDef metric_def =
+      MakeTMetricDef("histogram-metric", TMetricKind::HISTOGRAM, TUnit::TIME_MS);
+  constexpr int MAX_VALUE = 10000;
+  HistogramMetric* metric = metrics.RegisterMetric(new HistogramMetric(
+          metric_def, MAX_VALUE, 3));
+
+  // Add value beyond limit to make sure it's recorded accurately.
+  for (int i = 0; i <= MAX_VALUE + 1; ++i) metric->Update(i);
+
+  Document document;
+  Value val;
+  metrics.ToJson(true, &document, &val);
+  const Value& histo_val = val["metrics"][0u];
+  EXPECT_EQ(histo_val["min"].GetInt(), 0);
+  EXPECT_EQ(histo_val["max"].GetInt(), MAX_VALUE + 1);
+  EXPECT_EQ(histo_val["25th %-ile"].GetInt(), 2500);
+  EXPECT_EQ(histo_val["50th %-ile"].GetInt(), 5000);
+  EXPECT_EQ(histo_val["75th %-ile"].GetInt(), 7500);
+  EXPECT_EQ(histo_val["90th %-ile"].GetInt(), 9000);
+  EXPECT_EQ(histo_val["95th %-ile"].GetInt(), 9496);
+  EXPECT_EQ(histo_val["99.9th %-ile"].GetInt(), 9984);
+  EXPECT_EQ(histo_val["min"].GetInt(), 0);
+  EXPECT_EQ(histo_val["max"].GetInt(), MAX_VALUE + 1);
+
+  EXPECT_EQ(metric->ToHumanReadable(), "Count: 10002, min / max: 0 / 10s001ms, "
+      "25th %-ile: 2s500ms, 50th %-ile: 5s000ms, 75th %-ile: 7s500ms, "
+      "90th %-ile: 9s000ms, 95th %-ile: 9s496ms, 99.9th %-ile: 9s984ms");
 }
 
 TEST_F(MetricsTest, UnitsAndDescriptionJson) {

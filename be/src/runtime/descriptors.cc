@@ -27,15 +27,16 @@
 
 #include "codegen/llvm-codegen.h"
 #include "common/object-pool.h"
+#include "common/status.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "gen-cpp/Descriptors_types.h"
 #include "gen-cpp/PlanNodes_types.h"
-#include "exprs/expr.h"
 #include "runtime/runtime-state.h"
 
 #include "common/names.h"
 
 using boost::algorithm::join;
-using namespace llvm;
 using namespace strings;
 
 // In 'thrift_partition', the location is stored in a compressed format that references
@@ -128,6 +129,15 @@ string SlotDescriptor::DebugString() const {
   return out.str();
 }
 
+bool SlotDescriptor::LayoutEquals(const SlotDescriptor& other_desc) const {
+  if (type() != other_desc.type()) return false;
+  if (is_nullable() != other_desc.is_nullable()) return false;
+  if (slot_size() != other_desc.slot_size()) return false;
+  if (tuple_offset() != other_desc.tuple_offset()) return false;
+  if (!null_indicator_offset().Equals(other_desc.null_indicator_offset())) return false;
+  return true;
+}
+
 ColumnDescriptor::ColumnDescriptor(const TColumnDescriptor& tdesc)
   : name_(tdesc.name),
     type_(ColumnType::FromThrift(tdesc.type)) {
@@ -165,25 +175,17 @@ string TableDescriptor::DebugString() const {
   return out.str();
 }
 
-HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THdfsTable& thrift_table,
-    const THdfsPartition& thrift_partition, ObjectPool* pool)
+HdfsPartitionDescriptor::HdfsPartitionDescriptor(
+    const THdfsTable& thrift_table, const THdfsPartition& thrift_partition)
   : line_delim_(thrift_partition.lineDelim),
     field_delim_(thrift_partition.fieldDelim),
     collection_delim_(thrift_partition.collectionDelim),
     escape_char_(thrift_partition.escapeChar),
     block_size_(thrift_partition.blockSize),
     id_(thrift_partition.id),
-    file_format_(thrift_partition.fileFormat),
-    object_pool_(pool) {
+    thrift_partition_key_exprs_(thrift_partition.partitionKeyExprs),
+    file_format_(thrift_partition.fileFormat) {
   DecompressLocation(thrift_table, thrift_partition, &location_);
-  for (int i = 0; i < thrift_partition.partitionKeyExprs.size(); ++i) {
-    ExprContext* ctx;
-    // TODO: Move to dedicated Init method and treat Status return correctly
-    Status status = Expr::CreateExprTree(object_pool_,
-        thrift_partition.partitionKeyExprs[i], &ctx);
-    DCHECK(status.ok());
-    partition_key_value_ctxs_.push_back(ctx);
-  }
 }
 
 string HdfsPartitionDescriptor::DebugString() const {
@@ -202,17 +204,14 @@ string DataSourceTableDescriptor::DebugString() const {
   return out.str();
 }
 
-HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
-    ObjectPool* pool)
+HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool)
   : TableDescriptor(tdesc),
     hdfs_base_dir_(tdesc.hdfsTable.hdfsBaseDir),
     null_partition_key_value_(tdesc.hdfsTable.nullPartitionKeyValue),
-    null_column_value_(tdesc.hdfsTable.nullColumnValue),
-    object_pool_(pool) {
+    null_column_value_(tdesc.hdfsTable.nullColumnValue) {
   for (const auto& entry : tdesc.hdfsTable.partitions) {
     HdfsPartitionDescriptor* partition =
-        new HdfsPartitionDescriptor(tdesc.hdfsTable, entry.second, pool);
-    object_pool_->Add(partition);
+        pool->Add(new HdfsPartitionDescriptor(tdesc.hdfsTable, entry.second));
     partition_descriptors_[entry.first] = partition;
   }
   avro_schema_ = tdesc.hdfsTable.__isset.avroSchema ? tdesc.hdfsTable.avroSchema : "";
@@ -285,8 +284,7 @@ TupleDescriptor::TupleDescriptor(const TTupleDescriptor& tdesc)
     null_bytes_offset_(tdesc.byteSize - tdesc.numNullBytes),
     slots_(),
     has_varlen_slots_(false),
-    tuple_path_(tdesc.tuplePath),
-    llvm_struct_(NULL) {
+    tuple_path_(tdesc.tuplePath) {
 }
 
 void TupleDescriptor::AddSlot(SlotDescriptor* slot) {
@@ -331,6 +329,18 @@ string TupleDescriptor::DebugString() const {
   out << "]";
   out << ")";
   return out.str();
+}
+
+bool TupleDescriptor::LayoutEquals(const TupleDescriptor& other_desc) const {
+  if (byte_size() != other_desc.byte_size()) return false;
+  if (slots().size() != other_desc.slots().size()) return false;
+
+  vector<SlotDescriptor*> slots = SlotsOrderedByIdx();
+  vector<SlotDescriptor*> other_slots = other_desc.SlotsOrderedByIdx();
+  for (int i = 0; i < slots.size(); ++i) {
+    if (!slots[i]->LayoutEquals(*other_slots[i])) return false;
+  }
+  return true;
 }
 
 RowDescriptor::RowDescriptor(const DescriptorTbl& desc_tbl,
@@ -418,7 +428,7 @@ bool RowDescriptor::IsAnyTupleNullable() const {
   return false;
 }
 
-void RowDescriptor::ToThrift(vector<TTupleId>* row_tuple_ids) {
+void RowDescriptor::ToThrift(vector<TTupleId>* row_tuple_ids) const {
   row_tuple_ids->clear();
   for (int i = 0; i < tuple_desc_map_.size(); ++i) {
     row_tuple_ids->push_back(tuple_desc_map_[i]->id());
@@ -436,11 +446,20 @@ bool RowDescriptor::IsPrefixOf(const RowDescriptor& other_desc) const {
 
 bool RowDescriptor::Equals(const RowDescriptor& other_desc) const {
   if (tuple_desc_map_.size() != other_desc.tuple_desc_map_.size()) return false;
+  return IsPrefixOf(other_desc);
+}
+
+bool RowDescriptor::LayoutIsPrefixOf(const RowDescriptor& other_desc) const {
+  if (tuple_desc_map_.size() > other_desc.tuple_desc_map_.size()) return false;
   for (int i = 0; i < tuple_desc_map_.size(); ++i) {
-    // pointer comparison okay, descriptors are unique
-    if (tuple_desc_map_[i] != other_desc.tuple_desc_map_[i]) return false;
+    if (!tuple_desc_map_[i]->LayoutEquals(*other_desc.tuple_desc_map_[i])) return false;
   }
   return true;
+}
+
+bool RowDescriptor::LayoutEquals(const RowDescriptor& other_desc) const {
+  if (tuple_desc_map_.size() != other_desc.tuple_desc_map_.size()) return false;
+  return LayoutIsPrefixOf(other_desc);
 }
 
 string RowDescriptor::DebugString() const {
@@ -451,8 +470,31 @@ string RowDescriptor::DebugString() const {
   return ss.str();
 }
 
+Status DescriptorTbl::CreatePartKeyExprs(
+    const HdfsTableDescriptor& hdfs_tbl, ObjectPool* pool) {
+  // Prepare and open partition exprs
+  for (const auto& part_entry : hdfs_tbl.partition_descriptors()) {
+    HdfsPartitionDescriptor* part_desc = part_entry.second;
+    vector<ScalarExpr*> partition_key_value_exprs;
+    RETURN_IF_ERROR(ScalarExpr::Create(part_desc->thrift_partition_key_exprs_,
+         RowDescriptor(), nullptr, pool, &partition_key_value_exprs));
+    for (const ScalarExpr* partition_expr : partition_key_value_exprs) {
+      DCHECK(partition_expr->IsLiteral());
+      DCHECK(!partition_expr->HasFnCtx());
+      DCHECK_EQ(partition_expr->GetNumChildren(), 0);
+    }
+    // TODO: RowDescriptor should arguably be optional in Prepare for known literals.
+    // Partition exprs are not used in the codegen case. Don't codegen them.
+    RETURN_IF_ERROR(ScalarExprEvaluator::Create(partition_key_value_exprs, nullptr,
+        pool, nullptr, &part_desc->partition_key_value_evals_));
+    RETURN_IF_ERROR(ScalarExprEvaluator::Open(
+        part_desc->partition_key_value_evals_, nullptr));
+  }
+  return Status::OK();
+}
+
 Status DescriptorTbl::Create(ObjectPool* pool, const TDescriptorTable& thrift_tbl,
-                             DescriptorTbl** tbl) {
+    DescriptorTbl** tbl) {
   *tbl = pool->Add(new DescriptorTbl());
   // deserialize table descriptors first, they are being referenced by tuple descriptors
   for (size_t i = 0; i < thrift_tbl.tableDescriptors.size(); ++i) {
@@ -461,6 +503,8 @@ Status DescriptorTbl::Create(ObjectPool* pool, const TDescriptorTable& thrift_tb
     switch (tdesc.tableType) {
       case TTableType::HDFS_TABLE:
         desc = pool->Add(new HdfsTableDescriptor(tdesc, pool));
+        RETURN_IF_ERROR(CreatePartKeyExprs(
+            *static_cast<const HdfsTableDescriptor*>(desc), pool));
         break;
       case TTableType::HBASE_TABLE:
         desc = pool->Add(new HBaseTableDescriptor(tdesc));
@@ -502,27 +546,18 @@ Status DescriptorTbl::Create(ObjectPool* pool, const TDescriptorTable& thrift_tb
   return Status::OK();
 }
 
-Status DescriptorTbl::PrepareAndOpenPartitionExprs(RuntimeState* state) const {
-  for (const auto& tbl_entry : tbl_desc_map_) {
-    if (tbl_entry.second->type() != TTableType::HDFS_TABLE) continue;
-    HdfsTableDescriptor* hdfs_tbl = static_cast<HdfsTableDescriptor*>(tbl_entry.second);
-    for (const auto& part_entry : hdfs_tbl->partition_descriptors()) {
-      // TODO: RowDescriptor should arguably be optional in Prepare for known literals
-      // Partition exprs are not used in the codegen case.  Don't codegen them.
-      RETURN_IF_ERROR(Expr::Prepare(part_entry.second->partition_key_value_ctxs(), state,
-          RowDescriptor(), state->instance_mem_tracker()));
-      RETURN_IF_ERROR(Expr::Open(part_entry.second->partition_key_value_ctxs(), state));
-    }
-  }
-  return Status::OK();
-}
-
-void DescriptorTbl::ClosePartitionExprs(RuntimeState* state) const {
-  for (const auto& tbl_entry: tbl_desc_map_) {
-    if (tbl_entry.second->type() != TTableType::HDFS_TABLE) continue;
-    HdfsTableDescriptor* hdfs_tbl = static_cast<HdfsTableDescriptor*>(tbl_entry.second);
+void DescriptorTbl::ReleaseResources() {
+  // close partition exprs of hdfs tables
+  for (auto entry: tbl_desc_map_) {
+    if (entry.second->type() != TTableType::HDFS_TABLE) continue;
+    const HdfsTableDescriptor* hdfs_tbl =
+        static_cast<const HdfsTableDescriptor*>(entry.second);
     for (const auto& part_entry: hdfs_tbl->partition_descriptors()) {
-      Expr::Close(part_entry.second->partition_key_value_ctxs(), state);
+      for (ScalarExprEvaluator* eval :
+             part_entry.second->partition_key_value_evals()) {
+        eval->Close(nullptr);
+        const_cast<ScalarExpr&>(eval->root()).Close();
+      }
     }
   }
 }
@@ -557,7 +592,6 @@ SlotDescriptor* DescriptorTbl::GetSlotDescriptor(SlotId id) const {
   }
 }
 
-// return all registered tuple descriptors
 void DescriptorTbl::GetTupleDescs(vector<TupleDescriptor*>* descs) const {
   descs->clear();
   for (TupleDescriptorMap::const_iterator i = tuple_desc_map_.begin();
@@ -566,8 +600,8 @@ void DescriptorTbl::GetTupleDescs(vector<TupleDescriptor*>* descs) const {
   }
 }
 
-Value* SlotDescriptor::CodegenIsNull(
-    LlvmCodeGen* codegen, LlvmBuilder* builder, Value* tuple) const {
+llvm::Value* SlotDescriptor::CodegenIsNull(
+    LlvmCodeGen* codegen, LlvmBuilder* builder, llvm::Value* tuple) const {
   return CodegenIsNull(codegen, builder, null_indicator_offset_, tuple);
 }
 
@@ -577,14 +611,14 @@ Value* SlotDescriptor::CodegenIsNull(
 //  %null_byte = load i8, i8* %null_byte_ptr
 //  %null_mask = and i8 %null_byte, 1
 //  %is_null = icmp ne i8 %null_mask, 0
-Value* SlotDescriptor::CodegenIsNull(LlvmCodeGen* codegen, LlvmBuilder* builder,
-    const NullIndicatorOffset& null_indicator_offset, Value* tuple) {
-  Value* null_byte =
+llvm::Value* SlotDescriptor::CodegenIsNull(LlvmCodeGen* codegen, LlvmBuilder* builder,
+    const NullIndicatorOffset& null_indicator_offset, llvm::Value* tuple) {
+  llvm::Value* null_byte =
       CodegenGetNullByte(codegen, builder, null_indicator_offset, tuple, NULL);
-  Constant* mask =
-      ConstantInt::get(codegen->tinyint_type(), null_indicator_offset.bit_mask);
-  Value* null_mask = builder->CreateAnd(null_byte, mask, "null_mask");
-  Constant* zero = ConstantInt::get(codegen->tinyint_type(), 0);
+  llvm::Constant* mask =
+      llvm::ConstantInt::get(codegen->tinyint_type(), null_indicator_offset.bit_mask);
+  llvm::Value* null_mask = builder->CreateAnd(null_byte, mask, "null_mask");
+  llvm::Constant* zero = llvm::ConstantInt::get(codegen->tinyint_type(), 0);
   return builder->CreateICmpNE(null_mask, zero, "is_null");
 }
 
@@ -598,18 +632,19 @@ Value* SlotDescriptor::CodegenIsNull(LlvmCodeGen* codegen, LlvmBuilder* builder,
 //  %null_bit_set = or i8 %null_bit_cleared, %null_bit
 //  store i8 %null_bit_set, i8* %null_byte_ptr3
 void SlotDescriptor::CodegenSetNullIndicator(
-    LlvmCodeGen* codegen, LlvmBuilder* builder, Value* tuple, Value* is_null) const {
+    LlvmCodeGen* codegen, LlvmBuilder* builder, llvm::Value* tuple, llvm::Value* is_null)
+    const {
   DCHECK_EQ(is_null->getType(), codegen->boolean_type());
-  Value* null_byte_ptr;
-  Value* null_byte =
+  llvm::Value* null_byte_ptr;
+  llvm::Value* null_byte =
       CodegenGetNullByte(codegen, builder, null_indicator_offset_, tuple, &null_byte_ptr);
-  Constant* mask =
-      ConstantInt::get(codegen->tinyint_type(), null_indicator_offset_.bit_mask);
-  Constant* not_mask =
-      ConstantInt::get(codegen->tinyint_type(), ~null_indicator_offset_.bit_mask);
+  llvm::Constant* mask =
+      llvm::ConstantInt::get(codegen->tinyint_type(), null_indicator_offset_.bit_mask);
+  llvm::Constant* not_mask =
+      llvm::ConstantInt::get(codegen->tinyint_type(), ~null_indicator_offset_.bit_mask);
 
-  ConstantInt* constant_is_null = dyn_cast<ConstantInt>(is_null);
-  Value* result = NULL;
+  llvm::ConstantInt* constant_is_null = llvm::dyn_cast<llvm::ConstantInt>(is_null);
+  llvm::Value* result = NULL;
   if (constant_is_null != NULL) {
     if (constant_is_null->isOne()) {
       result = builder->CreateOr(null_byte, mask, "null_bit_set");
@@ -620,37 +655,42 @@ void SlotDescriptor::CodegenSetNullIndicator(
   } else {
     // Avoid branching by computing the new byte as:
     // (null_byte & ~mask) | (-null & mask);
-    Value* byte_with_cleared_bit =
+    llvm::Value* byte_with_cleared_bit =
         builder->CreateAnd(null_byte, not_mask, "null_bit_cleared");
-    Value* sign_extended_null = builder->CreateSExt(is_null, codegen->tinyint_type());
-    Value* bit_only = builder->CreateAnd(sign_extended_null, mask, "null_bit");
+    llvm::Value* sign_extended_null =
+        builder->CreateSExt(is_null, codegen->tinyint_type());
+    llvm::Value* bit_only = builder->CreateAnd(sign_extended_null, mask, "null_bit");
     result = builder->CreateOr(byte_with_cleared_bit, bit_only, "null_bit_set");
   }
 
   builder->CreateStore(result, null_byte_ptr);
 }
 
-Value* SlotDescriptor::CodegenGetNullByte(LlvmCodeGen* codegen, LlvmBuilder* builder,
-    const NullIndicatorOffset& null_indicator_offset, Value* tuple,
-    Value** null_byte_ptr) {
-  Constant* byte_offset =
-      ConstantInt::get(codegen->int_type(), null_indicator_offset.byte_offset);
-  Value* tuple_bytes = builder->CreateBitCast(tuple, codegen->ptr_type());
-  Value* byte_ptr = builder->CreateInBoundsGEP(tuple_bytes, byte_offset, "null_byte_ptr");
+llvm::Value* SlotDescriptor::CodegenGetNullByte(
+    LlvmCodeGen* codegen, LlvmBuilder* builder,
+    const NullIndicatorOffset& null_indicator_offset, llvm::Value* tuple,
+    llvm::Value** null_byte_ptr) {
+  llvm::Constant* byte_offset =
+      llvm::ConstantInt::get(codegen->int_type(), null_indicator_offset.byte_offset);
+  llvm::Value* tuple_bytes = builder->CreateBitCast(tuple, codegen->ptr_type());
+  llvm::Value* byte_ptr =
+      builder->CreateInBoundsGEP(tuple_bytes, byte_offset, "null_byte_ptr");
   if (null_byte_ptr != NULL) *null_byte_ptr = byte_ptr;
   return builder->CreateLoad(byte_ptr, "null_byte");
 }
 
-StructType* TupleDescriptor::GetLlvmStruct(LlvmCodeGen* codegen) const {
-  // If we already generated the llvm type, just return it.
-  if (llvm_struct_ != NULL) return llvm_struct_;
+vector<SlotDescriptor*> TupleDescriptor::SlotsOrderedByIdx() const {
+  vector<SlotDescriptor*> sorted_slots(slots().size());
+  for (SlotDescriptor* slot: slots()) sorted_slots[slot->slot_idx_] = slot;
+  return sorted_slots;
+}
 
-  // Sort slots in the order they will appear in LLVM struct.
-  vector<SlotDescriptor*> sorted_slots(slots_.size());
-  for (SlotDescriptor* slot: slots_) sorted_slots[slot->slot_idx_] = slot;
+llvm::StructType* TupleDescriptor::GetLlvmStruct(LlvmCodeGen* codegen) const {
+  // Get slots in the order they will appear in LLVM struct.
+  vector<SlotDescriptor*> sorted_slots = SlotsOrderedByIdx();
 
   // Add the slot types to the struct description.
-  vector<Type*> struct_fields;
+  vector<llvm::Type*> struct_fields;
   int curr_struct_offset = 0;
   for (SlotDescriptor* slot: sorted_slots) {
     // IMPALA-3207: Codegen for CHAR is not yet implemented: bail out of codegen here.
@@ -668,7 +708,7 @@ StructType* TupleDescriptor::GetLlvmStruct(LlvmCodeGen* codegen) const {
 
   DCHECK_LE(curr_struct_offset, byte_size_);
   if (curr_struct_offset < byte_size_) {
-    struct_fields.push_back(ArrayType::get(codegen->GetType(TYPE_TINYINT),
+    struct_fields.push_back(llvm::ArrayType::get(codegen->GetType(TYPE_TINYINT),
         byte_size_ - curr_struct_offset));
   }
 
@@ -677,16 +717,15 @@ StructType* TupleDescriptor::GetLlvmStruct(LlvmCodeGen* codegen) const {
   // fields are already aligned because we order the slots by descending size and only
   // have powers-of-two slot sizes. Note that STRING and TIMESTAMP slots both occupy
   // 16 bytes although their useful payload is only 12 bytes.
-  StructType* tuple_struct = StructType::get(codegen->context(),
-      ArrayRef<Type*>(struct_fields), true);
-  const DataLayout& data_layout = codegen->execution_engine()->getDataLayout();
-  const StructLayout* layout = data_layout.getStructLayout(tuple_struct);
+  llvm::StructType* tuple_struct = llvm::StructType::get(codegen->context(),
+      llvm::ArrayRef<llvm::Type*>(struct_fields), true);
+  const llvm::DataLayout& data_layout = codegen->execution_engine()->getDataLayout();
+  const llvm::StructLayout* layout = data_layout.getStructLayout(tuple_struct);
   for (SlotDescriptor* slot: slots()) {
     // Verify that the byte offset in the llvm struct matches the tuple offset
     // computed in the FE.
     DCHECK_EQ(layout->getElementOffset(slot->llvm_field_idx()), slot->tuple_offset());
   }
-  llvm_struct_ = tuple_struct;
   return tuple_struct;
 }
 

@@ -50,12 +50,9 @@ enum PrimitiveType {
   TYPE_DATETIME,    // Not implemented
   TYPE_BINARY,      // Not implemented
   TYPE_DECIMAL,
-
-  /// This is minimally supported currently. It can't be returned to the user or
-  /// parsed from scan nodes. It can be returned from exprs and must be consumable
-  /// by exprs.
   TYPE_CHAR,
   TYPE_VARCHAR,
+  TYPE_FIXED_UDA_INTERMEDIATE,
 
   TYPE_STRUCT,
   TYPE_ARRAY,
@@ -72,11 +69,10 @@ std::string TypeToOdbcString(PrimitiveType t);
 // TODO for 2.3: rename to TypeDescriptor
 struct ColumnType {
   PrimitiveType type;
-  /// Only set if type == TYPE_CHAR or type == TYPE_VARCHAR
+  /// Only set if type one of TYPE_CHAR, TYPE_VARCHAR, TYPE_FIXED_UDA_INTERMEDIATE.
   int len;
   static const int MAX_VARCHAR_LENGTH = (1 << 16) - 1; // 65535
   static const int MAX_CHAR_LENGTH = (1 << 8) - 1; // 255
-  static const int MAX_CHAR_INLINE_LENGTH = (1 << 7); // 128
 
   /// Only set if type == TYPE_DECIMAL
   int precision, scale;
@@ -84,6 +80,7 @@ struct ColumnType {
   /// Must be kept in sync with FE's max precision/scale.
   static const int MAX_PRECISION = 38;
   static const int MAX_SCALE = MAX_PRECISION;
+  static const int MIN_ADJUSTED_SCALE = 6;
 
   /// The maximum precision representable by a 4-byte decimal (Decimal4Value)
   static const int MAX_DECIMAL4_PRECISION = 9;
@@ -106,6 +103,7 @@ struct ColumnType {
     DCHECK_NE(type, TYPE_STRUCT);
     DCHECK_NE(type, TYPE_ARRAY);
     DCHECK_NE(type, TYPE_MAP);
+    DCHECK_NE(type, TYPE_FIXED_UDA_INTERMEDIATE);
   }
 
   static ColumnType CreateCharType(int len) {
@@ -126,6 +124,14 @@ struct ColumnType {
     return ret;
   }
 
+  static ColumnType CreateFixedUdaIntermediateType(int len) {
+    DCHECK_GE(len, 1);
+    ColumnType ret;
+    ret.type = TYPE_FIXED_UDA_INTERMEDIATE;
+    ret.len = len;
+    return ret;
+  }
+
   static bool ValidateDecimalParams(int precision, int scale) {
     return precision >= 1 && precision <= MAX_PRECISION && scale >= 0
         && scale <= MAX_SCALE && scale <= precision;
@@ -140,6 +146,17 @@ struct ColumnType {
     return ret;
   }
 
+  // Matches the results of createAdjustedDecimalType in front-end code.
+  static ColumnType CreateAdjustedDecimalType(int precision, int scale) {
+    if (precision > MAX_PRECISION) {
+      int min_scale = std::min(scale, MIN_ADJUSTED_SCALE);
+      int delta = precision - MAX_PRECISION;
+      precision = MAX_PRECISION;
+      scale = std::max(scale - delta, min_scale);
+    }
+    return CreateDecimalType(precision, scale);
+  }
+
   static ColumnType FromThrift(const TColumnType& t) {
     int idx = 0;
     ColumnType result(t.types, &idx);
@@ -147,10 +164,12 @@ struct ColumnType {
     return result;
   }
 
+  static std::vector<ColumnType> FromThrift(const std::vector<TColumnType>& ttypes);
+
   bool operator==(const ColumnType& o) const {
     if (type != o.type) return false;
     if (children != o.children) return false;
-    if (type == TYPE_CHAR) return len == o.len;
+    if (type == TYPE_CHAR || type == TYPE_FIXED_UDA_INTERMEDIATE) return len == o.len;
     if (type == TYPE_DECIMAL) return precision == o.precision && scale == o.scale;
     return true;
   }
@@ -185,8 +204,7 @@ struct ColumnType {
   inline bool IsTimestampType() const { return type == TYPE_TIMESTAMP; }
 
   inline bool IsVarLenStringType() const {
-    return type == TYPE_STRING || type == TYPE_VARCHAR
-        || (type == TYPE_CHAR && len > MAX_CHAR_INLINE_LENGTH);
+    return type == TYPE_STRING || type == TYPE_VARCHAR;
   }
 
   inline bool IsComplexType() const {
@@ -210,7 +228,7 @@ struct ColumnType {
       case TYPE_VARCHAR:
         return 0;
       case TYPE_CHAR:
-        if (IsVarLenStringType()) return 0;
+      case TYPE_FIXED_UDA_INTERMEDIATE:
         return len;
       case TYPE_NULL:
       case TYPE_BOOLEAN:
@@ -244,7 +262,7 @@ struct ColumnType {
       case TYPE_VARCHAR:
         return 16;
       case TYPE_CHAR:
-        if (IsVarLenStringType()) return 16;
+      case TYPE_FIXED_UDA_INTERMEDIATE:
         return len;
       case TYPE_ARRAY:
       case TYPE_MAP:

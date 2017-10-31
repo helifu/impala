@@ -31,6 +31,7 @@ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.apache.hadoop.fs.adl.AdlFileSystem;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.impala.analysis.DescriptorTable;
@@ -111,11 +112,6 @@ public class JniFrontend {
   private final static TBinaryProtocol.Factory protocolFactory_ =
       new TBinaryProtocol.Factory();
   private final Frontend frontend_;
-
-  // Required minimum value (in milliseconds) for the HDFS config
-  // 'dfs.client.file-block-storage-locations.timeout.millis'
-  private static final long MIN_DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS =
-      10 * 1000;
 
   /**
    * Create a new instance of the Jni Frontend.
@@ -637,7 +633,6 @@ public class JniFrontend {
     output.append(checkLogFilePermission());
     output.append(checkFileSystem(CONF));
     output.append(checkShortCircuitRead(CONF));
-    output.append(checkBlockLocationTracking(CONF));
     return output.toString();
   }
 
@@ -715,42 +710,6 @@ public class JniFrontend {
   }
 
   /**
-   * Return an empty string if block location tracking is properly enabled. If not,
-   * return an error string describing the issues.
-   */
-  private String checkBlockLocationTracking(Configuration conf) {
-    StringBuilder output = new StringBuilder();
-    String errorMessage = "ERROR: block location tracking is not properly enabled " +
-        "because\n";
-    String prefix = "  - ";
-    StringBuilder errorCause = new StringBuilder();
-    if (!conf.getBoolean(DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED,
-        DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED_DEFAULT)) {
-      errorCause.append(prefix);
-      errorCause.append(DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED);
-      errorCause.append(" is not enabled.\n");
-    }
-
-    // dfs.client.file-block-storage-locations.timeout.millis should be >= 10 seconds
-    int dfsClientFileBlockStorageLocationsTimeoutMs = conf.getInt(
-        DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS,
-        DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS_DEFAULT);
-    if (dfsClientFileBlockStorageLocationsTimeoutMs <
-        MIN_DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS) {
-      errorCause.append(prefix);
-      errorCause.append(DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS);
-      errorCause.append(" is too low. It should be at least 10 seconds.\n");
-    }
-
-    if (errorCause.length() > 0) {
-      output.append(errorMessage);
-      output.append(errorCause);
-    }
-
-    return output.toString();
-  }
-
-  /**
    * Return an empty string if the default FileSystem configured in CONF refers to a
    * DistributedFileSystem and Impala can list the root directory "/". Otherwise,
    * return an error string describing the issues.
@@ -758,7 +717,9 @@ public class JniFrontend {
   private String checkFileSystem(Configuration conf) {
     try {
       FileSystem fs = FileSystem.get(CONF);
-      if (!(fs instanceof DistributedFileSystem || fs instanceof S3AFileSystem)) {
+      if (!(fs instanceof DistributedFileSystem ||
+            fs instanceof S3AFileSystem ||
+            fs instanceof AdlFileSystem)) {
         return "Currently configured default filesystem: " +
             fs.getClass().getSimpleName() + ". " +
             CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY +

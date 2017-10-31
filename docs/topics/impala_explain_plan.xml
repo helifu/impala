@@ -98,10 +98,9 @@ under the License.
       <p rev="1.2">
         The amount of detail displayed in the <codeph>EXPLAIN</codeph> output is controlled by the
         <xref href="impala_explain_level.xml#explain_level">EXPLAIN_LEVEL</xref> query option. You typically
-        increase this setting from <codeph>normal</codeph> to <codeph>verbose</codeph> (or from <codeph>0</codeph>
-        to <codeph>1</codeph>) when doublechecking the presence of table and column statistics during performance
-        tuning, or when estimating query resource usage in conjunction with the resource management features in CDH
-        5.
+        increase this setting from <codeph>standard</codeph> to <codeph>extended</codeph> (or from <codeph>1</codeph>
+        to <codeph>2</codeph>) when doublechecking the presence of table and column statistics during performance
+        tuning, or when estimating query resource usage in conjunction with the resource management features.
       </p>
 
       <!-- To do:
@@ -168,8 +167,6 @@ under the License.
         output:
       </p>
 
-<!-- This example taken from: https://github.com/cloudera/Impala/commit/af85d3b518089b8840ddea4356947e40d1aca9bd -->
-
 <codeblock>Operator              #Hosts   Avg Time   Max Time    #Rows  Est. #Rows  Peak Mem  Est. Peak Mem  Detail
 ------------------------------------------------------------------------------------------------------------------------
 09:MERGING-EXCHANGE        1   79.738us   79.738us        5           5         0        -1.00 B  UNPARTITIONED
@@ -203,7 +200,7 @@ under the License.
         reads are in effect.
       </p>
 
-      <p rev="CDH-29157">
+      <p rev="">
         By default, time values in the profile output reflect the wall-clock time taken by an operation.
         For values denoting system time or user time, the measurement unit is reflected in the metric
         name, such as <codeph>ScannerThreadsSysTime</codeph> or <codeph>ScannerThreadsUserTime</codeph>.
@@ -243,7 +240,7 @@ Query (id=6540a03d4bee0691:4963d6269b210ebd):
     Query State: FINISHED
     Query Status: OK
     Impala Version: impalad version 1.2.1 RELEASE (build edb5af1bcad63d410bc5d47cc203df3a880e9324)
-    User: cloudera
+    User: doc_demo
     Network Address: 127.0.0.1:49161
     Default Db: stats_testing
     Sql Statement: select t1.s, t2.s from t1 join t2 on (t1.id = t2.parent)

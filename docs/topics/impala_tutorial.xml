@@ -57,19 +57,11 @@ under the License.
 
     <ul>
       <li>
-        If you already have a CDH environment set up and just need to add Impala to it, follow the installation
-        process described in <xref href="impala_install.xml#install"/>. Make sure to also install the Hive
+        If you already have some <keyword keyref="hadoop_distro"/> environment set up and just need to add Impala to it,
+        follow the installation process described in <xref href="impala_install.xml#install"/>. Make sure to also install the Hive
         metastore service if you do not already have Hive configured.
       </li>
 
-      <li>
-        To set up Impala and all its prerequisites at once, in a minimal configuration that you can use for
-        small-scale experiments, set up the Cloudera QuickStart VM, which includes CDH and Impala on CentOS.
-        Use this single-node VM to try out basic SQL functionality, not anything related to
-        performance and scalability. For more information, see
-        <xref href="http://www.cloudera.com/content/support/en/downloads/quickstart_vms.html" scope="external" format="html">the
-        Cloudera QuickStart VM</xref>.
-      </li>
     </ul>
 
     <p outputclass="toc inpage"/>
@@ -130,10 +122,8 @@ under the License.
 <codeblock>$ impala-shell -i localhost --quiet
 Starting Impala Shell without Kerberos authentication
 Welcome to the Impala shell. Press TAB twice to see a list of available commands.
-
-Copyright (c) 2012 Cloudera, Inc. All rights reserved.
-
-(Shell build version: Impala Shell v...
+...
+<ph conref="../shared/ImpalaVariables.xml#impala_vars/ShellBanner"/>
 [localhost:21000] > select version();
 +-------------------------------------------
 | version()
@@ -462,20 +452,7 @@ Copyright (c) 2012 Cloudera, Inc. All rights reserved.
       </conbody>
     </concept>
 
-    <concept audience="Cloudera" id="tutorial_quickstart_vm">
-
-      <title>Setting Up Impala with the QuickStart VM</title>
-
-      <conbody>
-
-        <p>
-          This tutorial scenario shows how to set up the Cloudera QuickStart VM, load some sample data, and begin
-          experimenting with Impala inside this virtualized environment.
-        </p>
-      </conbody>
-    </concept>
-
-    <concept audience="Cloudera" id="tutorial_hdfs">
+    <concept audience="hidden" id="tutorial_hdfs">
 
       <title>Exploring the HDFS Directory Structure</title>
 
@@ -489,7 +466,7 @@ Copyright (c) 2012 Cloudera, Inc. All rights reserved.
       </conbody>
     </concept>
 
-    <concept audience="Cloudera" id="tutorial_external_table">
+    <concept audience="hidden" id="tutorial_external_table">
 
       <title/>
 
@@ -517,20 +494,20 @@ Copyright (c) 2012 Cloudera, Inc. All rights reserved.
         <p>
           Populate HDFS with the data you want to query. To begin this process, create one or more new
           subdirectories underneath your user directory in HDFS. The data for each table resides in a separate
-          subdirectory. Substitute your own username for <codeph>cloudera</codeph> where appropriate. This example
+          subdirectory. Substitute your own username for <codeph>username</codeph> where appropriate. This example
           uses the <codeph>-p</codeph> option with the <codeph>mkdir</codeph> operation to create any necessary
           parent directories if they do not already exist.
         </p>
 
 <codeblock>$ whoami
-cloudera
+username
 $ hdfs dfs -ls /user
 Found 3 items
-drwxr-xr-x   - cloudera cloudera            0 2013-04-22 18:54 /user/cloudera
+drwxr-xr-x   - username username            0 2013-04-22 18:54 /user/username
 drwxrwx---   - mapred   mapred              0 2013-03-15 20:11 /user/history
 drwxr-xr-x   - hue      supergroup          0 2013-03-15 20:10 /user/hive
-<!-- $ hdfs dfs -mkdir -p /user/cloudera/sample_data/tab1 -->
-$ hdfs dfs -mkdir -p /user/cloudera/sample_data/tab1 /user/cloudera/sample_data/tab2</codeblock>
+<!-- $ hdfs dfs -mkdir -p /user/username/sample_data/tab1 -->
+$ hdfs dfs -mkdir -p /user/username/sample_data/tab1 /user/username/sample_data/tab2</codeblock>
 
         <p>
           Here is some sample data, for two tables named <codeph>TAB1</codeph> and <codeph>TAB2</codeph>.
@@ -571,16 +548,16 @@ $ hdfs dfs -mkdir -p /user/cloudera/sample_data/tab1 /user/cloudera/sample_data/
           which use paths available in the Impala Demo VM:
         </p>
 
-<codeblock><!-- $ hdfs dfs -mkdir /user/cloudera/tab1 -->$ hdfs dfs -put tab1.csv /user/cloudera/sample_data/tab1
-$ hdfs dfs -ls /user/cloudera/sample_data/tab1
+<codeblock><!-- $ hdfs dfs -mkdir /user/username/tab1 -->$ hdfs dfs -put tab1.csv /user/username/sample_data/tab1
+$ hdfs dfs -ls /user/username/sample_data/tab1
 Found 1 items
--rw-r--r--   1 cloudera cloudera        192 2013-04-02 20:08 /user/cloudera/sample_data/tab1/tab1.csv
+-rw-r--r--   1 username username        192 2013-04-02 20:08 /user/username/sample_data/tab1/tab1.csv
 
-<!-- $ hdfs dfs -mkdir /user/cloudera/tab2 -->
-$ hdfs dfs -put tab2.csv /user/cloudera/sample_data/tab2
-$ hdfs dfs -ls /user/cloudera/sample_data/tab2
+<!-- $ hdfs dfs -mkdir /user/username/tab2 -->
+$ hdfs dfs -put tab2.csv /user/username/sample_data/tab2
+$ hdfs dfs -ls /user/username/sample_data/tab2
 Found 1 items
--rw-r--r--   1 cloudera cloudera        158 2013-04-02 20:09 /user/cloudera/sample_data/tab2/tab2.csv
+-rw-r--r--   1 username username        158 2013-04-02 20:09 /user/username/sample_data/tab2/tab2.csv
 </codeblock>
 
         <p>
@@ -622,7 +599,7 @@ CREATE EXTERNAL TABLE tab1
    col_3 TIMESTAMP
 )
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-LOCATION '/user/cloudera/sample_data/tab1';
+LOCATION '/user/username/sample_data/tab1';
 
 DROP TABLE IF EXISTS tab2;
 -- TAB2 is an external table, similar to TAB1.
@@ -633,7 +610,7 @@ CREATE EXTERNAL TABLE tab2
    col_2 DOUBLE
 )
 ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-LOCATION '/user/cloudera/sample_data/tab2';
+LOCATION '/user/username/sample_data/tab2';
 
 DROP TABLE IF EXISTS tab3;
 -- Leaving out the EXTERNAL clause means the data will be managed
@@ -666,15 +643,6 @@ ROW FORMAT DELIMITED FIELDS TERMINATED BY ',';
               Impala can write to. The ownership should be <codeph>hive:hive</codeph>, and the
               <codeph>impala</codeph> user should also be a member of the <codeph>hive</codeph> group.
             </li>
-
-            <li>
-              If the value of <codeph>hive.metastore.warehouse.dir</codeph> is different in the Cloudera Manager
-              dialogs and in the Hive shell, you might need to
-              <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cm_mc_managing_roles.html" scope="external" format="html">designate
-              the hosts running <cmdname>impalad</cmdname> with the <q>gateway</q> role for Hive</xref>, and
-              <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cm_mc_client_config.html" scope="external" format="html">deploy
-              the client configuration files</xref> to those hosts.
-            </li>
           </ul>
         </note>
       </conbody>
@@ -695,20 +663,20 @@ ROW FORMAT DELIMITED FIELDS TERMINATED BY ',';
         </p>
 
         <p>
-          The following examples set up 2 tables, referencing the paths and sample data supplied with the Cloudera
-          QuickStart VM. For historical reasons, the data physically resides in an HDFS directory tree under
+          The following examples set up 2 tables, referencing the paths and sample data from the sample TPC-DS kit for Impala.
+          For historical reasons, the data physically resides in an HDFS directory tree under
           <filepath>/user/hive</filepath>, although this particular data is entirely managed by Impala rather than
           Hive. When we create an external table, we specify the directory containing one or more data files, and
           Impala queries the combined content of all the files inside that directory. Here is how we examine the
           directories and files within the HDFS filesystem:
         </p>
 
-<codeblock>$ cd ~/cloudera/datasets
+<codeblock>$ cd ~/username/datasets
 $ ./tpcds-setup.sh
 ... Downloads and unzips the kit, builds the data and loads it into HDFS ...
 $ hdfs dfs -ls /user/hive/tpcds/customer
 Found 1 items
--rw-r--r--   1 cloudera supergroup   13209372 2013-03-22 18:09 /user/hive/tpcds/customer/customer.dat
+-rw-r--r--   1 username supergroup   13209372 2013-03-22 18:09 /user/hive/tpcds/customer/customer.dat
 $ hdfs dfs -cat /user/hive/tpcds/customer/customer.dat | more
 1|AAAAAAAABAAAAAAA|980124|7135|32946|2452238|2452208|Mr.|Javier|Lewis|Y|9|12|1936|CHILE||Javie
 r.Lewis@VFAxlnZEvOx.org|2452508|
@@ -1517,7 +1485,7 @@ Returned 10 row(s) in 0.39s</codeblock>
       </conbody>
     </concept>
 
-    <concept audience="Cloudera" id="tut_connect">
+    <concept audience="hidden" id="tut_connect">
 
       <title>Connecting to Impala through impala-shell</title>
 
@@ -1578,7 +1546,7 @@ Returned 10 row(s) in 0.39s</codeblock>
     </concept>
   </concept>
 
-  <concept audience="Cloudera" id="tut_mem_limit">
+  <concept audience="hidden" id="tut_mem_limit">
 
     <title>Effects of Memory Limits on Impala Queries</title>
   <prolog>
@@ -1705,13 +1673,12 @@ queries and perform some copy and transform operations into other tables.
 
 <codeblock>$ impala-shell -i localhost
 Starting Impala Shell without Kerberos authentication
+
 Connected to localhost:21000
-Server version: impalad version 2.2.0-cdh5 RELEASE (build 2ffd73a4255cefd521362ffe1cfb37463f67f75c)
+<ph conref="../shared/ImpalaVariables.xml#impala_vars/ImpaladBanner"/>
 Welcome to the Impala shell. Press TAB twice to see a list of available commands.
-
-Copyright (c) 2012 Cloudera, Inc. All rights reserved.
-
-(Shell build version: Impala Shell v2.1.2-cdh5 (92438b7) built on Tue Feb 24 12:36:33 PST 2015)
+...
+<ph conref="../shared/ImpalaVariables.xml#impala_vars/ShellBanner"/>
 [localhost:21000] > create database airline_data;
 [localhost:21000] > use airline_data;
 [localhost:21000] > create external table airlines_external
@@ -2109,7 +2076,7 @@ The <codeph>SHOW CREATE TABLE</codeph> statement gives us the starting point.
 |   late_aircraft_delay INT COMMENT 'inferred from: optional int32 late_aircraft_delay'
 | )
 | STORED AS PARQUET
-| LOCATION 'hdfs://a1730.halxg.cloudera.com:8020/user/impala/staging/airlines'
+| LOCATION 'hdfs://a1730.example.com:8020/user/impala/staging/airlines'
 | TBLPROPERTIES ('numFiles'='0', 'COLUMN_STATS_ACCURATE'='false',
 |   'transient_lastDdlTime'='1439425228', 'numRows'='-1', 'totalSize'='0',
 |   'rawDataSize'='-1')
@@ -2130,12 +2097,10 @@ Goodbye jrussell
 $ impala-shell -i localhost -B -d airline_data;
 Starting Impala Shell without Kerberos authentication
 Connected to localhost:21000
-Server version: impalad version 2.2.0-cdh5 RELEASE (build 2ffd73a4255cefd521362ffe1cfb37463f67f75c)
+<ph conref="../shared/ImpalaVariables.xml#impala_vars/ImpaladBanner"/>
 Welcome to the Impala shell. Press TAB twice to see a list of available commands.
-
-Copyright (c) 2012 Cloudera, Inc. All rights reserved.
-
-(Shell build version: Impala Shell v2.1.2-cdh5 (92438b7) built on Tue Feb 24 12:36:33 PST 2015)
+...
+<ph conref="../shared/ImpalaVariables.xml#impala_vars/ShellBanner"/>
 [localhost:21000] > show create table airlines_external;
 "CREATE EXTERNAL TABLE airline_data.airlines_external (
   year INT COMMENT 'inferred from: optional int32 year',
@@ -2169,7 +2134,7 @@ Copyright (c) 2012 Cloudera, Inc. All rights reserved.
   late_aircraft_delay INT COMMENT 'inferred from: optional int32 late_aircraft_delay'
 )
 STORED AS PARQUET
-LOCATION 'hdfs://a1730.halxg.cloudera.com:8020/user/impala/staging/airlines'
+LOCATION 'hdfs://a1730.example.com:8020/user/impala/staging/airlines'
 TBLPROPERTIES ('numFiles'='0', 'COLUMN_STATS_ACCURATE'='false',
   'transient_lastDdlTime'='1439425228', 'numRows'='-1', 'totalSize'='0',
   'rawDataSize'='-1')"
@@ -2334,7 +2299,7 @@ It's even possible that by chance (depending on HDFS replication factor and the 
 across the cluster), that multiple year partitions selected by a filter such as
 <codeph>WHERE year BETWEEN 1999 AND 2001</codeph> could all be read and processed by the same data node.
 The more data files each partition has, the more parallelism you can get and the less probability of <q>hotspots</q> occurring
-on particular nodes, therefore a bigger performance boost by having a big CDH cluster.
+on particular nodes, therefore a bigger performance boost by having a big cluster.
 </p>
 
 <p>
@@ -2492,7 +2457,7 @@ need to be restricted to a date range of 1995 and higher.
     </conbody>
   </concept>
 
-  <concept audience="Cloudera" id="tut_synthesizing">
+  <concept audience="hidden" id="tut_synthesizing">
 
     <title>Synthesizing Data</title>
 

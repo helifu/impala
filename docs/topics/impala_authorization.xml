@@ -38,10 +38,10 @@ under the License.
 
     <p>
       Authorization determines which users are allowed to access which resources, and what operations they are
-      allowed to perform. In Impala 1.1 and higher, you use the Sentry open source project for authorization.
-      Sentry adds a fine-grained authorization framework for Hadoop. By default (when authorization is not
-      enabled), Impala does all read and write operations with the privileges of the <codeph>impala</codeph> user,
-      which is suitable for a development/test environment but not for a secure production environment. When
+      allowed to perform. In Impala 1.1 and higher, you use Apache Sentry for
+      authorization. Sentry adds a fine-grained authorization framework for Hadoop. By default (when authorization
+      is not enabled), Impala does all read and write operations with the privileges of the <codeph>impala</codeph>
+      user, which is suitable for a development/test environment but not for a secure production environment. When
       authorization is enabled, Impala uses the OS user ID of the user who runs <cmdname>impala-shell</cmdname> or
       other client program, and associates various privileges with each user.
     </p>
@@ -74,10 +74,11 @@ under the License.
       <p rev="2.3.0 collevelauth">
         The object hierarchy for Impala covers Server, URI, Database, Table, and Column. (The Table privileges apply to views as well;
         anywhere you specify a table name, you can specify a view name instead.)
-        Column-level authorization is available in <keyword keyref="impala23_full"/> and higher, as described in
-        <xref audience="integrated" href="sg_hive_sql.xml#concept_c2q_4qx_p4/col_level_auth_sentry"/><xref audience="standalone" href="https://www.cloudera.com/documentation/enterprise/latest/topics/sg_hive_sql.html" format="html" scope="external"/>.
-        Previously, you constructed views to query specific columns and assigned privileges
-        based on the views rather than the base tables.
+        Column-level authorization is available in <keyword keyref="impala23_full"/> and higher.
+        Previously, you constructed views to query specific columns and assigned privilege based on
+        the views rather than the base tables. Now, you can use Impala's <xref href="impala_grant.xml"/> and
+        <xref href="impala_revoke.xml"/> statements to assign and revoke privileges from specific columns
+        in a table.
       </p>
 
       <p>
@@ -224,19 +225,9 @@ under the License.
       <ul>
         <li>
           <p>
-            In an environment managed by Cloudera Manager, the server name is specified through
-            <menucascade><uicontrol>Impala (Service-Wide)</uicontrol><uicontrol>Category</uicontrol><uicontrol>Advanced</uicontrol><uicontrol>Sentry Service</uicontrol></menucascade> and
-            <menucascade><uicontrol>Hive</uicontrol><uicontrol>Service-Wide</uicontrol><uicontrol>Advanced</uicontrol><uicontrol>Sentry Service</uicontrol></menucascade>.
-            The values must be the same for both, so that Impala and Hive can share the privilege rules. Restart
-            the Impala and Hive services after setting or changing this value.
-          </p>
-        </li>
-
-        <li>
-          <p>
-            In an environment not managed by Cloudera Manager, you specify this value for the
-            <codeph>sentry.hive.server</codeph> property in the <filepath>sentry-site.xml</filepath> configuration
-            file for Hive, as well as in the <codeph>-server_name</codeph> option for <cmdname>impalad</cmdname>.
+            Specify the <codeph>server1</codeph> value for the <codeph>sentry.hive.server</codeph> property in the
+            <filepath>sentry-site.xml</filepath> configuration file for Hive, as well as in the
+            <codeph>-server_name</codeph> option for <cmdname>impalad</cmdname>.
           </p>
           <p>
             If the <cmdname>impalad</cmdname> daemon is not already running, start it as described in
@@ -282,21 +273,6 @@ report_generator = server=server1-&gt;db=reporting_db-&gt;table=*-&gt;action=SEL
         <codeph>REVOKE</codeph> statements in <keyword keyref="impala20_full"/>.)
       </p>
 
-      <p>
-        Hive already had <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> statements prior to CDH 5.1, but those
-        statements were not production-ready. CDH 5.1 is the first release where those statements use the Sentry
-        framework and are considered GA level. If you used the Hive <codeph>GRANT</codeph> and
-        <codeph>REVOKE</codeph> statements prior to CDH 5.1, you must set up these privileges with the CDH 5.1
-        versions of <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> to take advantage of Sentry authorization.
-      </p>
-
-      <p>
-        For information about using the updated Hive <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> statements,
-        see
-<!-- Original URL: http://www.cloudera.com/content/cloudera-content/cloudera-docs/CDH5/latest/CDH5-Security-Guide/cdh_sg_sentry_service.html -->
-        <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cm_sg_sentry_service.html" scope="external" format="html">Sentry
-        service</xref> topic in the <cite>CDH 5 Security Guide</cite>.
-      </p>
     </conbody>
   </concept>
 
@@ -316,10 +292,11 @@ report_generator = server=server1-&gt;db=reporting_db-&gt;table=*-&gt;action=SEL
 
       <note rev="1.4.0">
         <p rev="1.4.0">
-          In <ph rev="upstream">CDH 5</ph> and higher, <ph rev="upstream">Cloudera</ph> recommends
-          managing privileges through SQL statements, as described in
-          <xref href="impala_authorization.xml#sentry_service"/>. If you are still using policy files, plan to
-          migrate to the new approach some time in the future.
+          The Sentry service, as described in <xref href="impala_authorization.xml#sentry_service"/>, stores
+          authorization metadata in a relational database. This means you can manage user privileges for Impala tables
+          using traditional <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> SQL statements, rather than the
+          policy file approach described here.If you are still using policy files, migrate to the
+          database-backed service whenever practical.
         </p>
       </note>
 
@@ -504,7 +481,7 @@ entire_server = server=server1
           </p>
 
 <codeblock>[groups]
-cloudera = training_sysadmin, instructor
+employee = training_sysadmin, instructor
 visitor = student
 
 [roles]
@@ -588,7 +565,7 @@ student = server=server1-&gt;db=training-&gt;table=lesson_*-&gt;action=SELECT
 
             <li>
               The <codeph>staging_dir</codeph> role lets us specify the HDFS path
-              <filepath>/user/cloudera/external_data</filepath> with the <codeph>LOAD DATA</codeph> statement.
+              <filepath>/user/username/external_data</filepath> with the <codeph>LOAD DATA</codeph> statement.
               Remember, when Impala queries or loads data files, it operates on all the files in that directory,
               not just a single file, so any Impala <codeph>LOCATION</codeph> parameters refer to a directory
               rather than an individual file.
@@ -605,21 +582,21 @@ student = server=server1-&gt;db=training-&gt;table=lesson_*-&gt;action=SELECT
             <li>
               We start this example after the table <codeph>external_table.sample</codeph> is already created. In
               the policy file for the example, we have already taken away the <codeph>external_table_admin</codeph>
-              role from the <codeph>cloudera</codeph> group, and replaced it with the lesser-privileged
+              role from the <codeph>username</codeph> group, and replaced it with the lesser-privileged
               <codeph>external_table</codeph> role.
             </li>
 
             <li>
-              We assign privileges to a subdirectory underneath <filepath>/user/cloudera</filepath> in HDFS,
+              We assign privileges to a subdirectory underneath <filepath>/user/username</filepath> in HDFS,
               because such privileges also apply to any subdirectories underneath. If we had assigned privileges to
-              the parent directory <filepath>/user/cloudera</filepath>, it would be too likely to mess up other
+              the parent directory <filepath>/user/username</filepath>, it would be too likely to mess up other
               files by specifying a wrong location by mistake.
             </li>
 
             <li>
-              The <codeph>cloudera</codeph> under the <codeph>[groups]</codeph> section refers to the
-              <codeph>cloudera</codeph> group. (In the demo VM used for this example, there is a
-              <codeph>cloudera</codeph> user that is a member of a <codeph>cloudera</codeph> group.)
+              The <codeph>username</codeph> under the <codeph>[groups]</codeph> section refers to the
+              <codeph>username</codeph> group. (In this example, there is a <codeph>username</codeph> user
+              that is a member of a <codeph>username</codeph> group.)
             </li>
           </ul>
 
@@ -628,12 +605,12 @@ student = server=server1-&gt;db=training-&gt;table=lesson_*-&gt;action=SELECT
           </p>
 
 <codeblock>[groups]
-cloudera = external_table, staging_dir
+username = external_table, staging_dir
 
 [roles]
 external_table_admin = server=server1-&gt;db=external_table
 external_table = server=server1-&gt;db=external_table-&gt;table=sample-&gt;action=*
-staging_dir = server=server1-&gt;uri=hdfs://127.0.0.1:8020/user/cloudera/external_data-&gt;action=*
+staging_dir = server=server1-&gt;uri=hdfs://127.0.0.1:8020/user/username/external_data-&gt;action=*
 </codeblock>
 
           <p>
@@ -664,8 +641,8 @@ Query finished, fetching results ...
 +-----+
 Returned 3 row(s) in 1.04s
 
-[localhost:21000] &gt; load data inpath '/user/cloudera/external_data' into table sample;
-Query: load data inpath '/user/cloudera/external_data' into table sample
+[localhost:21000] &gt; load data inpath '/user/username/external_data' into table sample;
+Query: load data inpath '/user/username/external_data' into table sample
 Query finished, fetching results ...
 +----------------------------------------------------------+
 | summary                                                  |
@@ -691,14 +668,14 @@ Query finished, fetching results ...
 +-------+
 Returned 9 row(s) in 0.22s
 
-[localhost:21000] &gt; load data inpath '/user/cloudera/unauthorized_data' into table sample;
-Query: load data inpath '/user/cloudera/unauthorized_data' into table sample
-ERROR: AuthorizationException: User 'cloudera' does not have privileges to access: hdfs://127.0.0.1:8020/user/cloudera/unauthorized_data
+[localhost:21000] &gt; load data inpath '/user/username/unauthorized_data' into table sample;
+Query: load data inpath '/user/username/unauthorized_data' into table sample
+ERROR: AuthorizationException: User 'username' does not have privileges to access: hdfs://127.0.0.1:8020/user/username/unauthorized_data
 </codeblock>
 
         </example>
 
-        <example audience="Cloudera" id="sec_ex_views" rev="2.3.0 collevelauth">
+        <example audience="hidden" id="sec_ex_views" rev="2.3.0 collevelauth">
 
           <title>Controlling Access at the Column Level through Views</title>
 
@@ -744,7 +721,7 @@ ERROR: AuthorizationException: User 'cloudera' does not have privileges to acces
           </p>
 
 <codeblock>[groups]
-cloudera = view_only_privs
+employee = view_only_privs
 
 [roles]
 view_only_privs = server=server1-&gt;db=reports-&gt;table=name_address_view-&gt;action=SELECT
@@ -783,11 +760,10 @@ view_only_privs = server=server1-&gt;db=reports-&gt;table=name_address_view-&gt;
               so can set up a database named <codeph>training</codeph>.
             </li>
 
-            <li>
-              Members of the <codeph>cloudera</codeph> group have the <codeph>instructor</codeph> role and so can
-              create, insert into, and query any tables in the <codeph>training</codeph> database, but cannot
-              create or drop the database itself.
-            </li>
+            <li> Members of the <codeph>employee</codeph> group have the
+                <codeph>instructor</codeph> role and so can create, insert into,
+              and query any tables in the <codeph>training</codeph> database,
+              but cannot create or drop the database itself. </li>
 
             <li>
               Members of the <codeph>visitor</codeph> group have the <codeph>student</codeph> role and so can query
@@ -797,7 +773,7 @@ view_only_privs = server=server1-&gt;db=reports-&gt;table=name_address_view-&gt;
 
 <codeblock>[groups]
 supergroup = training_sysadmin
-cloudera = instructor
+employee = instructor
 visitor = student
 
 [roles]
@@ -848,8 +824,8 @@ sales = hdfs://ha-nn-uri/etc/access/sales.ini
 </codeblock>
 
         <p>
-          To enable URIs in per-DB policy files, add the following string in the Cloudera Manager field
-          <uicontrol>Impala Service Environment Advanced Configuration Snippet (Safety Valve)</uicontrol>:
+          To enable URIs in per-DB policy files, the Java configuration option <codeph>sentry.allow.uri.db.policyfile</codeph>
+          must be set to <codeph>true</codeph>. For example:
         </p>
 
 <codeblock>JAVA_TOOL_OPTIONS="-Dsentry.allow.uri.db.policyfile=true"
@@ -931,12 +907,12 @@ Database
       </p>
 
       <p rev="2.3.0 collevelauth">
-        In <keyword keyref="impala23_full"/> and higher, you can specify privileges for individual columns,
-        as described in
-        <xref audience="integrated" href="sg_hive_sql.xml#concept_c2q_4qx_p4/col_level_auth_sentry"/><xref audience="standalone" href="https://www.cloudera.com/documentation/enterprise/latest/topics/sg_hive_sql.html" format="html" scope="external"/>.
-        Formerly, to specify
-        read privileges at this level, you created a view that queried specific columns and/or partitions from a base
-        table, and gave <codeph>SELECT</codeph> privilege on the view but not the underlying table.
+        In <keyword keyref="impala23_full"/> and higher, you can specify privileges for individual columns.
+        Formerly, to specify read privileges at this level, you created a view that queried specific columns
+        and/or partitions from a base table, and gave <codeph>SELECT</codeph> privilege on the view but not
+        the underlying table. Now, you can use Impala's <xref href="impala_grant.xml"/> and
+        <xref href="impala_revoke.xml"/> statements to assign and revoke privileges from specific columns
+        in a table.
       </p>
 
       <p>
@@ -948,8 +924,8 @@ server=server1-&gt;uri=hdfs://namenode:port/path/to/dir
 </codeblock>
         <note type="warning">
           <p>
-            Because the NameNode host and port must be specified, Cloudera strongly recommends you use High
-            Availability (HA). This ensures that the URI will remain constant even if the namenode changes.
+            Because the NameNode host and port must be specified, enable High Availability (HA) to ensure
+            that the URI will remain constant even if the NameNode changes.
           </p>
 <codeblock>data_read = server=server1-&gt;uri=file:///path/to/dir,\ server=server1-&gt;uri=hdfs://ha-nn-uri/path/to/dir
 </codeblock>
@@ -1020,10 +996,6 @@ server=server1-&gt;uri=hdfs://namenode:port/path/to/dir
           </li>
         </ul>
       </note>
-
-      <draft-comment author="ambreen.kazi" translate="no">The Privilege Model lives at:
-https://wiki.cloudera.com/pages/viewpage.action?pageId=24919851</draft-comment>
-
       <table>
         <tgroup cols="4">
           <colspec colnum="1" colname="col1" colwidth="1.31*"/>
@@ -1224,355 +1196,6 @@ https://wiki.cloudera.com/pages/viewpage.action?pageId=24919851</draft-comment>
         </tgroup>
       </table>
 
-<!-- Original table, now replaced by content conref'ed from Security Guide
-<table>
-<title>Sentry privileges for Impala SQL operations</title>
-          <tgroup cols="3">
-              <colspec colnum="1" colname="col1" colwidth="*"/>
-              <colspec colnum="2" colname="col2" colwidth="*"/>
-              <colspec colnum="3" colname="col3" colwidth="4*"/>
-<thead>
-<row>
-<entry>Impala SQL Operation</entry>
-<entry>Privileges Required</entry>
-<entry>Object on which Privileges Required</entry>
-</row>
-</thead>
-<tbody>
-<row>
-<entry>EXPLAIN</entry>
-<entry>SELECT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>LOAD DATA</entry>
-<entry>INSERT, SELECT</entry>
-<entry>Table (INSERT) and URI (ALL); write privilege is required on the URI because the data files are physically moved from there</entry>
-</row>
-<row>
-<entry>CREATE DATABASE</entry>
-<entry>ALL</entry>
-<entry><ph rev="1.4.0">Server</ph></entry>
-</row>
-<row>
-<entry>DROP DATABASE</entry>
-<entry>ALL</entry>
-<entry><ph rev="1.4.0">Server</ph></entry>
-</row>
-<row>
-<entry>CREATE TABLE</entry>
-<entry>ALL</entry>
-<entry><ph rev="1.4.0">Database</ph></entry>
-</row>
-<row>
-<entry>DROP TABLE</entry>
-<entry>ALL</entry>
-<entry><ph rev="1.4.0">Database</ph></entry>
-</row>
-<row>
-<entry>DESCRIBE TABLE</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>ALTER TABLE</entry>
-<entry>ALL</entry>
-<entry><ph rev="1.4.0">Database</ph></entry>
-</row>
-<row>
-<entry>SHOW DATABASES</entry>
-<entry>Any privilege</entry>
-<entry>Any object in the database; only databases for which the user has privileges on some object are shown</entry>
-</row>
-<row>
-<entry>SHOW TABLES</entry>
-<entry>Any privilege</entry>
-<entry>Any table in the database; only tables for which the user has privileges are shown</entry>
-</row>
-<row>
-<entry>CREATE VIEW</entry>
-<entry>ALL, SELECT</entry>
-<entry rev="2.3.0 collevelauth">
-You need <codeph>ALL</codeph> privilege on the named view <ph rev="1.4.0">and the parent database</ph>, plus <codeph>SELECT</codeph> privilege for any tables or views referenced by the view query.
-Once the view is created or altered by a high-privileged system administrator,
-it can be queried by a lower-privileged user who does not have full query privileges for the base tables.
-</entry>
-</row>
-<row>
-<entry>DROP VIEW</entry>
-<entry>ALL</entry>
-<entry><ph rev="1.4.0">Database</ph></entry>
-</row>
-<row>
-<entry>ALTER VIEW</entry>
-<entry>ALL, SELECT</entry>
-<entry rev="2.3.0 collevelauth">
-You need <codeph>ALL</codeph> privilege on the named view <ph rev="1.4.0">and the parent database</ph>, plus <codeph>SELECT</codeph> privilege for any tables or views referenced by the view query.
-Once the view is created or altered by a high-privileged system administrator,
-it can be queried by a lower-privileged user who does not have full query privileges for the base tables.
-</entry>
-</row>
-<row>
-<entry>ALTER TABLE LOCATION</entry>
-<entry>ALL</entry>
-<entry>Table, URI</entry>
-</row>
-<row>
-<entry>CREATE EXTERNAL TABLE</entry>
-<entry>ALL, SELECT</entry>
-<entry>Database (ALL), URI (SELECT)</entry>
-</row>
-<row>
-<entry>SELECT</entry>
-<entry>SELECT</entry>
-<entry rev="2.3.0 collevelauth">Table, View; you can have SELECT privilege for a view without having SELECT privilege
-for the underlying tables. See
-<xref audience="integrated" href="sg_hive_sql.xml#concept_c2q_4qx_p4/col_level_auth_sentry"/><xref audience="standalone" href="https://www.cloudera.com/documentation/enterprise/latest/topics/sg_hive_sql.html" format="html" scope="external"/>
-for details about column-level authorization.
-Before column-level authorization was added in <keyword keyref="impala23_full"/> the way to implement
-column-level security was by creating views that referenced particular sets of columns.</entry>
-</row>
-<row>
-<entry>USE</entry>
-<entry>Any privilege</entry>
-<entry>Any object in the database</entry>
-</row>
-<row rev="1.2">
-<entry>CREATE FUNCTION</entry>
-<entry>ALL</entry>
-<entry>Server</entry>
-</row>
-<row rev="1.2">
-<entry>DROP FUNCTION</entry>
-<entry>ALL</entry>
-<entry>Server</entry>
-</row>
-<row>
-<entry>REFRESH</entry>
-<entry>ALL</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>INVALIDATE METADATA</entry>
-<entry>ALL</entry>
-<entry>Server</entry>
-</row>
-<row rev="1.2.2">
-<entry>COMPUTE STATS</entry>
-<entry>ALL</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW TABLE STATS, SHOW PARTITIONS</entry>
-<entry>?</entry>
-<entry>?</entry>
-</row>
-<row>
-<entry>SHOW COLUMN STATS</entry>
-<entry>?</entry>
-<entry>?</entry>
-</row>
-<row>
-<entry>SHOW FUNCTIONS</entry>
-<entry>?</entry>
-<entry>?</entry>
-</row>
-<row>
-<entry>SHOW DATABASES, SHOW SCHEMAS</entry>
-<entry>?</entry>
-<entry>?</entry>
-</row>
-</tbody>
-</tgroup>
-</table>
--->
-
-<!-- Here are pieces from the original Hive table that do not apply to Impala because of differences in the SQL syntax.
-   Might resurrect some of these later as features are added to Impala, in particular CREATE TABLE AS SELECT.
-<row>
-<entry>EXPORT</entry>
-<entry>SELECT, INSERT@URI</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>IMPORT</entry>
-<entry>ALL, SELECT@URI</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ANALYZE</entry>
-<entry>INSERT, SELECT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SWITCH DATABASE</entry>
-<entry>Any</entry>
-<entry>Any Table, View in the DB</entry>
-</row>
-<row>
-<entry>DESCRIBE FUNCTION&#42;</entry>
-<entry>Not Restricted</entry>
-</row>
-<row>
-<entry>MSCK</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>SHOW COLUMNS</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW TABLE STATUS</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW TABLE PROPERTIES</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW CREATE TABLE</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW FUNCTIONS&#42;</entry>
-<entry>Not restricted</entry>
-</row>
-<row>
-<entry>SHOW PARTITIONS</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW INDEXES</entry>
-<entry>SELECT or INSERT</entry>
-<entry>Table</entry>
-</row>
-<row>
-<entry>SHOW LOCKS</entry>
-<entry>Not Restricted</entry>
-</row>
-<row>
-<entry>CREATE FUNCTION</entry>
-<entry>Any Privilege</entry>
-<entry>Any Object</entry>
-</row>
-<row>
-<entry>CREATE INDEX</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>DROP FUNCTION</entry>
-<entry>Any Privilege</entry>
-<entry>Any Object</entry>
-</row>
-<row>
-<entry>DROP INDEX</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER INDEX REBUILD</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER VIEW PROPERTIES</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>GRANT PRIVILEGE</entry>
-<entry>Allowed, but has no effect on HS2 auth</entry>
-</row>
-<row>
-<entry>REVOKE PRIVILEGE</entry>
-<entry>Allowed, but has no effect on HS2 auth</entry>
-</row>
-<row>
-<entry>SHOW GRANTS</entry>
-<entry>Allowed, but has no effect on HS2 auth</entry>
-</row>
-<row>
-<entry>ALTER TABLE PROTECT MODE</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER TABLE FILE FORMAT</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER PARTITION PROTECT MODE</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER PARTITION FILE FORMAT</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER PARTITION LOCATION&#42;</entry>
-<entry>ALL</entry>
-<entry>Server</entry>
-</row>
-<row>
-<entry>CREATE TABLE AS SELECT</entry>
-<entry>ALL, SELECT</entry>
-<entry>Database, Table/View</entry>
-</row>
-<row>
-<entry>ALTER INDEX PROP</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER DATABASE</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>DESCRIBE DATABASE</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER TABLE MERGE FILE</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER PARTITION MERGE FILE</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER TABLE SKEWED</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ALTER TABLE PARTITION SKEWED LOCATION</entry>
-<entry>ALL</entry>
-<entry>Database</entry>
-</row>
-<row>
-<entry>ADD JAR&#42;</entry>
-<entry>Restricted unless hive.server2.authorization.external.exec = true</entry>
-</row>
-<row>
-<entry>TRANSFORM&#42;</entry>
-<entry>ALL</entry>
-<entry>Server</entry>
-</row>
--->
     </conbody>
   </concept>
 
@@ -1583,37 +1206,6 @@ column-level security was by creating views that referenced particular sets of c
     <conbody>
 
       <p conref="../shared/impala_common.xml#common/sentry_debug"/>
-    </conbody>
-  </concept>
-
-  <concept id="sentry_cm">
-
-    <title>Managing Sentry for Impala through Cloudera Manager</title>
-
-    <conbody>
-
-      <p>
-        To enable the Sentry service for Impala and Hive, set <uicontrol>Hive/Impala &gt; Service-Wide &gt; Sentry
-        Service</uicontrol> parameter to the Sentry service. Then restart Impala and Hive. Simply adding Sentry
-        service as a dependency and restarting enables Impala and Hive to use the Sentry service.
-      </p>
-
-      <p>
-        To set the server name to use when granting server level privileges, set the <uicontrol>Hive &gt;
-        Service-Wide &gt; Advanced &gt; Server Name for Sentry Authorization</uicontrol> parameter. When using
-        Sentry with the Hive Metastore, you can specify the list of users that are allowed to bypass Sentry
-        Authorization in Hive Metastore using <uicontrol>Hive &gt; Service-Wide &gt; Security &gt; Bypass Sentry
-        Authorization Users</uicontrol>. These are usually service users that already ensure all activity has been
-        authorized.
-      </p>
-
-      <note>
-        The <uicontrol>Hive/Impala &gt; Service-Wide &gt; Policy File Based Sentry</uicontrol> tab contains
-        parameters only relevant to configuring Sentry using policy files. In particular, make sure that
-        <uicontrol>Enable Sentry Authorization using Policy Files</uicontrol> parameter is unchecked when using the
-        Sentry service. Cloudera Manager throws a validation error if you attempt to configure the Sentry service
-        and policy file at the same time.
-      </note>
     </conbody>
   </concept>
 

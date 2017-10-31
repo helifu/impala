@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from copy import copy
+import itertools
+import math
 import os
 import pytest
 import random
@@ -22,12 +25,25 @@ import shutil
 import tempfile
 import time
 from subprocess import check_call
+from tests.common.test_dimensions import create_exec_option_dimension_from_dict
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
 from tests.util.filesystem_utils import WAREHOUSE, get_fs_path
 
 # Random fuzz testing of HDFS scanners. Existing tables for any HDFS file format
 # are corrupted in random ways to flush out bugs with handling of corrupted data.
 class TestScannersFuzzing(ImpalaTestSuite):
+  # Use abort_on_error = False to ensure we scan all the files.
+  ABORT_ON_ERROR_VALUES = [False]
+
+  # Only run on all nodes - num_nodes=1 would not provide additional coverage.
+  NUM_NODES_VALUES = [0]
+
+  # Limit memory to avoid causing other concurrent tests to fail.
+  MEM_LIMITS = ['512m']
+
+  # Test the codegen and non-codegen paths.
+  DISABLE_CODEGEN_VALUES = [True, False]
+
   # Test a range of batch sizes to exercise different corner cases.
   BATCH_SIZES = [0, 1, 16, 10000]
 
@@ -38,8 +54,13 @@ class TestScannersFuzzing(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestScannersFuzzing, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension_from_dict({
+          'abort_on_error' : cls.ABORT_ON_ERROR_VALUES,
+          'num_nodes' : cls.NUM_NODES_VALUES,
+          'mem_limit' : cls.MEM_LIMITS}))
     # TODO: enable for more table formats once they consistently pass the fuzz test.
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format in ('avro', 'parquet') or
         (v.get_value('table_format').file_format == 'text' and
           v.get_value('table_format').compression_codec in ('none', 'lzo')))
@@ -120,36 +141,33 @@ class TestScannersFuzzing(ImpalaTestSuite):
     # Execute a query that tries to read all the columns and rows in the file.
     # Also execute a count(*) that materializes no columns, since different code
     # paths are exercised.
-    # Use abort_on_error=0 to ensure we scan all the files.
     queries = [
         'select count(*) from (select distinct * from {0}.{1}) q'.format(
             unique_database, table),
         'select count(*) from {0}.{1} q'.format(unique_database, table)]
 
-    xfail_msgs = []
-    for query in queries:
-      for batch_size in self.BATCH_SIZES:
-        query_options = {'abort_on_error': '0', 'batch_size': batch_size}
-        try:
-          result = self.execute_query(query, query_options = query_options)
-          LOG.info('\n'.join(result.log))
-        except Exception as e:
-          if 'memory limit exceeded' in str(e).lower():
-            # Memory limit error should fail query.
-            continue
-          msg = "Should not throw error when abort_on_error=0: '{0}'".format(e)
-          LOG.error(msg)
-          # Parquet and compressed text can fail the query for some parse errors.
-          # E.g. corrupt Parquet footer (IMPALA-3773) or a corrupt LZO index file
-          # (IMPALA-4013).
-          if table_format.file_format == 'parquet' or \
-              (table_format.file_format == 'text' and
-              table_format.compression_codec != 'none'):
-            xfail_msgs.append(msg)
-          else:
-            raise
-    if len(xfail_msgs) != 0:
-      pytest.xfail('\n'.join(xfail_msgs))
+    for query, batch_size, disable_codegen in \
+        itertools.product(queries, self.BATCH_SIZES, self.DISABLE_CODEGEN_VALUES):
+      query_options = copy(vector.get_value('exec_option'))
+      query_options['batch_size'] = batch_size
+      query_options['disable_codegen'] = disable_codegen
+      query_options['disable_codegen_rows_threshold'] = 0
+      try:
+        result = self.execute_query(query, query_options = query_options)
+        LOG.info('\n'.join(result.log))
+      except Exception as e:
+        if 'memory limit exceeded' in str(e).lower():
+          # Memory limit error should fail query.
+          continue
+        msg = "Should not throw error when abort_on_error=0: '{0}'".format(e)
+        LOG.error(msg)
+        # Parquet and compressed text can fail the query for some parse errors.
+        # E.g. corrupt Parquet footer (IMPALA-3773) or a corrupt LZO index file
+        # (IMPALA-4013).
+        if table_format.file_format != 'parquet' \
+            and not (table_format.file_format == 'text' and
+            table_format.compression_codec != 'none'):
+          raise
 
   def walk_and_corrupt_table_data(self, tmp_table_dir, num_copies, rng):
     """ Walks a local copy of a HDFS table directory. Returns a list of partitions, each
@@ -196,17 +214,18 @@ class TestScannersFuzzing(ImpalaTestSuite):
     with open(path, "rb") as f:
       data = bytearray(f.read())
 
-    if rng.random() < 0.5:
+    num_corruptions = rng.randint(0, int(math.log(len(data))))
+    for _ in xrange(num_corruptions):
       flip_offset = rng.randint(0, len(data) - 1)
       flip_val = rng.randint(0, 255)
-      LOG.info("corrupt_file: Flip byte in %s at %d from %d to %d", path, flip_offset,
-          data[flip_offset], flip_val)
+      LOG.info("corrupt file: Flip byte in {0} at {1} from {2} to {3}".format(
+          path, flip_offset, data[flip_offset], flip_val))
       data[flip_offset] = flip_val
-    else:
+
+    if rng.random() < 0.4:
       truncation = rng.randint(0, len(data))
-      LOG.info("corrupt_file: Truncate %s to %d", path, truncation)
+      LOG.info("corrupt file: Truncate {0} to {1}".format(path, truncation))
       data = data[:truncation]
 
     with open(path, "wb") as f:
       f.write(data)
-

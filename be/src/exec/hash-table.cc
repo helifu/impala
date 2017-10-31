@@ -23,10 +23,10 @@
 
 #include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
-#include "exprs/expr.h"
-#include "exprs/expr-context.h"
 #include "exprs/slot-ref.h"
-#include "runtime/buffered-block-mgr.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
+#include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/runtime-state.h"
@@ -37,8 +37,17 @@
 #include "common/names.h"
 
 using namespace impala;
-using namespace llvm;
-using namespace strings;
+using llvm::APFloat;
+using llvm::ArrayRef;
+using llvm::BasicBlock;
+using llvm::ConstantFP;
+using llvm::Function;
+using llvm::LLVMContext;
+using llvm::PHINode;
+using llvm::PointerType;
+using llvm::Type;
+using llvm::Value;
+using strings::Substitute;
 
 DEFINE_bool(enable_quadratic_probing, true, "Enable quadratic probing hash table");
 
@@ -69,40 +78,40 @@ static uint32_t SEED_PRIMES[] = {
 // We don't want(NULL, 1) to hash to the same as (0, 1).
 // This needs to be as big as the biggest primitive type since the bytes
 // get copied directly.
-// TODO find a better approach, since primitives like CHAR(N) can be up to 128 bytes
-static int64_t NULL_VALUE[] = { HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED,
-                                HashUtil::FNV_SEED, HashUtil::FNV_SEED };
+// TODO find a better approach, since primitives like CHAR(N) can be up
+// to 255 bytes
+static int64_t NULL_VALUE[] = {
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED,
+  HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED, HashUtil::FNV_SEED
+};
 
-// The first NUM_SMALL_BLOCKS of nodes_ are made of blocks less than the IO size (of 8MB)
-// to reduce the memory footprint of small queries. In particular, we always first use a
-// 64KB and a 512KB block before starting using IO-sized blocks.
-static const int64_t INITIAL_DATA_PAGE_SIZES[] = { 64 * 1024, 512 * 1024 };
-static const int NUM_SMALL_DATA_PAGES = sizeof(INITIAL_DATA_PAGE_SIZES) / sizeof(int64_t);
+static_assert(sizeof(NULL_VALUE) >= ColumnType::MAX_CHAR_LENGTH,
+    "NULL_VALUE must be at least as large as the largest possible slot");
 
-HashTableCtx::HashTableCtx(const std::vector<ExprContext*>& build_expr_ctxs,
-    const std::vector<ExprContext*>& probe_expr_ctxs, bool stores_nulls,
+HashTableCtx::HashTableCtx(const std::vector<ScalarExpr*>& build_exprs,
+    const std::vector<ScalarExpr*>& probe_exprs, bool stores_nulls,
     const std::vector<bool>& finds_nulls, int32_t initial_seed,
-    int max_levels, MemTracker* tracker)
-    : build_expr_ctxs_(build_expr_ctxs),
-      probe_expr_ctxs_(probe_expr_ctxs),
+    int max_levels, MemPool* mem_pool)
+    : build_exprs_(build_exprs),
+      probe_exprs_(probe_exprs),
       stores_nulls_(stores_nulls),
       finds_nulls_(finds_nulls),
       finds_some_nulls_(std::accumulate(
           finds_nulls_.begin(), finds_nulls_.end(), false, std::logical_or<bool>())),
       level_(0),
       scratch_row_(NULL),
-      tracker_(tracker) {
+      mem_pool_(mem_pool) {
   DCHECK(!finds_some_nulls_ || stores_nulls_);
   // Compute the layout and buffer size to store the evaluated expr results
-  DCHECK_EQ(build_expr_ctxs_.size(), probe_expr_ctxs_.size());
-  DCHECK_EQ(build_expr_ctxs_.size(), finds_nulls_.size());
-  DCHECK(!build_expr_ctxs_.empty());
+  DCHECK_EQ(build_exprs_.size(), probe_exprs_.size());
+  DCHECK_EQ(build_exprs_.size(), finds_nulls_.size());
+  DCHECK(!build_exprs_.empty());
 
   // Populate the seeds to use for all the levels. TODO: revisit how we generate these.
   DCHECK_GE(max_levels, 0);
@@ -115,30 +124,57 @@ HashTableCtx::HashTableCtx(const std::vector<ExprContext*>& build_expr_ctxs,
   }
 }
 
-Status HashTableCtx::Create(RuntimeState* state,
-    const std::vector<ExprContext*>& build_expr_ctxs,
-    const std::vector<ExprContext*>& probe_expr_ctxs, bool stores_nulls,
-    const std::vector<bool>& finds_nulls, int32_t initial_seed, int max_levels,
-    int num_build_tuples, MemTracker* tracker, scoped_ptr<HashTableCtx>* ht_ctx) {
-  ht_ctx->reset(new HashTableCtx(build_expr_ctxs, probe_expr_ctxs, stores_nulls,
-      finds_nulls, initial_seed, max_levels, tracker));
-  return ht_ctx->get()->Init(state, num_build_tuples);
-}
-
-Status HashTableCtx::Init(RuntimeState* state, int num_build_tuples) {
+Status HashTableCtx::Init(ObjectPool* pool, RuntimeState* state, int num_build_tuples) {
   int scratch_row_size = sizeof(Tuple*) * num_build_tuples;
   scratch_row_ = reinterpret_cast<TupleRow*>(malloc(scratch_row_size));
   if (UNLIKELY(scratch_row_ == NULL)) {
     return Status(Substitute("Failed to allocate $0 bytes for scratch row of "
         "HashTableCtx.", scratch_row_size));
   }
-  return expr_values_cache_.Init(state, tracker_, build_expr_ctxs_);
+  RETURN_IF_ERROR(ScalarExprEvaluator::Create(build_exprs_, state, pool, mem_pool_,
+      &build_expr_evals_));
+  DCHECK_EQ(build_exprs_.size(), build_expr_evals_.size());
+  RETURN_IF_ERROR(ScalarExprEvaluator::Create(probe_exprs_, state, pool, mem_pool_,
+      &probe_expr_evals_));
+  DCHECK_EQ(probe_exprs_.size(), probe_expr_evals_.size());
+  return expr_values_cache_.Init(state, mem_pool_->mem_tracker(), build_exprs_);
 }
 
-void HashTableCtx::Close() {
+Status HashTableCtx::Create(ObjectPool* pool, RuntimeState* state,
+    const std::vector<ScalarExpr*>& build_exprs,
+    const std::vector<ScalarExpr*>& probe_exprs, bool stores_nulls,
+    const std::vector<bool>& finds_nulls, int32_t initial_seed, int max_levels,
+    int num_build_tuples, MemPool* mem_pool, scoped_ptr<HashTableCtx>* ht_ctx) {
+  ht_ctx->reset(new HashTableCtx(build_exprs, probe_exprs, stores_nulls,
+      finds_nulls, initial_seed, max_levels, mem_pool));
+  return (*ht_ctx)->Init(pool, state, num_build_tuples);
+}
+
+Status HashTableCtx::Open(RuntimeState* state) {
+  RETURN_IF_ERROR(ScalarExprEvaluator::Open(build_expr_evals_, state));
+  RETURN_IF_ERROR(ScalarExprEvaluator::Open(probe_expr_evals_, state));
+  return Status::OK();
+}
+
+void HashTableCtx::Close(RuntimeState* state) {
   free(scratch_row_);
   scratch_row_ = NULL;
-  expr_values_cache_.Close(tracker_);
+  expr_values_cache_.Close(mem_pool_->mem_tracker());
+  ScalarExprEvaluator::Close(build_expr_evals_, state);
+  ScalarExprEvaluator::Close(probe_expr_evals_, state);
+}
+
+void HashTableCtx::FreeBuildLocalAllocations() {
+  ScalarExprEvaluator::FreeLocalAllocations(build_expr_evals_);
+}
+
+void HashTableCtx::FreeProbeLocalAllocations() {
+  ScalarExprEvaluator::FreeLocalAllocations(probe_expr_evals_);
+}
+
+void HashTableCtx::FreeLocalAllocations() {
+  FreeBuildLocalAllocations();
+  FreeProbeLocalAllocations();
 }
 
 uint32_t HashTableCtx::Hash(const void* input, int len, uint32_t hash) const {
@@ -161,12 +197,13 @@ uint32_t HashTableCtx::HashRow(
   }
 }
 
-bool HashTableCtx::EvalRow(const TupleRow* row, const vector<ExprContext*>& ctxs,
+bool HashTableCtx::EvalRow(const TupleRow* row,
+    const vector<ScalarExprEvaluator*>& evals,
     uint8_t* expr_values, uint8_t* expr_values_null) noexcept {
   bool has_null = false;
-  for (int i = 0; i < ctxs.size(); ++i) {
+  for (int i = 0; i < evals.size(); ++i) {
     void* loc = expr_values_cache_.ExprValuePtr(expr_values, i);
-    void* val = ctxs[i]->GetValue(row);
+    void* val = evals[i]->GetValue(row);
     if (val == NULL) {
       // If the table doesn't store nulls, no reason to keep evaluating
       if (!stores_nulls_) return true;
@@ -176,9 +213,8 @@ bool HashTableCtx::EvalRow(const TupleRow* row, const vector<ExprContext*>& ctxs
     } else {
       expr_values_null[i] = false;
     }
-    DCHECK_LE(build_expr_ctxs_[i]->root()->type().GetSlotSize(),
-        sizeof(NULL_VALUE));
-    RawValue::Write(val, loc, build_expr_ctxs_[i]->root()->type(), NULL);
+    DCHECK_LE(build_exprs_[i]->type().GetSlotSize(), sizeof(NULL_VALUE));
+    RawValue::Write(val, loc, build_exprs_[i]->type(), NULL);
   }
   return has_null;
 }
@@ -192,11 +228,12 @@ uint32_t HashTableCtx::HashVariableLenRow(const uint8_t* expr_values,
     hash = Hash(expr_values, var_result_offset, hash);
   }
 
-  for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
+  for (int i = 0; i < build_exprs_.size(); ++i) {
     // non-string and null slots are already part of 'expr_values'.
-    if (build_expr_ctxs_[i]->root()->type().type != TYPE_STRING
-        && build_expr_ctxs_[i]->root()->type().type != TYPE_VARCHAR) continue;
-
+    if (build_exprs_[i]->type().type != TYPE_STRING &&
+        build_exprs_[i]->type().type != TYPE_VARCHAR) {
+      continue;
+    }
     const void* loc = expr_values_cache_.ExprValuePtr(expr_values, i);
     if (expr_values_null[i]) {
       // Hash the null random seed values at 'loc'
@@ -214,8 +251,8 @@ uint32_t HashTableCtx::HashVariableLenRow(const uint8_t* expr_values,
 template <bool FORCE_NULL_EQUALITY>
 bool HashTableCtx::Equals(const TupleRow* build_row, const uint8_t* expr_values,
     const uint8_t* expr_values_null) const noexcept {
-  for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
-    void* val = build_expr_ctxs_[i]->GetValue(build_row);
+  for (int i = 0; i < build_expr_evals_.size(); ++i) {
+    void* val = build_expr_evals_[i]->GetValue(build_row);
     if (val == NULL) {
       if (!(FORCE_NULL_EQUALITY || finds_nulls_[i])) return false;
       if (!expr_values_null[i]) return false;
@@ -225,13 +262,11 @@ bool HashTableCtx::Equals(const TupleRow* build_row, const uint8_t* expr_values,
     }
 
     const void* loc = expr_values_cache_.ExprValuePtr(expr_values, i);
-    if (!RawValue::Eq(loc, val, build_expr_ctxs_[i]->root()->type())) {
-      return false;
-    }
+    DCHECK(build_exprs_[i] == &build_expr_evals_[i]->root());
+    if (!RawValue::Eq(loc, val, build_exprs_[i]->type())) return false;
   }
   return true;
 }
-
 template bool HashTableCtx::Equals<true>(const TupleRow* build_row,
     const uint8_t* expr_values, const uint8_t* expr_values_null) const;
 template bool HashTableCtx::Equals<false>(const TupleRow* build_row,
@@ -249,11 +284,11 @@ HashTableCtx::ExprValuesCache::ExprValuesCache()
     null_bitmap_(0) {}
 
 Status HashTableCtx::ExprValuesCache::Init(RuntimeState* state,
-    MemTracker* tracker, const std::vector<ExprContext*>& build_expr_ctxs) {
+    MemTracker* tracker, const std::vector<ScalarExpr*>& build_exprs) {
   // Initialize the number of expressions.
-  num_exprs_ = build_expr_ctxs.size();
+  num_exprs_ = build_exprs.size();
   // Compute the layout of evaluated values of a row.
-  expr_values_bytes_per_row_ = Expr::ComputeResultsLayout(build_expr_ctxs,
+  expr_values_bytes_per_row_ = ScalarExpr::ComputeResultsLayout(build_exprs,
       &expr_values_offsets_, &var_result_offset_);
   if (expr_values_bytes_per_row_ == 0) {
     DCHECK_EQ(num_exprs_, 0);
@@ -346,21 +381,20 @@ void HashTableCtx::ExprValuesCache::ResetForRead() {
   ResetIterators();
 }
 
-const double HashTable::MAX_FILL_FACTOR = 0.75f;
+constexpr double HashTable::MAX_FILL_FACTOR;
+constexpr int64_t HashTable::DATA_PAGE_SIZE;
 
-HashTable* HashTable::Create(RuntimeState* state,
-    BufferedBlockMgr::Client* client, bool stores_duplicates, int num_build_tuples,
-    BufferedTupleStream* tuple_stream, int64_t max_num_buckets,
+HashTable* HashTable::Create(Suballocator* allocator, bool stores_duplicates,
+    int num_build_tuples, BufferedTupleStream* tuple_stream, int64_t max_num_buckets,
     int64_t initial_num_buckets) {
-  return new HashTable(FLAGS_enable_quadratic_probing, state, client, stores_duplicates,
+  return new HashTable(FLAGS_enable_quadratic_probing, allocator, stores_duplicates,
       num_build_tuples, tuple_stream, max_num_buckets, initial_num_buckets);
 }
 
-HashTable::HashTable(bool quadratic_probing, RuntimeState* state,
-    BufferedBlockMgr::Client* client, bool stores_duplicates, int num_build_tuples,
-    BufferedTupleStream* stream, int64_t max_num_buckets, int64_t num_buckets)
-  : state_(state),
-    block_mgr_client_(client),
+HashTable::HashTable(bool quadratic_probing, Suballocator* allocator,
+    bool stores_duplicates, int num_build_tuples, BufferedTupleStream* stream,
+    int64_t max_num_buckets, int64_t num_buckets)
+  : allocator_(allocator),
     tuple_stream_(stream),
     stores_tuples_(num_build_tuples == 1),
     stores_duplicates_(stores_duplicates),
@@ -378,26 +412,23 @@ HashTable::HashTable(bool quadratic_probing, RuntimeState* state,
     has_matches_(false),
     num_probes_(0), num_failed_probes_(0), travel_length_(0), num_hash_collisions_(0),
     num_resizes_(0) {
-  DCHECK_EQ((num_buckets & (num_buckets-1)), 0) << "num_buckets must be a power of 2";
+  DCHECK_EQ((num_buckets & (num_buckets - 1)), 0) << "num_buckets must be a power of 2";
   DCHECK_GT(num_buckets, 0) << "num_buckets must be larger than 0";
   DCHECK(stores_tuples_ || stream != NULL);
-  DCHECK(client != NULL);
 }
 
-bool HashTable::Init() {
+Status HashTable::Init(bool* got_memory) {
   int64_t buckets_byte_size = num_buckets_ * sizeof(Bucket);
-  if (!state_->block_mgr()->ConsumeMemory(block_mgr_client_, buckets_byte_size)) {
+  RETURN_IF_ERROR(allocator_->Allocate(buckets_byte_size, &bucket_allocation_));
+  if (bucket_allocation_ == nullptr) {
     num_buckets_ = 0;
-    return false;
+    *got_memory = false;
+    return Status::OK();
   }
-  buckets_ = reinterpret_cast<Bucket*>(malloc(buckets_byte_size));
-  if (buckets_ == NULL) {
-    state_->block_mgr()->ReleaseMemory(block_mgr_client_, buckets_byte_size);
-    num_buckets_ = 0;
-    return false;
-  }
+  buckets_ = reinterpret_cast<Bucket*>(bucket_allocation_->data());
   memset(buckets_, 0, buckets_byte_size);
-  return true;
+  *got_memory = true;
+  return Status::OK();
 }
 
 void HashTable::Close() {
@@ -407,36 +438,39 @@ void HashTable::Close() {
   const int64_t HEAVILY_USED = 1024 * 1024;
   // TODO: These statistics should go to the runtime profile as well.
   if ((num_buckets_ > LARGE_HT) || (num_probes_ > HEAVILY_USED)) VLOG(2) << PrintStats();
-  for (int i = 0; i < data_pages_.size(); ++i) {
-    data_pages_[i]->Delete();
-  }
+  for (auto& data_page : data_pages_) allocator_->Free(move(data_page));
+  data_pages_.clear();
   if (ImpaladMetrics::HASH_TABLE_TOTAL_BYTES != NULL) {
     ImpaladMetrics::HASH_TABLE_TOTAL_BYTES->Increment(-total_data_page_size_);
   }
-  data_pages_.clear();
-  if (buckets_ != NULL) free(buckets_);
-  state_->block_mgr()->ReleaseMemory(block_mgr_client_, num_buckets_ * sizeof(Bucket));
+  if (bucket_allocation_ != nullptr) allocator_->Free(move(bucket_allocation_));
 }
 
-bool HashTable::CheckAndResize(uint64_t buckets_to_fill, const HashTableCtx* ht_ctx) {
+Status HashTable::CheckAndResize(
+    uint64_t buckets_to_fill, const HashTableCtx* ht_ctx, bool* got_memory) {
   uint64_t shift = 0;
   while (num_filled_buckets_ + buckets_to_fill >
          (num_buckets_ << shift) * MAX_FILL_FACTOR) {
-    // TODO: next prime instead of double?
     ++shift;
   }
-  if (shift > 0) return ResizeBuckets(num_buckets_ << shift, ht_ctx);
-  return true;
+  if (shift > 0) return ResizeBuckets(num_buckets_ << shift, ht_ctx, got_memory);
+  *got_memory = true;
+  return Status::OK();
 }
 
-bool HashTable::ResizeBuckets(int64_t num_buckets, const HashTableCtx* ht_ctx) {
-  DCHECK_EQ((num_buckets & (num_buckets-1)), 0)
+Status HashTable::ResizeBuckets(
+    int64_t num_buckets, const HashTableCtx* ht_ctx, bool* got_memory) {
+  DCHECK_EQ((num_buckets & (num_buckets - 1)), 0)
       << "num_buckets=" << num_buckets << " must be a power of 2";
-  DCHECK_GT(num_buckets, num_filled_buckets_) << "Cannot shrink the hash table to "
-      "smaller number of buckets than the number of filled buckets.";
-  VLOG(2) << "Resizing hash table from "
-          << num_buckets_ << " to " << num_buckets << " buckets.";
-  if (max_num_buckets_ != -1 && num_buckets > max_num_buckets_) return false;
+  DCHECK_GT(num_buckets, num_filled_buckets_)
+    << "Cannot shrink the hash table to smaller number of buckets than the number of "
+    << "filled buckets.";
+  VLOG(2) << "Resizing hash table from " << num_buckets_ << " to " << num_buckets
+          << " buckets.";
+  if (max_num_buckets_ != -1 && num_buckets > max_num_buckets_) {
+    *got_memory = false;
+    return Status::OK();
+  }
   ++num_resizes_;
 
   // All memory that can grow proportional to the input should come from the block mgrs
@@ -444,14 +478,16 @@ bool HashTable::ResizeBuckets(int64_t num_buckets, const HashTableCtx* ht_ctx) {
   // Note that while we copying over the contents of the old hash table, we need to have
   // allocated both the old and the new hash table. Once we finish, we return the memory
   // of the old hash table.
-  int64_t old_size = num_buckets_ * sizeof(Bucket);
+  // int64_t old_size = num_buckets_ * sizeof(Bucket);
   int64_t new_size = num_buckets * sizeof(Bucket);
-  if (!state_->block_mgr()->ConsumeMemory(block_mgr_client_, new_size)) return false;
-  Bucket* new_buckets = reinterpret_cast<Bucket*>(malloc(new_size));
-  if (new_buckets == NULL) {
-    state_->block_mgr()->ReleaseMemory(block_mgr_client_, new_size);
-    return false;
+
+  unique_ptr<Suballocation> new_allocation;
+  RETURN_IF_ERROR(allocator_->Allocate(new_size, &new_allocation));
+  if (new_allocation == NULL) {
+    *got_memory = false;
+    return Status::OK();
   }
+  Bucket* new_buckets = reinterpret_cast<Bucket*>(new_allocation->data());
   memset(new_buckets, 0, new_size);
 
   // Walk the old table and copy all the filled buckets to the new (resized) table.
@@ -471,28 +507,22 @@ bool HashTable::ResizeBuckets(int64_t num_buckets, const HashTableCtx* ht_ctx) {
   }
 
   num_buckets_ = num_buckets;
-  free(buckets_);
-  buckets_ = new_buckets;
-  state_->block_mgr()->ReleaseMemory(block_mgr_client_, old_size);
-  return true;
+  allocator_->Free(move(bucket_allocation_));
+  bucket_allocation_ = move(new_allocation);
+  buckets_ = reinterpret_cast<Bucket*>(bucket_allocation_->data());
+  *got_memory = true;
+  return Status::OK();
 }
 
-bool HashTable::GrowNodeArray() {
-  int64_t page_size = 0;
-  page_size = state_->block_mgr()->max_block_size();
-  if (data_pages_.size() < NUM_SMALL_DATA_PAGES) {
-    page_size = min(page_size, INITIAL_DATA_PAGE_SIZES[data_pages_.size()]);
-  }
-  BufferedBlockMgr::Block* block = NULL;
-  Status status = state_->block_mgr()->GetNewBlock(
-      block_mgr_client_, NULL, &block, page_size);
-  DCHECK(status.ok() || block == NULL);
-  if (block == NULL) return false;
-  data_pages_.push_back(block);
-  next_node_ = block->Allocate<DuplicateNode>(page_size);
-  ImpaladMetrics::HASH_TABLE_TOTAL_BYTES->Increment(page_size);
-  node_remaining_current_page_ = page_size / sizeof(DuplicateNode);
-  total_data_page_size_ += page_size;
+bool HashTable::GrowNodeArray(Status* status) {
+  unique_ptr<Suballocation> allocation;
+  *status = allocator_->Allocate(DATA_PAGE_SIZE, &allocation);
+  if (!status->ok() || allocation == nullptr) return false;
+  next_node_ = reinterpret_cast<DuplicateNode*>(allocation->data());
+  data_pages_.push_back(move(allocation));
+  ImpaladMetrics::HASH_TABLE_TOTAL_BYTES->Increment(DATA_PAGE_SIZE);
+  node_remaining_current_page_ = DATA_PAGE_SIZE / sizeof(DuplicateNode);
+  total_data_page_size_ += DATA_PAGE_SIZE;
   return true;
 }
 
@@ -501,8 +531,7 @@ void HashTable::DebugStringTuple(stringstream& ss, HtData& htdata,
   if (stores_tuples_) {
     ss << "(" << htdata.tuple << ")";
   } else {
-    ss << "(" << htdata.idx.block() << ", " << htdata.idx.idx()
-       << ", " << htdata.idx.offset() << ")";
+    ss << "(" << htdata.flat_row << ")";
   }
   if (desc != NULL) {
     Tuple* row[num_build_tuples_];
@@ -623,8 +652,8 @@ static void CodegenAssignNullValue(
   }
 }
 
-// Codegen for evaluating a tuple row over either build_expr_ctxs_ or probe_expr_ctxs_.
-// For a group by with (big int, string) the IR looks like:
+// Codegen for evaluating a tuple row over either build_expr_evals_ or
+// probe_expr_evals_. For a group by with (big int, string) the IR looks like:
 //
 // define i1 @EvalProbeRow(%"class.impala::HashTableCtx"* %this_ptr,
 //    %"class.impala::TupleRow"* %row, i8* %expr_values, i8* %expr_values_null) #34 {
@@ -695,10 +724,10 @@ static void CodegenAssignNullValue(
 // becomes the start of the next block for codegen (either the next expr or just the
 // end of the function).
 Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function** fn) {
-  const vector<ExprContext*>& ctxs = build ? build_expr_ctxs_ : probe_expr_ctxs_;
-  for (int i = 0; i < ctxs.size(); ++i) {
+  const vector<ScalarExpr*>& exprs = build ? build_exprs_ : probe_exprs_;
+  for (int i = 0; i < exprs.size(); ++i) {
     // Disable codegen for CHAR
-    if (ctxs[i]->root()->type().type == TYPE_CHAR) {
+    if (exprs[i]->type().type == TYPE_CHAR) {
       return Status("HashTableCtx::CodegenEvalRow(): CHAR NYI");
     }
   }
@@ -728,13 +757,13 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
   Value* expr_values_null = args[3];
   Value* has_null = codegen->false_value();
 
-  IRFunction::Type get_expr_ctx_fn_name = build ?
-      IRFunction::HASH_TABLE_GET_BUILD_EXPR_CTX :
-      IRFunction::HASH_TABLE_GET_PROBE_EXPR_CTX;
-  Function* get_expr_ctx_fn = codegen->GetFunction(get_expr_ctx_fn_name, false);
-  DCHECK(get_expr_ctx_fn != NULL);
+  // evaluator_vector = build_expr_evals_.data() / probe_expr_evals_.data()
+  Value* eval_vector = codegen->CodegenCallFunction(&builder, build ?
+      IRFunction::HASH_TABLE_GET_BUILD_EXPR_EVALUATORS :
+      IRFunction::HASH_TABLE_GET_PROBE_EXPR_EVALUATORS,
+      this_ptr, "eval_vector");
 
-  for (int i = 0; i < ctxs.size(); ++i) {
+  for (int i = 0; i < exprs.size(); ++i) {
     // TODO: refactor this to somewhere else?  This is not hash table specific except for
     // the null handling bit and would be used for anyone that needs to materialize a
     // vector of exprs
@@ -743,7 +772,7 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
     Value* loc = builder.CreateInBoundsGEP(
         NULL, expr_values, codegen->GetIntConstant(TYPE_INT, offset), "loc_addr");
     Value* llvm_loc = builder.CreatePointerCast(
-        loc, codegen->GetPtrType(ctxs[i]->root()->type()), "loc");
+        loc, codegen->GetPtrType(exprs[i]->type()), "loc");
 
     BasicBlock* null_block = BasicBlock::Create(context, "null", *fn);
     BasicBlock* not_null_block = BasicBlock::Create(context, "not_null", *fn);
@@ -751,7 +780,7 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
 
     // Call expr
     Function* expr_fn;
-    Status status = ctxs[i]->root()->GetCodegendComputeFn(codegen, &expr_fn);
+    Status status = exprs[i]->GetCodegendComputeFn(codegen, &expr_fn);
     if (!status.ok()) {
       (*fn)->eraseFromParent(); // deletes function
       *fn = NULL;
@@ -764,11 +793,10 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
       codegen->SetNoInline(expr_fn);
     }
 
-    Value* get_expr_ctx_args[] = {this_ptr, codegen->GetIntConstant(TYPE_INT, i)};
-    Value* ctx_arg = builder.CreateCall(get_expr_ctx_fn, get_expr_ctx_args, "expr_ctx");
-    Value* expr_fn_args[] = {ctx_arg, row};
+    Value* eval_arg =
+        codegen->CodegenArrayAt(&builder, eval_vector, i, "eval");
     CodegenAnyVal result = CodegenAnyVal::CreateCallWrapped(
-        codegen, &builder, ctxs[i]->root()->type(), expr_fn, expr_fn_args, "result");
+        codegen, &builder, exprs[i]->type(), expr_fn, {eval_arg, row}, "result");
     Value* is_null = result.GetIsNull();
 
     // Set null-byte result
@@ -784,13 +812,13 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
       // hash table doesn't store nulls, no reason to keep evaluating exprs
       builder.CreateRet(codegen->true_value());
     } else {
-      CodegenAssignNullValue(codegen, &builder, llvm_loc, ctxs[i]->root()->type());
+      CodegenAssignNullValue(codegen, &builder, llvm_loc, exprs[i]->type());
       builder.CreateBr(continue_block);
     }
 
     // Not null block
     builder.SetInsertPoint(not_null_block);
-    result.ToNativePtr(llvm_loc);
+    result.StoreToNativePtr(llvm_loc);
     builder.CreateBr(continue_block);
 
     // Continue block
@@ -806,7 +834,7 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
   builder.CreateRet(has_null);
 
   // Avoid inlining a large EvalRow() function into caller.
-  if (ctxs.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
+  if (exprs.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
     codegen->SetNoInline(*fn);
   }
 
@@ -853,9 +881,9 @@ Status HashTableCtx::CodegenEvalRow(LlvmCodeGen* codegen, bool build, Function**
 //   ret i32 %hash_phi
 // }
 Status HashTableCtx::CodegenHashRow(LlvmCodeGen* codegen, bool use_murmur, Function** fn) {
-  for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
+  for (int i = 0; i < build_exprs_.size(); ++i) {
     // Disable codegen for CHAR
-    if (build_expr_ctxs_[i]->root()->type().type == TYPE_CHAR) {
+    if (build_exprs_[i]->type().type == TYPE_CHAR) {
       return Status("HashTableCtx::CodegenHashRow(): CHAR NYI");
     }
   }
@@ -881,10 +909,8 @@ Status HashTableCtx::CodegenHashRow(LlvmCodeGen* codegen, bool use_murmur, Funct
   Value* expr_values_null = args[2];
 
   // Call GetHashSeed() to get seeds_[level_]
-  Function* get_hash_seed_fn =
-      codegen->GetFunction(IRFunction::HASH_TABLE_GET_HASH_SEED, false);
-  Value* seed = builder.CreateCall(get_hash_seed_fn, ArrayRef<Value*>({this_arg}),
-      "seed");
+  Value* seed = codegen->CodegenCallFunction(&builder,
+      IRFunction::HASH_TABLE_GET_HASH_SEED, this_arg, "seed");
 
   Value* hash_result = seed;
   const int var_result_offset = expr_values_cache_.var_result_offset();
@@ -910,9 +936,11 @@ Status HashTableCtx::CodegenHashRow(LlvmCodeGen* codegen, bool use_murmur, Funct
     }
 
     // Hash string slots
-    for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
-      if (build_expr_ctxs_[i]->root()->type().type != TYPE_STRING
-          && build_expr_ctxs_[i]->root()->type().type != TYPE_VARCHAR) continue;
+    for (int i = 0; i < build_exprs_.size(); ++i) {
+      if (build_exprs_[i]->type().type != TYPE_STRING &&
+          build_exprs_[i]->type().type != TYPE_VARCHAR) {
+        continue;
+      }
 
       BasicBlock* null_block = NULL;
       BasicBlock* not_null_block = NULL;
@@ -984,7 +1012,7 @@ Status HashTableCtx::CodegenHashRow(LlvmCodeGen* codegen, bool use_murmur, Funct
   builder.CreateRet(hash_result);
 
   // Avoid inlining into caller if there are many exprs.
-  if (build_expr_ctxs_.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
+  if (build_exprs_.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
     codegen->SetNoInline(*fn);
   }
   *fn = codegen->FinalizeFunction(*fn);
@@ -1063,9 +1091,9 @@ Status HashTableCtx::CodegenHashRow(LlvmCodeGen* codegen, bool use_murmur, Funct
 // }
 Status HashTableCtx::CodegenEquals(LlvmCodeGen* codegen, bool force_null_equality,
     Function** fn) {
-  for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
+  for (int i = 0; i < build_exprs_.size(); ++i) {
     // Disable codegen for CHAR
-    if (build_expr_ctxs_[i]->root()->type().type == TYPE_CHAR) {
+    if (build_exprs_[i]->type().type == TYPE_CHAR) {
       return Status("HashTableCtx::CodegenEquals(): CHAR NYI");
     }
   }
@@ -1094,38 +1122,36 @@ Status HashTableCtx::CodegenEquals(LlvmCodeGen* codegen, bool force_null_equalit
   Value* expr_values = args[2];
   Value* expr_values_null = args[3];
 
-  Function* get_expr_ctx_fn =
-      codegen->GetFunction(IRFunction::HASH_TABLE_GET_BUILD_EXPR_CTX, false);
-  DCHECK(get_expr_ctx_fn != NULL);
+  // eval_vector = build_expr_evals_.data()
+  Value* eval_vector = codegen->CodegenCallFunction(&builder,
+      IRFunction::HASH_TABLE_GET_BUILD_EXPR_EVALUATORS, this_ptr, "eval_vector");
 
   BasicBlock* false_block = BasicBlock::Create(context, "false_block", *fn);
-  for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
+  for (int i = 0; i < build_exprs_.size(); ++i) {
     BasicBlock* null_block = BasicBlock::Create(context, "null", *fn);
     BasicBlock* not_null_block = BasicBlock::Create(context, "not_null", *fn);
     BasicBlock* continue_block = BasicBlock::Create(context, "continue", *fn);
 
     // call GetValue on build_exprs[i]
     Function* expr_fn;
-    Status status = build_expr_ctxs_[i]->root()->GetCodegendComputeFn(codegen, &expr_fn);
+    Status status = build_exprs_[i]->GetCodegendComputeFn(codegen, &expr_fn);
     if (!status.ok()) {
       (*fn)->eraseFromParent(); // deletes function
       *fn = NULL;
       return Status(
           Substitute("Problem with HashTableCtx::CodegenEquals: $0", status.GetDetail()));
     }
-    if (build_expr_ctxs_.size() > LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
+    if (build_exprs_.size() > LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
       // Avoid bloating function by inlining too many exprs into it.
       codegen->SetNoInline(expr_fn);
     }
 
-    // Load ExprContext* from 'build_expr_ctxs_'.
-    Value* get_expr_ctx_args[] = {this_ptr, codegen->GetIntConstant(TYPE_INT, i)};
-    Value* ctx_arg = builder.CreateCall(get_expr_ctx_fn, get_expr_ctx_args, "expr_ctx");
-
+    // Load ScalarExprEvaluator*: eval = eval_vector[i];
+    Value* eval_arg =
+        codegen->CodegenArrayAt(&builder, eval_vector, i, "eval");
     // Evaluate the expression.
-    Value* expr_fn_args[] = { ctx_arg, row };
     CodegenAnyVal result = CodegenAnyVal::CreateCallWrapped(codegen, &builder,
-        build_expr_ctxs_[i]->root()->type(), expr_fn, expr_fn_args, "result");
+        build_exprs_[i]->type(), expr_fn, {eval_arg, row}, "result");
     Value* is_null = result.GetIsNull();
 
     // Determine if row is null (i.e. expr_values_null[i] == true). In
@@ -1147,7 +1173,7 @@ Status HashTableCtx::CodegenEquals(LlvmCodeGen* codegen, bool force_null_equalit
     Value* loc = builder.CreateInBoundsGEP(
         NULL, expr_values, codegen->GetIntConstant(TYPE_INT, offset), "loc");
     Value* row_val = builder.CreatePointerCast(
-        loc, codegen->GetPtrType(build_expr_ctxs_[i]->root()->type()), "row_val");
+        loc, codegen->GetPtrType(build_exprs_[i]->type()), "row_val");
 
     // Branch for GetValue() returning NULL
     builder.CreateCondBr(is_null, null_block, not_null_block);
@@ -1176,7 +1202,7 @@ Status HashTableCtx::CodegenEquals(LlvmCodeGen* codegen, bool force_null_equalit
   builder.CreateRet(codegen->false_value());
 
   // Avoid inlining into caller if it is large.
-  if (build_expr_ctxs_.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
+  if (build_exprs_.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
     codegen->SetNoInline(*fn);
   }
   *fn = codegen->FinalizeFunction(*fn);

@@ -31,7 +31,6 @@ import org.apache.impala.thrift.TPrimitiveType;
 import org.apache.impala.thrift.TScalarType;
 import org.apache.impala.thrift.TStructField;
 import org.apache.impala.thrift.TTypeNode;
-import org.apache.impala.thrift.TTypeNodeType;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -62,14 +61,15 @@ public abstract class Type {
   public static final ScalarType TIMESTAMP = new ScalarType(PrimitiveType.TIMESTAMP);
   public static final ScalarType DATE = new ScalarType(PrimitiveType.DATE);
   public static final ScalarType DATETIME = new ScalarType(PrimitiveType.DATETIME);
-  public static final ScalarType DEFAULT_DECIMAL = (ScalarType)
+  public static final ScalarType DEFAULT_DECIMAL =
       ScalarType.createDecimalType(ScalarType.DEFAULT_PRECISION,
           ScalarType.DEFAULT_SCALE);
-  public static final ScalarType DECIMAL =
-      (ScalarType) ScalarType.createDecimalTypeInternal(-1, -1);
+  public static final ScalarType DECIMAL = ScalarType.createWildCardDecimalType();
   public static final ScalarType DEFAULT_VARCHAR = ScalarType.createVarcharType(-1);
   public static final ScalarType VARCHAR = ScalarType.createVarcharType(-1);
-  public static final ScalarType CHAR = (ScalarType) ScalarType.createCharType(-1);
+  public static final ScalarType CHAR = ScalarType.createCharType(-1);
+  public static final ScalarType FIXED_UDA_INTERMEDIATE =
+      ScalarType.createFixedUdaIntermediateType(-1);
 
   private static ArrayList<ScalarType> integerTypes;
   private static ArrayList<ScalarType> numericTypes;
@@ -155,7 +155,6 @@ public abstract class Type {
   public boolean isBoolean() { return isScalarType(PrimitiveType.BOOLEAN); }
   public boolean isTimestamp() { return isScalarType(PrimitiveType.TIMESTAMP); }
   public boolean isDecimal() { return isScalarType(PrimitiveType.DECIMAL); }
-  public boolean isDecimalOrNull() { return isDecimal() || isNull(); }
   public boolean isFullySpecifiedDecimal() { return false; }
   public boolean isWildcardDecimal() { return false; }
   public boolean isWildcardVarchar() { return false; }
@@ -317,15 +316,6 @@ public abstract class Type {
   }
 
   /**
-   * Checks if types t1 and t2 are assignment compatible, i.e. if both t1 and t2 can be
-   * assigned to a type t without an explicit cast and without any conversions that would
-   * result in loss of precision.
-   */
-  public static boolean areAssignmentCompatibleTypes(Type t1, Type t2) {
-    return getAssignmentCompatibleType(t1, t2, true) != ScalarType.INVALID;
-  }
-
-  /**
    * Returns true if this type exceeds the MAX_NESTING_DEPTH, false otherwise.
    */
   public boolean exceedsMaxNestingDepth() { return exceedsMaxNestingDepth(0); }
@@ -448,16 +438,6 @@ public abstract class Type {
   }
 
   /**
-   * Utility function to get the primitive type of a thrift type that is known
-   * to be scalar.
-   */
-  public TPrimitiveType getTPrimitiveType(TColumnType ttype) {
-    Preconditions.checkState(ttype.getTypesSize() == 1);
-    Preconditions.checkState(ttype.types.get(0).getType() == TTypeNodeType.SCALAR);
-    return ttype.types.get(0).scalar_type.getType();
-  }
-
-  /**
    * JDBC data type description
    * Returns the column size for this type.
    * For numeric data this is the maximum precision.
@@ -478,6 +458,7 @@ public abstract class Type {
         return 29;
       case CHAR:
       case VARCHAR:
+      case FIXED_UDA_INTERMEDIATE:
         return t.getLength();
       default:
         return null;
@@ -598,6 +579,7 @@ public abstract class Type {
       case VARCHAR: return java.sql.Types.VARCHAR;
       case BINARY: return java.sql.Types.BINARY;
       case DECIMAL: return java.sql.Types.DECIMAL;
+      case FIXED_UDA_INTERMEDIATE: return java.sql.Types.BINARY;
       default:
         Preconditions.checkArgument(false, "Invalid primitive type " +
             t.getPrimitiveType().name());
@@ -641,6 +623,14 @@ public abstract class Type {
       // BINARY is not supported.
       compatibilityMatrix[BINARY.ordinal()][i] = PrimitiveType.INVALID_TYPE;
       compatibilityMatrix[i][BINARY.ordinal()] = PrimitiveType.INVALID_TYPE;
+
+      // FIXED_UDA_INTERMEDIATE cannot be cast to/from another type
+      if (i != FIXED_UDA_INTERMEDIATE.ordinal()) {
+        compatibilityMatrix[FIXED_UDA_INTERMEDIATE.ordinal()][i] =
+            PrimitiveType.INVALID_TYPE;
+        compatibilityMatrix[i][FIXED_UDA_INTERMEDIATE.ordinal()] =
+            PrimitiveType.INVALID_TYPE;
+      }
     }
 
     compatibilityMatrix[BOOLEAN.ordinal()][TINYINT.ordinal()] = PrimitiveType.TINYINT;

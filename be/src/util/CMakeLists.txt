@@ -18,11 +18,6 @@
 set(SQUEASEL_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/squeasel")
 set(MUSTACHE_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/mustache")
 
-# Without this option Squeasel looks up the SSL library at run-time
-# and may not guess the correct name on some distributions
-SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c PROPERTIES
-  COMPILE_FLAGS -DNO_SSL_DL)
-
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 
@@ -39,6 +34,7 @@ add_library(Util
   bloom-filter.cc
   coding-util.cc
   codec.cc
+  common-metrics.cc
   compress.cc
   cpu-info.cc
   decimal-util.cc
@@ -74,6 +70,7 @@ add_library(Util
   redactor.cc
   runtime-profile.cc
   simple-logger.cc
+  string-parser.cc
   symbols-util.cc
   static-asserts.cc
   summary-util.cc

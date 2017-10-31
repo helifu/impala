@@ -134,7 +134,6 @@ static const string LDAPS_URI_PREFIX = "ldaps://";
 // to log messages about the start of authentication. This is that plugin's name.
 static const string IMPALA_AUXPROP_PLUGIN = "impala-auxprop";
 
-bool SaslAuthProvider::env_setup_complete_ = false;
 AuthManager* AuthManager::auth_manager_ = new AuthManager();
 
 // This Sasl callback is called when the underlying cyrus-sasl layer has
@@ -643,7 +642,7 @@ Status InitAuth(const string& appname) {
     // Impala's SASL initialization. This must be called before any KuduClients are
     // created to ensure that Kudu doesn't init SASL first, and this returns an error if
     // Kudu has already initialized SASL.
-    if (impala::KuduIsAvailable()) {
+    if (KuduIsAvailable()) {
       KUDU_RETURN_IF_ERROR(kudu::client::DisableSaslInitialization(),
           "Unable to disable Kudu SASL initialization.");
     }
@@ -656,7 +655,14 @@ Status InitAuth(const string& appname) {
     }
   }
 
+  // Initializes OpenSSL.
   RETURN_IF_ERROR(AuthManager::GetInstance()->Init());
+
+  // Prevent Kudu from re-initializing OpenSSL.
+  if (KuduIsAvailable()) {
+    KUDU_RETURN_IF_ERROR(kudu::client::DisableOpenSSLInitialization(),
+        "Unable to disable Kudu SSL initialization.");
+  }
   return Status::OK();
 }
 
@@ -713,9 +719,6 @@ Status SaslAuthProvider::InitKerberos(const string& principal,
   hostname_ = names[1];
   realm_ = names[2];
 
-  RETURN_IF_ERROR(CheckReplayCacheDirPermissions());
-  RETURN_IF_ERROR(InitKerberosEnv());
-
   LOG(INFO) << "Using " << (is_internal_ ? "internal" : "external")
             << " kerberos principal \"" << service_name_ << "/"
             << hostname_ << "@" << realm_ << "\"";
@@ -756,20 +759,19 @@ static Status EnvAppend(const string& attr, const string& thing, const string& t
   return Status::OK();
 }
 
-Status SaslAuthProvider::InitKerberosEnv() {
-  DCHECK(!principal_.empty());
+Status AuthManager::InitKerberosEnv() {
+  DCHECK(!FLAGS_principal.empty());
 
-  // Called only during setup; no locking required.
-  if (env_setup_complete_) return Status::OK();
+  RETURN_IF_ERROR(CheckReplayCacheDirPermissions());
 
-  if (!is_regular(keytab_file_)) {
+  if (!is_regular(FLAGS_keytab_file)) {
     return Status(Substitute("Bad --keytab_file value: The file $0 is not a "
-        "regular file", keytab_file_));
+        "regular file", FLAGS_keytab_file));
   }
 
   // Set the keytab name in the environment so that Sasl Kerberos and kinit can
   // find and use it.
-  if (setenv("KRB5_KTNAME", keytab_file_.c_str(), 1)) {
+  if (setenv("KRB5_KTNAME", FLAGS_keytab_file.c_str(), 1)) {
     return Status(Substitute("Kerberos could not set KRB5_KTNAME: $0",
         GetStrErrMsg()));
   }
@@ -822,7 +824,6 @@ Status SaslAuthProvider::InitKerberosEnv() {
     }
   }
 
-  env_setup_complete_ = true;
   return Status::OK();
 }
 
@@ -923,7 +924,7 @@ Status SaslAuthProvider::WrapClientTransport(const string& hostname,
   try {
     const string& service = service_name.empty() ? service_name_ : service_name;
     sasl_client.reset(new sasl::TSaslClient(KERBEROS_MECHANISM, auth_id,
-        service, hostname, props, &KERB_INT_CALLBACKS[0]));
+        service, hostname, props, KERB_INT_CALLBACKS.data()));
   } catch (sasl::SaslClientImplException& e) {
     LOG(ERROR) << "Failed to create a GSSAPI/SASL client: " << e.what();
     return Status(e.what());
@@ -955,6 +956,8 @@ Status NoAuthProvider::WrapClientTransport(const string& hostname,
 }
 
 Status AuthManager::Init() {
+  ssl_socket_factory_.reset(new TSSLSocketFactory());
+
   bool use_ldap = false;
   const string excl_msg = "--$0 and --$1 are mutually exclusive "
       "and should not be set together";
@@ -1029,6 +1032,7 @@ Status AuthManager::Init() {
     } else {
       kerberos_internal_principal = FLAGS_be_principal;
     }
+    RETURN_IF_ERROR(InitKerberosEnv());
   }
   // This is written from the perspective of the daemons - thus "internal"
   // means "I am used for communication with other daemons, both as a client

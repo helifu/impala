@@ -22,8 +22,10 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Date;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.TimeZone;
 
 import javax.json.Json;
 import javax.json.JsonObject;
@@ -85,17 +87,18 @@ public class TestUtils {
     new PathFilter("file: ")
   };
 
-  // File size could vary from run to run. For example, parquet file header size could
-  // change if Impala version changes. That doesn't mean anything wrong with the plan
-  // so we want to filter file size out.
+  // File size could vary from run to run. For example, the parquet file header size
+  // or column metadata size could change if the Impala version changes. That doesn't
+  // mean anything is wrong with the plan, so we want to filter the file size out.
   static class FileSizeFilter implements ResultFilter {
+    private final static String BYTE_FILTER = "[KMGT]?B";
     private final static String NUMBER_FILTER = "\\d+(\\.\\d+)?";
     private final static String FILTER_KEY = "size=";
 
     public boolean matches(String input) { return input.contains(FILTER_KEY); }
 
     public String transform(String input) {
-      return input.replaceAll(FILTER_KEY + NUMBER_FILTER, FILTER_KEY);
+      return input.replaceAll(FILTER_KEY + NUMBER_FILTER + BYTE_FILTER, FILTER_KEY);
     }
   }
 
@@ -252,17 +255,20 @@ public class TestUtils {
    */
   public static TQueryCtx createQueryContext(String defaultDb, String user) {
     TQueryCtx queryCtx = new TQueryCtx();
-    queryCtx.setRequest(new TClientRequest("FeTests", new TQueryOptions()));
+    queryCtx.setClient_request(new TClientRequest("FeTests", new TQueryOptions()));
     queryCtx.setQuery_id(new TUniqueId());
     queryCtx.setSession(new TSessionState(new TUniqueId(), TSessionType.BEESWAX,
         defaultDb, user, new TNetworkAddress("localhost", 0)));
     SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
-    queryCtx.setNow_string(formatter.format(Calendar.getInstance().getTime()));
+    Date now = Calendar.getInstance().getTime();
+    queryCtx.setNow_string(formatter.format(now));
+    formatter.setTimeZone(TimeZone.getTimeZone("GMT"));
+    queryCtx.setUtc_timestamp_string(formatter.format(now));
     queryCtx.setStart_unix_millis(System.currentTimeMillis());
     queryCtx.setPid(1000);
     // Disable rewrites by default because some analyzer tests have non-executable
     // constant exprs (e.g. dummy UDFs) that do not work with constant folding.
-    queryCtx.request.query_options.setEnable_expr_rewrites(false);
+    queryCtx.client_request.query_options.setEnable_expr_rewrites(false);
     return queryCtx;
   }
 

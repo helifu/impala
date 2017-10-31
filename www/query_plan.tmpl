@@ -38,8 +38,13 @@ under the License.
 
 {{> www/query_detail_tabs.tmpl }}
 
-<h3>Plan</h3>
 
+{{?plan_metadata_unavailable}}
+<h3>Plan not yet available. Page will update when query planning completes.</h3>
+{{/plan_metadata_unavailable}}
+
+{{^plan_metadata_unavailable}}
+<h3>Plan</h3>
 <div>
   <label>
   <input type="checkbox" checked="true" id="colour_scheme"/>
@@ -48,6 +53,7 @@ under the License.
 </div>
 
 <svg style="border: 1px solid darkgray" width=1200 height=600 class="panel"><g/></svg>
+{{/plan_metadata_unavailable}}
 
 {{> www/common-footer.tmpl }}
 
@@ -95,7 +101,7 @@ function build(node, parent, edges, states, colour_idx, max_node_time) {
                 "max_time_val": node["max_time_val"],
                 "style": "fill: " + colours[colour_idx]});
   if (parent != null) {
-    var label_val = "" + node["output_card"];
+    var label_val = "" + node["output_card"].toLocaleString();
     edges.push({ start: node["label"], end: parent,
                  style: { label: label_val }});
   }
@@ -104,7 +110,7 @@ function build(node, parent, edges, states, colour_idx, max_node_time) {
   if (node["data_stream_target"]) {
     edges.push({ "start": node["label"],
                  "end": node["data_stream_target"],
-                 "style": { label: "" + node["output_card"],
+                 "style": { label: "" + node["output_card"].toLocaleString(),
                             style: "stroke: #f66; stroke-dasharray: 5, 5;"}});
   }
   max_node_time = Math.max(node["max_time_val"], max_node_time)

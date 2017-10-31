@@ -53,14 +53,130 @@ under the License.
     <p outputclass="toc inpage"/>
   </conbody>
 
-  <concept rev="2.7.0" id="incompatible_changes_27x">
+  <concept rev="2.9.0" id="incompatible_changes_29x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.9.x / Impala 2.7.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.9.x</title>
+
+    <conbody>
+
+      <p>
+        For the full list of issues closed in this release, including any that introduce
+        behavior changes or incompatibilities, see the
+        <xref keyref="changelog_29">changelog for <keyword keyref="impala29"/></xref>.
+      </p>
+
+<!-- Prose explanations of specific incompatible changes - TBD.
+      <ul>
+        <li>
+        </li>
+      </ul>
+-->
+
+    </conbody>
+
+  </concept>
+
+  <concept rev="2.8.0" id="incompatible_changes_28x">
+
+    <title>Incompatible Changes Introduced in Impala 2.8.x</title>
 
     <conbody>
       <ul>
         <li>
-          <p rev="IMPALA-1731 IMPALA-3868 CDH-43734">
+          <p rev="IMPALA-4160">
+            Llama support is removed completely from Impala. Related flags (<codeph>--enable_rm</codeph>)
+            and query options (such as <codeph>V_CPU_CORES</codeph>) remain but do not have any effect.
+          </p>
+          <p rev="IMPALA-4160">
+            If <codeph>--enable_rm</codeph> is passed to Impala, a warning is printed to the log on startup.
+          </p>
+        </li>
+        <li>
+          <p rev="kudu">
+            The syntax related to Kudu tables includes a number of new reserved words,
+            such as <codeph>COMPRESSION</codeph>, <codeph>DEFAULT</codeph>, and <codeph>ENCODING</codeph>, that
+            might conflict with names of existing tables, columns, or other identifiers from older Impala versions.
+            See <xref href="impala_reserved_words.xml#reserved_words"/> for the full list of reserved words.
+          </p>
+        </li>
+        <li>
+          <p rev="kudu">
+            The DDL syntax for Kudu tables, particularly in the <codeph>CREATE TABLE</codeph> statement, is different
+            from the special <codeph>impala_next</codeph> fork that was previously used for accessing Kudu tables
+            from Impala:
+          </p>
+          <ul rev="kudu">
+            <li>
+              <p>
+                The <codeph>DISTRIBUTE BY</codeph> clause is now <codeph>PARTITIONED BY</codeph>.
+              </p>
+            </li>
+            <li>
+              <p>
+                The <codeph>INTO <varname>N</varname> BUCKETS</codeph>
+                clause is now <codeph>PARTITIONS <varname>N</varname></codeph>.
+              </p>
+            </li>
+            <li>
+              <p>
+                The <codeph>SPLIT ROWS</codeph> clause is replaced by different syntax for specifying
+                the ranges covered by each partition.
+              </p>
+            </li>
+          </ul>
+        </li>
+        <li>
+          <p>
+            The <codeph>DESCRIBE</codeph> output for Kudu tables includes several extra columns.
+          </p>
+        </li>
+        <li>
+          <p rev="kudu IMPALA-4527">
+            Non-primary-key columns can contain <codeph>NULL</codeph> values by default. The
+            <codeph>SHOW CREATE TABLE</codeph> output for these columns displays the <codeph>NULL</codeph>
+            attribute. There was a period during early experimental versions of Impala + Kudu where
+            non-primary-key columns had the <codeph>NOT NULL</codeph> attribute by default.
+          </p>
+        </li>
+        <li>
+          <p rev="kudu IMPALA-3710">
+            The <codeph>IGNORE</codeph> keyword that was present in early experimental versions of Impala + Kudu
+            is no longer present. The behavior of the <codeph>IGNORE</codeph> keyword is now the default:
+            DML statements continue with warnings, instead of failing with errors, if they encounter conditions
+            such as <q>primary key already exists</q> for an <codeph>INSERT</codeph> statement or
+            <q>primary key already deleted</q> for a <codeph>DELETE</codeph> statement.
+          </p>
+        </li>
+        <li>
+          <p rev="IMPALA-4589">
+            The replication factor for Kudu tables must be an odd number.
+          </p>
+        </li>
+        <li>
+          <p rev="IMPALA-4432">
+            A UDF compiled into an LLVM IR bitcode module (<codeph>.bc</codeph>) might
+            encounter a runtime error when native code generation is turned off by
+            setting the query option <codeph>DISABLE_CODEGEN=1</codeph>.
+            This issue also applies when running a built-in or native UDF with
+            more than 20 arguments.
+            See <xref keyref="IMPALA-4432">IMPALA-4432</xref> for details.
+            As a workaround, either turn native code generation back on with the query option
+            <codeph>DISABLE_CODEGEN=0</codeph>, or use the regular UDF compilation path
+            that does not produce an IR module.
+          </p>
+        </li>
+      </ul>
+    </conbody>
+  </concept>
+
+  <concept rev="2.7.0" id="incompatible_changes_27x">
+
+    <title>Incompatible Changes Introduced in Impala 2.7.x</title>
+
+    <conbody>
+      <ul>
+        <li>
+          <p rev="IMPALA-1731 IMPALA-3868">
             Bug fixes related to parsing of floating-point values (IMPALA-1731 and IMPALA-3868) can change
             the results of casting strings that represent invalid floating-point values.
             For example, formerly a string value beginning or ending with <codeph>inf</codeph>,
@@ -72,13 +188,6 @@ under the License.
             are now interpreted as <codeph>NULL</codeph> rather than being converted to valid floating-point values.
           </p>
         </li>
-        <li>
-          <p rev="IMPALA-4372">
-            The column types shown in the <codeph>DESCRIBE FORMATTED</codeph> output are in uppercase, where formerly they
-            were in lowercase. This is not an intended change and could be reverted in the future, when IMPALA-4372
-            is resolved.
-          </p>
-        </li>
       </ul>
     </conbody>
 
@@ -86,17 +195,17 @@ under the License.
 
   <concept rev="2.6.0" id="incompatible_changes_26x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.8.x / Impala 2.6.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.6.x</title>
 
     <conbody>
       <ul>
         <li>
-          <p rev="CDH-41184">
-            The default for the <codeph>RUNTIME_FILTER_MODE</codeph> 
+          <p rev="">
+            The default for the <codeph>RUNTIME_FILTER_MODE</codeph>
             query option is changed to <codeph>GLOBAL</codeph> (the highest setting).
           </p>
         </li>
-        <li rev="CDH-41184 IMPALA-3007">
+        <li rev="IMPALA-3007">
           <p>
             The <codeph>RUNTIME_BLOOM_FILTER_SIZE</codeph> setting is now only used
             as a fallback if statistics are not available; otherwise, Impala
@@ -123,8 +232,8 @@ under the License.
           <p rev="IMPALA-3554">
             For Kerberized clusters, the Catalog service now uses
             the Kerberos principal instead of the operating sytem user that runs
-            the <cmdname>catalogd</cmdname> daemon. 
-            This eliminates the requirement to configure a <codeph>hadoop.user.group.static.mapping.overrides</codeph> 
+            the <cmdname>catalogd</cmdname> daemon.
+            This eliminates the requirement to configure a <codeph>hadoop.user.group.static.mapping.overrides</codeph>
             setting to put the OS user into the Sentry administrative group, on clusters where the principal
             and the OS user name for this user are different.
           </p>
@@ -164,7 +273,7 @@ under the License.
         <li>
           <p conref="../shared/impala_common.xml#common/IMPALA-3662"/>
         </li>
-        <li rev="IMPALA-3452 CDH-39913">
+        <li rev="IMPALA-3452">
           <p>
             The <codeph>S3_SKIP_INSERT_STAGING</codeph> query option, which is enabled by
             default, increases the speed of <codeph>INSERT</codeph> operations for S3 tables.
@@ -181,7 +290,7 @@ under the License.
       </p>
       <ul>
         <li>
-          <p rev="IMPALA-2660 CDH-40241">
+          <p rev="IMPALA-2660">
             Impala now recognizes the <codeph>auth_to_local</codeph> setting,
             specified through the HDFS configuration setting
             <codeph>hadoop.security.auth_to_local</codeph>.
@@ -201,7 +310,7 @@ under the License.
           </p>
         </li>
         <li>
-          <p rev="IMPALA-2835 CDH-33330">
+          <p rev="IMPALA-2835">
             A new query option,
             <codeph>PARQUET_FALLBACK_SCHEMA_RESOLUTION</codeph>,
             lets Impala locate columns within Parquet files based on
@@ -218,7 +327,7 @@ under the License.
 
   <concept rev="2.5.x" id="incompatible_changes_25x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.7.x / Impala 2.5.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.5.x</title>
 
     <conbody>
       <ul>
@@ -244,19 +353,19 @@ under the License.
             reason about.
           </p>
         </li>
-        <li rev="IMPALA-2204 CDH-33139">
+        <li rev="IMPALA-2204">
           <p>
             Previously, the <codeph>_</codeph> and <codeph>%</codeph> wildcard
             characters for the <codeph>LIKE</codeph> operator would not match
             characters on the second or subsequent lines of multi-line string values. The fix for issue
-            <xref href="https://issues.cloudera.org/browse/IMPALA-2204" scope="external" format="html">IMPALA-2204</xref> causes
+            <xref keyref="IMPALA-2204">IMPALA-2204</xref> causes
             the wildcard matching to apply to the entire string for values
             containing embedded <codeph>\n</codeph> characters. This could cause
             different results than in previous Impala releases for identical
             queries on identical data.
           </p>
         </li>
-        <li rev="IMPALA-1748 CDH-38369">
+        <li rev="IMPALA-1748">
           <p>
             Formerly, all Impala UDFs and UDAs required running the
             <codeph>CREATE FUNCTION</codeph> statements to
@@ -306,12 +415,12 @@ under the License.
 
   <concept rev="2.4.x" id="incompatible_changes_24x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.6.x / Impala 2.4.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.4.x</title>
 
     <conbody>
       <p>
-        Other than support for DSSD storage, the Impala feature set for CDH 5.6 is the same as for CDH 5.5.
-        Therefore, there are no incompatible changes for Impala introduced in CDH 5.6.
+        Other than support for DSSD storage, the Impala feature set for <keyword keyref="impala24"/> is the same as for <keyword keyref="impala23"/>.
+        Therefore, there are no incompatible changes for Impala introduced in <keyword keyref="impala24"/>.
       </p>
     </conbody>
 
@@ -319,20 +428,20 @@ under the License.
 
 <!-- All 2.3.x subsections go under here -->
 
-<!-- Actually for 2.3 / 5.5, let's get away from doing a separate subhead for each maintenance release,
-     because in the normal course of events there will be nothing to add here until 5.6. If something new
-     needs to get noted, just add a new bullet with wording to indicate which 5.5.x release it applies to. -->
+<!-- Actually for 2.3 and higher, let's get away from doing a separate subhead for each maintenance release,
+     because in the normal course of events there will be nothing to add here until the next full release. If something new
+     needs to get noted, just add a new bullet with wording to indicate which x.y.z release it applies to. -->
 
   <concept rev="2.3.x" id="incompatible_changes_23x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.5.x / Impala 2.3.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.3.x</title>
 
     <conbody>
 
       <note conref="../shared/impala_common.xml#common/impala_llama_obsolete"/>
 
       <ul>
-        <li rev="IMPALA-2005" audience="Cloudera">
+        <li rev="IMPALA-2005" audience="hidden">
           <p>
             If a <codeph>CREATE TABLE AS SELECT</codeph> operation fails while data is being inserted,
             the table is automatically removed. Previously, the table was left behind with no data.
@@ -341,11 +450,11 @@ under the License.
         <li rev="IMPALA-2130">
           <p>
             If Impala encounters a Parquet file that is invalid because of an incorrect magic number,
-            the query skips the file. This change is caused by the fix for issue <xref href="https://issues.cloudera.org/browse/IMPALA-2130" scope="external" format="html">IMPALA-2130</xref>.
+            the query skips the file. This change is caused by the fix for issue <xref keyref="IMPALA-2130">IMPALA-2130</xref>.
             Previously, Impala would attempt to read the file despite the possibility that the file was corrupted.
           </p>
         </li>
-        <li rev="IMPALA-2233 CDH-33145">
+        <li rev="IMPALA-2233">
           <p>
             Previously, calls to overloaded built-in functions could treat parameters as <codeph>DOUBLE</codeph>
             or <codeph>FLOAT</codeph> when no overload had a signature that matched the exact argument types.
@@ -371,7 +480,7 @@ under the License.
             but displays a warning message.
           </p>
         </li>
-        <li rev="CDH-28071">
+        <li rev="">
           <p>
             Formerly, Impala could include snippets of table data in log files by default, for example
             when reporting conversion errors for data values. Now any such log messages are only produced
@@ -388,30 +497,9 @@ under the License.
 
   <concept rev="2.2.x" id="incompatible_changes_22x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.4.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.2.x</title>
 
     <conbody>
-
-<!--
-      <p>
-        No incompatible changes. CDH maintenance releases such as 5.4.1, 5.4.2, and so on are exclusively bug fix releases.
-        See <xref href="impala_incompatible_changes.xml#incompatible_changes_220"/> for the initial Impala feature release,
-        which are the releases that typically include incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_22x"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.2.0" id="incompatible_changes_220">
-
-    <title>Incompatible Changes Introduced in Impala 2.2.0 / CDH 5.4.0</title>
-
-    <conbody>
--->
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_220"/>
 
       <section id="files_220">
       <title>
@@ -430,7 +518,6 @@ under the License.
         </p>
       </section>
 
-
       <section id="prereqs_210">
       <title>
         Changes to Prerequisites
@@ -445,122 +532,18 @@ under the License.
 
   <concept rev="2.1.x" id="incompatible_changes_21x">
 
-    <title>Incompatible Changes Introduced in Impala for CDH 5.3.x</title>
+    <title>Incompatible Changes Introduced in Impala 2.1.x</title>
 
     <conbody>
-
-<!--
-      <p>
-        No incompatible changes. CDH maintenance releases such as 5.3.1, 5.3.2, and so on are exclusively bug fix releases.
-        See <xref href="impala_incompatible_changes.xml#incompatible_changes_210"/> for the initial Impala feature release,
-        which are the releases that typically include incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_21x"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.7" id="incompatible_changes_217">
-    <title>Incompatible Changes Introduced in Cloudera Impala 2.1.7 / CDH 5.3.9</title>
-    <conbody>
-      <p>
-        No incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_21x"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.6" id="incompatible_changes_216">
-    <title>Incompatible Changes Introduced in Impala 2.1.6 / CDH 5.3.8</title>
-    <conbody>
-      <p>
-        No incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_21x"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.5" id="incompatible_changes_215">
-    <title>Incompatible Changes Introduced in Impala 2.1.5 / CDH 5.3.6</title>
-    <conbody>
-      <p>
-        No incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_21x"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.4" id="incompatible_changes_214">
-    <title>Incompatible Changes Introduced in Impala 2.1.4 / CDH 5.3.4</title>
-    <conbody>
-      <p>
-        No incompatible changes.
-        <ph conref="../shared/impala_common.xml#common/impala_214_redux"/>
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_21x"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.3" id="incompatible_changes_213">
-    <title>Incompatible Changes Introduced in Impala 2.1.3 / CDH 5.3.3</title>
-    <conbody>
-      <p>
-        No incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_213"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.2" id="incompatible_changes_212">
-    <title>Incompatible Changes Introduced in Impala 2.1.2 / CDH 5.3.2</title>
-    <conbody>
-      <p>
-        No incompatible changes.
-      </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_212"/>
-
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.1" id="incompatible_changes_211">
-
-    <title>Incompatible Changes Introduced in Impala 2.1.1 / CDH 5.3.1</title>
-
-    <conbody>
-
-      <p>
-        No incompatible changes.
-      </p>
-    </conbody>
-  </concept>
-
-  <concept rev="2.1.0" id="incompatible_changes_210">
-
-    <title>Incompatible Changes Introduced in Impala 2.1.0 / CDH 5.3.0</title>
-
-    <conbody>
--->
 
       <section id="prereqs_210">
       <title>
         Changes to Prerequisites
       </title>
-        <p rev="CDH-24874">
+        <p rev="">
           Currently, Impala 2.1.x does not function on CPUs without the SSE4.1 instruction set. This minimum CPU
           requirement is higher than in previous versions, which relied on the older SSSE3 instruction set. Check
-          the CPU level of the hosts in your cluster before upgrading to Impala 2.1.x or CDH 5.3.x.
+          the CPU level of the hosts in your cluster before upgrading to <keyword keyref="impala21_full"/>.
         </p>
       </section>
 
@@ -594,48 +577,42 @@ under the License.
 
   <concept rev="2.0.5" id="incompatible_changes_205">
 
-    <title>Incompatible Changes Introduced in Impala 2.0.5 / CDH 5.2.6</title>
+    <title>Incompatible Changes Introduced in Impala 2.0.5</title>
 
     <conbody>
 
       <p>
         No incompatible changes.
       </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_205"/>
 
     </conbody>
   </concept>
 
   <concept rev="2.0.4" id="incompatible_changes_204">
 
-    <title>Incompatible Changes Introduced in Impala 2.0.4 / CDH 5.2.5</title>
+    <title>Incompatible Changes Introduced in Impala 2.0.4</title>
 
     <conbody>
 
       <p>
         No incompatible changes.
       </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_204"/>
 
     </conbody>
   </concept>
 
   <concept rev="2.0.3" id="incompatible_changes_203">
 
-    <title>Incompatible Changes Introduced in Impala 2.0.3 / CDH 5.2.4</title>
+    <title>Incompatible Changes Introduced in Impala 2.0.3</title>
 
     <conbody>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_203"/>
 
     </conbody>
   </concept>
 
   <concept rev="2.0.2" id="incompatible_changes_202">
 
-    <title>Incompatible Changes Introduced in Impala 2.0.2 / CDH 5.2.3</title>
+    <title>Incompatible Changes Introduced in Impala 2.0.2</title>
 
     <conbody>
 
@@ -643,14 +620,12 @@ under the License.
         No incompatible changes.
       </p>
 
-      <note conref="../shared/impala_common.xml#common/only_cdh5_202"/>
-
     </conbody>
   </concept>
 
   <concept rev="2.0.1" id="incompatible_changes_201">
 
-    <title>Incompatible Changes Introduced in Impala 2.0.1 / CDH 5.2.1</title>
+    <title>Incompatible Changes Introduced in Impala 2.0.1</title>
 
     <conbody>
 
@@ -681,7 +656,7 @@ under the License.
 
   <concept rev="2.0.0" id="incompatible_changes_200">
 
-    <title>Incompatible Changes Introduced in Impala 2.0.0 / CDH 5.2.0</title>
+    <title>Incompatible Changes Introduced in Impala 2.0.0</title>
 
     <conbody>
 
@@ -689,10 +664,10 @@ under the License.
       <title>
         Changes to Prerequisites
       </title>
-        <p rev="CDH-24874">
+        <p rev="">
           Currently, Impala 2.0.x does not function on CPUs without the SSE4.1 instruction set. This minimum CPU
           requirement is higher than in previous versions, which relied on the older SSSE3 instruction set. Check
-          the CPU level of the hosts in your cluster before upgrading to Impala 2.0.x or CDH 5.2.x.
+          the CPU level of the hosts in your cluster before upgrading to <keyword keyref="impala20_full"/>.
         </p>
       </section>
 
@@ -873,20 +848,18 @@ under the License.
   </concept>
 
   <concept rev="1.4.4" id="incompatible_changes_144">
-    <title>Incompatible Changes Introduced in Impala 1.4.4 / CDH 5.1.5</title>
+    <title>Incompatible Changes Introduced in Impala 1.4.4</title>
     <conbody>
       <p>
         No incompatible changes.
       </p>
-
-      <note conref="../shared/impala_common.xml#common/only_cdh5_144"/>
 
     </conbody>
   </concept>
 
   <concept rev="1.4.3" id="incompatible_changes_143">
 
-    <title>Incompatible Changes Introduced in Impala 1.4.3 / CDH 5.1.4</title>
+    <title>Incompatible Changes Introduced in Impala 1.4.3</title>
 
     <conbody>
 
@@ -895,14 +868,12 @@ under the License.
         Impala.
       </p>
 
-      <note conref="../shared/impala_common.xml#common/only_cdh5_143"/>
-
     </conbody>
   </concept>
 
   <concept rev="1.4.2" id="incompatible_changes_142">
 
-    <title>Incompatible Changes Introduced in Impala 1.4.2 / CDH 5.1.3</title>
+    <title>Incompatible Changes Introduced in Impala 1.4.2</title>
 
     <conbody>
 
@@ -910,14 +881,12 @@ under the License.
         None. Impala 1.4.2 is purely a bug-fix release. It does not include any incompatible changes.
       </p>
 
-      <note conref="../shared/impala_common.xml#common/only_cdh5_142"/>
-
     </conbody>
   </concept>
 
   <concept rev="1.4.1" id="incompatible_changes_141">
 
-    <title>Incompatible Changes Introduced in Impala 1.4.1 / CDH 5.1.2</title>
+    <title>Incompatible Changes Introduced in Impala 1.4.1</title>
 
     <conbody>
 
@@ -929,7 +898,7 @@ under the License.
 
   <concept rev="1.4.0" id="incompatible_changes_140">
 
-    <title>Incompatible Changes Introduced in Impala 1.4.0 / CDH 5.1.0</title>
+    <title>Incompatible Changes Introduced in Impala 1.4.0</title>
   <prolog>
     <metadata>
       <data name="Category" value="Deprecated Features"/>
@@ -944,12 +913,8 @@ under the License.
             There is a slight change to required security privileges in the Sentry framework. To create a new
             object, now you need the <codeph>ALL</codeph> privilege on the parent object. For example, to create a
             new table, view, or function requires having the <codeph>ALL</codeph> privilege on the database
-            containing the new object. <ph audience="PDF">See
-              <xref
-                href="http://www.cloudera.com/documentation/enterprise/latest/topics/impala_authorization.html"
-                scope="external" format="html">Privilege Model and Object Hierarchy</xref>
-              for a full list of operations and
-            associated privileges.</ph>
+            containing the new object. See <xref href="impala_authorization.xml"/> for a full list of operations and
+            associated privileges.
           </p>
         </li>
 
@@ -1023,7 +988,7 @@ under the License.
         <li>
           <p>
             The fix for issue
-            <xref href="https://issues.cloudera.org/browse/IMPALA-973" scope="external" format="html">IMPALA-973</xref>
+            <xref keyref="IMPALA-973">IMPALA-973</xref>
             changes the behavior of the <codeph>INVALIDATE METADATA</codeph> statement regarding nonexistent
             tables. In Impala 1.4.0 and higher, the statement returns an error if the specified table is not in the
             metastore database at all. It completes successfully if the specified table is in the metastore
@@ -1037,7 +1002,7 @@ under the License.
 
   <concept rev="1.3.3" id="incompatible_changes_133">
 
-    <title>Incompatible Changes Introduced in Impala 1.3.3 / CDH 5.0.5</title>
+    <title>Incompatible Changes Introduced in Impala 1.3.3</title>
 
     <conbody>
 
@@ -1046,14 +1011,12 @@ under the License.
         Impala.
       </p>
 
-      <note conref="../shared/impala_common.xml#common/only_cdh5_133"/>
-
     </conbody>
   </concept>
 
   <concept rev="1.3.2" id="incompatible_changes_132">
 
-    <title>Incompatible Changes Introduced in Impala 1.3.2 / CDH 5.0.4</title>
+    <title>Incompatible Changes Introduced in Impala 1.3.2</title>
 
     <conbody>
 
@@ -1061,14 +1024,12 @@ under the License.
         With the fix for IMPALA-1019, you can use HDFS caching for files that are accessed by Impala.
       </p>
 
-      <note conref="../shared/impala_common.xml#common/only_cdh5_132"/>
-
     </conbody>
   </concept>
 
   <concept rev="1.3.1" id="incompatible_changes_131">
 
-    <title>Incompatible Changes Introduced in Impala 1.3.1 / CDH 5.0.3</title>
+    <title>Incompatible Changes Introduced in Impala 1.3.1</title>
 
     <conbody>
 
@@ -1090,7 +1051,7 @@ under the License.
 
   <concept rev="1.3.0" id="incompatible_changes_130">
 
-    <title>Incompatible Changes Introduced in Impala 1.3.0 / CDH 5.0.0</title>
+    <title>Incompatible Changes Introduced in Impala 1.3.0</title>
 
     <conbody>
 
@@ -1121,7 +1082,7 @@ under the License.
 
         <li>
           <p>
-            The query option named <codeph>YARN_POOL</codeph> during the CDH 5 beta period is now named
+            The query option formerly named <codeph>YARN_POOL</codeph> is now named
             <codeph>REQUEST_POOL</codeph> to reflect its broader use with the Impala admission control feature.
             <ph audience="PDF">See <xref href="impala_request_pool.xml#request_pool"/> for information about the
             option, and <xref href="impala_admission.xml#admission_control"/> for details about its use with the
@@ -1166,7 +1127,7 @@ under the License.
             The HDFS property <codeph>dfs.client.file-block-storage-locations.timeout</codeph> was renamed to
             <codeph>dfs.client.file-block-storage-locations.timeout.millis</codeph>, to emphasize that the unit of
             measure is milliseconds, not seconds. Impala requires a timeout of at least 10 seconds, making the
-            minimum value for this setting 10000. On systems not managed by Cloudera Manager, you might need to
+            minimum value for this setting 10000. If you are not using cluster management software, you might need to
             edit the <filepath>hdfs-site.xml</filepath> file in the Impala configuration directory for the new name
             and minimum value.
           </p>
@@ -1276,9 +1237,6 @@ select * from `cross`;</codeblock>
         to Impala 1.2.x in general.
       </p>
 
-      <p conref="../shared/impala_common.xml#common/cm48_upgrade"/>
-
-<!-- <note conref="common.xml#common/cdh4_cdh5_upgrade"/> -->
     </conbody>
   </concept>
 
@@ -1303,12 +1261,6 @@ select * from `cross`;</codeblock>
       </ul>
 
       <p>
-        Impala 1.2.1 goes along with CDH 4.5 and Cloudera Manager 4.8. If you used the beta version Impala 1.2.0
-        that came with the beta of CDH 5, Impala 1.2.1 includes all the features of Impala 1.2.0 except for
-        resource management, which relies on the YARN framework from CDH 5.
-      </p>
-
-      <p>
         The new <cmdname>catalogd</cmdname> service might require changes to any user-written scripts that stop,
         start, or restart Impala services, install or upgrade Impala packages, or issue <codeph>REFRESH</codeph> or
         <codeph>INVALIDATE METADATA</codeph> statements:
@@ -1318,9 +1270,6 @@ select * from `cross`;</codeblock>
         <li/>
       </ul>
 
-      <p conref="../shared/impala_common.xml#common/cm48_upgrade"/>
-
-<!--  <note conref="common.xml#common/cdh4_cdh5_upgrade"/> -->
     </conbody>
   </concept>
 
@@ -1335,11 +1284,6 @@ select * from `cross`;</codeblock>
       </p>
 
       <p>
-        Because Impala 1.2.0 is bundled with the CDH 5 beta download and depends on specific levels of Apache
-        Hadoop components supplied with CDH 5, you can only install it in combination with the CDH 5 beta.
-      </p>
-
-      <p>
         The new <cmdname>catalogd</cmdname> service might require changes to any user-written scripts that stop,
         start, or restart Impala services, install or upgrade Impala packages, or issue <codeph>REFRESH</codeph> or
         <codeph>INVALIDATE METADATA</codeph> statements:
@@ -1350,16 +1294,8 @@ select * from `cross`;</codeblock>
       </ul>
 
       <p>
-        The new resource management feature interacts with both YARN and Llama services, which are available in CDH
-        5. These services are set up for you automatically in a Cloudera Manager (CM) environment. For information
-        about setting up the YARN and Llama services, see the instructions for
-<!-- Original URL: http://www.cloudera.com/content/cloudera-content/cloudera-docs/CDH5/latest/CDH5-Installation-Guide/cdh_ig_yarn_cluster_deploy.html -->
-        <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cdh_ig_yarn_cluster_deploy.html" scope="external" format="html">YARN</xref>
-        and
-<!-- Original URL: http://www.cloudera.com/content/cloudera-content/cloudera-docs/CDH5/latest/CDH5-Installation-Guide/cdh_ig_llama_installation.html -->
-<!-- Then this, which was removed: http://www.cloudera.com/documentation/enterprise/latest/topics/cdh_ig_llama_installation.html -->
-        <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/admin_llama.html" scope="external" format="html">Llama</xref>
-        in the <cite>CDH 5 Documentation</cite>. <ph audience="PDF">See
+        The new resource management feature interacts with both YARN and Llama services.
+        <ph audience="PDF">See
         <xref href="impala_resource_management.xml#resource_management"/> for usage information for Impala resource
         management.</ph>
       </p>
@@ -1410,7 +1346,7 @@ ALTER TABLE <varname>table_name</varname> SET FILEFORMAT
       </p>
 
       <p>
-        As usual, make sure to upgrade the <codeph>impala-lzo-cdh4</codeph> package to the latest level at the same
+        As usual, make sure to upgrade the Impala LZO package to the latest level at the same
         time as you upgrade the Impala server.
       </p>
     </conbody>
@@ -1452,86 +1388,11 @@ ALTER TABLE <varname>table_name</varname> SET FILEFORMAT
       <ul>
         <li>
           If you use LZO-compressed text files, when you upgrade Impala to version 1.0, also update the
-          <codeph>impala-lzo-cdh4</codeph> to the latest level. See <xref href="impala_txtfile.xml#lzo"/> for
+          Impala LZO package to the latest level. See <xref href="impala_txtfile.xml#lzo"/> for
           details.
         </li>
-
-        <li>
-          Cloudera Manager 4.5.2 and higher only supports Impala 1.0 and higher, and vice versa. If you upgrade to
-          Impala 1.0 or higher managed by Cloudera Manager, you must also upgrade Cloudera Manager to version 4.5.2
-          or higher. If you upgrade from an earlier version of Cloudera Manager, and were using Impala, you must
-          also upgrade Impala to version 1.0 or higher. The beta versions of Impala are no longer supported as of
-          the release of Impala 1.0.
-        </li>
       </ul>
     </conbody>
   </concept>
 
-  <concept id="incompatible_changes_07">
-
-    <title>Incompatible Change Introduced in Version 0.7 of the Impala Beta Release</title>
-
-    <conbody>
-
-      <ul>
-        <li>
-          The defaults for the <codeph>-nn</codeph> and <codeph>-nn_port</codeph> flags have changed and are now
-          read from <codeph>core-site.xml</codeph>. Impala prints the values of <codeph>-nn</codeph> and
-          <codeph>-nn_port</codeph> to the log when it starts. The ability to set <codeph>-nn</codeph> and
-          <codeph>-nn_port</codeph> on the command line is deprecated in 0.7 and may be removed in Impala 0.8.
-        </li>
-      </ul>
-    </conbody>
-  </concept>
-
-  <concept id="incompatible_changes_06">
-
-    <title>Incompatible Change Introduced in Version 0.6 of the Impala Beta Release</title>
-
-    <conbody>
-
-      <ul>
-        <li>
-          Cloudera Manager 4.5 supports only version 0.6 of the Impala Beta Release. It does not support
-          the earlier beta versions. If you upgrade your Cloudera Manager installation, you must also upgrade
-          Impala to beta version 0.6. If you upgrade Impala to beta version 0.6, you must upgrade Cloudera Manager
-          to 4.5.
-        </li>
-      </ul>
-    </conbody>
-  </concept>
-
-  <concept id="incompatible_changes_04">
-
-    <title>Incompatible Change Introduced in Version 0.4 of the Impala Beta Release</title>
-
-    <conbody>
-
-      <ul>
-        <li>
-          Cloudera Manager 4.1.3 supports only version 0.4 of the Impala Beta Release. It does not support
-          the earlier beta versions. If you upgrade your Cloudera Manager installation, you must also upgrade
-          Impala to beta version 0.4. If you upgrade Impala to beta version 0.4, you must upgrade Cloudera Manager
-          to 4.1.3.
-        </li>
-      </ul>
-    </conbody>
-  </concept>
-
-  <concept id="incompatible_changes_03">
-
-    <title>Incompatible Change Introduced in Version 0.3 of the Impala Beta Release</title>
-
-    <conbody>
-
-      <ul>
-        <li>
-          Cloudera Manager 4.1.2 supports only version 0.3 of the Impala Beta Release. It does not support
-          the earlier beta versions. If you upgrade your Cloudera Manager installation, you must also upgrade
-          Impala to beta version 0.3. If you upgrade Impala to beta version 0.3, you must upgrade Cloudera Manager
-          to 4.1.2.
-        </li>
-      </ul>
-    </conbody>
-  </concept>
 </concept>

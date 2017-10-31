@@ -19,35 +19,41 @@
 #ifndef IMPALA_EXEC_EXEC_NODE_H
 #define IMPALA_EXEC_EXEC_NODE_H
 
+#include <memory>
 #include <sstream>
 #include <vector>
 
 #include "common/status.h"
-#include "exprs/expr-context.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "gen-cpp/PlanNodes_types.h"
+#include "runtime/bufferpool/buffer-pool.h"
+#include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/descriptors.h" // for RowDescriptor
 #include "util/blocking-queue.h"
 #include "util/runtime-profile.h"
 
 namespace impala {
 
-class Expr;
-class ExprContext;
+class DataSink;
+class MemPool;
+class MemTracker;
 class ObjectPool;
-class Counters;
-class SortExecExprs;
 class RowBatch;
 class RuntimeState;
+class ScalarExpr;
+class SubplanNode;
 class TPlan;
 class TupleRow;
-class DataSink;
-class MemTracker;
-class SubplanNode;
+class TDebugOptions;
 
-/// Superclass of all executor nodes.
+/// Superclass of all execution nodes.
+///
 /// All subclasses need to make sure to check RuntimeState::is_cancelled()
 /// periodically in order to ensure timely termination after the cancellation
 /// flag gets set.
+/// TODO: Move static state of ExecNode into PlanNode, of which there is one instance
+/// per fragment. ExecNode contains only runtime state and there can be up to MT_DOP
+/// instances of it per fragment.
 class ExecNode {
  public:
   /// Init conjuncts.
@@ -58,13 +64,13 @@ class ExecNode {
   /// Initializes this object from the thrift tnode desc. The subclass should
   /// do any initialization that can fail in Init() rather than the ctor.
   /// If overridden in subclass, must first call superclass's Init().
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Sets up internal structures, etc., without doing any actual work.
   /// Must be called prior to Open(). Will only be called once in this
   /// node's lifetime.
   /// If overridden in subclass, must first call superclass's Prepare().
-  virtual Status Prepare(RuntimeState* state);
+  virtual Status Prepare(RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Recursively calls Codegen() on all children.
   /// Expected to be overriden in subclass to generate LLVM IR functions and register
@@ -79,7 +85,15 @@ class ExecNode {
   /// If overridden in subclass, must first call superclass's Open().
   /// Open() is called after Prepare() or Reset(), i.e., possibly multiple times
   /// throughout the lifetime of this node.
-  virtual Status Open(RuntimeState* state);
+  ///
+  /// Memory resources must be acquired by an ExecNode only during or after the first
+  /// call to Open(). Blocking ExecNodes outside of a subplan must call Open() on their
+  /// child before acquiring their own resources to reduce the peak resource requirement.
+  /// This is particularly important if there are multiple blocking ExecNodes in a
+  /// pipeline because the lower nodes will release resources in Close() before the
+  /// Open() of their parent retuns.  The resource profile calculation in the frontend
+  /// relies on this when computing the peak resources required for a query.
+  virtual Status Open(RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Retrieves rows and returns them via row_batch. Sets eos to true
   /// if subsequent calls will not retrieve any more rows.
@@ -94,7 +108,8 @@ class ExecNode {
   /// row_batch's tuple_data_pool.
   /// Caller must not be holding any io buffers. This will cause deadlock.
   /// TODO: AggregationNode and HashJoinNode cannot be "re-opened" yet.
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
+  virtual Status GetNext(
+      RuntimeState* state, RowBatch* row_batch, bool* eos) WARN_UNUSED_RESULT = 0;
 
   /// Resets the stream of row batches to be retrieved by subsequent GetNext() calls.
   /// Clears all internal state, returning this node to the state it was in after calling
@@ -109,7 +124,7 @@ class ExecNode {
   /// implementation calls Reset() on children.
   /// Note that this function may be called many times (proportional to the input data),
   /// so should be fast.
-  virtual Status Reset(RuntimeState* state);
+  virtual Status Reset(RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Close() will get called for every exec node, regardless of what else is called and
   /// the status of these calls (i.e. Prepare() may never have been called, or
@@ -130,11 +145,10 @@ class ExecNode {
   /// traversal. All nodes are placed in state->obj_pool() and have Init() called on them.
   /// Returns error if 'plan' is corrupted, otherwise success.
   static Status CreateTree(RuntimeState* state, const TPlan& plan,
-      const DescriptorTbl& descs, ExecNode** root);
+      const DescriptorTbl& descs, ExecNode** root) WARN_UNUSED_RESULT;
 
-  /// Set debug action for node with given id in 'tree'
-  static void SetDebugOptions(int node_id, TExecNodePhase::type phase,
-                              TDebugAction::type action, ExecNode* tree);
+  /// Set debug action in 'tree' according to debug_options.
+  static void SetDebugOptions(const TDebugOptions& debug_options, ExecNode* tree);
 
   /// Collect all nodes of given 'node_type' that are part of this subtree, and return in
   /// 'nodes'.
@@ -143,16 +157,19 @@ class ExecNode {
   /// Collect all scan node types.
   void CollectScanNodes(std::vector<ExecNode*>* nodes);
 
-  /// Evaluate ExprContexts over row.  Returns true if all exprs return true.
-  /// TODO: This doesn't use the vector<Expr*> signature because I haven't figured
-  /// out how to deal with declaring a templated std:vector type in IR
-  static bool EvalConjuncts(ExprContext* const* ctxs, int num_ctxs, TupleRow* row);
+  /// Evaluates the predicate in 'eval' over 'row' and returns the result.
+  static bool EvalPredicate(ScalarExprEvaluator* eval, TupleRow* row);
+
+  /// Evaluate the conjuncts in 'evaluators' over 'row'.
+  /// Returns true if all exprs return true.
+  static bool EvalConjuncts(
+      ScalarExprEvaluator* const* evals, int num_conjuncts, TupleRow* row);
 
   /// Codegen EvalConjuncts(). Returns a non-OK status if the function couldn't be
   /// codegen'd. The codegen'd version uses inlined, codegen'd GetBooleanVal() functions.
-  static Status CodegenEvalConjuncts(
-      LlvmCodeGen* codegen, const std::vector<ExprContext*>& conjunct_ctxs,
-      llvm::Function** fn, const char* name = "EvalConjuncts");
+  static Status CodegenEvalConjuncts(LlvmCodeGen* codegen,
+      const std::vector<ScalarExpr*>& conjuncts, llvm::Function** fn,
+      const char* name = "EvalConjuncts") WARN_UNUSED_RESULT;
 
   /// Returns a string representation in DFS order of the plan rooted at this.
   std::string DebugString() const;
@@ -165,10 +182,21 @@ class ExecNode {
   ///   out: Stream to accumulate debug string.
   virtual void DebugString(int indentation_level, std::stringstream* out) const;
 
-  const std::vector<ExprContext*>& conjunct_ctxs() const { return conjunct_ctxs_; }
+  const std::vector<ScalarExpr*>& conjuncts() const { return conjuncts_; }
+
+  const std::vector<ScalarExprEvaluator*>& conjunct_evals() const {
+    return conjunct_evals_;
+  }
+
   int id() const { return id_; }
   TPlanNodeType::type type() const { return type_; }
-  const RowDescriptor& row_desc() const { return row_descriptor_; }
+
+  /// Returns the row descriptor for rows produced by this node. The RowDescriptor is
+  /// constant for the lifetime of the fragment instance, and so is shared by reference
+  /// across the plan tree, including in RowBatches. The lifetime of the descriptor is the
+  /// same as the lifetime of this node.
+  const RowDescriptor* row_desc() const { return &row_descriptor_; }
+
   ExecNode* child(int i) { return children_[i]; }
   int num_children() const { return children_.size(); }
   SubplanNode* get_containing_subplan() const { return containing_subplan_; }
@@ -183,6 +211,7 @@ class ExecNode {
   RuntimeProfile* runtime_profile() { return runtime_profile_.get(); }
   MemTracker* mem_tracker() { return mem_tracker_.get(); }
   MemTracker* expr_mem_tracker() { return expr_mem_tracker_.get(); }
+  MemPool* expr_mem_pool() { return expr_mem_pool_.get(); }
 
   /// Return true if codegen was disabled by the planner for this ExecNode. Does not
   /// check to see if codegen was enabled for the enclosing fragment.
@@ -200,6 +229,26 @@ class ExecNode {
  protected:
   friend class DataSink;
 
+  /// Initialize 'buffer_pool_client_' and claim the initial reservation for this
+  /// ExecNode. Only needs to be called by ExecNodes that will use the client.
+  /// The client is automatically cleaned up in Close(). Should not be called if
+  /// the client is already open.
+  ///
+  /// The ExecNode must return the initial reservation to
+  /// QueryState::initial_reservations(), which is done automatically in Close() as long
+  /// as the initial reservation is not released before Close().
+  Status ClaimBufferReservation(RuntimeState* state) WARN_UNUSED_RESULT;
+
+  /// Release any unused reservation in excess of the node's initial reservation. Returns
+  /// an error if releasing the reservation requires flushing pages to disk, and that
+  /// fails.
+  Status ReleaseUnusedReservation() WARN_UNUSED_RESULT;
+
+  /// Enable the increase reservation denial probability on 'buffer_pool_client_' based on
+  /// the 'debug_action_' set on this node. Returns an error if 'debug_action_param_' is
+  /// invalid.
+  Status EnableDenyReservationDebugAction();
+
   /// Extends blocking queue for row batches. Row batches have a property that
   /// they must be processed in the order they were produced, even in cancellation
   /// paths. Preceding row batches can contain ptrs to memory in subsequent row batches
@@ -207,7 +256,7 @@ class ExecNode {
   /// Row batches that are added after Shutdown() are queued in another queue, which can
   /// be cleaned up during Close().
   /// All functions are thread safe.
-  class RowBatchQueue : public BlockingQueue<RowBatch*> {
+  class RowBatchQueue : public BlockingQueue<std::unique_ptr<RowBatch>> {
    public:
     /// max_batches is the maximum number of row batches that can be queued.
     /// When the queue is full, producers will block.
@@ -215,19 +264,12 @@ class ExecNode {
     ~RowBatchQueue();
 
     /// Adds a batch to the queue. This is blocking if the queue is full.
-    void AddBatch(RowBatch* batch);
-
-    /// Adds a batch to the queue. If the queue is full, this blocks until space becomes
-    /// available or 'timeout_micros' has elapsed.
-    /// Returns true if the element was added to the queue, false if it wasn't. If this
-    /// method returns false, the queue didn't take ownership of the batch and it must be
-    /// managed externally.
-    bool AddBatchWithTimeout(RowBatch* batch, int64_t timeout_micros);
+    void AddBatch(std::unique_ptr<RowBatch> batch);
 
     /// Gets a row batch from the queue. Returns NULL if there are no more.
     /// This function blocks.
     /// Returns NULL after Shutdown().
-    RowBatch* GetBatch();
+    std::unique_ptr<RowBatch> GetBatch();
 
     /// Deletes all row batches in cleanup_queue_. Not valid to call AddBatch()
     /// after this is called.
@@ -239,23 +281,31 @@ class ExecNode {
     SpinLock lock_;
 
     /// Queue of orphaned row batches
-    std::list<RowBatch*> cleanup_queue_;
+    std::list<std::unique_ptr<RowBatch>> cleanup_queue_;
   };
 
   /// Unique within a single plan tree.
   int id_;
-
   TPlanNodeType::type type_;
   ObjectPool* pool_;
-  std::vector<ExprContext*> conjunct_ctxs_;
+
+  /// Conjuncts and their evaluators in this node. 'conjuncts_' live in the
+  /// query-state's object pool while the evaluators live in this exec node's
+  /// object pool.
+  std::vector<ScalarExpr*> conjuncts_;
+  std::vector<ScalarExprEvaluator*> conjunct_evals_;
 
   std::vector<ExecNode*> children_;
   RowDescriptor row_descriptor_;
+
+  /// Resource information sent from the frontend.
+  const TBackendResourceProfile resource_profile_;
 
   /// debug-only: if debug_action_ is not INVALID, node will perform action in
   /// debug_phase_
   TExecNodePhase::type debug_phase_;
   TDebugAction::type debug_action_;
+  std::string debug_action_param_;
 
   int64_t limit_;  // -1: no limit
   int64_t num_rows_returned_;
@@ -267,8 +317,18 @@ class ExecNode {
   /// Account for peak memory used by this node
   boost::scoped_ptr<MemTracker> mem_tracker_;
 
-  /// MemTracker that should be used for ExprContexts.
+  /// MemTracker used by 'expr_mem_pool_'.
   boost::scoped_ptr<MemTracker> expr_mem_tracker_;
+
+  /// MemPool for allocating data structures used by expression evaluators in this node.
+  /// Created in Prepare().
+  boost::scoped_ptr<MemPool> expr_mem_pool_;
+
+  /// Buffer pool client for this node. Initialized with the node's minimum reservation
+  /// in ClaimBufferReservation(). After initialization, the client must hold onto at
+  /// least the minimum reservation so that it can be returned to the initial
+  /// reservations pool in Close().
+  BufferPool::ClientHandle buffer_pool_client_;
 
   bool is_closed() const { return is_closed_; }
 
@@ -285,49 +345,64 @@ class ExecNode {
 
   /// Create a single exec node derived from thrift node; place exec node in 'pool'.
   static Status CreateNode(ObjectPool* pool, const TPlanNode& tnode,
-      const DescriptorTbl& descs, ExecNode** node, RuntimeState* state);
+      const DescriptorTbl& descs, ExecNode** node,
+      RuntimeState* state) WARN_UNUSED_RESULT;
 
   static Status CreateTreeHelper(RuntimeState* state,
       const std::vector<TPlanNode>& tnodes, const DescriptorTbl& descs, ExecNode* parent,
-      int* node_idx, ExecNode** root);
+      int* node_idx, ExecNode** root) WARN_UNUSED_RESULT;
 
   virtual bool IsScanNode() const { return false; }
 
   void InitRuntimeProfile(const std::string& name);
 
-  /// Executes debug_action_ if phase matches debug_phase_.
+  /// Executes 'debug_action_' if 'phase' matches 'debug_phase_'.
   /// 'phase' must not be INVALID.
-  Status ExecDebugAction(TExecNodePhase::type phase, RuntimeState* state);
+  Status ExecDebugAction(
+      TExecNodePhase::type phase, RuntimeState* state) WARN_UNUSED_RESULT {
+    DCHECK_NE(phase, TExecNodePhase::INVALID);
+    // Fast path for the common case when an action is not enabled for this phase.
+    if (LIKELY(debug_phase_ != phase)) return Status::OK();
+    return ExecDebugActionImpl(phase, state);
+  }
 
-  /// Frees any local allocations made by expr_ctxs_to_free_ and returns the result of
+  /// Frees any local allocations made by evals_to_free_ and returns the result of
   /// state->CheckQueryState(). Nodes should call this periodically, e.g. once per input
   /// row batch. This should not be called outside the main execution thread.
   //
   /// Nodes may override this to add extra periodic cleanup, e.g. freeing other local
   /// allocations. ExecNodes overriding this function should return
   /// ExecNode::QueryMaintenance().
-  virtual Status QueryMaintenance(RuntimeState* state);
+  virtual Status QueryMaintenance(RuntimeState* state) WARN_UNUSED_RESULT;
 
-  /// Add an ExprContext to have its local allocations freed by QueryMaintenance().
+  /// Add an expr evaluator to have its local allocations freed by QueryMaintenance().
   /// Exprs that are evaluated in the main execution thread should be added. Exprs
   /// evaluated in a separate thread are generally not safe to add, since a local
   /// allocation may be freed while it's being used. Rather than using this mechanism,
-  /// threads should call FreeLocalAllocations() on local ExprContexts periodically.
-  void AddExprCtxToFree(ExprContext* ctx) { expr_ctxs_to_free_.push_back(ctx); }
-  void AddExprCtxsToFree(const std::vector<ExprContext*>& ctxs);
-  void AddExprCtxsToFree(const SortExecExprs& sort_exec_exprs);
-
-  /// Free any local allocations made by expr_ctxs_to_free_.
-  void FreeLocalAllocations() { ExprContext::FreeLocalAllocations(expr_ctxs_to_free_); }
+  /// threads should call FreeLocalAllocations() on local evaluators periodically.
+  void AddEvaluatorToFree(ScalarExprEvaluator* eval);
+  void AddEvaluatorsToFree(const std::vector<ScalarExprEvaluator*>& evals);
 
  private:
+  /// Implementation of ExecDebugAction(). This is the slow path we take when there is
+  /// actually a debug action enabled for 'phase'.
+  Status ExecDebugActionImpl(
+      TExecNodePhase::type phase, RuntimeState* state) WARN_UNUSED_RESULT;
+
   /// Set in ExecNode::Close(). Used to make Close() idempotent. This is not protected
   /// by a lock, it assumes all calls to Close() are made by the same thread.
   bool is_closed_;
 
-  /// Expr contexts whose local allocations are safe to free in the main execution thread.
-  std::vector<ExprContext*> expr_ctxs_to_free_;
+  /// Expr evaluators whose local allocations are safe to free in the main execution
+  /// thread.
+  std::vector<ScalarExprEvaluator*> evals_to_free_;
 };
+
+inline bool ExecNode::EvalPredicate(ScalarExprEvaluator* eval, TupleRow* row) {
+  BooleanVal v = eval->GetBooleanVal(row);
+  if (v.is_null || !v.val) return false;
+  return true;
+}
 
 }
 #endif

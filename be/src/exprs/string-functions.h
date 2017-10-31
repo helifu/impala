@@ -28,6 +28,19 @@ using namespace impala_udf;
 
 namespace impala {
 
+using impala_udf::FunctionContext;
+using impala_udf::AnyVal;
+using impala_udf::BooleanVal;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
+
 class Expr;
 class OpcodeRegistry;
 class TupleRow;
@@ -53,6 +66,10 @@ class StringFunctions {
   static StringVal Lower(FunctionContext*, const StringVal& str);
   static StringVal Upper(FunctionContext*, const StringVal& str);
   static StringVal InitCap(FunctionContext*, const StringVal& str);
+  static void ReplacePrepare(FunctionContext*, FunctionContext::FunctionStateScope);
+  static void ReplaceClose(FunctionContext*, FunctionContext::FunctionStateScope);
+  static StringVal Replace(FunctionContext*, const StringVal& str,
+      const StringVal& pattern, const StringVal& replace);
   static StringVal Reverse(FunctionContext*, const StringVal& str);
   static StringVal Translate(FunctionContext*, const StringVal& str, const StringVal& src,
       const StringVal& dst);

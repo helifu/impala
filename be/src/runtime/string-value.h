@@ -31,7 +31,7 @@ namespace impala {
 
 /// The format of a string-typed slot.
 /// The returned StringValue of all functions that return StringValue
-/// shares its buffer the parent.
+/// shares its buffer with the parent.
 /// TODO: rename this to be less confusing with impala_udf::StringVal.
 struct StringValue {
   /// The current limitation for a string instance is 1GB character data.
@@ -120,12 +120,6 @@ struct StringValue {
 
   /// Returns number of characters in a char array (ignores trailing spaces)
   inline static int64_t UnpaddedCharLength(const char* cptr, int64_t len);
-
-  /// Converts a char slot to a pointer to the char string.
-  /// The slot should be a StringValue* or a char*, determined by type.IsVarLenStringType()
-  /// Returns NULL if the slot is null.
-  inline static char* CharSlotToPtr(void* slot, const ColumnType& type);
-  inline static const char* CharSlotToPtr(const void* slot, const ColumnType& type);
 
   /// For C++/IR interop, we need to be able to look up types by name.
   static const char* LLVM_CLASS_NAME;

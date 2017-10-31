@@ -36,7 +36,7 @@ under the License.
 
     <p>
       The Impala server is a distributed, massively parallel processing (MPP) database engine. It consists of
-      different daemon processes that run on specific hosts within your CDH cluster.
+      different daemon processes that run on specific hosts within your <keyword keyref="distro"/> cluster.
     </p>
 
     <p outputclass="toc inpage"/>
@@ -76,6 +76,12 @@ under the License.
         <codeph>INSERT</codeph> or <codeph>LOAD DATA</codeph> statement is processed through Impala. This
         background communication minimizes the need for <codeph>REFRESH</codeph> or <codeph>INVALIDATE
         METADATA</codeph> statements that were needed to coordinate metadata across nodes prior to Impala 1.2.
+      </p>
+
+      <p rev="2.9.0 IMPALA-3807 IMPALA-5147 IMPALA-5503">
+        In <keyword keyref="impala29_full"/> and higher, you can control which hosts act as query coordinators
+        and which act as query executors, to improve scalability for highly concurrent workloads on large clusters.
+        See <xref keyref="scalability_coordinator"/> for details.
       </p>
 
       <p>

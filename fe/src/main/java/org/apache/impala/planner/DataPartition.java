@@ -40,8 +40,6 @@ import com.google.common.collect.Lists;
  * DataStreamSender/DataStreamMgr/DataStreamRecvr).
  */
 public class DataPartition {
-  private final static Logger LOG = LoggerFactory.getLogger(DataPartition.class);
-
   private final TPartitionType type_;
 
   // for hash partition: exprs used to compute hash value
@@ -51,7 +49,8 @@ public class DataPartition {
     Preconditions.checkNotNull(exprs);
     Preconditions.checkState(!exprs.isEmpty());
     Preconditions.checkState(type == TPartitionType.HASH_PARTITIONED
-        || type == TPartitionType.RANGE_PARTITIONED);
+        || type == TPartitionType.RANGE_PARTITIONED
+        || type == TPartitionType.KUDU);
     type_ = type;
     partitionExprs_ = exprs;
   }
@@ -71,6 +70,10 @@ public class DataPartition {
 
   public static DataPartition hashPartitioned(List<Expr> exprs) {
     return new DataPartition(TPartitionType.HASH_PARTITIONED, exprs);
+  }
+
+  public static DataPartition kuduPartitioned(Expr expr) {
+    return new DataPartition(TPartitionType.KUDU, Lists.newArrayList(expr));
   }
 
   public boolean isPartitioned() { return type_ != TPartitionType.UNPARTITIONED; }
@@ -125,6 +128,7 @@ public class DataPartition {
       case HASH_PARTITIONED: return "HASH";
       case RANGE_PARTITIONED: return "RANGE";
       case UNPARTITIONED: return "UNPARTITIONED";
+      case KUDU: return "KUDU";
       default: return "";
     }
   }

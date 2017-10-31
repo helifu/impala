@@ -25,8 +25,8 @@
 #include "common/status.h"
 #include "exec/kudu-util.h"
 #include "exec/data-sink.h"
-#include "exprs/expr-context.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 
 namespace impala {
 
@@ -37,10 +37,10 @@ namespace impala {
 /// requires specifying a mutation buffer size and a buffer flush watermark percentage in
 /// the Kudu client. The mutation buffer needs to be large enough to buffer rows sent to
 /// all destination nodes because the buffer accounting is not specified per-tablet
-/// server (KUDU-1693). Tests showed that 100MB was a good default, and this is
+/// server (KUDU-1693). Tests showed that 10MB was a good default, and this is
 /// configurable via the gflag --kudu_mutation_buffer_size. The buffer flush watermark
 /// percentage is set to a value that results in Kudu flushing after 7MB is in a
-/// buffer for a particular destination (of the 100MB of the total mutation buffer space)
+/// buffer for a particular destination (of the 10MB of the total mutation buffer space)
 /// because Kudu currently has some 8MB buffer limits.
 ///
 /// Kudu doesn't have transactions yet, so some rows may fail to write while others are
@@ -53,8 +53,7 @@ namespace impala {
 /// status. All reported errors (ignored or not) will be logged via the RuntimeState.
 class KuduTableSink : public DataSink {
  public:
-  KuduTableSink(const RowDescriptor& row_desc,
-      const std::vector<TExpr>& select_list_texprs, const TDataSink& tsink);
+  KuduTableSink(const RowDescriptor* row_desc, const TDataSink& tsink);
 
   virtual std::string GetName() { return "KuduTableSink"; }
 
@@ -76,9 +75,6 @@ class KuduTableSink : public DataSink {
   virtual void Close(RuntimeState* state);
 
  private:
-  /// Turn thrift TExpr into Expr and prepare them to run
-  Status PrepareExprs(RuntimeState* state);
-
   /// Create a new write operation according to the sink type.
   kudu::client::KuduWriteOperation* NewWriteOp();
 
@@ -86,7 +82,7 @@ class KuduTableSink : public DataSink {
   /// appropriate counters for ignored errors.
   //
   /// Returns a bad Status if there are non-ignorable errors.
-  Status CheckForErrors(RuntimeState* state);
+  Status CheckForErrors(RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Used to get the KuduTableDescriptor from the RuntimeState
   TableId table_id_;
@@ -94,13 +90,9 @@ class KuduTableSink : public DataSink {
   /// The descriptor of the KuduTable being written to. Set on Prepare().
   const KuduTableDescriptor* table_desc_;
 
-  /// The expression descriptors and the prepared expressions. The latter are built
-  /// on Prepare().
-  const std::vector<TExpr>& select_list_texprs_;
-  std::vector<ExprContext*> output_expr_ctxs_;
-
-  /// The Kudu client, table and session.
-  kudu::client::sp::shared_ptr<kudu::client::KuduClient> client_;
+  /// The Kudu client, owned by the ExecEnv.
+  kudu::client::KuduClient* client_ = nullptr;
+  /// The Kudu table and session.
   kudu::client::sp::shared_ptr<kudu::client::KuduTable> table_;
   kudu::client::sp::shared_ptr<kudu::client::KuduSession> session_;
 
@@ -118,14 +110,14 @@ class KuduTableSink : public DataSink {
 
   /// Total number of rows processed, i.e. rows written to Kudu and also rows with
   /// errors.
-  RuntimeProfile::Counter* total_rows_;
+  RuntimeProfile::Counter* total_rows_ = nullptr;
 
   /// The number of rows with errors.
-  RuntimeProfile::Counter* num_row_errors_;
+  RuntimeProfile::Counter* num_row_errors_ = nullptr;
 
   /// Rate at which the sink consumes and processes rows, i.e. writing rows to Kudu or
   /// skipping rows that are known to violate nullability constraints.
-  RuntimeProfile::Counter* rows_processed_rate_;
+  RuntimeProfile::Counter* rows_processed_rate_ = nullptr;
 };
 
 }  // namespace impala

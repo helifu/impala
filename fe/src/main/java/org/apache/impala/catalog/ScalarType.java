@@ -39,7 +39,8 @@ import com.google.common.base.Preconditions;
 public class ScalarType extends Type {
   private final PrimitiveType type_;
 
-  // Only used for type CHAR.
+  // Used for fixed-length types parameterized by size, i.e. CHAR, VARCHAR and
+  // FIXED_UDA_INTERMEDIATE.
   private int len_;
 
   // Only used if type is DECIMAL. -1 (for both) is used to represent a
@@ -59,13 +60,10 @@ public class ScalarType extends Type {
   public static final int MAX_VARCHAR_LENGTH = (1 << 16) - 1; // 65535
   public static final int MAX_CHAR_LENGTH = (1 << 8) - 1; // 255
 
-  // Longest CHAR that we in line in the tuple.
-  // Keep consistent with backend ColumnType::CHAR_INLINE_LENGTH
-  public static final int CHAR_INLINE_LENGTH = (1 << 7); // 128
-
   // Hive, mysql, sql server standard.
   public static final int MAX_PRECISION = 38;
   public static final int MAX_SCALE = MAX_PRECISION;
+  public static final int MIN_ADJUSTED_SCALE = 6;
 
   protected ScalarType(PrimitiveType type) {
     type_ = type;
@@ -101,12 +99,21 @@ public class ScalarType extends Type {
     return type;
   }
 
+  public static ScalarType createFixedUdaIntermediateType(int len) {
+    ScalarType type = new ScalarType(PrimitiveType.FIXED_UDA_INTERMEDIATE);
+    type.len_ = len;
+    return type;
+  }
+
   public static ScalarType createDecimalType() { return DEFAULT_DECIMAL; }
 
   public static ScalarType createDecimalType(int precision) {
     return createDecimalType(precision, DEFAULT_SCALE);
   }
 
+  /**
+   * Returns a DECIMAL type with the specified precision and scale.
+   */
   public static ScalarType createDecimalType(int precision, int scale) {
     Preconditions.checkState(precision >= 0); // Enforced by parser
     Preconditions.checkState(scale >= 0); // Enforced by parser.
@@ -116,13 +123,47 @@ public class ScalarType extends Type {
     return type;
   }
 
-  // Identical to createDecimalType except that higher precisions are truncated
-  // to the max storable precision. The BE will report overflow in these cases
-  // (think of this as adding ints to BIGINT but BIGINT can still overflow).
-  public static ScalarType createDecimalTypeInternal(int precision, int scale) {
+  /**
+   * Returns a DECIMAL wildcard type (i.e. precision and scale hasn't yet been resolved).
+   */
+  public static ScalarType createWildCardDecimalType() {
+    ScalarType type = new ScalarType(PrimitiveType.DECIMAL);
+    type.precision_ = -1;
+    type.scale_ = -1;
+    return type;
+  }
+
+  /**
+   * Returns a DECIMAL type with the specified precision and scale, but truncating the
+   * precision to the max storable precision (i.e. removes digits from before the
+   * decimal point).
+   */
+  public static ScalarType createClippedDecimalType(int precision, int scale) {
+    Preconditions.checkState(precision >= 0);
+    Preconditions.checkState(scale >= 0);
     ScalarType type = new ScalarType(PrimitiveType.DECIMAL);
     type.precision_ = Math.min(precision, MAX_PRECISION);
     type.scale_ = Math.min(type.precision_, scale);
+    return type;
+  }
+
+  /**
+   * Returns a DECIMAL type with the specified precision and scale. When the given
+   * precision exceeds the max storable precision, reduce both precision and scale but
+   * preserve at least MIN_ADJUSTED_SCALE for scale (unless the desired scale was less).
+   */
+  public static ScalarType createAdjustedDecimalType(int precision, int scale) {
+    Preconditions.checkState(precision >= 0);
+    Preconditions.checkState(scale >= 0);
+    if (precision > MAX_PRECISION) {
+      int minScale = Math.min(scale, MIN_ADJUSTED_SCALE);
+      int delta = precision - MAX_PRECISION;
+      precision = MAX_PRECISION;
+      scale = Math.max(scale - delta, minScale);
+    }
+    ScalarType type = new ScalarType(PrimitiveType.DECIMAL);
+    type.precision_ = precision;
+    type.scale_ = scale;
     return type;
   }
 
@@ -148,6 +189,8 @@ public class ScalarType extends Type {
     } else if (type_ == PrimitiveType.VARCHAR) {
       if (isWildcardVarchar()) return "VARCHAR(*)";
       return "VARCHAR(" + len_ + ")";
+    } else if (type_ == PrimitiveType.FIXED_UDA_INTERMEDIATE) {
+      return "FIXED_UDA_INTERMEDIATE(" + len_ + ")";
     }
     return type_.toString();
   }
@@ -159,6 +202,7 @@ public class ScalarType extends Type {
       case BINARY: return type_.toString();
       case VARCHAR:
       case CHAR:
+      case FIXED_UDA_INTERMEDIATE:
          return type_.toString() + "(" + len_ + ")";
       case DECIMAL:
         return String.format("%s(%s,%s)", type_.toString(), precision_, scale_);
@@ -177,7 +221,8 @@ public class ScalarType extends Type {
     container.types.add(node);
     switch(type_) {
       case VARCHAR:
-      case CHAR: {
+      case CHAR:
+      case FIXED_UDA_INTERMEDIATE: {
         node.setType(TTypeNodeType.SCALAR);
         TScalarType scalarType = new TScalarType();
         scalarType.setType(type_.toThrift());
@@ -202,14 +247,6 @@ public class ScalarType extends Type {
         break;
       }
     }
-  }
-
-  public static Type[] toColumnType(PrimitiveType[] types) {
-    Type result[] = new Type[types.length];
-    for (int i = 0; i < types.length; ++i) {
-      result[i] = createType(types[i]);
-    }
-    return result;
   }
 
   public int decimalPrecision() {
@@ -261,7 +298,8 @@ public class ScalarType extends Type {
         || type_ == PrimitiveType.BIGINT || type_ == PrimitiveType.FLOAT
         || type_ == PrimitiveType.DOUBLE || type_ == PrimitiveType.DATE
         || type_ == PrimitiveType.DATETIME || type_ == PrimitiveType.TIMESTAMP
-        || type_ == PrimitiveType.CHAR || type_ == PrimitiveType.DECIMAL;
+        || type_ == PrimitiveType.CHAR || type_ == PrimitiveType.DECIMAL
+        || type_ == PrimitiveType.FIXED_UDA_INTERMEDIATE;
   }
 
   @Override
@@ -281,7 +319,7 @@ public class ScalarType extends Type {
   public int getSlotSize() {
     switch (type_) {
       case CHAR:
-        if (len_ > CHAR_INLINE_LENGTH || len_ == 0) return STRING.getSlotSize();
+      case FIXED_UDA_INTERMEDIATE:
         return len_;
       case DECIMAL: return TypesUtil.getDecimalSlotSize(this);
       default:
@@ -319,7 +357,9 @@ public class ScalarType extends Type {
     if (!(o instanceof ScalarType)) return false;
     ScalarType other = (ScalarType)o;
     if (type_ != other.type_) return false;
-    if (type_ == PrimitiveType.CHAR) return len_ == other.len_;
+    if (type_ == PrimitiveType.CHAR || type_ == PrimitiveType.FIXED_UDA_INTERMEDIATE) {
+      return len_ == other.len_;
+    }
     if (type_ == PrimitiveType.VARCHAR) return len_ == other.len_;
     if (type_ == PrimitiveType.DECIMAL) {
       return precision_ == other.precision_ && scale_ == other.scale_;
@@ -336,7 +376,7 @@ public class ScalarType extends Type {
     } else if (isNull()) {
       return ScalarType.NULL;
     } else if (isDecimal()) {
-      return createDecimalTypeInternal(MAX_PRECISION, scale_);
+      return createClippedDecimalType(MAX_PRECISION, scale_);
     } else {
       return ScalarType.INVALID;
     }
@@ -347,7 +387,7 @@ public class ScalarType extends Type {
     if (type_ == PrimitiveType.DOUBLE || type_ == PrimitiveType.BIGINT || isNull()) {
       return this;
     } else if (type_ == PrimitiveType.DECIMAL) {
-      return createDecimalTypeInternal(MAX_PRECISION, scale_);
+      return createClippedDecimalType(MAX_PRECISION, scale_);
     }
     return createType(PrimitiveType.values()[type_.ordinal() + 1]);
   }
@@ -364,8 +404,8 @@ public class ScalarType extends Type {
       case SMALLINT: return createDecimalType(5);
       case INT: return createDecimalType(10);
       case BIGINT: return createDecimalType(19);
-      case FLOAT: return createDecimalTypeInternal(MAX_PRECISION, 9);
-      case DOUBLE: return createDecimalTypeInternal(MAX_PRECISION, 17);
+      case FLOAT: return createDecimalType(MAX_PRECISION, 9);
+      case DOUBLE: return createDecimalType(MAX_PRECISION, 17);
       default: return ScalarType.INVALID;
     }
   }

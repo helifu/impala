@@ -239,14 +239,15 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
         ss << "hbase table: " << table_name_ << endl;
         void* key;
         int key_length;
-        hbase_scanner_->GetRowKey(env, &key, &key_length);
+        RETURN_IF_ERROR(hbase_scanner_->GetRowKey(env, &key, &key_length));
         ss << "row key: " << string(reinterpret_cast<const char*>(key), key_length);
         state->LogError(ErrorMsg(TErrorCode::GENERAL, ss.str()));
       }
       if (state->abort_on_error()) return Status(state->ErrorLog());
     }
 
-    if (EvalConjuncts(&conjunct_ctxs_[0], conjunct_ctxs_.size(), row)) {
+    DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
+    if (EvalConjuncts(conjunct_evals_.data(), conjuncts_.size(), row)) {
       row_batch->CommitLastRow();
       ++num_rows_returned_;
       COUNTER_SET(rows_returned_counter_, num_rows_returned_);

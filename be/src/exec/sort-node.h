@@ -19,17 +19,15 @@
 #define IMPALA_EXEC_SORT_NODE_H
 
 #include "exec/exec-node.h"
-#include "exec/sort-exec-exprs.h"
 #include "runtime/sorter.h"
-#include "runtime/buffered-block-mgr.h"
 
 namespace impala {
 
 /// Node that implements a full sort of its input with a fixed memory budget, spilling
 /// to disk if the input is larger than available memory.
-/// Uses Sorter and BufferedBlockMgr for the external sort implementation.
+/// Uses Sorter for the external sort implementation.
 /// Input rows to SortNode are materialized by the Sorter into a single tuple
-/// using the expressions specified in sort_exec_exprs_.
+/// using the expressions specified in sort_tuple_exprs_.
 /// In GetNext(), SortNode passes in the output batch to the sorter instance created
 /// in Open() to fill it with sorted rows.
 /// If a merge phase was performed in the sort, sorted rows are deep copied into
@@ -48,22 +46,32 @@ class SortNode : public ExecNode {
   virtual void Close(RuntimeState* state);
 
  protected:
+  virtual Status QueryMaintenance(RuntimeState* state);
   virtual void DebugString(int indentation_level, std::stringstream* out) const;
 
  private:
   /// Fetch input rows and feed them to the sorter until the input is exhausted.
-  Status SortInput(RuntimeState* state);
+  Status SortInput(RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Number of rows to skip.
   int64_t offset_;
 
-  /// The tuple row comparator derived based on 'sort_exec_exprs_'.
+  /// Compares tuples according to 'ordering_exprs'.
   boost::scoped_ptr<TupleRowComparator> less_than_;
 
-  /// Expressions and parameters used for tuple materialization and tuple comparison.
-  SortExecExprs sort_exec_exprs_;
+  /// Expressions and parameters used for tuple comparison.
+  std::vector<ScalarExpr*> ordering_exprs_;
+
+  /// Expressions used to materialize slots in the tuples to be sorted.
+  /// One expr per slot in the materialized tuple.
+  std::vector<ScalarExpr*> sort_tuple_exprs_;
+
   std::vector<bool> is_asc_order_;
   std::vector<bool> nulls_first_;
+
+  /// Whether the previous call to GetNext() returned a buffer attached to the RowBatch.
+  /// Used to avoid unnecessary calls to ReleaseUnusedReservation().
+  bool returned_buffer_ = false;
 
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()

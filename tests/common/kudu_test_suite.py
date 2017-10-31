@@ -45,6 +45,11 @@ class KuduTestSuite(ImpalaTestSuite):
   __DB_NAME = None
 
   @classmethod
+  def get_conn_timeout(cls):
+    # For IMPALA-5079,IMPALA-4454
+    return 60 * 5 # 5 minutes
+
+  @classmethod
   def setup_class(cls):
     if os.environ["KUDU_IS_SUPPORTED"] == "false":
       pytest.skip("Kudu is not supported")
@@ -58,7 +63,8 @@ class KuduTestSuite(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(KuduTestSuite, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
 
   @classmethod
   def auto_create_db(cls):
@@ -80,6 +86,13 @@ class KuduTestSuite(ImpalaTestSuite):
   @classmethod
   def random_table_name(cls):
     return "".join(choice(string.lowercase) for _ in xrange(10))
+
+  @classmethod
+  def to_kudu_table_name(cls, db_name, tbl_name):
+    """Return the name of the underlying Kudu table, from the Impala database and table
+    name. This must be kept in sync with KuduUtil.getDefaultCreateKuduTableName() in the
+    FE."""
+    return "impala::%s.%s" % (db_name, tbl_name)
 
   @classmethod
   def get_kudu_table_base_name(cls, name):

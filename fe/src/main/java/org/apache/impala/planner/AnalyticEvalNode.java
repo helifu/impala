@@ -100,7 +100,7 @@ public class AnalyticEvalNode extends PlanNode {
   }
 
   @Override
-  public boolean isBlockingNode() { return true; }
+  public boolean isBlockingNode() { return false; }
   public List<Expr> getPartitionExprs() { return partitionExprs_; }
   public List<OrderByElement> getOrderByElements() { return orderByElements_; }
 
@@ -242,10 +242,21 @@ public class AnalyticEvalNode extends PlanNode {
   }
 
   @Override
-  public void computeCosts(TQueryOptions queryOptions) {
-    Preconditions.checkNotNull(fragment_,
-        "PlanNode must be placed into a fragment before calling this method.");
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+    Preconditions.checkNotNull(
+        fragment_, "PlanNode must be placed into a fragment before calling this method.");
     // TODO: come up with estimate based on window
-    perHostMemCost_ = 0;
+    long perInstanceMemEstimate = 0;
+
+    // Analytic uses a single buffer size.
+    long bufferSize = computeMaxSpillableBufferSize(
+        queryOptions.getDefault_spillable_buffer_size(), queryOptions.getMax_row_size());
+
+    // Must be kept in sync with MIN_REQUIRED_BUFFERS in AnalyticEvalNode in be.
+    long perInstanceMinBufferBytes = 2 * bufferSize;
+    nodeResourceProfile_ = new ResourceProfileBuilder()
+        .setMemEstimateBytes(perInstanceMemEstimate)
+        .setMinReservationBytes(perInstanceMinBufferBytes)
+        .setSpillableBufferBytes(bufferSize).setMaxRowBufferBytes(bufferSize).build();
   }
 }

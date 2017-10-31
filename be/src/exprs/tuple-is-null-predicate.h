@@ -26,24 +26,25 @@ namespace impala {
 class TExprNode;
 
 /// Returns true if all of the given tuples are NULL, false otherwise.
+/// Returns false if any of the given tuples is non-nullable.
 /// It is important that this predicate not require the given tuples to be nullable,
-/// because the FE may sometimes wrap expressions in this predicate that contain SlotRefs
-/// on non-nullable tuples (see IMPALA-904).
+/// because the FE sometimes wrap expressions in this predicate that contain SlotRefs
+/// on non-nullable tuples (see IMPALA-904/IMPALA-5504). This happens for exprs that
+/// are evaluated before the outer join that makes the tuples given to this predicate
+/// nullable, e.g., in the ON-clause of that join.
 /// TODO: Implement codegen to eliminate overhead on non-nullable tuples.
 class TupleIsNullPredicate: public Predicate {
  protected:
-  friend class Expr;
+  friend class ScalarExpr;
 
   TupleIsNullPredicate(const TExprNode& node);
 
-  virtual Status Prepare(RuntimeState* state, const RowDescriptor& row_desc,
-                         ExprContext* ctx);
-  virtual Status GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn);
-  virtual std::string DebugString() const;
+  virtual Status Init(const RowDescriptor& row_desc, RuntimeState* state) override;
+  virtual Status GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn)
+      override WARN_UNUSED_RESULT;
+  virtual std::string DebugString() const override;
 
-  virtual bool IsConstant() const { return false; }
-
-  virtual BooleanVal GetBooleanVal(ExprContext* context, const TupleRow* row);
+  virtual BooleanVal GetBooleanVal(ScalarExprEvaluator*, const TupleRow*) const override;
 
  private:
   /// Tuple ids to check for NULL. May contain ids of nullable and non-nullable tuples.

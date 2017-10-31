@@ -22,10 +22,13 @@ from subprocess import check_call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfOldAggsJoins, SkipIfIsilon, SkipIfS3, SkipIfLocal
+from tests.common.skip import (
+    SkipIfIsilon,
+    SkipIfS3,
+    SkipIfADLS,
+    SkipIfLocal)
 from tests.util.filesystem_utils import WAREHOUSE, get_fs_path
 
-@SkipIfOldAggsJoins.nested_types
 class TestNestedTypes(ImpalaTestSuite):
   @classmethod
   def get_workload(self):
@@ -34,7 +37,7 @@ class TestNestedTypes(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestNestedTypes, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format == 'parquet')
 
   def test_scanner_basic(self, vector):
@@ -75,7 +78,13 @@ class TestNestedTypes(ImpalaTestSuite):
     """Queries over the larger nested TPCH dataset."""
     self.run_test_case('QueryTest/nested-types-tpch', vector)
 
-@SkipIfOldAggsJoins.nested_types
+  def test_parquet_stats(self, vector):
+    """Queries that test evaluation of Parquet row group statistics."""
+    # The test makes assumptions about the number of row groups that are processed and
+    # skipped inside a fragment, so we ensure that the tests run in a single fragment.
+    vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/nested-types-parquet-stats', vector)
+
 class TestParquetArrayEncodings(ImpalaTestSuite):
   TESTFILE_DIR = os.path.join(os.environ['IMPALA_HOME'],
                               "testdata/parquet_nested_types_encodings")
@@ -87,7 +96,7 @@ class TestParquetArrayEncodings(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestParquetArrayEncodings, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format == 'parquet')
 
   # $ parquet-tools schema SingleFieldGroupInList.parquet
@@ -429,6 +438,89 @@ class TestParquetArrayEncodings(ImpalaTestSuite):
     assert len(result.data) == 1
     assert result.data == ['2']
 
+  # $ parquet-tools schema AmbiguousList_Modern.parquet
+  # message org.apache.impala.nested {
+  #   required group ambigArray (LIST) {
+  #     repeated group list {
+  #       required group element {
+  #         required group s2 {
+  #           optional int32 f21;
+  #           optional int32 f22;
+  #         }
+  #         optional int32 F11;
+  #         optional int32 F12;
+  #       }
+  #     }
+  #   }
+  # }
+  # $ parquet-tools cat AmbiguousList_Modern.parquet
+  # ambigArray:
+  # .list:
+  # ..element:
+  # ...s2:
+  # ....f21 = 21
+  # ....f22 = 22
+  # ...F11 = 11
+  # ...F12 = 12
+  # .list:
+  # ..element:
+  # ...s2:
+  # ....f21 = 210
+  # ....f22 = 220
+  # ...F11 = 110
+  # ...F12 = 120
+  #
+  # $ parquet-tools schema AmbiguousList_Legacy.parquet
+  # message org.apache.impala.nested {
+  #  required group ambigArray (LIST) {
+  #    repeated group array {
+  #       required group s2 {
+  #         optional int32 f21;
+  #         optional int32 f22;
+  #       }
+  #       optional int32 F11;
+  #       optional int32 F12;
+  #     }
+  #   }
+  # }
+  # $ parquet-tools cat AmbiguousList_Legacy.parquet
+  # ambigArray:
+  # .array:
+  # ..s2:
+  # ...f21 = 21
+  # ...f22 = 22
+  # ..F11 = 11
+  # ..F12 = 12
+  # .array:
+  # ..s2:
+  # ...f21 = 210
+  # ...f22 = 220
+  # ..F11 = 110
+  # ..F12 = 120
+  def test_ambiguous_list(self, vector, unique_database):
+    """IMPALA-4725: Tests the schema-resolution behavior with different values for the
+    PARQUET_ARRAY_RESOLUTION and PARQUET_FALLBACK_SCHEMA_RESOLUTION query options.
+    The schema of the Parquet test files is constructed to induce incorrect results
+    with index-based resolution and the default TWO_LEVEL_THEN_THREE_LEVEL array
+    resolution policy. Regardless of whether the Parquet data files use the 2-level or
+    3-level encoding, incorrect results may be returned if the array resolution does
+    not exactly match the data files'. The name-based policy generally does not have
+    this problem because it avoids traversing incorrect schema paths.
+    """
+    ambig_modern_tbl = "ambig_modern"
+    self._create_test_table(unique_database, ambig_modern_tbl,
+        "AmbiguousList_Modern.parquet",
+        "ambigarray array<struct<s2:struct<f21:int,f22:int>,f11:int,f12:int>>")
+    self.run_test_case('QueryTest/parquet-ambiguous-list-modern',
+                        vector, unique_database)
+
+    ambig_legacy_tbl = "ambig_legacy"
+    self._create_test_table(unique_database, ambig_legacy_tbl,
+        "AmbiguousList_Legacy.parquet",
+        "ambigarray array<struct<s2:struct<f21:int,f22:int>,f11:int,f12:int>>")
+    self.run_test_case('QueryTest/parquet-ambiguous-list-legacy',
+                        vector, unique_database)
+
   def _create_test_table(self, dbname, tablename, filename, columns):
     """Creates a table in the given database with the given name and columns. Copies
     the file with the given name from TESTFILE_DIR into the table."""
@@ -438,7 +530,6 @@ class TestParquetArrayEncodings(ImpalaTestSuite):
     local_path = self.TESTFILE_DIR + "/" + filename
     check_call(["hadoop", "fs", "-put", local_path, location], shell=False)
 
-@SkipIfOldAggsJoins.nested_types
 class TestMaxNestingDepth(ImpalaTestSuite):
   # Should be kept in sync with the FE's Type.MAX_NESTING_DEPTH
   MAX_NESTING_DEPTH = 100
@@ -450,7 +541,7 @@ class TestMaxNestingDepth(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestMaxNestingDepth, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format == 'parquet')
 
   def test_max_nesting_depth(self, vector, unique_database):
@@ -463,6 +554,7 @@ class TestMaxNestingDepth(ImpalaTestSuite):
 
   @SkipIfIsilon.hive
   @SkipIfS3.hive
+  @SkipIfADLS.hive
   @SkipIfLocal.hive
   def test_load_hive_table(self, vector, unique_database):
     """Tests that Impala rejects Hive-created tables with complex types that exceed

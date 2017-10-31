@@ -21,8 +21,11 @@
 #include <thrift/protocol/TDebugProtocol.h>
 
 #include "catalog/catalog-util.h"
+#include "exec/read-write-util.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/debug-util.h"
+#include "util/logging-support.h"
+#include "util/webserver.h"
 #include "gen-cpp/CatalogInternalService_types.h"
 #include "gen-cpp/CatalogObjects_types.h"
 #include "gen-cpp/CatalogService_types.h"
@@ -202,6 +205,8 @@ void CatalogServer::RegisterWebpages(Webserver* webserver) {
       bind<void>(mem_fn(&CatalogServer::CatalogObjectsUrlCallback), this, _1, _2);
   webserver->RegisterUrlCallback(CATALOG_OBJECT_WEB_PAGE, CATALOG_OBJECT_TEMPLATE,
       catalog_objects_callback, false);
+
+  RegisterLogLevelCallbacks(webserver, true);
 }
 
 void CatalogServer::UpdateCatalogTopicCallback(
@@ -295,7 +300,6 @@ void CatalogServer::UpdateCatalogTopicCallback(
 
 void CatalogServer::BuildTopicUpdates(const vector<TCatalogObject>& catalog_objects) {
   unordered_set<string> current_entry_keys;
-
   // Add any new/updated catalog objects to the topic.
   for (const TCatalogObject& catalog_object: catalog_objects) {
     const string& entry_key = TCatalogObjectToEntryKey(catalog_object);
@@ -323,6 +327,14 @@ void CatalogServer::BuildTopicUpdates(const vector<TCatalogObject>& catalog_obje
     if (!status.ok()) {
       LOG(ERROR) << "Error serializing topic value: " << status.GetDetail();
       pending_topic_updates_.pop_back();
+      continue;
+    }
+    if (FLAGS_compact_catalog_topic) {
+      status = CompressCatalogObject(&item.value);
+      if (!status.ok()) {
+        LOG(ERROR) << "Error compressing catalog object: " << status.GetDetail();
+        pending_topic_updates_.pop_back();
+      }
     }
   }
 
@@ -389,11 +401,11 @@ void CatalogServer::CatalogObjectsUrlCallback(const Webserver::ArgumentMap& args
 
     // Get the object type and name from the topic entry key
     TCatalogObject request;
-    TCatalogObjectFromObjectName(object_type, object_name_arg->second, &request);
+    Status status = TCatalogObjectFromObjectName(object_type, object_name_arg->second, &request);
 
     // Get the object and dump its contents.
     TCatalogObject result;
-    Status status = catalog_->GetCatalogObject(request, &result);
+    if (status.ok()) status = catalog_->GetCatalogObject(request, &result);
     if (status.ok()) {
       Value debug_string(ThriftDebugString(result).c_str(), document->GetAllocator());
       document->AddMember("thrift_string", debug_string, document->GetAllocator());

@@ -157,7 +157,7 @@ class DiskIoRequestContext {
     // boost doesn't let us dcheck that the reader lock is taken
     DCHECK_GT(num_disks_with_ranges_, 0);
     if (--num_disks_with_ranges_ == 0) {
-      disks_complete_cond_var_.notify_one();
+      disks_complete_cond_var_.notify_all();
     }
     DCHECK(Validate()) << std::endl << DebugString();
   }
@@ -247,6 +247,12 @@ class DiskIoRequestContext {
   /// The total number of scan ranges that have not been started. Only used for
   /// diagnostics. This is the sum of all unstarted_scan_ranges across all disks.
   AtomicInt32 num_unstarted_scan_ranges_;
+
+  /// Total number of file handle opens where the file handle was present in the cache
+  AtomicInt32 cached_file_handles_hit_count_;
+
+  /// Total number of file handle opens where the file handle was not in the cache
+  AtomicInt32 cached_file_handles_miss_count_;
 
   /// The number of buffers that are being used for this reader. This is the sum
   /// of all buffers in ScanRange queues and buffers currently being read into (i.e. about

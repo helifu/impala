@@ -386,19 +386,19 @@ struct TQueryExecRequest {
   // AS SELECT), these may differ.
   7: required Types.TStmtType stmt_type
 
-  // Estimated per-host peak memory consumption in bytes. Used for resource management.
-  8: optional i64 per_host_mem_req
-
-  // Estimated per-host CPU requirements in YARN virtual cores.
-  // Used for resource management.
-  // TODO: Remove this and associated code in Planner.
-  9: optional i16 per_host_vcores
-
   // List of replica hosts.  Used by the host_idx field of TScanRangeLocation.
-  10: required list<Types.TNetworkAddress> host_list
+  9: required list<Types.TNetworkAddress> host_list
 
   // Column lineage graph
-  11: optional LineageGraph.TLineageGraph lineage_graph
+  10: optional LineageGraph.TLineageGraph lineage_graph
+
+  // Estimated per-host peak memory consumption in bytes. Used by admission control.
+  // TODO: Remove when AC doesn't rely on this any more.
+  8: optional i64 per_host_mem_estimate
+
+  // Maximum possible (in the case all fragments are scheduled on all hosts with
+  // max DOP) minimum reservation required per host, in bytes.
+  11: optional i64 max_per_host_min_reservation;
 }
 
 enum TCatalogOpType {
@@ -566,6 +566,11 @@ struct TExecRequest {
 
   // Timeline of planner's operation, for profiling
   11: optional RuntimeProfile.TEventSequence timeline
+
+  // If false, the user that runs this statement doesn't have access to the runtime
+  // profile. For example, a user can't access the runtime profile of a query
+  // that has a view for which the user doesn't have access to the underlying tables.
+  12: optional bool user_has_profile_access
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -713,6 +718,51 @@ struct TGetJvmMetricsResponse {
   // One entry for every pool tracked by the Jvm, plus a synthetic aggregate pool called
   // 'total'
   1: required list<TJvmMemoryPool> memory_pools
+}
+
+// Contains information about a JVM thread
+struct TJvmThreadInfo {
+  // Summary of a JVM thread. Includes stacktraces, locked monitors
+  // and synchronizers.
+  1: required string summary
+
+  // The total CPU time for this thread in nanoseconds
+  2: required i64 cpu_time_in_ns
+
+  // The CPU time that this thread has executed in user mode in nanoseconds
+  3: required i64 user_time_in_ns
+
+  // The number of times this thread blocked to enter or reenter a monitor
+  4: required i64 blocked_count
+
+  // Approximate accumulated elapsed time (in milliseconds) that this thread has blocked
+  // to enter or reenter a monitor
+  5: required i64 blocked_time_in_ms
+
+  // True if this thread is executing native code via the Java Native Interface (JNI)
+  6: required bool is_in_native
+}
+
+// Request to get information about JVM threads
+struct TGetJvmThreadsInfoRequest {
+  // If set, return complete info about JVM threads. Otherwise, return only
+  // the total number of live JVM threads.
+  1: required bool get_complete_info
+}
+
+struct TGetJvmThreadsInfoResponse {
+  // The current number of live threads including both daemon and non-daemon threads
+  1: required i32 total_thread_count
+
+  // The current number of live daemon threads
+  2: required i32 daemon_thread_count
+
+  // The peak live thread count since the Java virtual machine started
+  3: required i32 peak_thread_count
+
+  // Information about JVM threads. It is not included when
+  // TGetJvmThreadsInfoRequest.get_complete_info is false.
+  4: optional list<TJvmThreadInfo> threads
 }
 
 struct TGetHadoopConfigRequest {

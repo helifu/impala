@@ -20,9 +20,7 @@
 import pytest
 
 from testdata.common import widetable
-from tests.common.environ import USING_OLD_AGGS_JOINS
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfOldAggsJoins
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -32,7 +30,7 @@ from tests.common.test_result_verifier import (
     parse_column_labels,
     QueryTestResult,
     parse_result_rows)
-from tests.common.test_vector import TestDimension
+from tests.common.test_vector import ImpalaTestDimension
 
 # Test dimensions for TestAggregation.
 AGG_FUNCTIONS = ['sum', 'count', 'min', 'max', 'avg', 'ndv']
@@ -95,9 +93,9 @@ class TestAggregation(ImpalaTestSuite):
     super(TestAggregation, cls).add_test_dimensions()
 
     # Add two more dimensions
-    cls.TestMatrix.add_dimension(TestDimension('agg_func', *AGG_FUNCTIONS))
-    cls.TestMatrix.add_dimension(TestDimension('data_type', *DATA_TYPES))
-    cls.TestMatrix.add_constraint(lambda v: cls.is_valid_vector(v))
+    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('agg_func', *AGG_FUNCTIONS))
+    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('data_type', *DATA_TYPES))
+    cls.ImpalaTestMatrix.add_constraint(lambda v: cls.is_valid_vector(v))
 
   @classmethod
   def is_valid_vector(cls, vector):
@@ -122,8 +120,6 @@ class TestAggregation(ImpalaTestSuite):
   def test_aggregation(self, vector):
     exec_option = vector.get_value('exec_option')
     disable_codegen = exec_option['disable_codegen']
-    # The old aggregation node does not support codegen for all aggregate functions.
-    check_codegen_enabled = not disable_codegen and not USING_OLD_AGGS_JOINS
     data_type, agg_func = (vector.get_value('data_type'), vector.get_value('agg_func'))
 
     query = 'select %s(%s_col) from alltypesagg where day is not null' % (agg_func,
@@ -133,7 +129,7 @@ class TestAggregation(ImpalaTestSuite):
     assert len(result.data) == 1
     self.verify_agg_result(agg_func, data_type, False, result.data[0]);
 
-    if check_codegen_enabled:
+    if not disable_codegen:
       # Verify codegen was enabled for the preaggregation.
       # It is deliberately disabled for the merge aggregation.
       assert_codegen_enabled(result.runtime_profile, [1])
@@ -144,7 +140,7 @@ class TestAggregation(ImpalaTestSuite):
     assert len(result.data) == 1
     self.verify_agg_result(agg_func, data_type, True, result.data[0]);
 
-    if check_codegen_enabled:
+    if not disable_codegen:
       # Verify codegen was enabled for all stages of the aggregation.
       assert_codegen_enabled(result.runtime_profile, [1, 2, 4, 6])
 
@@ -180,11 +176,12 @@ class TestAggregationQueries(ImpalaTestSuite):
   def add_test_dimensions(cls):
     super(TestAggregationQueries, cls).add_test_dimensions()
 
-    cls.TestMatrix.add_dimension(
+    cls.ImpalaTestMatrix.add_dimension(
       create_exec_option_dimension(disable_codegen_options=[False, True]))
 
     if cls.exploration_strategy() == 'core':
-      cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+      cls.ImpalaTestMatrix.add_dimension(
+          create_uncompressed_text_dimension(cls.get_workload()))
 
   def test_non_codegen_tinyint_grouping(self, vector, unique_database):
     # Regression for IMPALA-901. The test includes an INSERT statement, so can only be run
@@ -233,8 +230,7 @@ class TestAggregationQueries(ImpalaTestSuite):
       assert(set(row[i].split(delimiter[i-1])) == set(['1', '2', '3', '4']))
     assert(row[4] == '40')
     assert(row[5] == '4')
-    check_codegen_enabled = not disable_codegen and not USING_OLD_AGGS_JOINS
-    if check_codegen_enabled:
+    if not disable_codegen:
       # Verify codegen was enabled for all three stages of the aggregation.
       assert_codegen_enabled(result.runtime_profile, [1, 2, 4])
 
@@ -266,9 +262,18 @@ class TestAggregationQueries(ImpalaTestSuite):
     where int_col < 10"""
     result = self.execute_query(query, exec_option, table_format=table_format)
     assert(set((result.data)[0].split(" ")) == set(['1','2','3','4','5','6','7','8','9']))
-    if check_codegen_enabled:
+    if not disable_codegen:
       # Verify codegen was enabled for all four stages of the aggregation.
       assert_codegen_enabled(result.runtime_profile, [1, 2, 4, 6])
+
+  def test_parquet_count_star_optimization(self, vector, unique_database):
+    if (vector.get_value('table_format').file_format != 'text' or
+        vector.get_value('table_format').compression_codec != 'none'):
+      # No need to run this test on all file formats
+      pytest.skip()
+    self.run_test_case('QueryTest/parquet-stats-agg', vector, unique_database)
+    vector.get_value('exec_option')['batch_size'] = 1
+    self.run_test_case('QueryTest/parquet-stats-agg', vector, unique_database)
 
 class TestWideAggregationQueries(ImpalaTestSuite):
   """Test that aggregations with many grouping columns work"""
@@ -280,11 +285,11 @@ class TestWideAggregationQueries(ImpalaTestSuite):
   def add_test_dimensions(cls):
     super(TestWideAggregationQueries, cls).add_test_dimensions()
 
-    cls.TestMatrix.add_dimension(
+    cls.ImpalaTestMatrix.add_dimension(
       create_exec_option_dimension(disable_codegen_options=[False, True]))
 
     # File format doesn't matter for this test.
-    cls.TestMatrix.add_constraint(
+    cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format == 'parquet')
 
   def test_many_grouping_columns(self, vector):
@@ -317,12 +322,11 @@ class TestTPCHAggregationQueries(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTPCHAggregationQueries, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('table_format').file_format in ['parquet'])
 
   def test_tpch_aggregations(self, vector):
     self.run_test_case('tpch-aggregations', vector)
 
-  @SkipIfOldAggsJoins.passthrough_preagg
   def test_tpch_passthrough_aggregations(self, vector):
     self.run_test_case('tpch-passthrough-aggregations', vector)

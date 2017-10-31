@@ -16,7 +16,6 @@
 // under the License.
 
 #include "exec/sort-node.h"
-#include "exec/sort-exec-exprs.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/sorted-run-merger.h"
@@ -37,8 +36,13 @@ SortNode::~SortNode() {
 }
 
 Status SortNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+  const TSortInfo& tsort_info = tnode.sort_node.sort_info;
   RETURN_IF_ERROR(ExecNode::Init(tnode, state));
-  RETURN_IF_ERROR(sort_exec_exprs_.Init(tnode.sort_node.sort_info, pool_));
+  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.ordering_exprs, row_descriptor_,
+      state, &ordering_exprs_));
+  DCHECK(tsort_info.__isset.sort_tuple_slot_exprs);
+  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.sort_tuple_slot_exprs,
+      *child(0)->row_desc(), state, &sort_tuple_exprs_));
   is_asc_order_ = tnode.sort_node.sort_info.is_asc_order;
   nulls_first_ = tnode.sort_node.sort_info.nulls_first;
   return Status::OK();
@@ -47,14 +51,13 @@ Status SortNode::Init(const TPlanNode& tnode, RuntimeState* state) {
 Status SortNode::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Prepare(state));
-  RETURN_IF_ERROR(sort_exec_exprs_.Prepare(
-      state, child(0)->row_desc(), row_descriptor_, expr_mem_tracker()));
-  AddExprCtxsToFree(sort_exec_exprs_);
-  less_than_.reset(new TupleRowComparator(sort_exec_exprs_, is_asc_order_, nulls_first_));
+  less_than_.reset(new TupleRowComparator(ordering_exprs_, is_asc_order_, nulls_first_));
   sorter_.reset(
-      new Sorter(*less_than_.get(), sort_exec_exprs_.sort_tuple_slot_expr_ctxs(),
-          &row_descriptor_, mem_tracker(), runtime_profile(), state));
-  RETURN_IF_ERROR(sorter_->Init());
+      new Sorter(*less_than_, sort_tuple_exprs_, &row_descriptor_, mem_tracker(),
+          &buffer_pool_client_, resource_profile_.spillable_buffer_size,
+          runtime_profile(), state, id(), true));
+  RETURN_IF_ERROR(sorter_->Prepare(pool_, expr_mem_pool()));
+  DCHECK_GE(resource_profile_.min_reservation, sorter_->ComputeMinReservation());
   AddCodegenDisabledMessage(state);
   return Status::OK();
 }
@@ -63,7 +66,6 @@ void SortNode::Codegen(RuntimeState* state) {
   DCHECK(state->ShouldCodegen());
   ExecNode::Codegen(state);
   if (IsNodeCodegenDisabled()) return;
-
   Status codegen_status = less_than_->Codegen(state);
   runtime_profile()->AddCodegenMsg(codegen_status.ok(), codegen_status);
 }
@@ -71,18 +73,20 @@ void SortNode::Codegen(RuntimeState* state) {
 Status SortNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Open(state));
-  RETURN_IF_ERROR(sort_exec_exprs_.Open(state));
+  RETURN_IF_ERROR(child(0)->Open(state));
+  // Claim reservation after the child has been opened to reduce the peak reservation
+  // requirement.
+  if (!buffer_pool_client_.is_registered()) {
+    RETURN_IF_ERROR(ClaimBufferReservation(state));
+  }
+  RETURN_IF_ERROR(less_than_->Open(pool_, state, expr_mem_pool()));
+  RETURN_IF_ERROR(sorter_->Open());
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
-  RETURN_IF_ERROR(child(0)->Open(state));
 
   // The child has been opened and the sorter created. Sort the input.
   // The final merge is done on-demand as rows are requested in GetNext().
   RETURN_IF_ERROR(SortInput(state));
-
-  // Unless we are inside a subplan expecting to call Open()/GetNext() on the child
-  // again, the child can be closed at this point.
-  if (!IsInSubplan()) child(0)->Close(state);
   return Status::OK();
 }
 
@@ -97,6 +101,19 @@ Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     return Status::OK();
   } else {
     *eos = false;
+  }
+
+  if (returned_buffer_) {
+    // If the Sorter returned a buffer on the last call to GetNext(), we might have an
+    // opportunity to release memory. Release reservation, unless it might be needed
+    // for the next subplan iteration or merging spilled runs.
+    returned_buffer_ = false;
+    if (!IsInSubplan() && !sorter_->HasSpilledRuns()) {
+      DCHECK(!buffer_pool_client_.has_unpinned_pages());
+      Status status = ReleaseUnusedReservation();
+      DCHECK(status.ok()) << "Should not fail - no runs were spilled so no pages are "
+                          << "unpinned. " << status.GetDetail();
+    }
   }
 
   DCHECK_EQ(row_batch->num_rows(), 0);
@@ -115,6 +132,7 @@ Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     RETURN_IF_ERROR(sorter_->GetNext(row_batch, eos));
   }
 
+  returned_buffer_ = row_batch->num_buffers() > 0;
   num_rows_returned_ += row_batch->num_rows();
   if (ReachedLimit()) {
     row_batch->set_num_rows(row_batch->num_rows() - (num_rows_returned_ - limit_));
@@ -134,16 +152,22 @@ Status SortNode::Reset(RuntimeState* state) {
 
 void SortNode::Close(RuntimeState* state) {
   if (is_closed()) return;
-  sort_exec_exprs_.Close(state);
-  if (sorter_ != NULL) sorter_->Close();
+  if (less_than_.get() != nullptr) less_than_->Close(state);
+  if (sorter_ != nullptr) sorter_->Close(state);
   sorter_.reset();
+  ScalarExpr::Close(ordering_exprs_);
+  ScalarExpr::Close(sort_tuple_exprs_);
   ExecNode::Close(state);
+}
+
+Status SortNode::QueryMaintenance(RuntimeState* state) {
+  sorter_->FreeLocalAllocations();
+  return ExecNode::QueryMaintenance(state);
 }
 
 void SortNode::DebugString(int indentation_level, stringstream* out) const {
   *out << string(indentation_level * 2, ' ');
-  *out << "SortNode("
-       << Expr::DebugString(sort_exec_exprs_.lhs_ordering_expr_ctxs());
+  *out << "SortNode(" << ScalarExpr::DebugString(ordering_exprs_);
   for (int i = 0; i < is_asc_order_.size(); ++i) {
     *out << (i > 0 ? " " : "")
          << (is_asc_order_[i] ? "asc" : "desc")
@@ -157,12 +181,17 @@ Status SortNode::SortInput(RuntimeState* state) {
   RowBatch batch(child(0)->row_desc(), state->batch_size(), mem_tracker());
   bool eos;
   do {
-    batch.Reset();
     RETURN_IF_ERROR(child(0)->GetNext(state, &batch, &eos));
     RETURN_IF_ERROR(sorter_->AddBatch(&batch));
+    batch.Reset();
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(QueryMaintenance(state));
   } while(!eos);
+
+  // Unless we are inside a subplan expecting to call Open()/GetNext() on the child
+  // again, the child can be closed at this point to release resources.
+  if (!IsInSubplan()) child(0)->Close(state);
+
   RETURN_IF_ERROR(sorter_->InputDone());
   return Status::OK();
 }

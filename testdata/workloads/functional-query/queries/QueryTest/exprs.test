@@ -1931,6 +1931,33 @@ CAUSED BY: InternalException: Could not compile regexp pattern: *
 Error: no argument for repetition operator: *
 ====
 ---- QUERY
+select sum(length(replace(y, x, 'bbbbbbbbbbb')))
+from (select cast(round(float_col) AS STRING) as x, string_col as y
+      from functional.alltypes) v;
+---- TYPES
+BIGINT
+---- RESULTS
+43800
+====
+---- QUERY
+select sum(length(replace(y, '0', x)))
+from (select cast(round(float_col) AS STRING) as x, string_col as y
+      from functional.alltypes) v;
+---- TYPES
+BIGINT
+---- RESULTS
+7300
+====
+---- QUERY
+select sum(length(concat(replace(y, '0', x), replace(y, '0', x))))
+from (select cast(round(float_col) AS STRING) as x, string_col as y
+      from functional.alltypes) v;
+---- TYPES
+BIGINT
+---- RESULTS
+14600
+====
+---- QUERY
 # Test for factorial operator
 select distinct int_col, int_col! from functional.alltypes order by 1
 ---- RESULTS
@@ -2547,7 +2574,7 @@ order by c, cast('2016-11-22 16:40:00.00' as timestamp)
 BIGINT, TIMESTAMP, TIMESTAMP
 ====
 ---- QUERY
-# Constant timestamp expresisons in a join condition / runtime filter as well
+# Constant timestamp expressions in a join condition / runtime filter as well
 # as a select node.
 select count(*) from (
   select a.timestamp_col from
@@ -2562,6 +2589,18 @@ where timestamp_col < cast('2013-02-18 20:46:00.01' as timestamp)
 8
 ---- TYPES
 BIGINT
+====
+---- QUERY
+# IMPALA-4739: rewrites in HAVING clause
+select tinyint_col, count(*) cnt
+from functional_parquet.alltypesagg
+group by 1
+having cnt > 1000 or cnt > 1000
+  and cnt between 1500 and 2500
+---- TYPES
+TINYINT, BIGINT
+---- RESULTS
+NULL,2000
 ====
 ---- QUERY
 # IMPALA-4550: Regression test for proper cast analysis after slot substitution within a
@@ -2600,7 +2639,7 @@ UDF WARNING: Timestamp '1400-01-01 05:00:00' in timezone 'JST' could not be conv
 ====
 ---- QUERY
 # Test out-of-range value handling when adding dates.
-select CAST('9999-12-31 21:00:00' AS TIMESTAMP) + INTERVAL 367 DAYS
+select CAST('9999-12-31 21:00:00' AS TIMESTAMP) + INTERVAL 1 DAYS
 from alltypes
 limit 1
 ---- RESULTS
@@ -2608,7 +2647,7 @@ NULL
 ---- TYPES
 TIMESTAMP
 ---- ERRORS
-UDF WARNING: Cannot add interval 367: Year is out of valid range: 1400..10000
+UDF WARNING: Cannot add interval 1: Year is out of valid range: 1400..9999
 ====
 ---- QUERY
 # Test out-of-range value handling when subtracting dates.
@@ -2620,7 +2659,7 @@ NULL
 ---- TYPES
 TIMESTAMP
 ---- ERRORS
-UDF WARNING: Cannot subtract interval 1: Year is out of valid range: 1400..10000
+UDF WARNING: Cannot subtract interval 1: Year is out of valid range: 1400..9999
 ====
 ---- QUERY
 # IMPALA-4574: UUID() is not a constant expression.
@@ -2636,4 +2675,92 @@ select count(*) from functional.alltypestiny group by concat(uuid(), "_test")
 1
 ---- TYPES
 BIGINT
+====
+---- QUERY
+# IMPALA-4716: Tests that decode with 'when' values of different types is analyzed
+# correctly when expr rewrites are enabled.
+select decode(0, 1, 0, id, 1, 2) a from functional.alltypestiny order by a
+---- RESULTS
+1
+2
+2
+2
+2
+2
+2
+2
+---- TYPES
+TINYINT
+====
+---- QUERY
+# Test expr rewrite behavior of IF with constant conditions.
+select if(true, id * 10, 0) from functional.alltypestiny where id = if(false, 0, 1)
+---- RESULTS
+10
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Test expr rewrite behavior of CompoundPredicate with constant conditions.
+select id, null and id = 0 from functional.alltypestiny where id < 2 or false
+---- RESULTS
+0,NULL
+1,false
+---- TYPES
+INT,BOOLEAN
+====
+---- QUERY
+# Test expr rewrite behavior of CASE with constant conditions.
+select id, case id when null then null when 1 then 10 when true then 20 end
+from functional.alltypestiny
+where id = case when false then 0 when 1 = 1 then 1 else 2 end
+---- RESULTS
+1,10
+---- TYPES
+INT,TINYINT
+====
+---- QUERY
+# IMPALA-4849: verify that DISTINCT with a CASE that is rewritten analyzes correctly.
+select distinct case when true then id else 0 end from functional.alltypestiny
+---- RESULTS
+0
+1
+2
+3
+4
+5
+6
+7
+---- TYPES
+INT
+====
+---- QUERY
+# IMPALA-5125: test behavior when an agg function could be eliminated by expr rewrites.
+select if (true, 0, sum(id)) from functional.alltypestiny
+---- RESULTS
+0
+---- TYPES
+BIGINT
+====
+---- QUERY
+# IMPALA-5725: test coalesce() is not rewritten when its first parameter is a non-nullable
+# Kudu column, but can have NULL values due to an outer join.
+select coalesce(b.id, a.id), b.id, a.id
+from functional_kudu.alltypes a left join functional_kudu.alltypestiny b on a.id = b.id
+where a.id = 100
+---- RESULTS
+100,NULL,100
+---- TYPES
+INT,INT,INT
+====
+---- QUERY
+# IMPALA-5725: test coalesce() is not rewritten when its first parameter is an HDFS
+# partition col with no NULL partitions, but can have NULL values due to an outer join.
+select coalesce(b.year, a.id), b.id, a.id
+from functional.alltypes a left join functional.alltypestiny b on a.id = b.id
+where a.id = 100
+---- RESULTS
+100,NULL,100
+---- TYPES
+INT,INT,INT
 ====

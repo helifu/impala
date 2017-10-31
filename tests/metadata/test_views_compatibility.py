@@ -22,7 +22,7 @@ from subprocess import call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.test_file_parser import QueryTestSectionReader
 
@@ -46,6 +46,7 @@ from tests.util.test_file_parser import QueryTestSectionReader
 # Missing Coverage: Views created by Hive and Impala being visible and queryble by each
 # other on non hdfs storage.
 @SkipIfS3.hive
+@SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 class TestViewCompatibility(ImpalaTestSuite):
@@ -64,9 +65,10 @@ class TestViewCompatibility(ImpalaTestSuite):
       pytest.skip("Should only run in exhaustive due to long execution time.")
 
     # don't use any exec options, running exactly once is fine
-    cls.TestMatrix.clear_dimension('exec_option')
+    cls.ImpalaTestMatrix.clear_dimension('exec_option')
     # There is no reason to run these tests using all dimensions.
-    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
 
   def test_view_compatibility(self, vector, unique_database):
     self._run_view_compat_test_case('QueryTest/views-compatibility', vector,

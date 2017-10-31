@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.HashSet;
 import java.util.List;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -41,6 +42,7 @@ import org.apache.log4j.Logger;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Represents a COMPUTE STATS <table> and COMPUTE INCREMENTAL STATS <table> [PARTITION
@@ -163,14 +165,8 @@ public class ComputeStatsStmt extends StatementBase {
 
     for (int i = startColIdx; i < table_.getColumns().size(); ++i) {
       Column c = table_.getColumns().get(i);
-      Type type = c.getType();
+      if (ignoreColumn(c)) continue;
 
-      // Ignore columns with an invalid/unsupported type. For example, complex types in
-      // an HBase-backed table will appear as invalid types.
-      if (!type.isValid() || !type.isSupported()
-          || c.getType().isComplexType()) {
-        continue;
-      }
       // NDV approximation function. Add explicit alias for later identification when
       // updating the Metastore.
       String colRefSql = ToSqlUtils.getIdentSql(c.getName());
@@ -189,6 +185,7 @@ public class ComputeStatsStmt extends StatementBase {
       }
 
       // For STRING columns also compute the max and avg string length.
+      Type type = c.getType();
       if (type.isStringType()) {
         columnStatsSelectList.add("MAX(length(" + colRefSql + "))");
         columnStatsSelectList.add("AVG(length(" + colRefSql + "))");
@@ -285,6 +282,7 @@ public class ComputeStatsStmt extends StatementBase {
         partitionSet_.setPartitionShouldExist();
         partitionSet_.analyze(analyzer);
       }
+
       // For incremental stats, estimate the size of intermediate stats and report an
       // error if the estimate is greater than --inc_stats_size_limit_bytes in bytes
       if (isIncremental_) {
@@ -313,12 +311,13 @@ public class ComputeStatsStmt extends StatementBase {
         boolean tableIsMissingColStats = false;
 
         // We'll warn the user if a column is missing stats (and therefore we rescan the
-        // whole table), but if all columns are missing stats, the table just doesn't have
-        // any stats and there's no need to warn.
+        // whole table), but if all columns are missing stats, the table just doesn't
+        // have any stats and there's no need to warn.
         boolean allColumnsMissingStats = true;
         String exampleColumnMissingStats = null;
         // Partition columns always have stats, so exclude them from this search
         for (Column col: table_.getNonClusteringColumns()) {
+          if (ignoreColumn(col)) continue;
           if (!col.getStats().hasStats()) {
             if (!tableIsMissingColStats) {
               tableIsMissingColStats = true;
@@ -358,12 +357,9 @@ public class ComputeStatsStmt extends StatementBase {
           expectAllPartitions_ = true;
         }
       } else {
-        List<HdfsPartition> targetPartitions = partitionSet_.getPartitions();
-
         // Always compute stats on a set of partitions when told to.
-        List<String> partitionConjuncts = Lists.newArrayList();
-        for (HdfsPartition targetPartition : targetPartitions) {
-          partitionConjuncts.add(targetPartition.getConjunctSql());
+        for (HdfsPartition targetPartition: partitionSet_.getPartitions()) {
+          filterPreds.add(targetPartition.getConjunctSql());
           List<String> partValues = Lists.newArrayList();
           for (LiteralExpr partValue: targetPartition.getPartitionValues()) {
             partValues.add(PartitionKeyValue.getPartitionKeyValueString(partValue,
@@ -371,7 +367,9 @@ public class ComputeStatsStmt extends StatementBase {
           }
           expectedPartitions_.add(partValues);
         }
-        filterPreds.add("(" + Joiner.on(" AND ").join(partitionConjuncts) + ")");
+        // Create a hash set out of partitionSet_ for O(1) lookups.
+        HashSet<HdfsPartition> targetPartitions =
+            Sets.newHashSet(partitionSet_.getPartitions());
         for (HdfsPartition p : hdfsTable.getPartitions()) {
           if (p.isDefaultPartition()) continue;
           if (targetPartitions.contains(p)) continue;
@@ -527,6 +525,16 @@ public class ComputeStatsStmt extends StatementBase {
     }
   }
 
+  /**
+   * Returns true if the given column should be ignored for the purpose of computing
+   * column stats. Columns with an invalid/unsupported/complex type are ignored.
+   * For example, complex types in an HBase-backed table will appear as invalid types.
+   */
+  private boolean ignoreColumn(Column c) {
+    Type t = c.getType();
+    return !t.isValid() || !t.isSupported() || t.isComplexType();
+  }
+
   public String getTblStatsQuery() { return tableStatsQueryStr_; }
   public String getColStatsQuery() { return columnStatsQueryStr_; }
 
@@ -574,6 +582,9 @@ public class ComputeStatsStmt extends StatementBase {
     if (!expectAllPartitions_) params.setExpected_partitions(expectedPartitions_);
     if (isIncremental_) {
       params.setNum_partition_cols(((HdfsTable)table_).getNumClusteringCols());
+    }
+    if (table_ instanceof HdfsTable && !isIncremental_) {
+      params.setTotal_file_bytes(((HdfsTable)table_).getTotalHdfsBytes());
     }
     return params;
   }

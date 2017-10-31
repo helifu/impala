@@ -20,11 +20,11 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.hadoop.hive.metastore.MetaStoreUtils;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TExprNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,8 +38,6 @@ import com.google.common.collect.Sets;
  * its own Analyzer context.
  */
 public class Subquery extends Expr {
-  private final static Logger LOG = LoggerFactory.getLogger(Subquery.class);
-
   // The QueryStmt of the subquery.
   protected QueryStmt stmt_;
   // A subquery has its own analysis context
@@ -72,9 +70,7 @@ public class Subquery extends Expr {
    * Analyzes the subquery in a child analyzer.
    */
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (isAnalyzed_) return;
-    super.analyze(analyzer);
+  protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     if (!(stmt_ instanceof SelectStmt)) {
       throw new AnalysisException("A subquery must contain a single select block: " +
         toSql());
@@ -100,11 +96,10 @@ public class Subquery extends Expr {
     if (!((SelectStmt)stmt_).returnsSingleRow()) type_ = new ArrayType(type_);
 
     Preconditions.checkNotNull(type_);
-    isAnalyzed_ = true;
   }
 
   @Override
-  public boolean isConstant() { return false; }
+  protected boolean isConstantImpl() { return false; }
 
   /**
    * Check if the subquery's SelectStmt returns a single column of scalar type.
@@ -133,7 +128,7 @@ public class Subquery extends Expr {
       Expr expr = stmtResultExprs.get(i);
       String fieldName = null;
       // Check if the label meets the Metastore's requirements.
-      if (MetaStoreUtils.validateName(labels.get(i))) {
+      if (MetastoreShim.validateName(labels.get(i))) {
         fieldName = labels.get(i);
         // Make sure the field names are unique.
         if (!hasUniqueLabels) {

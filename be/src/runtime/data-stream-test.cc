@@ -27,8 +27,11 @@
 #include "rpc/thrift-server.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
+#include "runtime/data-stream-mgr-base.h"
 #include "runtime/data-stream-mgr.h"
+#include "runtime/exec-env.h"
 #include "runtime/data-stream-sender.h"
+#include "runtime/data-stream-recvr-base.h"
 #include "runtime/data-stream-recvr.h"
 #include "runtime/descriptors.h"
 #include "runtime/client-cache.h"
@@ -80,20 +83,16 @@ class ImpalaTestBackend : public ImpalaInternalServiceIf {
   ImpalaTestBackend(DataStreamMgr* stream_mgr): mgr_(stream_mgr) {}
   virtual ~ImpalaTestBackend() {}
 
-  virtual void ExecPlanFragment(
-      TExecPlanFragmentResult& return_val, const TExecPlanFragmentParams& params) {}
-
-  virtual void ReportExecStatus(
-      TReportExecStatusResult& return_val, const TReportExecStatusParams& params) {}
-
-  virtual void CancelPlanFragment(
-      TCancelPlanFragmentResult& return_val, const TCancelPlanFragmentParams& params) {}
-
-  virtual void UpdateFilter(
-      TUpdateFilterResult& return_val, const TUpdateFilterParams& params) {}
-
-  virtual void PublishFilter(
-      TPublishFilterResult& return_val, const TPublishFilterParams& params) {}
+  virtual void ExecQueryFInstances(TExecQueryFInstancesResult& return_val,
+      const TExecQueryFInstancesParams& params) {}
+  virtual void CancelQueryFInstances(TCancelQueryFInstancesResult& return_val,
+      const TCancelQueryFInstancesParams& params) {}
+  virtual void ReportExecStatus(TReportExecStatusResult& return_val,
+      const TReportExecStatusParams& params) {}
+  virtual void UpdateFilter(TUpdateFilterResult& return_val,
+      const TUpdateFilterParams& params) {}
+  virtual void PublishFilter(TPublishFilterResult& return_val,
+      const TPublishFilterParams& params) {}
 
   virtual void TransmitData(
       TTransmitDataResult& return_val, const TTransmitDataParams& params) {
@@ -112,17 +111,22 @@ class ImpalaTestBackend : public ImpalaInternalServiceIf {
 
 class DataStreamTest : public testing::Test {
  protected:
-  DataStreamTest() : runtime_state_(TExecPlanFragmentParams(), &exec_env_), next_val_(0) {
-    // Initialize Mem trackers for use by the data stream receiver.
-    exec_env_.InitForFeTests();
-    runtime_state_.InitMemTrackers(TUniqueId(), NULL, -1);
+  DataStreamTest() : next_val_(0) {
+    // Initialize MemTrackers and RuntimeState for use by the data stream receiver.
+    ABORT_IF_ERROR(exec_env_.InitForFeTests());
+    runtime_state_.reset(new RuntimeState(TQueryCtx(), &exec_env_));
+    mem_pool_.reset(new MemPool(&tracker_));
 
     // Stop tests that rely on mismatched sender / receiver pairs timing out from failing.
     FLAGS_datastream_sender_timeout_ms = 250;
   }
+  ~DataStreamTest() { runtime_state_->ReleaseResources(); }
 
   virtual void SetUp() {
     CreateRowDesc();
+
+    is_asc_.push_back(true);
+    nulls_first_.push_back(true);
     CreateTupleComparator();
 
     next_instance_id_.lo = 0;
@@ -158,20 +162,29 @@ class DataStreamTest : public testing::Test {
     StartBackend();
   }
 
-  const TDataStreamSink& GetSink(TPartitionType::type partition_type) {
+  const TDataSink GetSink(TPartitionType::type partition_type) {
+    TDataSink tdata_sink;
     switch (partition_type) {
-      case TPartitionType::UNPARTITIONED: return broadcast_sink_;
-      case TPartitionType::RANDOM: return random_sink_;
-      case TPartitionType::HASH_PARTITIONED: return hash_sink_;
-      default: EXPECT_TRUE(false) << "Unhandled sink type: " << partition_type;
+      case TPartitionType::UNPARTITIONED:
+        tdata_sink.__set_stream_sink(broadcast_sink_);
+        break;
+      case TPartitionType::RANDOM:
+        tdata_sink.__set_stream_sink(random_sink_);
+        break;
+      case TPartitionType::HASH_PARTITIONED:
+        tdata_sink.__set_stream_sink(hash_sink_);
+        break;
+      default:
+        EXPECT_TRUE(false) << "Unhandled sink type: " << partition_type;
     }
-    // Should never reach this.
-    return broadcast_sink_;
+    return tdata_sink;
   }
 
   virtual void TearDown() {
-    lhs_slot_ctx_->Close(NULL);
-    rhs_slot_ctx_->Close(NULL);
+    desc_tbl_->ReleaseResources();
+    less_than_->Close(runtime_state_.get());
+    ScalarExpr::Close(ordering_exprs_);
+    mem_pool_->FreeAll();
     exec_env_.impalad_client_cache()->TestShutdown();
     StopBackend();
   }
@@ -184,13 +197,18 @@ class DataStreamTest : public testing::Test {
 
   ObjectPool obj_pool_;
   MemTracker tracker_;
+  scoped_ptr<MemPool> mem_pool_;
   DescriptorTbl* desc_tbl_;
   const RowDescriptor* row_desc_;
+  vector<bool> is_asc_;
+  vector<bool> nulls_first_;
   TupleRowComparator* less_than_;
   ExecEnv exec_env_;
-  RuntimeState runtime_state_;
+  scoped_ptr<RuntimeState> runtime_state_;
   TUniqueId next_instance_id_;
   string stmt_;
+  // The sorting expression for the single BIGINT column.
+  vector<ScalarExpr*> ordering_exprs_;
 
   // RowBatch generation
   scoped_ptr<RowBatch> batch_;
@@ -198,7 +216,7 @@ class DataStreamTest : public testing::Test {
   int64_t* tuple_mem_;
 
   // receiving node
-  DataStreamMgr* stream_mgr_;
+  DataStreamMgrBase* stream_mgr_;
   ThriftServer* server_;
 
   // sending node(s)
@@ -212,7 +230,7 @@ class DataStreamTest : public testing::Test {
     Status status;
     int num_bytes_sent;
 
-    SenderInfo(): thread_handle(NULL), num_bytes_sent(0) {}
+    SenderInfo(): thread_handle(nullptr), num_bytes_sent(0) {}
   };
   vector<SenderInfo> sender_info_;
 
@@ -222,7 +240,7 @@ class DataStreamTest : public testing::Test {
     int receiver_num;
 
     thread* thread_handle;
-    shared_ptr<DataStreamRecvr> stream_recvr;
+    shared_ptr<DataStreamRecvrBase> stream_recvr;
     Status status;
     int num_rows_received;
     multiset<int64_t> data_values;
@@ -231,7 +249,7 @@ class DataStreamTest : public testing::Test {
       : stream_type(stream_type),
         num_senders(num_senders),
         receiver_num(receiver_num),
-        thread_handle(NULL),
+        thread_handle(nullptr),
         num_rows_received(0) {}
 
     ~ReceiverInfo() {
@@ -274,7 +292,6 @@ class DataStreamTest : public testing::Test {
     slot_desc.__set_slotIdx(0);
     thrift_desc_tbl.slotDescriptors.push_back(slot_desc);
     EXPECT_OK(DescriptorTbl::Create(&obj_pool_, thrift_desc_tbl, &desc_tbl_));
-    runtime_state_.set_desc_tbl(desc_tbl_);
 
     vector<TTupleId> row_tids;
     row_tids.push_back(0);
@@ -286,24 +303,16 @@ class DataStreamTest : public testing::Test {
   // Create a tuple comparator to sort in ascending order on the single bigint column.
   void CreateTupleComparator() {
     SlotRef* lhs_slot = obj_pool_.Add(new SlotRef(TYPE_BIGINT, 0));
-    lhs_slot_ctx_ = obj_pool_.Add(new ExprContext(lhs_slot));
-    SlotRef* rhs_slot = obj_pool_.Add(new SlotRef(TYPE_BIGINT, 0));
-    rhs_slot_ctx_ = obj_pool_.Add(new ExprContext(rhs_slot));
-
-    lhs_slot_ctx_->Prepare(NULL, *row_desc_, &tracker_);
-    rhs_slot_ctx_->Prepare(NULL, *row_desc_, &tracker_);
-    lhs_slot_ctx_->Open(NULL);
-    rhs_slot_ctx_->Open(NULL);
-    SortExecExprs* sort_exprs = obj_pool_.Add(new SortExecExprs());
-    sort_exprs->Init(
-        vector<ExprContext*>(1, lhs_slot_ctx_), vector<ExprContext*>(1, rhs_slot_ctx_));
-    less_than_ = obj_pool_.Add(new TupleRowComparator(
-        *sort_exprs, vector<bool>(1, true), vector<bool>(1, false)));
+    ASSERT_OK(lhs_slot->Init(RowDescriptor(), runtime_state_.get()));
+    ordering_exprs_.push_back(lhs_slot);
+    less_than_ = obj_pool_.Add(new TupleRowComparator(ordering_exprs_,
+        is_asc_, nulls_first_));
+    ASSERT_OK(less_than_->Open(&obj_pool_, runtime_state_.get(), mem_pool_.get()));
   }
 
   // Create batch_, but don't fill it with data yet. Assumes we created row_desc_.
   RowBatch* CreateRowBatch() {
-    RowBatch* batch = new RowBatch(*row_desc_, BATCH_CAPACITY, &tracker_);
+    RowBatch* batch = new RowBatch(row_desc_, BATCH_CAPACITY, &tracker_);
     int64_t* tuple_mem = reinterpret_cast<int64_t*>(
         batch->tuple_data_pool()->Allocate(BATCH_CAPACITY * 8));
     bzero(tuple_mem, BATCH_CAPACITY * 8);
@@ -326,7 +335,7 @@ class DataStreamTest : public testing::Test {
 
   // Start receiver (expecting given number of senders) in separate thread.
   void StartReceiver(TPartitionType::type stream_type, int num_senders, int receiver_num,
-                     int buffer_size, bool is_merging, TUniqueId* out_id = NULL) {
+      int buffer_size, bool is_merging, TUniqueId* out_id = nullptr) {
     VLOG_QUERY << "start receiver";
     RuntimeProfile* profile =
         obj_pool_.Add(new RuntimeProfile(&obj_pool_, "TestReceiver"));
@@ -334,17 +343,15 @@ class DataStreamTest : public testing::Test {
     GetNextInstanceId(&instance_id);
     receiver_info_.push_back(ReceiverInfo(stream_type, num_senders, receiver_num));
     ReceiverInfo& info = receiver_info_.back();
-    info.stream_recvr =
-        stream_mgr_->CreateRecvr(&runtime_state_,
-            *row_desc_, instance_id, DEST_NODE_ID, num_senders, buffer_size, profile,
-            is_merging);
+    info.stream_recvr = stream_mgr_->CreateRecvr(runtime_state_.get(), row_desc_,
+        instance_id, DEST_NODE_ID, num_senders, buffer_size, profile, is_merging);
     if (!is_merging) {
       info.thread_handle = new thread(&DataStreamTest::ReadStream, this, &info);
     } else {
       info.thread_handle = new thread(&DataStreamTest::ReadStreamMerging, this, &info,
           profile);
     }
-    if (out_id != NULL) *out_id = instance_id;
+    if (out_id != nullptr) *out_id = instance_id;
   }
 
   void JoinReceivers() {
@@ -360,7 +367,7 @@ class DataStreamTest : public testing::Test {
     RowBatch* batch;
     VLOG_QUERY <<  "start reading";
     while (!(info->status = info->stream_recvr->GetBatch(&batch)).IsCancelled() &&
-        (batch != NULL)) {
+        (batch != nullptr)) {
       VLOG_QUERY << "read batch #rows=" << batch->num_rows();
       for (int i = 0; i < batch->num_rows(); ++i) {
         TupleRow* row = batch->GetRow(i);
@@ -375,7 +382,7 @@ class DataStreamTest : public testing::Test {
   void ReadStreamMerging(ReceiverInfo* info, RuntimeProfile* profile) {
     info->status = info->stream_recvr->CreateMerger(*less_than_);
     if (info->status.IsCancelled()) return;
-    RowBatch batch(*row_desc_, 1024, &tracker_);
+    RowBatch batch(row_desc_, 1024, &tracker_);
     VLOG_QUERY << "start reading merging";
     bool eos;
     while (!(info->status = info->stream_recvr->GetNext(&batch, &eos)).IsCancelled()) {
@@ -447,10 +454,14 @@ class DataStreamTest : public testing::Test {
 
   // Start backend in separate thread.
   void StartBackend() {
-    boost::shared_ptr<ImpalaTestBackend> handler(new ImpalaTestBackend(stream_mgr_));
+    // Dynamic cast stream_mgr_ which is of type DataStreamMgrBase to derived type
+    // DataStreamMgr, since ImpalaTestBackend() accepts only DataStreamMgr*.
+    boost::shared_ptr<ImpalaTestBackend> handler(
+        new ImpalaTestBackend(dynamic_cast<DataStreamMgr*>(stream_mgr_)));
     boost::shared_ptr<TProcessor> processor(new ImpalaInternalServiceProcessor(handler));
-    server_ = new ThriftServer("DataStreamTest backend", processor, FLAGS_port, NULL);
-    server_->Start();
+    ThriftServerBuilder builder("DataStreamTest backend", processor, FLAGS_port);
+    ASSERT_OK(builder.Build(&server_));
+    ASSERT_OK(server_->Start());
   }
 
   void StopBackend() {
@@ -478,15 +489,20 @@ class DataStreamTest : public testing::Test {
     }
   }
 
-  void Sender(int sender_num, int channel_buffer_size,
-              TPartitionType::type partition_type) {
-    RuntimeState state(TExecPlanFragmentParams(), &exec_env_);
-    state.set_desc_tbl(desc_tbl_);
-    state.InitMemTrackers(TUniqueId(), NULL, -1);
+  void Sender(
+      int sender_num, int channel_buffer_size, TPartitionType::type partition_type) {
+    RuntimeState state(TQueryCtx(), &exec_env_, desc_tbl_);
     VLOG_QUERY << "create sender " << sender_num;
-    const TDataStreamSink& sink = GetSink(partition_type);
+    const TDataSink& sink = GetSink(partition_type);
     DataStreamSender sender(
-        &obj_pool_, sender_num, *row_desc_, sink, dest_, channel_buffer_size);
+        sender_num, row_desc_, sink.stream_sink, dest_, channel_buffer_size);
+
+    TExprNode expr_node;
+    expr_node.node_type = TExprNodeType::SLOT_REF;
+    TExpr output_exprs;
+    output_exprs.nodes.push_back(expr_node);
+    EXPECT_OK(sender.Init(vector<TExpr>({output_exprs}), sink, &state));
+
     EXPECT_OK(sender.Prepare(&state, &tracker_));
     EXPECT_OK(sender.Open(&state));
     scoped_ptr<RowBatch> batch(CreateRowBatch());
@@ -499,15 +515,16 @@ class DataStreamTest : public testing::Test {
       if (!info.status.ok()) break;
     }
     VLOG_QUERY << "closing sender" << sender_num;
-    sender.FlushFinal(&state);
+    info.status.MergeStatus(sender.FlushFinal(&state));
     sender.Close(&state);
     info.num_bytes_sent = sender.GetNumDataBytesSent();
 
     batch->Reset();
+    state.ReleaseResources();
   }
 
-  void TestStream(TPartitionType::type stream_type, int num_senders,
-                  int num_receivers, int buffer_size, bool is_merging) {
+  void TestStream(TPartitionType::type stream_type, int num_senders, int num_receivers,
+      int buffer_size, bool is_merging) {
     VLOG_QUERY << "Testing stream=" << stream_type << " #senders=" << num_senders
                << " #receivers=" << num_receivers << " buffer_size=" << buffer_size
                << " is_merging=" << is_merging;
@@ -523,10 +540,6 @@ class DataStreamTest : public testing::Test {
     JoinReceivers();
     CheckReceivers(stream_type, num_senders);
   }
-
- private:
-  ExprContext* lhs_slot_ctx_;
-  ExprContext* rhs_slot_ctx_;
 };
 
 TEST_F(DataStreamTest, UnknownSenderSmallResult) {
@@ -593,23 +606,22 @@ TEST_F(DataStreamTest, BasicTest) {
 //
 // TODO: Make lifecycle requirements more explicit.
 TEST_F(DataStreamTest, CloseRecvrWhileReferencesRemain) {
-  scoped_ptr<RuntimeState> runtime_state(
-      new RuntimeState(TExecPlanFragmentParams(), &exec_env_));
-  runtime_state->InitMemTrackers(TUniqueId(), NULL, -1);
-
+  scoped_ptr<RuntimeState> runtime_state(new RuntimeState(TQueryCtx(), &exec_env_));
   scoped_ptr<RuntimeProfile> profile(new RuntimeProfile(&obj_pool_, "TestReceiver"));
 
   // Start just one receiver.
   TUniqueId instance_id;
   GetNextInstanceId(&instance_id);
-  shared_ptr<DataStreamRecvr> stream_recvr = stream_mgr_->CreateRecvr(runtime_state.get(),
-      *row_desc_, instance_id, DEST_NODE_ID, 1, 1, profile.get(), false);
+  shared_ptr<DataStreamRecvrBase> stream_recvr = stream_mgr_->CreateRecvr(
+      runtime_state.get(), row_desc_, instance_id, DEST_NODE_ID, 1, 1, profile.get(),
+      false);
 
   // Perform tear down, but keep a reference to the receiver so that it is deleted last
   // (to confirm that the destructor does not access invalid state after tear-down).
   stream_recvr->Close();
 
   // Force deletion of the parent memtracker by destroying it's owning runtime state.
+  runtime_state->ReleaseResources();
   runtime_state.reset();
 
   // Send an eos RPC to the receiver. Not required for tear-down, but confirms that the
@@ -645,6 +657,6 @@ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   InitCommonRuntime(argc, argv, true, TestInfo::BE_TEST);
   InitFeSupport();
-  impala::LlvmCodeGen::InitializeLlvm();
+  ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
   return RUN_ALL_TESTS();
 }

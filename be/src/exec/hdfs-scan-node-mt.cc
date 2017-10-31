@@ -45,7 +45,8 @@ Status HdfsScanNodeMt::Prepare(RuntimeState* state) {
   // Return an error if this scan node has been assigned a range that is not supported
   // because the scanner of the corresponding file format does implement GetNext().
   for (const auto& files: per_type_files_) {
-    if (!files.second.empty() && files.first != THdfsFileFormat::PARQUET) {
+    if (!files.second.empty() && files.first != THdfsFileFormat::PARQUET
+        && files.first != THdfsFileFormat::TEXT) {
       stringstream msg;
       msg << "Unsupported file format with HdfsScanNodeMt: " << files.first;
       return Status(msg.str());
@@ -88,7 +89,13 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
     HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
     scanner_ctx_.reset(new ScannerContext(
         runtime_state_, this, partition, scan_range_, filter_ctxs()));
-    RETURN_IF_ERROR(CreateAndOpenScanner(partition, scanner_ctx_.get(), &scanner_));
+    Status status = CreateAndOpenScanner(partition, scanner_ctx_.get(), &scanner_);
+    if (!status.ok()) {
+      DCHECK(scanner_ == NULL);
+      // Avoid leaking unread buffers in the scan range.
+      scan_range_->Cancel(status);
+      return status;
+    }
   }
 
   Status status = scanner_->GetNext(row_batch);

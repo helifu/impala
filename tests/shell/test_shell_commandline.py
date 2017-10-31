@@ -25,6 +25,7 @@ import signal
 from subprocess import call
 from tests.common.impala_service import ImpaladService
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIf
 from time import sleep
 from util import IMPALAD, SHELL_CMD
 from util import assert_var_substitution, run_impala_shell_cmd, ImpalaShell
@@ -419,6 +420,10 @@ class TestImpalaShell(ImpalaTestSuite):
            % (os.path.join(QUERY_FILE_PATH, 'test_var_substitution.sql'))
     result = run_impala_shell_cmd(args, expect_success=True)
     assert_var_substitution(result)
+    args = '--var=foo'
+    result = run_impala_shell_cmd(args, expect_success=False)
+    assert ("Error: Could not parse key-value \"foo\". It must follow the pattern "
+             "\"KEY=VALUE\".") in result.stderr
 
   # Checks if 'messages' exists/does not exist in 'result_stderr' based on the value of
   # 'should_exist'
@@ -475,6 +480,7 @@ class TestImpalaShell(ImpalaTestSuite):
         (expected_rows_modified, expected_row_errors)
     assert expected_output in results.stderr
 
+  @SkipIf.kudu_not_supported
   def test_kudu_dml_reporting(self, unique_database):
     db = unique_database
     run_impala_shell_cmd('--query="create table %s.dml_test (id int primary key, '\

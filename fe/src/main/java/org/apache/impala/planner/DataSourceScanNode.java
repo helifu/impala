@@ -83,10 +83,11 @@ public class DataSourceScanNode extends ScanNode {
   // The number of rows estimate as returned by prepare().
   private long numRowsEstimate_;
 
-  public DataSourceScanNode(PlanNodeId id, TupleDescriptor desc) {
+  public DataSourceScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts) {
     super(id, desc, "SCAN DATA SOURCE");
     desc_ = desc;
     table_ = (DataSourceTable) desc_.getTable();
+    conjuncts_ = conjuncts;
     acceptedPredicates_ = null;
     acceptedConjuncts_ = null;
   }
@@ -94,8 +95,6 @@ public class DataSourceScanNode extends ScanNode {
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
     checkForSupportedFileFormats();
-    assignConjuncts(analyzer);
-    analyzer.createEquivConjuncts(tupleIds_.get(0), conjuncts_);
     prepareDataSource();
     conjuncts_ = orderConjunctsByCost(conjuncts_);
     computeStats(analyzer);
@@ -331,18 +330,9 @@ public class DataSourceScanNode extends ScanNode {
   }
 
   @Override
-  public void computeCosts(TQueryOptions queryOptions) {
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
     // TODO: What's a good estimate of memory consumption?
-    perHostMemCost_ = 1024L * 1024L * 1024L;
-  }
-
-  /**
-   * Returns the per-host upper bound of memory that any number of concurrent scan nodes
-   * will use. Used for estimating the per-host memory requirement of queries.
-   */
-  public static long getPerHostMemUpperBound() {
-    // TODO: What's a good estimate of memory consumption?
-    return 1024L * 1024L * 1024L;
+    nodeResourceProfile_ = ResourceProfile.noReservation(1024L * 1024L * 1024L);
   }
 
   @Override
@@ -372,4 +362,7 @@ public class DataSourceScanNode extends ScanNode {
     }
     return output.toString();
   }
+
+  @Override
+  public boolean hasStorageLayerConjuncts() { return !acceptedConjuncts_.isEmpty(); }
 }

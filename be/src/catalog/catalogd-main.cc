@@ -32,6 +32,7 @@
 #include "util/debug-util.h"
 #include "util/jni-util.h"
 #include "util/metrics.h"
+#include "util/common-metrics.h"
 #include "util/network-util.h"
 #include "util/memory-metrics.h"
 #include "util/webserver.h"
@@ -46,10 +47,13 @@ DECLARE_int32(state_store_subscriber_port);
 DECLARE_string(ssl_server_certificate);
 DECLARE_string(ssl_private_key);
 DECLARE_string(ssl_private_key_password_cmd);
+DECLARE_string(ssl_cipher_list);
+DECLARE_string(ssl_minimum_version);
 
 #include "common/names.h"
 
 using namespace impala;
+using namespace apache::thrift;
 using namespace apache::thrift;
 
 int CatalogdMain(int argc, char** argv) {
@@ -69,12 +73,15 @@ int CatalogdMain(int argc, char** argv) {
     LOG(INFO) << "Not starting webserver";
   }
 
-  metrics->Init(FLAGS_enable_webserver ? webserver.get() : NULL);
-  ABORT_IF_ERROR(RegisterMemoryMetrics(metrics.get(), true));
-  StartThreadInstrumentation(metrics.get(), webserver.get());
+  ABORT_IF_ERROR(metrics->Init(FLAGS_enable_webserver ? webserver.get() : nullptr));
+  ABORT_IF_ERROR(RegisterMemoryMetrics(metrics.get(), true, nullptr, nullptr));
+  StartMemoryMaintenanceThread();
+  ABORT_IF_ERROR(StartThreadInstrumentation(metrics.get(), webserver.get(), true));
 
   InitRpcEventTracing(webserver.get());
   metrics->AddProperty<string>("catalog.version", GetVersionString(true));
+
+  CommonMetrics::InitCommonMetrics(metrics.get());
 
   CatalogServer catalog_server(metrics.get());
   ABORT_IF_ERROR(catalog_server.Start());
@@ -85,13 +92,20 @@ int CatalogdMain(int argc, char** argv) {
       new RpcEventHandler("catalog-server", metrics.get()));
   processor->setEventHandler(event_handler);
 
-  ThriftServer* server = new ThriftServer("CatalogService", processor,
-      FLAGS_catalog_service_port, NULL, metrics.get(), 5);
+  ThriftServer* server;
+  ThriftServerBuilder builder("CatalogService", processor, FLAGS_catalog_service_port);
+
   if (EnableInternalSslConnections()) {
+    SSLProtocol ssl_version;
+    ABORT_IF_ERROR(
+        SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));
     LOG(INFO) << "Enabling SSL for CatalogService";
-    ABORT_IF_ERROR(server->EnableSsl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key,
-        FLAGS_ssl_private_key_password_cmd));
+    builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
+        .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
+        .ssl_version(ssl_version)
+        .cipher_list(FLAGS_ssl_cipher_list);
   }
+  ABORT_IF_ERROR(builder.metrics(metrics.get()).Build(&server));
   ABORT_IF_ERROR(server->Start());
   LOG(INFO) << "CatalogService started on port: " << FLAGS_catalog_service_port;
   server->Join();

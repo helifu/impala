@@ -10,7 +10,7 @@
 #include "gutil/hash/hash.h"
 
 #include "gutil/integral_types.h"
-#include <glog/logging.h>
+#include <common/logging.h>
 #include "gutil/logging-inl.h"
 #include "gutil/hash/jenkins.h"
 #include "gutil/hash/jenkins_lookup2.h"
@@ -34,10 +34,6 @@ static const uint32 kFingerprintSeed1 = 102072;
 
 static inline uint32 char2unsigned(char c) {
   return static_cast<uint32>(static_cast<unsigned char>(c));
-}
-
-static inline uint64 char2unsigned64(char c) {
-  return static_cast<uint64>(static_cast<unsigned char>(c));
 }
 
 uint64 FingerprintReferenceImplementation(const char *s, uint32 len) {
@@ -186,16 +182,3 @@ uint64 FingerprintInterleavedImplementation(const char *s, uint32 len) {
   mix(d, e, f);
   return CombineFingerprintHalves(c, f);
 }
-
-// Extern template definitions.
-
-#if defined(__GNUC__)
-#include <ext/hash_set>
-namespace __gnu_cxx {
-
-template class hash_set<string>;
-template class hash_map<string, string>;
-
-}  // namespace __gnu_cxx
-
-#endif

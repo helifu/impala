@@ -23,11 +23,11 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "exec/kudu-util.h"
-#include "exprs/expr.h"
-#include "exprs/timezone_db.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "gutil/atomicops.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-util.h"
+#include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/decimal-value.h"
 #include "runtime/exec-env.h"
 #include "runtime/hdfs-fs-cache.h"
@@ -40,6 +40,7 @@
 #include "util/disk-info.h"
 #include "util/logging-support.h"
 #include "util/mem-info.h"
+#include "util/memory-metrics.h"
 #include "util/minidump.h"
 #include "util/network-util.h"
 #include "util/openssl-util.h"
@@ -54,16 +55,24 @@
 
 using namespace impala;
 
-DECLARE_string(hostname);
-DECLARE_string(redaction_rules_file);
-// TODO: renamed this to be more generic when we have a good CM release to do so.
-DECLARE_int32(logbufsecs);
-DECLARE_string(heap_profile_dir);
 DECLARE_bool(enable_process_lifetime_heap_profiling);
+DECLARE_string(heap_profile_dir);
+DECLARE_string(hostname);
+// TODO: rename this to be more generic when we have a good CM release to do so.
+DECLARE_int32(logbufsecs);
+DECLARE_int32(max_minidumps);
+DECLARE_string(redaction_rules_file);
 
 DEFINE_int32(max_log_files, 10, "Maximum number of log files to retain per severity "
     "level. The most recent log files are retained. If set to 0, all log files are "
     "retained.");
+
+DEFINE_int32(max_audit_event_log_files, 0, "Maximum number of audit event log files "
+    "to retain. The most recent audit event log files are retained. If set to 0, "
+    "all audit event log files are retained.");
+
+DEFINE_int32(memory_maintenance_sleep_time_ms, 10000, "Sleep time in milliseconds "
+    "between memory maintenance iterations");
 
 DEFINE_int64(pause_monitor_sleep_time_ms, 500, "Sleep time in milliseconds for "
     "pause monitor thread.");
@@ -72,76 +81,79 @@ DEFINE_int64(pause_monitor_warn_threshold_ms, 10000, "If the pause monitor sleep
     "more than this time period, a warning is logged. If set to 0 or less, pause monitor"
     " is disabled.");
 
+DEFINE_string(local_library_dir, "/tmp",
+    "Scratch space for local fs operations. Currently used for copying "
+    "UDF binaries locally from HDFS and also for initializing the timezone db");
+
 // Defined by glog. This allows users to specify the log level using a glob. For
 // example -vmodule=*scanner*=3 would enable full logging for scanners. If redaction
 // is enabled, this option won't be allowed because some logging dumps table data
 // in ways the authors of redaction rules can't anticipate.
 DECLARE_string(vmodule);
 
-// tcmalloc will hold on to freed memory. We will periodically release the memory back
-// to the OS if the extra memory is too high. If the memory used by the application
-// is less than this fraction of the total reserved memory, free it back to the OS.
-static const float TCMALLOC_RELEASE_FREE_MEMORY_FRACTION = 0.5f;
-
 using std::string;
 
-// Maintenance thread that runs periodically. It does a few things:
-// 1) flushes glog every logbufsecs sec. glog flushes the log file only if
-//    logbufsecs has passed since the previous flush when a new log is written. That means
-//    that on a quiet system, logs will be buffered indefinitely.
-// 2) checks that tcmalloc has not left too much memory in its pageheap
-static scoped_ptr<impala::Thread> maintenance_thread;
+// Log maintenance thread that runs periodically. It flushes glog every logbufsecs sec.
+// glog only automatically flushes the log file if logbufsecs has passed since the
+// previous flush when a new log is written. That means that on a quiet system, logs
+// will be buffered indefinitely. It also rotates log files.
+static scoped_ptr<impala::Thread> log_maintenance_thread;
+
+// Memory Maintenance thread that runs periodically to free up memory. It does the
+// following things every memory_maintenance_sleep_time_ms secs:
+// 1) Releases BufferPool memory that is not currently in use.
+// 2) Frees excess memory that TCMalloc has left in its pageheap.
+static scoped_ptr<impala::Thread> memory_maintenance_thread;
 
 // A pause monitor thread to monitor process pauses in impala daemons. The thread sleeps
 // for a short interval of time (THREAD_SLEEP_TIME_MS), wakes up and calculates the actual
 // time slept. If that exceeds PAUSE_WARN_THRESHOLD_MS, a warning is logged.
 static scoped_ptr<impala::Thread> pause_monitor;
 
-[[noreturn]] static void MaintenanceThread() {
+[[noreturn]] static void LogMaintenanceThread() {
   while (true) {
     sleep(FLAGS_logbufsecs);
 
     google::FlushLogFiles(google::GLOG_INFO);
 
-    // Tests don't need to run the maintenance thread. It causes issues when
-    // on teardown.
+    // No need to rotate log files in tests.
     if (impala::TestInfo::is_test()) continue;
-
-#ifndef ADDRESS_SANITIZER
-    // Required to ensure memory gets released back to the OS, even if tcmalloc doesn't do
-    // it for us. This is because tcmalloc releases memory based on the
-    // TCMALLOC_RELEASE_RATE property, which is not actually a rate but a divisor based
-    // on the number of blocks that have been deleted. When tcmalloc does decide to
-    // release memory, it removes a single span from the PageHeap. This means there are
-    // certain allocation patterns that can lead to OOM due to not enough memory being
-    // released by tcmalloc, even when that memory is no longer being used.
-    // One example is continually resizing a vector which results in many allocations.
-    // Even after the vector goes out of scope, all the memory will not be released
-    // unless there are enough other deletions that are occurring in the system.
-    // This can eventually lead to OOM/crashes (see IMPALA-818).
-    // See: http://google-perftools.googlecode.com/svn/trunk/doc/tcmalloc.html#runtime
-    size_t bytes_used = 0;
-    size_t bytes_in_pageheap = 0;
-    MallocExtension::instance()->GetNumericProperty(
-        "generic.current_allocated_bytes", &bytes_used);
-    MallocExtension::instance()->GetNumericProperty(
-        "generic.heap_size", &bytes_in_pageheap);
-    if (bytes_used < bytes_in_pageheap * TCMALLOC_RELEASE_FREE_MEMORY_FRACTION) {
-      MallocExtension::instance()->ReleaseFreeMemory();
-    }
-
-    // When using tcmalloc, the process limit as measured by our trackers will
-    // be out of sync with the process usage. Update the process tracker periodically.
-    impala::ExecEnv* env = impala::ExecEnv::GetInstance();
-    if (env != NULL && env->process_mem_tracker() != NULL) {
-      env->process_mem_tracker()->RefreshConsumptionFromMetric();
-    }
-#endif
-    // TODO: we should also update the process mem tracker with the reported JVM
-    // mem usage.
-
     // Check for log rotation in every interval of the maintenance thread
     impala::CheckAndRotateLogFiles(FLAGS_max_log_files);
+    // Check for audit event log rotation in every interval of the maintenance thread
+    impala::CheckAndRotateAuditEventLogFiles(FLAGS_max_audit_event_log_files);
+    // Check for minidump rotation in every interval of the maintenance thread. This is
+    // necessary since an arbitrary number of minidumps can be written by sending SIGUSR1
+    // to the process.
+    impala::CheckAndRotateMinidumps(FLAGS_max_minidumps);
+  }
+}
+
+[[noreturn]] static void MemoryMaintenanceThread() {
+  while (true) {
+    SleepForMs(FLAGS_memory_maintenance_sleep_time_ms);
+    impala::ExecEnv* env = impala::ExecEnv::GetInstance();
+    // ExecEnv may not have been created yet or this may be the catalogd or statestored,
+    // which don't have ExecEnvs.
+    if (env != nullptr) {
+      BufferPool* buffer_pool = env->buffer_pool();
+      if (buffer_pool != nullptr) buffer_pool->Maintenance();
+
+#ifndef ADDRESS_SANITIZER
+      // When using tcmalloc, the process limit as measured by our trackers will
+      // be out of sync with the process usage. The metric is refreshed whenever
+      // memory is consumed or released via a MemTracker, so on a system with
+      // queries executing it will be refreshed frequently. However if the system
+      // is idle, we need to refresh the tracker occasionally since untracked
+      // memory may be allocated or freed, e.g. by background threads.
+      if (env->process_mem_tracker() != nullptr) {
+        env->process_mem_tracker()->RefreshConsumptionFromMetric();
+      }
+#endif
+    }
+    // Periodically refresh values of the aggregate memory metrics to ensure they are
+    // somewhat up-to-date.
+    AggregateMemoryMetrics::Refresh();
   }
 }
 
@@ -165,7 +177,6 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   DiskInfo::Init();
   MemInfo::Init();
   OsInfo::Init();
-  DecimalUtil::InitMaxUnscaledDecimal16();
   TestInfo::Init(test_mode);
 
   // Verify CPU meets the minimum requirements before calling InitGoogleLoggingSafe()
@@ -173,7 +184,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   CpuInfo::VerifyCpuRequirements();
 
   // Set the default hostname. The user can override this with the hostname flag.
-  GetHostname(&FLAGS_hostname);
+  ABORT_IF_ERROR(GetHostname(&FLAGS_hostname));
 
   google::SetVersionString(impala::GetBuildVersion());
   google::ParseCommandLineFlags(&argc, &argv, true);
@@ -193,15 +204,13 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   impala::InitThreading();
   impala::TimestampParser::Init();
   impala::SeedOpenSSLRNG();
-  ABORT_IF_ERROR(impala::TimezoneDatabase::Initialize());
   ABORT_IF_ERROR(impala::InitAuth(argv[0]));
 
   // Initialize maintenance_thread after InitGoogleLoggingSafe and InitThreading.
-  maintenance_thread.reset(
-      new Thread("common", "maintenance-thread", &MaintenanceThread));
+  log_maintenance_thread.reset(
+      new Thread("common", "log-maintenance-thread", &LogMaintenanceThread));
 
-  pause_monitor.reset(
-      new Thread("common", "pause-monitor", &PauseMonitorLoop));
+  pause_monitor.reset(new Thread("common", "pause-monitor", &PauseMonitorLoop));
 
   LOG(INFO) << impala::GetVersionString();
   LOG(INFO) << "Using hostname: " << FLAGS_hostname;
@@ -216,7 +225,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   LOG(INFO) << "Process ID: " << getpid();
 
   // Required for the FE's Catalog
-  impala::LibCache::Init();
+  ABORT_IF_ERROR(impala::LibCache::Init());
   Status fs_cache_init_status = impala::HdfsFsCache::Init();
   if (!fs_cache_init_status.ok()) CLEAN_EXIT_WITH_ERROR(fs_cache_init_status.GetDetail());
 
@@ -229,7 +238,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     // Should not be called. We need BuiltinsInit() so the builtin symbols are
     // not stripped.
     DCHECK(false);
-    Expr::InitBuiltinsDummy();
+    ScalarExprEvaluator::InitBuiltinsDummy();
   }
 
   if (impala::KuduIsAvailable()) impala::InitKuduLogging();
@@ -240,4 +249,10 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     HeapProfilerStart(FLAGS_heap_profile_dir.c_str());
   }
 #endif
+}
+
+void impala::StartMemoryMaintenanceThread() {
+  DCHECK(AggregateMemoryMetrics::NUM_MAPS != nullptr) << "Mem metrics not registered.";
+  memory_maintenance_thread.reset(
+      new Thread("common", "memory-maintenance-thread", &MemoryMaintenanceThread));
 }

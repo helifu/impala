@@ -18,8 +18,8 @@
 from copy import deepcopy
 from itertools import ifilter
 
-from common import ValExpr
-from db_types import (
+from tests.comparison.common import ValExpr
+from tests.comparison.db_types import (
     Boolean,
     Char,
     DataType,
@@ -456,6 +456,19 @@ def create_analytic(
   func.SUPPORTS_WINDOWING = supports_window
   ANALYTIC_FUNCS.append(func)
   return func
+
+
+class CastFunc(Func):
+  """
+  This function is used internally by the InsertStatementGenerator to cast ValExprs into
+  the proper exact types of columns.
+
+  Arguments:
+  val_expr: ValExpr to cast
+  type_: Type to cast ValExpr
+  """
+  def __init__(self, val_expr, type_):
+    self.args = [val_expr, type_]
 
 
 create_func('IsNull', returns=Boolean, accepts=[DataType])

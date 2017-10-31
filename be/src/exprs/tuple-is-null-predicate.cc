@@ -27,12 +27,15 @@
 
 namespace impala {
 
-BooleanVal TupleIsNullPredicate::GetBooleanVal(ExprContext* ctx, const TupleRow* row) {
+BooleanVal TupleIsNullPredicate::GetBooleanVal(
+    ScalarExprEvaluator* evaluator, const TupleRow* row) const {
   int count = 0;
   for (int i = 0; i < tuple_idxs_.size(); ++i) {
     count += row->GetTuple(tuple_idxs_[i]) == NULL;
   }
-  return BooleanVal(!tuple_idxs_.empty() && count == tuple_idxs_.size());
+  // Return true only if all originally specified tuples are NULL. Return false if any
+  // tuple is non-nullable.
+  return BooleanVal(count == tuple_ids_.size());
 }
 
 TupleIsNullPredicate::TupleIsNullPredicate(const TExprNode& node)
@@ -41,9 +44,8 @@ TupleIsNullPredicate::TupleIsNullPredicate(const TExprNode& node)
                node.tuple_is_null_pred.tuple_ids.end()) {
 }
 
-Status TupleIsNullPredicate::Prepare(RuntimeState* state, const RowDescriptor& row_desc,
-                                     ExprContext* ctx) {
-  RETURN_IF_ERROR(Expr::Prepare(state, row_desc, ctx));
+Status TupleIsNullPredicate::Init(const RowDescriptor& row_desc, RuntimeState* state) {
+  RETURN_IF_ERROR(ScalarExpr::Init(row_desc, state));
   DCHECK_EQ(0, children_.size());
   // Resolve tuple ids to tuple indexes.
   for (int i = 0; i < tuple_ids_.size(); ++i) {

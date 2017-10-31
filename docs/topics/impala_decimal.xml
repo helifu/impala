@@ -124,7 +124,7 @@ under the License.
           if all the digits of the input values were 9s and the absolute values were added together.
         </p>
 <!-- Seems like buggy output from this first query, so hiding the example for the time being. -->
-<codeblock audience="Cloudera"><![CDATA[[localhost:21000] > select 50000.5 + 12.444, precision(50000.5 + 12.444), scale(50000.5 + 12.444);
+<codeblock audience="hidden"><![CDATA[[localhost:21000] > select 50000.5 + 12.444, precision(50000.5 + 12.444), scale(50000.5 + 12.444);
 +------------------+-----------------------------+-------------------------+
 | 50000.5 + 12.444 | precision(50000.5 + 12.444) | scale(50000.5 + 12.444) |
 +------------------+-----------------------------+-------------------------+
@@ -697,7 +697,7 @@ Expression '1' (type: INT) would need to be cast to DECIMAL(9,0) for column 'x'
 
       <li>
         Impala can query Avro, RCFile, or SequenceFile tables containing <codeph>DECIMAL</codeph> columns, created
-        by other Hadoop components, on CDH 5 only.
+        by other Hadoop components.
       </li>
 
       <li>
@@ -717,10 +717,6 @@ Expression '1' (type: INT) would need to be cast to DECIMAL(9,0) for column 'x'
         depending on the precision specified for the <codeph>DECIMAL</codeph> column.
       </li>
 
-      <li>
-        Parquet files containing <codeph>DECIMAL</codeph> columns are not expected to be readable under CDH 4. See
-        the <b>Compatibility</b> section for details.
-      </li>
     </ul>
 
     <p>
@@ -802,10 +798,6 @@ SELECT x+y, ROUND(y,1), z/98.6 FROM t1;
 SELECT CAST(1000.5 AS DECIMAL);
 </codeblock>
 
-    <p conref="../shared/impala_common.xml#common/restrictions_blurb"/>
-
-    <p conref="../shared/impala_common.xml#common/decimal_no_stats"/>
-
 <!-- <p conref="../shared/impala_common.xml#common/partitioning_good"/> -->
 
     <p conref="../shared/impala_common.xml#common/hbase_ok"/>
@@ -821,6 +813,9 @@ SELECT CAST(1000.5 AS DECIMAL);
 <!-- <p conref="../shared/impala_common.xml#common/added_in_20"/> -->
 
     <p conref="../shared/impala_common.xml#common/column_stats_constant"/>
+
+    <p conref="../shared/impala_common.xml#common/kudu_blurb"/>
+    <p conref="../shared/impala_common.xml#common/kudu_unsupported_data_type"/>
 
     <p conref="../shared/impala_common.xml#common/related_info"/>
 

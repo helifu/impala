@@ -37,7 +37,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">impala-shell</indexterm>
+      <indexterm audience="hidden">impala-shell</indexterm>
       You can use the Impala shell tool (<codeph>impala-shell</codeph>) to set up databases and tables, insert
       data, and issue queries. For ad hoc queries and exploration, you can submit SQL statements in an interactive
       session. To automate your work, you can specify command-line options to process a single statement or a
@@ -95,11 +95,7 @@ under the License.
     </ul>
 
     <p>
-      For information on installing the Impala shell, see <xref href="impala_install.xml#install"/>. In Cloudera
-      Manager 4.1 and higher, Cloudera Manager installs <cmdname>impala-shell</cmdname> automatically. You might
-      install <cmdname>impala-shell</cmdname> manually on other systems not managed by Cloudera Manager, so that
-      you can issue queries from client systems that are not also running the Impala daemon or other Apache Hadoop
-      components.
+      For information on installing the Impala shell, see <xref href="impala_install.xml#install"/>.
     </p>
 
     <p>

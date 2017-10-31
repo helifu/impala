@@ -36,7 +36,7 @@ under the License.
   <conbody>
 
     <p rev="2.0.0">
-      <indexterm audience="Cloudera">VARCHAR data type</indexterm>
+      <indexterm audience="hidden">VARCHAR data type</indexterm>
       A variable-length character type, truncated during processing if necessary to fit within the specified
       length.
     </p>
@@ -119,7 +119,7 @@ prefer to use an integer data type with sufficient range (<codeph>INT</codeph>,
     <p conref="../shared/impala_common.xml#common/compatibility_blurb"/>
 
     <p>
-      This type is available on CDH 5.2 or higher.
+      This type is available in <keyword keyref="impala20_full"/> or higher.
     </p>
 
     <p conref="../shared/impala_common.xml#common/internals_min_bytes"/>
@@ -127,6 +127,9 @@ prefer to use an integer data type with sufficient range (<codeph>INT</codeph>,
     <p conref="../shared/impala_common.xml#common/added_in_20"/>
 
     <p conref="../shared/impala_common.xml#common/column_stats_variable"/>
+
+    <p conref="../shared/impala_common.xml#common/kudu_blurb"/>
+    <p conref="../shared/impala_common.xml#common/kudu_unsupported_data_type"/>
 
     <p conref="../shared/impala_common.xml#common/restrictions_blurb"/>
 

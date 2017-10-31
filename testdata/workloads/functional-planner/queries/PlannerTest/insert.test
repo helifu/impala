@@ -402,14 +402,20 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(2010,10)]
 WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(2010,10)]
 |  partitions=1
 |
-02:AGGREGATE [FINALIZE]
+06:AGGREGATE [FINALIZE]
+|  output: count:merge(int_col)
+|  group by: string_col
+|
+05:EXCHANGE [HASH(string_col)]
+|
+02:AGGREGATE [STREAMING]
 |  output: count(int_col)
 |  group by: string_col
 |
 04:AGGREGATE
 |  group by: string_col, int_col
 |
-03:EXCHANGE [HASH(string_col)]
+03:EXCHANGE [HASH(string_col,int_col)]
 |
 01:AGGREGATE [STREAMING]
 |  group by: string_col, int_col
@@ -578,7 +584,7 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(year,month)
 |  partitions=24
 |
 01:SORT
-|  order by: year DESC NULLS LAST, month DESC NULLS LAST
+|  order by: year ASC NULLS LAST, month ASC NULLS LAST
 |
 00:SCAN HDFS [functional.alltypes]
    partitions=24/24 files=24 size=478.45KB
@@ -587,7 +593,7 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(year,month)
 |  partitions=24
 |
 02:SORT
-|  order by: year DESC NULLS LAST, month DESC NULLS LAST
+|  order by: year ASC NULLS LAST, month ASC NULLS LAST
 |
 01:EXCHANGE [HASH(functional.alltypes.year,functional.alltypes.month)]
 |
@@ -602,7 +608,7 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(year,month)
 |  partitions=24
 |
 01:SORT
-|  order by: year DESC NULLS LAST, month DESC NULLS LAST
+|  order by: year ASC NULLS LAST, month ASC NULLS LAST
 |
 00:SCAN HDFS [functional.alltypes]
    partitions=24/24 files=24 size=478.45KB
@@ -611,7 +617,7 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(year,month)
 |  partitions=24
 |
 01:SORT
-|  order by: year DESC NULLS LAST, month DESC NULLS LAST
+|  order by: year ASC NULLS LAST, month ASC NULLS LAST
 |
 00:SCAN HDFS [functional.alltypes]
    partitions=24/24 files=24 size=478.45KB
@@ -626,7 +632,7 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(year,month)
 |  partitions=24
 |
 04:SORT
-|  order by: year DESC NULLS LAST, month DESC NULLS LAST
+|  order by: year ASC NULLS LAST, month ASC NULLS LAST
 |
 03:HASH JOIN [LEFT SEMI JOIN]
 |  hash predicates: int_col = max(int_col)
@@ -646,7 +652,7 @@ WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(year,month)
 |  partitions=24
 |
 08:SORT
-|  order by: year DESC NULLS LAST, month DESC NULLS LAST
+|  order by: year ASC NULLS LAST, month ASC NULLS LAST
 |
 07:EXCHANGE [HASH(functional.alltypes.year,functional.alltypes.month)]
 |

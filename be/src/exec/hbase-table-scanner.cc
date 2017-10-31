@@ -153,26 +153,16 @@ Status HBaseTableScanner::Init() {
       JniUtil::GetGlobalClassRef(env,
           "org/apache/hadoop/hbase/filter/CompareFilter$CompareOp",
           &compare_op_cl_));
-  RETURN_IF_ERROR(
-      JniUtil::GetGlobalClassRef(env,
-          "org/apache/hadoop/hbase/client/ScannerTimeoutException",
-          &scanner_timeout_ex_cl_));
-
-  // Distinguish HBase versions by checking for the existence of the Cell class.
-  // HBase 0.95.2: Use Cell class and corresponding methods.
-  // HBase prior to 0.95.2: Use the KeyValue class and Cell-equivalent methods.
-  bool has_cell_class = JniUtil::ClassExists(env, "org/apache/hadoop/hbase/Cell");
-  if (has_cell_class) {
-    LOG(INFO) << "Detected HBase version >= 0.95.2";
-    RETURN_IF_ERROR(
-        JniUtil::GetGlobalClassRef(env, "org/apache/hadoop/hbase/Cell", &cell_cl_));
-  } else {
-    // Assume a HBase version prior to 0.95.2 because the Cell class wasn't found.
-    LOG(INFO) << "Detected HBase version < 0.95.2";
-    RETURN_IF_ERROR(
-        JniUtil::GetGlobalClassRef(env, "org/apache/hadoop/hbase/KeyValue",
-            &cell_cl_));
+  // ScannerTimeoutException is removed in HBase 2.0. Leave this as null if
+  // ScannerTimeoutException does not exist.
+  if (JniUtil::ClassExists(env,
+      "org/apache/hadoop/hbase/client/ScannerTimeoutException")) {
+    RETURN_IF_ERROR(JniUtil::GetGlobalClassRef(env,
+        "org/apache/hadoop/hbase/client/ScannerTimeoutException",
+        &scanner_timeout_ex_cl_));
   }
+  RETURN_IF_ERROR(
+      JniUtil::GetGlobalClassRef(env, "org/apache/hadoop/hbase/Cell", &cell_cl_));
 
   // Scan method ids.
   scan_ctor_ = env->GetMethodID(scan_cl_, "<init>", "()V");
@@ -180,16 +170,31 @@ Status HBaseTableScanner::Init() {
   scan_set_max_versions_id_ = env->GetMethodID(scan_cl_, "setMaxVersions",
       "(I)Lorg/apache/hadoop/hbase/client/Scan;");
   RETURN_ERROR_IF_EXC(env);
-  scan_set_caching_id_ = env->GetMethodID(scan_cl_, "setCaching", "(I)V");
-  RETURN_ERROR_IF_EXC(env);
-  scan_set_cache_blocks_id_ = env->GetMethodID(scan_cl_, "setCacheBlocks", "(Z)V");
-  RETURN_ERROR_IF_EXC(env);
+
+  // The signature of setCaching and setCacheBlocks returns either void (old behavior)
+  // or a Scan object (new behavior). Since the code doesn't use the return value,
+  // tolerate either. However, the two are expected to be consistent.
+  if (JniUtil::MethodExists(env, scan_cl_, "setCaching", "(I)V")) {
+    scan_set_caching_id_ = env->GetMethodID(scan_cl_, "setCaching", "(I)V");
+    RETURN_ERROR_IF_EXC(env);
+    scan_set_cache_blocks_id_ = env->GetMethodID(scan_cl_, "setCacheBlocks", "(Z)V");
+    RETURN_ERROR_IF_EXC(env);
+  } else {
+    scan_set_caching_id_ = env->GetMethodID(scan_cl_, "setCaching",
+        "(I)Lorg/apache/hadoop/hbase/client/Scan;");
+    RETURN_ERROR_IF_EXC(env);
+    scan_set_cache_blocks_id_ = env->GetMethodID(scan_cl_, "setCacheBlocks",
+        "(Z)Lorg/apache/hadoop/hbase/client/Scan;");
+    RETURN_ERROR_IF_EXC(env);
+  }
+
   scan_add_column_id_ = env->GetMethodID(scan_cl_, "addColumn",
       "([B[B)Lorg/apache/hadoop/hbase/client/Scan;");
   RETURN_ERROR_IF_EXC(env);
   scan_set_filter_id_ = env->GetMethodID(scan_cl_, "setFilter",
       "(Lorg/apache/hadoop/hbase/filter/Filter;)Lorg/apache/hadoop/hbase/client/Scan;");
   RETURN_ERROR_IF_EXC(env);
+  // TODO: IMPALA-5584: In HBase 2.0, setStartRow() and setStopRow() are deprecated.
   scan_set_start_row_id_ = env->GetMethodID(scan_cl_, "setStartRow",
       "([B)Lorg/apache/hadoop/hbase/client/Scan;");
   RETURN_ERROR_IF_EXC(env);
@@ -205,38 +210,25 @@ Status HBaseTableScanner::Init() {
   RETURN_ERROR_IF_EXC(env);
 
   // Result method ids.
-  if (has_cell_class) {
-    result_raw_cells_id_ = env->GetMethodID(result_cl_, "rawCells",
-        "()[Lorg/apache/hadoop/hbase/Cell;");
-  } else {
-    result_raw_cells_id_ = env->GetMethodID(result_cl_, "raw",
-        "()[Lorg/apache/hadoop/hbase/KeyValue;");
-  }
+  result_raw_cells_id_ = env->GetMethodID(result_cl_, "rawCells",
+      "()[Lorg/apache/hadoop/hbase/Cell;");
   RETURN_ERROR_IF_EXC(env);
   result_isempty_id_ = env->GetMethodID(result_cl_, "isEmpty", "()Z");
   RETURN_ERROR_IF_EXC(env);
 
 
-  // Cell or equivalent KeyValue method ids.
-  // Method ids to retrieve buffers backing different portions of row data.
-  if (has_cell_class) {
-    cell_get_row_array_ = env->GetMethodID(cell_cl_, "getRowArray", "()[B");
-    RETURN_ERROR_IF_EXC(env);
-    cell_get_family_array_ = env->GetMethodID(cell_cl_, "getFamilyArray", "()[B");
-    RETURN_ERROR_IF_EXC(env);
-    cell_get_qualifier_array_ = env->GetMethodID(cell_cl_, "getQualifierArray", "()[B");
-    RETURN_ERROR_IF_EXC(env);
-    cell_get_value_array_ = env->GetMethodID(cell_cl_, "getValueArray", "()[B");
-    RETURN_ERROR_IF_EXC(env);
-  } else {
-    // In HBase versions prior to 0.95.2 all data from a row is backed by the same buffer
-    cell_get_row_array_ = cell_get_family_array_ =
-        cell_get_qualifier_array_ = cell_get_value_array_ =
-        env->GetMethodID(cell_cl_, "getBuffer", "()[B");
-    RETURN_ERROR_IF_EXC(env);
-  }
-  // Method ids for retrieving lengths and offsets into buffers backing different
-  // portions of row data. Both the Cell and KeyValue classes support these methods.
+  // Cell method ids to retrieve buffers backing different portions of row data.
+  cell_get_row_array_ = env->GetMethodID(cell_cl_, "getRowArray", "()[B");
+  RETURN_ERROR_IF_EXC(env);
+  cell_get_family_array_ = env->GetMethodID(cell_cl_, "getFamilyArray", "()[B");
+  RETURN_ERROR_IF_EXC(env);
+  cell_get_qualifier_array_ = env->GetMethodID(cell_cl_, "getQualifierArray", "()[B");
+  RETURN_ERROR_IF_EXC(env);
+  cell_get_value_array_ = env->GetMethodID(cell_cl_, "getValueArray", "()[B");
+  RETURN_ERROR_IF_EXC(env);
+
+  // Cell method ids for retrieving lengths and offsets into buffers backing different
+  // portions of row data.
   cell_get_family_offset_id_ = env->GetMethodID(cell_cl_, "getFamilyOffset", "()I");
   RETURN_ERROR_IF_EXC(env);
   cell_get_family_length_id_ = env->GetMethodID(cell_cl_, "getFamilyLength", "()B");
@@ -416,8 +408,11 @@ Status HBaseTableScanner::HandleResultScannerTimeout(JNIEnv* env, bool* timeout)
   if (exc == NULL) return Status::OK();
 
   // GetJniExceptionMsg gets the error message and clears the exception status (which is
-  // necessary). We return the error if the exception was not a ScannerTimeoutException.
+  // necessary). For HBase 2.0, ScannerTimeoutException does not exist, so simply
+  // return the error. Otherwise, we return the error if the exception was not a
+  // ScannerTimeoutException.
   Status status = JniUtil::GetJniExceptionMsg(env, false);
+  if (scanner_timeout_ex_cl_ == nullptr) return status;
   if (env->IsInstanceOf(exc, scanner_timeout_ex_cl_) != JNI_TRUE) return status;
 
   *timeout = true;
@@ -435,7 +430,7 @@ Status HBaseTableScanner::HandleResultScannerTimeout(JNIEnv* env, bool* timeout)
   jbyteArray start_bytes =
     (jbyteArray) env->CallObjectMethod(cell, cell_get_row_array_);
   jbyteArray end_bytes;
-  CreateByteArray(env, scan_range.stop_key(), &end_bytes);
+  RETURN_IF_ERROR(CreateByteArray(env, scan_range.stop_key(), &end_bytes));
   return InitScanRange(env, start_bytes, end_bytes);
 }
 
@@ -443,9 +438,9 @@ Status HBaseTableScanner::InitScanRange(JNIEnv* env, const ScanRange& scan_range
   JniLocalFrame jni_frame;
   RETURN_IF_ERROR(jni_frame.push(env));
   jbyteArray start_bytes;
-  CreateByteArray(env, scan_range.start_key(), &start_bytes);
+  RETURN_IF_ERROR(CreateByteArray(env, scan_range.start_key(), &start_bytes));
   jbyteArray end_bytes;
-  CreateByteArray(env, scan_range.stop_key(), &end_bytes);
+  RETURN_IF_ERROR(CreateByteArray(env, scan_range.stop_key(), &end_bytes));
   return InitScanRange(env, start_bytes, end_bytes);
 }
 
@@ -462,7 +457,8 @@ Status HBaseTableScanner::InitScanRange(JNIEnv* env, jbyteArray start_bytes,
   if (resultscanner_ != NULL) {
     // resultscanner_.close();
     env->CallObjectMethod(resultscanner_, resultscanner_close_id_);
-    RETURN_IF_ERROR(JniUtil::FreeGlobalRef(env, resultscanner_));
+    RETURN_ERROR_IF_EXC(env);
+    env->DeleteGlobalRef(resultscanner_);
     resultscanner_ = NULL;
   }
   // resultscanner_ = htable_.getScanner(scan_);
@@ -547,7 +543,7 @@ Status HBaseTableScanner::Next(JNIEnv* env, bool* has_next) {
     return Status::OK();
   }
 
-  if (cells_ != NULL) RETURN_IF_ERROR(JniUtil::FreeGlobalRef(env, cells_));
+  if (cells_ != NULL) env->DeleteGlobalRef(cells_);
   // cells_ = result.raw();
   jobject local_cells = reinterpret_cast<jobjectArray>(
       env->CallObjectMethod(result, result_raw_cells_id_));
@@ -661,7 +657,7 @@ Status HBaseTableScanner::GetRowKey(JNIEnv* env, const SlotDescriptor* slot_desc
   void* key;
   int key_length;
   jobject cell = env->GetObjectArrayElement(cells_, 0);
-  GetRowKey(env, cell, &key, &key_length);
+  RETURN_IF_ERROR(GetRowKey(env, cell, &key, &key_length));
   DCHECK_EQ(key_length, slot_desc->type().GetByteSize());
   WriteTupleSlot(slot_desc, tuple, reinterpret_cast<char*>(key));
   RETURN_ERROR_IF_EXC(env);
@@ -705,7 +701,7 @@ Status HBaseTableScanner::GetCurrentValue(JNIEnv* env, const string& family,
 Status HBaseTableScanner::GetValue(JNIEnv* env, const string& family,
     const string& qualifier, void** value, int* value_length) {
   bool is_null;
-  GetCurrentValue(env, family, qualifier, value, value_length, &is_null);
+  RETURN_IF_ERROR(GetCurrentValue(env, family, qualifier, value, value_length, &is_null));
   RETURN_ERROR_IF_EXC(env);
   if (is_null) {
     *value = NULL;
@@ -721,7 +717,8 @@ Status HBaseTableScanner::GetValue(JNIEnv* env, const string& family,
   void* value;
   int value_length;
   bool is_null;
-  GetCurrentValue(env, family, qualifier, &value, &value_length, &is_null);
+  RETURN_IF_ERROR(
+      GetCurrentValue(env, family, qualifier, &value, &value_length, &is_null));
   RETURN_ERROR_IF_EXC(env);
   if (is_null) {
     tuple->SetNull(slot_desc->null_indicator_offset());
@@ -760,15 +757,16 @@ void HBaseTableScanner::Close(JNIEnv* env) {
                   << "(this does not necessarily indicate a problem)";
       } else {
         // GetJniExceptionMsg will clear the exception status and log
-        JniUtil::GetJniExceptionMsg(env, true,
+        Status status = JniUtil::GetJniExceptionMsg(env, true,
             "Unknown error occurred while closing ResultScanner: ");
+        if (!status.ok()) LOG(WARNING) << "Error closing ResultScanner()";
       }
     }
-    JniUtil::FreeGlobalRef(env, resultscanner_);
+    env->DeleteGlobalRef(resultscanner_);
     resultscanner_ = NULL;
   }
-  if (scan_ != NULL) JniUtil::FreeGlobalRef(env, scan_);
-  if (cells_ != NULL) JniUtil::FreeGlobalRef(env, cells_);
+  if (scan_ != NULL) env->DeleteGlobalRef(scan_);
+  if (cells_ != NULL) env->DeleteGlobalRef(cells_);
 
   // Close the HTable so that the connections are not kept around.
   if (htable_.get() != NULL) htable_->Close(state_);

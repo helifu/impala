@@ -42,12 +42,11 @@ enum TPrimitiveType {
   DATETIME,
   TIMESTAMP,
   STRING,
-  // Unsupported types
-  BINARY,
+  BINARY, // Unsupported
   DECIMAL,
-  // CHAR(n). Currently only supported in UDAs
   CHAR,
-  VARCHAR
+  VARCHAR,
+  FIXED_UDA_INTERMEDIATE,
 }
 
 enum TTypeNodeType {
@@ -185,15 +184,15 @@ struct TScalarFunction {
 
 struct TAggregateFunction {
   1: required TColumnType intermediate_type
-  2: required string update_fn_symbol
-  3: required string init_fn_symbol
-  4: optional string serialize_fn_symbol
-  5: optional string merge_fn_symbol
-  6: optional string finalize_fn_symbol
+  2: required bool is_analytic_only_fn
+  3: required string update_fn_symbol
+  4: required string init_fn_symbol
+  5: optional string serialize_fn_symbol
+  6: optional string merge_fn_symbol
+  7: optional string finalize_fn_symbol
   8: optional string get_value_fn_symbol
   9: optional string remove_fn_symbol
-
-  7: optional bool ignores_distinct
+  10: optional bool ignores_distinct
 }
 
 // Represents a function in the Catalog.

@@ -20,7 +20,7 @@ import pytest
 import time
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal, SkipIfOldAggsJoins
+from tests.common.skip import SkipIfLocal
 
 @SkipIfLocal.multiple_impalad
 class TestRuntimeFilters(ImpalaTestSuite):
@@ -32,7 +32,7 @@ class TestRuntimeFilters(ImpalaTestSuite):
   def add_test_dimensions(cls):
     super(TestRuntimeFilters, cls).add_test_dimensions()
     # Runtime filters are disabled on HBase, Kudu
-    cls.TestMatrix.add_constraint(
+    cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format not in ['hbase', 'kudu'])
 
   def test_basic_filters(self, vector):
@@ -57,13 +57,11 @@ class TestRuntimeRowFilters(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestRuntimeRowFilters, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format in ['parquet'])
 
   def test_row_filters(self, vector):
     self.run_test_case('QueryTest/runtime_row_filters', vector)
 
-  @SkipIfOldAggsJoins.requires_spilling
-  @SkipIfOldAggsJoins.nested_types
   def test_row_filters_phj_only(self, vector):
     self.run_test_case('QueryTest/runtime_row_filters_phj', vector)

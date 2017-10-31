@@ -19,21 +19,13 @@ package org.apache.impala.planner;
 
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.common.ImpalaException;
 import org.apache.impala.thrift.TDataSink;
 import org.apache.impala.thrift.TDataSinkType;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TJoinBuildSink;
-import org.apache.impala.thrift.TPlanNode;
-import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
-import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -41,8 +33,6 @@ import com.google.common.collect.Lists;
  * Sink to materialize the build side of a join.
  */
 public class JoinBuildSink extends DataSink {
-  private final static Logger LOG = LoggerFactory.getLogger(JoinBuildSink.class);
-
   // id of join's build-side table assigned during planning
   private final JoinTableId joinTableId_;
 
@@ -79,9 +69,8 @@ public class JoinBuildSink extends DataSink {
   }
 
   @Override
-  public String getExplainString(String prefix, String detailPrefix,
-      TExplainLevel detailLevel) {
-    StringBuilder output = new StringBuilder();
+  public void appendSinkExplainString(String prefix, String detailPrefix,
+      TQueryOptions queryOptions, TExplainLevel detailLevel, StringBuilder output) {
     output.append(String.format("%s%s\n", prefix, "JOIN BUILD"));
     if (detailLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
       output.append(
@@ -93,11 +82,11 @@ public class JoinBuildSink extends DataSink {
             .append(Expr.toSql(buildExprs_) + "\n");
       }
     }
-    return output.toString();
   }
 
   @Override
-  public void computeCosts() {
-    // TODO: implement?
+  public void computeResourceProfile(TQueryOptions queryOptions) {
+    // The memory consumption is counted against the join PlanNode.
+    resourceProfile_ = ResourceProfile.noReservation(0);
   }
 }

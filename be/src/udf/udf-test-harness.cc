@@ -18,6 +18,7 @@
 #include "udf/udf-test-harness.h"
 
 #include <vector>
+#include "runtime/runtime-state.h"
 #include "udf/udf-internal.h"
 
 #include "common/names.h"
@@ -27,8 +28,9 @@ using namespace impala;
 
 FunctionContext* UdfTestHarness::CreateTestContext(
     const FunctionContext::TypeDesc& return_type,
-    const vector<FunctionContext::TypeDesc>& arg_types) {
-  return FunctionContextImpl::CreateContext(NULL, NULL, return_type, arg_types, 0, true);
+    const vector<FunctionContext::TypeDesc>& arg_types, RuntimeState* state,
+    MemPool* pool) {
+  return FunctionContextImpl::CreateContext(state, pool, return_type, arg_types, 0, true);
 }
 
 void UdfTestHarness::SetConstantArgs(

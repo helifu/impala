@@ -18,10 +18,8 @@
 # Functional tests running the TPCH workload.
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfOldAggsJoins
 from tests.common.test_dimensions import create_single_exec_option_dimension
 
-@SkipIfOldAggsJoins.nested_types
 class TestTpchNestedQuery(ImpalaTestSuite):
   @classmethod
   def get_workload(self):
@@ -30,9 +28,9 @@ class TestTpchNestedQuery(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTpchNestedQuery, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # The nested tpch data is currently only available in parquet.
-    cls.TestMatrix.add_constraint(lambda v:\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('table_format').file_format in ['parquet'])
 
   def test_tpch_q1(self, vector):

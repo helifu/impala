@@ -24,8 +24,8 @@
 #include <boost/scoped_ptr.hpp>
 #include <ostream>
 
-#include "common/status.h"
 #include "common/global-types.h"
+#include "common/status.h"
 #include "runtime/types.h"
 
 #include "gen-cpp/Descriptors_types.h"  // for TTupleId
@@ -40,12 +40,12 @@ namespace llvm {
 
 namespace impala {
 
-class Expr;
-class ExprContext;
 class LlvmBuilder;
 class LlvmCodeGen;
 class ObjectPool;
 class RuntimeState;
+class ScalarExpr;
+class ScalarExprEvaluator;
 class TDescriptorTable;
 class TSlotDescriptor;
 class TTable;
@@ -90,9 +90,13 @@ struct NullIndicatorOffset {
   int byte_offset;
   uint8_t bit_mask;  /// to extract null indicator
 
-  NullIndicatorOffset(int byte_offset, int bit_offset)
+  NullIndicatorOffset(int byte_offset = 0, int bit_offset = -1)
     : byte_offset(byte_offset),
       bit_mask(bit_offset == -1 ? 0 : 1 << bit_offset) {
+  }
+
+  bool Equals(const NullIndicatorOffset& o) const {
+    return this->byte_offset == o.byte_offset && this->bit_mask == o.bit_mask;
   }
 
   std::string DebugString() const;
@@ -134,6 +138,10 @@ class SlotDescriptor {
   static bool ColPathLessThan(const SlotDescriptor* a, const SlotDescriptor* b);
 
   std::string DebugString() const;
+
+  /// Return true if the physical layout of this descriptor matches the physical layout
+  /// of other_desc, but not necessarily ids.
+  bool LayoutEquals(const SlotDescriptor& other_desc) const;
 
   /// Generate LLVM code at the insert position of 'builder' that returns a boolean value
   /// represented as a LLVM i1 indicating whether this slot is null in 'tuple'.
@@ -182,7 +190,7 @@ class SlotDescriptor {
   SlotDescriptor(const TSlotDescriptor& tdesc, const TupleDescriptor* parent,
       const TupleDescriptor* collection_item_descriptor);
 
-  /// Generate LLVM code at the insert position of 'builder' to get the i8 value of the
+  /// Generate LLVM code at the insert position of 'builder' to get the i8 value of
   /// the byte containing 'null_indicator_offset' in 'tuple'. If 'null_byte_ptr' is
   /// non-NULL, sets that to a pointer to the null byte.
   static llvm::Value* CodegenGetNullByte(LlvmCodeGen* codegen, LlvmBuilder* builder,
@@ -240,7 +248,7 @@ class TableDescriptor {
 class HdfsPartitionDescriptor {
  public:
   HdfsPartitionDescriptor(const THdfsTable& thrift_table,
-      const THdfsPartition& thrift_partition, ObjectPool* pool);
+      const THdfsPartition& thrift_partition);
 
   char line_delim() const { return line_delim_; }
   char field_delim() const { return field_delim_; }
@@ -252,14 +260,16 @@ class HdfsPartitionDescriptor {
   int64_t id() const { return id_; }
   std::string DebugString() const;
 
-  /// It is safe to evaluate the returned expr contexts concurrently from multiple
+  /// It is safe to call the returned expr evaluators concurrently from multiple
   /// threads because all exprs are literals, after the descriptor table has been
   /// opened.
-  const std::vector<ExprContext*>& partition_key_value_ctxs() const {
-    return partition_key_value_ctxs_;
+  const std::vector<ScalarExprEvaluator*>& partition_key_value_evals() const {
+    return partition_key_value_evals_;
   }
 
  private:
+  friend class DescriptorTbl;
+
   char line_delim_;
   char field_delim_;
   char collection_delim_;
@@ -275,15 +285,15 @@ class HdfsPartitionDescriptor {
   /// The Prepare()/Open()/Close() cycle is controlled by the containing descriptor table
   /// because the same partition descriptor may be used by multiple exec nodes with
   /// different lifetimes.
-  /// TODO: Move these into the new query-wide state, indexed by partition id.
-  std::vector<ExprContext*> partition_key_value_ctxs_;
+  const std::vector<TExpr>& thrift_partition_key_exprs_;
+
+  /// These evaluators are safe to be shared by all fragment instances as all expressions
+  /// are Literals.
+  /// TODO: replace this with vector<Literal> instead.
+  std::vector<ScalarExprEvaluator*> partition_key_value_evals_;
 
   /// The format (e.g. text, sequence file etc.) of data in the files in this partition
   THdfsFileFormat::type file_format_;
-
-  /// For allocating expression objects in partition_key_values_
-  /// Owned by DescriptorTbl, supplied in constructor.
-  ObjectPool* object_pool_;
 };
 
 class HdfsTableDescriptor : public TableDescriptor {
@@ -319,8 +329,6 @@ class HdfsTableDescriptor : public TableDescriptor {
   PartitionIdToDescriptorMap partition_descriptors_;
   /// Set to the table's Avro schema if this is an Avro table, empty string otherwise
   std::string avro_schema_;
-  /// Owned by DescriptorTbl
-  ObjectPool* object_pool_;
 };
 
 class HBaseTableDescriptor : public TableDescriptor {
@@ -397,6 +405,10 @@ class TupleDescriptor {
   /// Returns true if this tuple or any nested collection item tuples have string slots.
   bool ContainsStringData() const;
 
+  /// Return true if the physical layout of this descriptor matches that of other_desc,
+  /// but not necessarily the id.
+  bool LayoutEquals(const TupleDescriptor& other_desc) const;
+
   /// Creates a typed struct description for llvm.  The layout of the struct is computed
   /// by the FE which includes the order of the fields in the resulting struct.
   /// Returns the struct type or NULL if the type could not be created.
@@ -407,7 +419,6 @@ class TupleDescriptor {
   ///   int32_t  min_a;
   ///   int64_t  count_val;
   /// };
-  /// The resulting struct definition is cached.
   llvm::StructType* GetLlvmStruct(LlvmCodeGen* codegen) const;
 
   static const char* LLVM_CLASS_NAME;
@@ -421,7 +432,8 @@ class TupleDescriptor {
   const int num_null_bytes_;
   const int null_bytes_offset_;
 
-  /// Contains all slots.
+  /// Contains all slots. Slots are in the same order as the expressions that materialize
+  /// them. See Tuple::MaterializeExprs().
   std::vector<SlotDescriptor*> slots_;
 
   /// Contains only materialized string slots.
@@ -439,11 +451,11 @@ class TupleDescriptor {
   /// collection, empty otherwise.
   SchemaPath tuple_path_;
 
-  /// Cached codegen'd struct type for this tuple desc
-  mutable llvm::StructType* llvm_struct_;
-
   TupleDescriptor(const TTupleDescriptor& tdesc);
   void AddSlot(SlotDescriptor* slot);
+
+  /// Returns slots in their physical order.
+  vector<SlotDescriptor*> SlotsOrderedByIdx() const;
 };
 
 class DescriptorTbl {
@@ -451,13 +463,10 @@ class DescriptorTbl {
   /// Creates a descriptor tbl within 'pool' from thrift_tbl and returns it via 'tbl'.
   /// Returns OK on success, otherwise error (in which case 'tbl' will be unset).
   static Status Create(ObjectPool* pool, const TDescriptorTable& thrift_tbl,
-                       DescriptorTbl** tbl);
+      DescriptorTbl** tbl) WARN_UNUSED_RESULT;
 
-  /// Prepares and opens partition exprs of Hdfs tables.
-  Status PrepareAndOpenPartitionExprs(RuntimeState* state) const;
-
-  /// Closes partition exprs of Hdfs tables.
-  void ClosePartitionExprs(RuntimeState* state) const;
+  /// Free memory allocated in Create().
+  void ReleaseResources();
 
   TableDescriptor* GetTableDescriptor(TableId id) const;
   TupleDescriptor* GetTupleDescriptor(TupleId id) const;
@@ -478,9 +487,14 @@ class DescriptorTbl {
   SlotDescriptorMap slot_desc_map_;
 
   DescriptorTbl(): tbl_desc_map_(), tuple_desc_map_(), slot_desc_map_() {}
+
+  static Status CreatePartKeyExprs(
+      const HdfsTableDescriptor& hdfs_tbl, ObjectPool* pool) WARN_UNUSED_RESULT;
 };
 
-/// Records positions of tuples within row produced by ExecNode.
+/// Records positions of tuples within row produced by ExecNode. RowDescriptors are
+/// typically owned by their ExecNode, and shared by reference across the plan tree.
+///
 /// TODO: this needs to differentiate between tuples contained in row
 /// and tuples produced by ExecNode (parallel to PlanNode.rowTupleIds and
 /// PlanNode.tupleIds); right now, we conflate the two (and distinguish based on
@@ -532,7 +546,7 @@ class RowDescriptor {
   }
 
   /// Populate row_tuple_ids with our ids.
-  void ToThrift(std::vector<TTupleId>* row_tuple_ids);
+  void ToThrift(std::vector<TTupleId>* row_tuple_ids) const;
 
   /// Return true if the tuple ids of this descriptor are a prefix
   /// of the tuple ids of other_desc.
@@ -540,6 +554,14 @@ class RowDescriptor {
 
   /// Return true if the tuple ids of this descriptor match tuple ids of other desc.
   bool Equals(const RowDescriptor& other_desc) const;
+
+  /// Return true if the tuples of this descriptor are a prefix of the tuples of
+  /// other_desc. Tuples are compared by their physical layout and not by ids.
+  bool LayoutIsPrefixOf(const RowDescriptor& other_desc) const;
+
+  /// Return true if the physical layout of this descriptor matches the physical layout
+  /// of other_desc, but not necessarily the ids.
+  bool LayoutEquals(const RowDescriptor& other_desc) const;
 
   std::string DebugString() const;
 

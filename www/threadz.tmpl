@@ -18,6 +18,8 @@ under the License.
 -->
 {{> www/common-header.tmpl }}
 
+{{> www/threadz_tabs.tmpl }}
+
 <h2>Thread Groups</h2>
 
 {{#total-threads}}
@@ -28,8 +30,18 @@ under the License.
 
 {{#thread-groups}}
 <a href='/thread-group?group={{name}}'>
-  <h3>{{name}} : {{size}}</h3>
+  <h3>{{name}} : (running: {{size}}, total created: {{num_created}})</h3>
 </a>
 {{/thread-groups}}
+
+{{#jvm-threads}}
+<a href='/jvm-threadz'>
+  <h3>{{name}} : (Total: {{total}}, Daemon: {{daemon}})</h3>
+</a>
+{{/jvm-threads}}
+
+<script>
+document.getElementById("overview-tab").className = "active";
+</script>
 
 {{> www/common-footer.tmpl }}

@@ -27,11 +27,13 @@
 #include "exec/hbase-table-scanner.h"
 #include "exec/hbase-table-writer.h"
 #include "exprs/hive-udf-call.h"
+#include "exprs/timezone_db.h"
 #include "runtime/hbase-table.h"
 #include "codegen/llvm-codegen.h"
 #include "common/status.h"
 #include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
+#include "util/common-metrics.h"
 #include "util/jni-util.h"
 #include "util/network-util.h"
 #include "rpc/thrift-util.h"
@@ -48,23 +50,22 @@
 
 using namespace impala;
 
-DECLARE_string(classpath);
-DECLARE_bool(use_statestore);
 DECLARE_int32(beeswax_port);
 DECLARE_int32(hs2_port);
 DECLARE_int32(be_port);
-DECLARE_string(principal);
 DECLARE_bool(enable_rm);
+DECLARE_bool(is_coordinator);
 
 int ImpaladMain(int argc, char** argv) {
   InitCommonRuntime(argc, argv, true);
 
-  LlvmCodeGen::InitializeLlvm();
+  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
+  ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm());
   JniUtil::InitLibhdfs();
   ABORT_IF_ERROR(HBaseTableScanner::Init());
   ABORT_IF_ERROR(HBaseTable::InitJNI());
   ABORT_IF_ERROR(HBaseTableWriter::InitJNI());
-  ABORT_IF_ERROR(HiveUdfCall::Init());
+  ABORT_IF_ERROR(HiveUdfCall::InitEnv());
   InitFeSupport();
 
   if (FLAGS_enable_rm) {
@@ -76,20 +77,19 @@ int ImpaladMain(int argc, char** argv) {
 
   // start backend service for the coordinator on be_port
   ExecEnv exec_env;
-  StartThreadInstrumentation(exec_env.metrics(), exec_env.webserver());
+  ABORT_IF_ERROR(
+      StartThreadInstrumentation(exec_env.metrics(), exec_env.webserver(), true));
   InitRpcEventTracing(exec_env.webserver());
+
+  CommonMetrics::InitCommonMetrics(exec_env.metrics());
 
   ThriftServer* beeswax_server = NULL;
   ThriftServer* hs2_server = NULL;
   ThriftServer* be_server = NULL;
-  ImpalaServer* server = NULL;
+  boost::shared_ptr<ImpalaServer> server;
   ABORT_IF_ERROR(CreateImpalaServer(&exec_env, FLAGS_beeswax_port, FLAGS_hs2_port,
       FLAGS_be_port, &beeswax_server, &hs2_server, &be_server, &server));
 
-  ABORT_IF_ERROR(be_server->Start());
-
-  ABORT_IF_ERROR(beeswax_server->Start());
-  ABORT_IF_ERROR(hs2_server->Start());
   Status status = exec_env.StartServices();
   if (!status.ok()) {
     LOG(ERROR) << "Impalad services did not start correctly, exiting.  Error: "
@@ -97,15 +97,30 @@ int ImpaladMain(int argc, char** argv) {
     ShutdownLogging();
     exit(1);
   }
+  StartMemoryMaintenanceThread(); // Memory metrics are created in StartServices().
+
+  DCHECK(exec_env.process_mem_tracker() != nullptr)
+      << "ExecEnv::StartServices() must be called before starting RPC services";
+  ABORT_IF_ERROR(be_server->Start());
+
+  if (FLAGS_is_coordinator) {
+    ABORT_IF_ERROR(beeswax_server->Start());
+    ABORT_IF_ERROR(hs2_server->Start());
+  }
+
   ImpaladMetrics::IMPALA_SERVER_READY->set_value(true);
   LOG(INFO) << "Impala has started.";
-  // this blocks until the beeswax and hs2 servers terminate
-  beeswax_server->Join();
-  hs2_server->Join();
 
+  be_server->Join();
   delete be_server;
-  delete beeswax_server;
-  delete hs2_server;
+
+  if (FLAGS_is_coordinator) {
+    // this blocks until the beeswax and hs2 servers terminate
+    beeswax_server->Join();
+    hs2_server->Join();
+    delete beeswax_server;
+    delete hs2_server;
+  }
 
   return 0;
 }

@@ -59,7 +59,7 @@ Status PhjBuilder::ProcessBuildBatch(
       DCHECK_EQ(ctx->level(), 0)
           << "Runtime filters should not be built during repartitioning.";
       // TODO: unroll loop and codegen expr evaluation and hashing (IMPALA-3360).
-      for (const FilterContext& ctx : filters_) ctx.Insert(build_row);
+      for (const FilterContext& ctx : filter_ctxs_) ctx.Insert(build_row);
     }
     const uint32_t hash = expr_vals_cache->CurExprValuesHash();
     const uint32_t partition_idx = hash >> (32 - NUM_PARTITIONING_BITS);
@@ -73,12 +73,12 @@ Status PhjBuilder::ProcessBuildBatch(
 
 bool PhjBuilder::Partition::InsertBatch(TPrefetchMode::type prefetch_mode,
     HashTableCtx* ht_ctx, RowBatch* batch,
-    const vector<BufferedTupleStream::RowIdx>& indices) {
+    const vector<BufferedTupleStream::FlatRowPtr>& flat_rows, Status* status) {
   // Compute the hash values and prefetch the hash table buckets.
   const int num_rows = batch->num_rows();
   HashTableCtx::ExprValuesCache* expr_vals_cache = ht_ctx->expr_values_cache();
   const int prefetch_size = expr_vals_cache->capacity();
-  const BufferedTupleStream::RowIdx* row_indices = indices.data();
+  const BufferedTupleStream::FlatRowPtr* flat_rows_data = flat_rows.data();
   for (int prefetch_group_row = 0; prefetch_group_row < num_rows;
        prefetch_group_row += prefetch_size) {
     int cur_row = prefetch_group_row;
@@ -97,9 +97,9 @@ bool PhjBuilder::Partition::InsertBatch(TPrefetchMode::type prefetch_mode,
     expr_vals_cache->ResetForRead();
     FOREACH_ROW_LIMIT(batch, cur_row, prefetch_size, batch_iter) {
       TupleRow* row = batch_iter.Get();
-      BufferedTupleStream::RowIdx row_idx = row_indices[cur_row];
+      BufferedTupleStream::FlatRowPtr flat_row = flat_rows_data[cur_row];
       if (!expr_vals_cache->IsRowNull()
-          && UNLIKELY(!hash_tbl_->Insert(ht_ctx, row_idx, row))) {
+          && UNLIKELY(!hash_tbl_->Insert(ht_ctx, flat_row, row, status))) {
         return false;
       }
       expr_vals_cache->NextRow();

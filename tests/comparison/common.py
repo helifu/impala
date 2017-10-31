@@ -33,7 +33,7 @@ def get_import(name):
   # noqa below tells flake8 to not warn when it thinks imports are not used
   global __ALREADY_IMPORTED
   if not __ALREADY_IMPORTED:
-    from db_types import (  # noqa
+    from tests.comparison.db_types import (  # noqa
         BigInt,
         Boolean,
         Char,
@@ -44,8 +44,8 @@ def get_import(name):
         JOINABLE_TYPES,
         Number,
         Timestamp)
-    from funcs import AggFunc, AnalyticFunc, Func  # noqa
-    from query import InlineView, Subquery, WithClauseInlineView  # noqa
+    from tests.comparison.funcs import AggFunc, AnalyticFunc, Func  # noqa
+    from tests.comparison.query import InlineView, Subquery, WithClauseInlineView  # noqa
     for key, value in locals().items():
       globals()[key] = value
     __ALREADY_IMPORTED = True
@@ -289,7 +289,7 @@ class Column(ValExpr):
 
   def __repr__(self):
     return '%s<name: %s, type: %s>' % (
-        type(self).__name__, self.name, self.type.__name__)
+        type(self).__name__, self.name, self.exact_type.__name__)
 
   def __deepcopy__(self, memo):
     # Don't return a deep copy of owner, since that is a circular reference

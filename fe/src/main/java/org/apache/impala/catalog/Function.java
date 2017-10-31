@@ -25,6 +25,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAggregateFunction;
+import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TFunction;
@@ -163,7 +164,6 @@ public class Function implements CatalogObject {
     return argTypes_[argTypes_.length - 1];
   }
 
-  public void setName(FunctionName name) { name_ = name; }
   public void setLocation(HdfsUri loc) { location_ = loc; }
   public void setBinaryType(TFunctionBinaryType type) { binaryType_ = type; }
   public void setHasVarArgs(boolean v) { hasVarArgs_ = v; }
@@ -240,24 +240,6 @@ public class Function implements CatalogObject {
     return new Function(name_, promoted, retType_, hasVarArgs_);
   }
 
-  /**
-   * Given a list of functions which are a super type of this function, select the best
-   * match. This is the one which requires the fewest type promotions.
-   */
-  public Function selectClosestSuperType(List<Function> candidates) {
-    Preconditions.checkArgument(candidates.size() > 0);
-    if (candidates.size() == 1) return candidates.get(0);
-
-    // Always promote CHAR to STRING before attempting any other promotions.
-    Function withStrs = promoteCharsToStrings();
-    for (Function f: candidates) {
-      if (withStrs.isIndistinguishable(f)) return f;
-    }
-    // Otherwise, we use the previous rules of resolution which are to take the first
-    // one in the list.
-    return candidates.get(0);
-  }
-
   private boolean isIdentical(Function o) {
     if (!o.name_.equals(name_)) return false;
     if (o.argTypes_.length != this.argTypes_.length) return false;
@@ -328,6 +310,14 @@ public class Function implements CatalogObject {
 
   // Child classes must override this function.
   public String toSql(boolean ifNotExists) { return ""; }
+
+  public TCatalogObject toTCatalogObject () {
+    TCatalogObject result = new TCatalogObject();
+    result.setType(TCatalogObjectType.FUNCTION);
+    result.setFn(toThrift());
+    result.setCatalog_version(catalogVersion_);
+    return result;
+  }
 
   public TFunction toThrift() {
     TFunction fn = new TFunction();
@@ -461,6 +451,8 @@ public class Function implements CatalogObject {
     case STRING:
     case VARCHAR:
     case CHAR:
+    case FIXED_UDA_INTERMEDIATE:
+      // These types are marshaled into a StringVal.
       return "StringVal";
     case TIMESTAMP:
       return "TimestampVal";

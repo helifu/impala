@@ -9,12 +9,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <ext/hash_map>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_map;  // Not used in this file.
-#include <ext/hash_set>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_set;  // Not used in this file.
 #include <iterator>
 using std::back_insert_iterator;
 using std::iterator_traits;
@@ -115,6 +109,32 @@ string JoinStringsIterator(const ITERATOR& start,
                            const ITERATOR& end,
                            const StringPiece& delim);
 
+// Join the keys of a map using the specified delimiter.
+template<typename ITERATOR>
+void JoinKeysIterator(const ITERATOR& start,
+                      const ITERATOR& end,
+                      const StringPiece& delim,
+                      string *result) {
+  result->clear();
+  for (ITERATOR iter = start; iter != end; ++iter) {
+    if (iter == start) {
+      StrAppend(result, iter->first);
+    } else {
+      StrAppend(result, delim, iter->first);
+    }
+  }
+}
+
+template <typename ITERATOR>
+string JoinKeysIterator(const ITERATOR& start,
+                        const ITERATOR& end,
+                        const StringPiece& delim) {
+  string result;
+  JoinKeysIterator(start, end, delim, &result);
+  return result;
+}
+
+// Join the keys and values of a map using the specified delimiters.
 template<typename ITERATOR>
 void JoinKeysAndValuesIterator(const ITERATOR& start,
                                const ITERATOR& end,
@@ -171,6 +191,24 @@ inline string JoinStrings(const CONTAINER& components,
                           const StringPiece& delim) {
   string result;
   JoinStrings(components, delim, &result);
+  return result;
+}
+
+// Join the strings produced by calling 'functor' on each element of
+// 'components'.
+template<class CONTAINER, typename FUNC>
+string JoinMapped(const CONTAINER& components,
+                  const FUNC& functor,
+                  const StringPiece& delim) {
+  string result;
+  for (typename CONTAINER::const_iterator iter = components.begin();
+      iter != components.end();
+      iter++) {
+    if (iter != components.begin()) {
+      result.append(delim.data(), delim.size());
+    }
+    result.append(functor(*iter));
+  }
   return result;
 }
 

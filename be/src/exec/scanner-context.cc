@@ -21,8 +21,9 @@
 
 #include "exec/hdfs-scan-node-base.h"
 #include "exec/hdfs-scan-node.h"
-#include "runtime/row-batch.h"
+#include "runtime/exec-env.h"
 #include "runtime/mem-pool.h"
+#include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-buffer.h"
 #include "util/debug-util.h"
@@ -76,11 +77,10 @@ ScannerContext::Stream::Stream(ScannerContext* parent)
 ScannerContext::Stream* ScannerContext::AddStream(DiskIoMgr::ScanRange* range) {
   std::unique_ptr<Stream> stream(new Stream(this));
   stream->scan_range_ = range;
-  stream->file_desc_ = scan_node_->GetFileDesc(stream->filename());
+  stream->file_desc_ = scan_node_->GetFileDesc(partition_desc_->id(), stream->filename());
   stream->file_len_ = stream->file_desc_->file_length;
   stream->total_bytes_returned_ = 0;
   stream->io_buffer_pos_ = NULL;
-  stream->io_buffer_ = NULL;
   stream->io_buffer_bytes_left_ = 0;
   stream->boundary_buffer_bytes_left_ = 0;
   stream->output_buffer_pos_ = NULL;
@@ -92,29 +92,28 @@ ScannerContext::Stream* ScannerContext::AddStream(DiskIoMgr::ScanRange* range) {
 }
 
 void ScannerContext::Stream::ReleaseCompletedResources(RowBatch* batch, bool done) {
-  DCHECK(batch != nullptr || done);
+  DCHECK(batch != nullptr || done || !contains_tuple_data_);
   if (done) {
     // Mark any pending resources as completed
     if (io_buffer_ != nullptr) {
       ++parent_->num_completed_io_buffers_;
-      completed_io_buffers_.push_back(io_buffer_);
+      completed_io_buffers_.push_back(move(io_buffer_));
     }
     // Set variables to nullptr to make sure streams are not used again
-    io_buffer_ = nullptr;
     io_buffer_pos_ = nullptr;
     io_buffer_bytes_left_ = 0;
     // Cancel the underlying scan range to clean up any queued buffers there
     scan_range_->Cancel(Status::CANCELLED);
   }
 
-  for (DiskIoMgr::BufferDescriptor* buffer: completed_io_buffers_) {
+  for (unique_ptr<DiskIoMgr::BufferDescriptor>& buffer : completed_io_buffers_) {
     if (contains_tuple_data_ && batch != nullptr) {
-      batch->AddIoBuffer(buffer);
+      batch->AddIoBuffer(move(buffer));
       // TODO: We can do row batch compaction here.  This is the only place io buffers are
       // queued.  A good heuristic is to check the number of io buffers queued and if
       // there are too many, we should compact.
     } else {
-      buffer->Return();
+      ExecEnv::GetInstance()->disk_io_mgr()->ReturnBuffer(move(buffer));
       parent_->scan_node_->num_owned_io_buffers_.Add(-1);
     }
   }
@@ -147,8 +146,7 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
   if (io_buffer_ != NULL) {
     eosr = io_buffer_->eosr();
     ++parent_->num_completed_io_buffers_;
-    completed_io_buffers_.push_back(io_buffer_);
-    io_buffer_ = NULL;
+    completed_io_buffers_.push_back(move(io_buffer_));
   }
 
   if (!eosr) {
@@ -177,8 +175,9 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
       // TODO: We are leaving io_buffer_ = NULL, revisit.
       return Status::OK();
     }
+    int64_t partition_id = parent_->partition_descriptor()->id();
     DiskIoMgr::ScanRange* range = parent_->scan_node_->AllocateScanRange(
-        scan_range_->fs(), filename(), read_past_buffer_size, offset, -1,
+        scan_range_->fs(), filename(), read_past_buffer_size, offset, partition_id,
         scan_range_->disk_id(), false, DiskIoMgr::BufferOpts::Uncached());
     RETURN_IF_ERROR(parent_->state_->io_mgr()->Read(
         parent_->scan_node_->reader_context(), range, &io_buffer_));

@@ -32,6 +32,7 @@ limit 10
 ---- CATCH: ANY_OF
 Repartitioning did not reduce the size of a spilled partition
 Memory limit exceeded
+__NO_ERROR__
 ====
 ---- QUERY
 # Regression test for IMPALA-2612. The following query will cause CastToChar

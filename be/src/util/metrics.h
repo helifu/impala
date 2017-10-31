@@ -19,9 +19,10 @@
 #define IMPALA_UTIL_METRICS_H
 
 #include <map>
-#include <string>
 #include <sstream>
 #include <stack>
+#include <string>
+#include <vector>
 #include <boost/function.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/locks.hpp>
@@ -211,6 +212,44 @@ class SimpleMetric : public Metric {
   T value_;
 };
 
+// Gauge metric that computes the sum of several gauges.
+template <typename T>
+class SumGauge : public SimpleMetric<T, TMetricKind::GAUGE> {
+ public:
+  SumGauge(const TMetricDef& metric_def,
+      const std::vector<SimpleMetric<T, TMetricKind::GAUGE>*>& metrics)
+    : SimpleMetric<T, TMetricKind::GAUGE>(metric_def, 0), metrics_(metrics) {}
+  virtual ~SumGauge() {}
+
+ private:
+  virtual void CalculateValue() override {
+    T sum = 0;
+    for (SimpleMetric<T, TMetricKind::GAUGE>* metric : metrics_) sum += metric->value();
+    this->value_ = sum;
+  }
+
+  /// The metrics to be summed.
+  std::vector<SimpleMetric<T, TMetricKind::GAUGE>*> metrics_;
+};
+
+// Gauge metric that negates another gauge.
+template <typename T>
+class NegatedGauge : public SimpleMetric<T, TMetricKind::GAUGE> {
+ public:
+  NegatedGauge(const TMetricDef& metric_def,
+      SimpleMetric<T, TMetricKind::GAUGE>* metric)
+    : SimpleMetric<T, TMetricKind::GAUGE>(metric_def, 0), metric_(metric) {}
+  virtual ~NegatedGauge() {}
+
+ private:
+  virtual void CalculateValue() override {
+    this->value_ = -metric_->value();
+  }
+
+  /// The metric to be negated.
+  SimpleMetric<T, TMetricKind::GAUGE>* metric_;
+};
+
 /// Container for a set of metrics. A MetricGroup owns the memory for every metric
 /// contained within it (see Add*() to create commonly used metric
 /// types). Metrics are 'registered' with a MetricGroup, once registered they cannot be
@@ -218,8 +257,8 @@ class SimpleMetric : public Metric {
 //
 /// MetricGroups may be organised hierarchically as a tree.
 //
-/// Typically a metric object is cached by its creator after registration. If a metric must
-/// be retrieved without an available pointer, FindMetricForTesting() will search the
+/// Typically a metric object is cached by its creator after registration. If a metric
+/// must be retrieved without an available pointer, FindMetricForTesting() will search the
 /// MetricGroup and all its descendent MetricGroups in turn.
 //
 /// TODO: Hierarchical naming: that is, resolve "group1.group2.metric-name" to a path
@@ -343,13 +382,16 @@ class MetricGroup {
 
 /// We write 'Int' as a placeholder for all integer types.
 typedef class SimpleMetric<int64_t, TMetricKind::GAUGE> IntGauge;
-typedef class SimpleMetric<uint64_t, TMetricKind::GAUGE> UIntGauge;
 typedef class SimpleMetric<double, TMetricKind::GAUGE> DoubleGauge;
 typedef class SimpleMetric<int64_t, TMetricKind::COUNTER> IntCounter;
 
 typedef class SimpleMetric<bool, TMetricKind::PROPERTY> BooleanProperty;
 typedef class SimpleMetric<std::string, TMetricKind::PROPERTY> StringProperty;
 
+/// Convenience method to instantiate a TMetricDef with a subset of its fields defined.
+/// Most externally-visible metrics should be defined in metrics.json and retrieved via
+/// MetricDefs::Get(). This alternative method of instantiating TMetricDefs is only used
+/// in special cases where the regular approach is unsuitable.
 TMetricDef MakeTMetricDef(const std::string& key, TMetricKind::type kind,
     TUnit::type unit);
 }

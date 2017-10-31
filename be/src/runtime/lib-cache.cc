@@ -33,8 +33,7 @@
 
 namespace filesystem = boost::filesystem;
 
-DEFINE_string(local_library_dir, "/tmp",
-              "Local directory to copy UDF libraries from HDFS into");
+DECLARE_string(local_library_dir);
 
 namespace impala {
 
@@ -400,12 +399,9 @@ Status LibCache::GetCacheEntryInternal(const string& hdfs_lib_file, LibType type
         DynamicOpen((*entry)->local_path.c_str(), &(*entry)->shared_object_handle));
   } else if (type == TYPE_IR) {
     // Load the module temporarily and populate all symbols.
-    ObjectPool pool;
-    scoped_ptr<LlvmCodeGen> codegen;
-    string module_id = filesystem::path((*entry)->local_path).stem().string();
-    RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(
-        &pool, NULL, (*entry)->local_path, module_id, &codegen));
-    codegen->GetSymbols(&(*entry)->symbols);
+    const string file = (*entry)->local_path;
+    const string module_id = filesystem::path(file).stem().string();
+    RETURN_IF_ERROR(LlvmCodeGen::GetSymbols(file, module_id, &(*entry)->symbols));
   } else {
     DCHECK_EQ(type, TYPE_JAR);
     // Nothing to do.

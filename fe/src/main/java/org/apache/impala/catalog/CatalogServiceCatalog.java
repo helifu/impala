@@ -26,12 +26,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.UUID;
 
 import org.apache.commons.codec.binary.Base64;
 import org.apache.hadoop.fs.Path;
@@ -45,10 +45,7 @@ import org.apache.hadoop.hive.metastore.api.ResourceType;
 import org.apache.hadoop.hive.metastore.api.ResourceUri;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.hadoop.hive.ql.exec.FunctionUtils;
-import org.apache.log4j.Logger;
-import org.apache.thrift.protocol.TCompactProtocol;
-import org.apache.thrift.TException;
-
+import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.authorization.SentryConfig;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.common.FileSystemUtil;
@@ -56,6 +53,7 @@ import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.JniUtil;
 import org.apache.impala.common.Pair;
+import org.apache.impala.common.Reference;
 import org.apache.impala.hive.executor.UdfExecutor;
 import org.apache.impala.thrift.TCatalog;
 import org.apache.impala.thrift.TCatalogObject;
@@ -69,6 +67,10 @@ import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.SentryProxy;
+import org.apache.log4j.Logger;
+import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TCompactProtocol;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -180,6 +182,42 @@ public class CatalogServiceCatalog extends Catalog {
     localLibraryPath_ = new String("file://" + localLibraryPath);
   }
 
+  // Timeout for acquiring a table lock
+  // TODO: Make this configurable
+  private static final long TBL_LOCK_TIMEOUT_MS = 7200000;
+  // Time to sleep before retrying to acquire a table lock
+  private static final int TBL_LOCK_RETRY_MS = 10;
+
+  /**
+   * Tries to acquire catalogLock_ and the lock of 'tbl' in that order. Returns true if it
+   * successfully acquires both within TBL_LOCK_TIMEOUT_MS millisecs; both locks are held
+   * when the function returns. Returns false otherwise and no lock is held in this case.
+   */
+  public boolean tryLockTable(Table tbl) {
+    long begin = System.currentTimeMillis();
+    long end;
+    do {
+      catalogLock_.writeLock().lock();
+      if (tbl.getLock().tryLock()) {
+        if (LOG.isTraceEnabled()) {
+          end = System.currentTimeMillis();
+          LOG.trace(String.format("Lock for table %s was acquired in %d msec",
+              tbl.getFullName(), end - begin));
+        }
+        return true;
+      }
+      catalogLock_.writeLock().unlock();
+      try {
+        // Sleep to avoid spinning and allow other operations to make progress.
+        Thread.sleep(TBL_LOCK_RETRY_MS);
+      } catch (InterruptedException e) {
+        // ignore
+      }
+      end = System.currentTimeMillis();
+    } while (end - begin < TBL_LOCK_TIMEOUT_MS);
+    return false;
+  }
+
   /**
    * Reads the current set of cache pools from HDFS and updates the catalog.
    * Called periodically by the cachePoolReader_.
@@ -194,9 +232,8 @@ public class CatalogServiceCatalog extends Catalog {
     }
 
     public void run() {
-      if (LOG.isTraceEnabled()) {
-        LOG.trace("Reloading cache pool names from HDFS");
-      }
+      if (LOG.isTraceEnabled()) LOG.trace("Reloading cache pool names from HDFS");
+
       // Map of cache pool name to CachePoolInfo. Stored in a map to allow Set operations
       // to be performed on the keys.
       Map<String, CachePoolInfo> currentCachePools = Maps.newHashMap();
@@ -291,7 +328,8 @@ public class CatalogServiceCatalog extends Catalog {
           }
 
           // Protect the table from concurrent modifications.
-          synchronized(tbl) {
+          tbl.getLock().lock();
+          try {
             // Only add the extended metadata if this table's version is >=
             // the fromVersion.
             if (tbl.getCatalogVersion() >= fromVersion) {
@@ -308,6 +346,8 @@ public class CatalogServiceCatalog extends Catalog {
             } else {
               catalogTbl.setTable(new TTable(db.getName(), tblName));
             }
+          } finally {
+            tbl.getLock().unlock();
           }
           resp.addToObjects(catalogTbl);
         }
@@ -523,9 +563,7 @@ public class CatalogServiceCatalog extends Catalog {
   private void loadFunctionsFromDbParams(Db db,
       org.apache.hadoop.hive.metastore.api.Database msDb) {
     if (msDb == null || msDb.getParameters() == null) return;
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("Loading native functions for database: " + db.getName());
-    }
+    LOG.info("Loading native functions for database: " + db.getName());
     TCompactProtocol.Factory protocolFactory = new TCompactProtocol.Factory();
     for (String key: msDb.getParameters().keySet()) {
       if (!key.startsWith(Db.FUNCTION_INDEX_PREFIX)) continue;
@@ -541,6 +579,7 @@ public class CatalogServiceCatalog extends Catalog {
             + ",continuing", e);
       }
     }
+    LOG.info("Loaded native functions for database: " + db.getName());
   }
 
   /**
@@ -551,9 +590,7 @@ public class CatalogServiceCatalog extends Catalog {
   private void loadJavaFunctions(Db db,
       List<org.apache.hadoop.hive.metastore.api.Function> functions) {
     Preconditions.checkNotNull(functions);
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("Loading Java functions for database: " + db.getName());
-    }
+    LOG.info("Loading Java functions for database: " + db.getName());
     for (org.apache.hadoop.hive.metastore.api.Function function: functions) {
       try {
         for (Function fn: extractFunctions(db.getName(), function)) {
@@ -563,6 +600,69 @@ public class CatalogServiceCatalog extends Catalog {
       } catch (Exception e) {
         LOG.error("Skipping function load: " + function.getFunctionName(), e);
       }
+    }
+    LOG.info("Loaded Java functions for database: " + db.getName());
+  }
+
+  /**
+   * Reloads function metadata for 'dbName' database. Populates the 'addedFuncs' list
+   * with functions that were added as a result of this operation. Populates the
+   * 'removedFuncs' list with functions that were removed.
+   */
+  public void refreshFunctions(MetaStoreClient msClient, String dbName,
+      List<TCatalogObject> addedFuncs, List<TCatalogObject> removedFuncs)
+      throws CatalogException {
+    // Create a temporary database that will contain all the functions from the HMS.
+    Db tmpDb;
+    try {
+      List<org.apache.hadoop.hive.metastore.api.Function> javaFns =
+          Lists.newArrayList();
+      for (String javaFn : msClient.getHiveClient().getFunctions(dbName, "*")) {
+        javaFns.add(msClient.getHiveClient().getFunction(dbName, javaFn));
+      }
+      // Contains native functions in it's params map.
+      org.apache.hadoop.hive.metastore.api.Database msDb =
+          msClient.getHiveClient().getDatabase(dbName);
+      tmpDb = new Db(dbName, this, null);
+      // Load native UDFs into the temporary db.
+      loadFunctionsFromDbParams(tmpDb, msDb);
+      // Load Java UDFs from HMS into the temporary db.
+      loadJavaFunctions(tmpDb, javaFns);
+
+      Db db = dbCache_.get().get(dbName);
+      if (db == null) {
+        throw new DatabaseNotFoundException("Database does not exist: " + dbName);
+      }
+      // Load transient functions into the temporary db.
+      for (Function fn: db.getTransientFunctions()) tmpDb.addFunction(fn);
+
+      // Compute the removed functions and remove them from the db.
+      for (Map.Entry<String, List<Function>> e: db.getAllFunctions().entrySet()) {
+        for (Function fn: e.getValue()) {
+          if (tmpDb.getFunction(
+              fn, Function.CompareMode.IS_INDISTINGUISHABLE) == null) {
+            fn.setCatalogVersion(incrementAndGetCatalogVersion());
+            removedFuncs.add(fn.toTCatalogObject());
+          }
+        }
+      }
+
+      // We will re-add all the functions to the db because it's possible that a
+      // function was dropped and a different function (for example, the binary is
+      // different) with the same name and signature was re-added in Hive.
+      db.removeAllFunctions();
+      for (Map.Entry<String, List<Function>> e: tmpDb.getAllFunctions().entrySet()) {
+        for (Function fn: e.getValue()) {
+          // We do not need to increment and acquire a new catalog version for this
+          // function here because this already happens when the functions are loaded
+          // into tmpDb.
+          db.addFunction(fn);
+          addedFuncs.add(fn.toTCatalogObject());
+        }
+      }
+
+    } catch (Exception e) {
+      throw new CatalogException("Error refreshing functions in " + dbName + ": ", e);
     }
   }
 
@@ -622,6 +722,8 @@ public class CatalogServiceCatalog extends Catalog {
    * Resets this catalog instance by clearing all cached table and database metadata.
    */
   public void reset() throws CatalogException {
+    LOG.info("Invalidating all metadata.");
+
     // First update the policy metadata.
     if (sentryProxy_ != null) {
       // Sentry Service is enabled.
@@ -665,6 +767,7 @@ public class CatalogServiceCatalog extends Catalog {
     } finally {
       catalogLock_.writeLock().unlock();
     }
+    LOG.info("Invalidated all metadata.");
   }
 
   /**
@@ -866,83 +969,59 @@ public class CatalogServiceCatalog extends Catalog {
 
   /**
    * Renames a table. Equivalent to an atomic drop + add of the table. Returns
-   * the new Table object with an incremented catalog version or null if operation
-   * was not successful.
+   * the new Table object with an incremented catalog version or null if the
+   * drop or add were unsuccessful. If null is returned, then the catalog cache
+   * is in one of the following two states:
+   * 1. Old table was not removed, and new table was not added
+   * 2. Old table was removed, but new table was not added
    */
   public Table renameTable(TTableName oldTableName, TTableName newTableName)
       throws CatalogException {
     // Remove the old table name from the cache and add the new table.
     Db db = getDb(oldTableName.getDb_name());
-    if (db != null) db.removeTable(oldTableName.getTable_name());
+    if (db == null) return null;
+    Table oldTable = db.removeTable(oldTableName.getTable_name());
+    if (oldTable == null) return null;
     return addTable(newTableName.getDb_name(), newTableName.getTable_name());
   }
 
   /**
-   * Reloads metadata for table 'tbl'. If 'tbl' is an IncompleteTable, it makes an
-   * asynchronous request to the table loading manager to create a proper table instance
-   * and load the metadata from Hive Metastore. Otherwise, it updates table metadata
-   * in-place by calling the load() function on the specified table. Returns 'tbl', if it
-   * is a fully loaded table (e.g. HdfsTable, HBaseTable, etc). Otherwise, returns a
-   * newly constructed fully loaded table. Applies proper synchronization to protect the
+   * Reloads metadata for table 'tbl' which must not be an IncompleteTable. Updates the
+   * table metadata in-place by calling load() on the given table. Returns the
+   * TCatalogObject representing 'tbl'. Applies proper synchronization to protect the
    * metadata load from concurrent table modifications and assigns a new catalog version.
    * Throws a CatalogException if there is an error loading table metadata.
    */
-  public Table reloadTable(Table tbl) throws CatalogException {
-    if (LOG.isTraceEnabled()) {
-      LOG.trace(String.format("Refreshing table metadata: %s", tbl.getFullName()));
-    }
-    TTableName tblName = new TTableName(tbl.getDb().getName().toLowerCase(),
-        tbl.getName().toLowerCase());
-    Db db = tbl.getDb();
-    if (tbl instanceof IncompleteTable) {
-      TableLoadingMgr.LoadRequest loadReq;
-      long previousCatalogVersion;
-      // Return the table if it is already loaded or submit a new load request.
-      catalogLock_.readLock().lock();
-      try {
-        previousCatalogVersion = tbl.getCatalogVersion();
-        loadReq = tableLoadingMgr_.loadAsync(tblName);
-      } finally {
-        catalogLock_.readLock().unlock();
-      }
-      Preconditions.checkNotNull(loadReq);
-      try {
-        // The table may have been dropped/modified while the load was in progress, so
-        // only apply the update if the existing table hasn't changed.
-        return replaceTableIfUnchanged(loadReq.get(), previousCatalogVersion);
-      } finally {
-        loadReq.close();
-      }
-    }
+  public TCatalogObject reloadTable(Table tbl) throws CatalogException {
+    LOG.info(String.format("Refreshing table metadata: %s", tbl.getFullName()));
+    Preconditions.checkState(!(tbl instanceof IncompleteTable));
+    String dbName = tbl.getDb().getName();
+    String tblName = tbl.getName();
 
-    catalogLock_.writeLock().lock();
-    synchronized(tbl) {
+    if (!tryLockTable(tbl)) {
+      throw new CatalogException(String.format("Error refreshing metadata for table " +
+          "%s due to lock contention", tbl.getFullName()));
+    }
+    try {
       long newCatalogVersion = incrementAndGetCatalogVersion();
       catalogLock_.writeLock().unlock();
       try (MetaStoreClient msClient = getMetaStoreClient()) {
         org.apache.hadoop.hive.metastore.api.Table msTbl = null;
         try {
-          msTbl = msClient.getHiveClient().getTable(db.getName(),
-              tblName.getTable_name());
+          msTbl = msClient.getHiveClient().getTable(dbName, tblName);
         } catch (Exception e) {
           throw new TableLoadingException("Error loading metadata for table: " +
-              db.getName() + "." + tblName.getTable_name(), e);
+              dbName + "." + tblName, e);
         }
-        tbl.load(false, msClient.getHiveClient(), msTbl);
+        tbl.load(true, msClient.getHiveClient(), msTbl);
       }
       tbl.setCatalogVersion(newCatalogVersion);
-      return tbl;
+      LOG.info(String.format("Refreshed table metadata: %s", tbl.getFullName()));
+      return tbl.toTCatalogObject();
+    } finally {
+      Preconditions.checkState(!catalogLock_.isWriteLockedByCurrentThread());
+      tbl.getLock().unlock();
     }
-  }
-
-  /**
-   * Reloads the metadata of a table with name 'tableName'. Returns the table or null if
-   * the table does not exist.
-   */
-  public Table reloadTable(TTableName tableName) throws CatalogException {
-    Table table = getTable(tableName.getDb_name(), tableName.getTable_name());
-    if (table == null) return null;
-    return reloadTable(table);
   }
 
   /**
@@ -953,7 +1032,7 @@ public class CatalogServiceCatalog extends Catalog {
       throws CatalogException {
     Preconditions.checkNotNull(tbl);
     Preconditions.checkNotNull(partitionSet);
-    Preconditions.checkState(Thread.holdsLock(tbl));
+    Preconditions.checkArgument(tbl.getLock().isHeldByCurrentThread());
     if (!(tbl instanceof HdfsTable)) {
       throw new CatalogException("Table " + tbl.getFullName() + " is not an Hdfs table");
     }
@@ -965,31 +1044,11 @@ public class CatalogServiceCatalog extends Catalog {
   }
 
   /**
-   * Drops the partition specified in 'partitionSpec' from 'tbl'. Throws a
-   * CatalogException if 'tbl' is not an HdfsTable. If the partition having the given
-   * partition spec does not exist, null is returned. Otherwise, the modified table is
-   * returned.
-   */
-  public Table dropPartition(Table tbl, List<TPartitionKeyValue> partitionSpec)
-      throws CatalogException {
-    Preconditions.checkNotNull(tbl);
-    Preconditions.checkNotNull(partitionSpec);
-    Preconditions.checkState(Thread.holdsLock(tbl));
-    if (!(tbl instanceof HdfsTable)) {
-      throw new CatalogException("Table " + tbl.getFullName() + " is not an Hdfs table");
-    }
-    HdfsTable hdfsTable = (HdfsTable) tbl;
-    if (hdfsTable.dropPartition(partitionSpec) == null) return null;
-    return hdfsTable;
-  }
-
-  /**
    * Adds a partition to its HdfsTable and returns the modified table.
    */
   public Table addPartition(HdfsPartition partition) throws CatalogException {
     Preconditions.checkNotNull(partition);
     HdfsTable hdfsTable = partition.getTable();
-    Db db = getDb(hdfsTable.getDb().getName());
     hdfsTable.addPartition(partition);
     return hdfsTable;
   }
@@ -998,33 +1057,28 @@ public class CatalogServiceCatalog extends Catalog {
    * Invalidates the table in the catalog cache, potentially adding/removing the table
    * from the cache based on whether it exists in the Hive Metastore.
    * The invalidation logic is:
-   * - If the table exists in the metastore, add it to the catalog as an uninitialized
+   * - If the table exists in the Metastore, add it to the catalog as an uninitialized
    *   IncompleteTable (replacing any existing entry). The table metadata will be
    *   loaded lazily, on the next access. If the parent database for this table does not
    *   yet exist in Impala's cache it will also be added.
-   * - If the table does not exist in the metastore, remove it from the catalog cache.
-   * - If we are unable to determine whether the table exists in the metastore (there was
+   * - If the table does not exist in the Metastore, remove it from the catalog cache.
+   * - If we are unable to determine whether the table exists in the Metastore (there was
    *   an exception thrown making the RPC), invalidate any existing Table by replacing
    *   it with an uninitialized IncompleteTable.
-   *
-   * The parameter updatedObjects is a Pair that contains details on what catalog objects
-   * were modified as a result of the invalidateTable() call. The first item in the Pair
-   * is a Db which will only be set if a new database was added as a result of this call,
-   * otherwise it will be null. The second item in the Pair is the Table that was
-   * modified/added/removed.
-   * Returns a flag that indicates whether the items in updatedObjects were removed
-   * (returns true) or added/modified (return false). Only Tables should ever be removed.
+   * Returns the thrift representation of the added/updated/removed table, or null if
+   * the table was not present in the catalog cache or the Metastore.
+   * Sets tblWasRemoved to true if the table was absent from the Metastore and it was
+   * removed from the catalog cache.
+   * Sets dbWasAdded to true if both a new database and table were added to the catalog
+   * cache.
    */
-  public boolean invalidateTable(TTableName tableName, Pair<Db, Table> updatedObjects) {
-    Preconditions.checkNotNull(updatedObjects);
-    updatedObjects.first = null;
-    updatedObjects.second = null;
-    if (LOG.isTraceEnabled()) {
-      LOG.trace(String.format("Invalidating table metadata: %s.%s",
-          tableName.getDb_name(), tableName.getTable_name()));
-    }
+  public TCatalogObject invalidateTable(TTableName tableName,
+      Reference<Boolean> tblWasRemoved, Reference<Boolean> dbWasAdded) {
+    tblWasRemoved.setRef(false);
+    dbWasAdded.setRef(false);
     String dbName = tableName.getDb_name();
     String tblName = tableName.getTable_name();
+    LOG.info(String.format("Invalidating table metadata: %s.%s", dbName, tblName));
 
     // Stores whether the table exists in the metastore. Can have three states:
     // 1) true - Table exists in metastore.
@@ -1046,17 +1100,24 @@ public class CatalogServiceCatalog extends Catalog {
       }
 
       if (tableExistsInMetaStore != null && !tableExistsInMetaStore) {
-        updatedObjects.second = removeTable(dbName, tblName);
-        return true;
+        Table result = removeTable(dbName, tblName);
+        if (result == null) return null;
+        tblWasRemoved.setRef(true);
+        result.getLock().lock();
+        try {
+          return result.toTCatalogObject();
+        } finally {
+          result.getLock().unlock();
+        }
       }
 
       db = getDb(dbName);
       if ((db == null || !db.containsTable(tblName)) && tableExistsInMetaStore == null) {
         // The table does not exist in our cache AND it is unknown whether the
-        // table exists in the metastore. Do nothing.
-        return false;
+        // table exists in the Metastore. Do nothing.
+        return null;
       } else if (db == null && tableExistsInMetaStore) {
-        // The table exists in the metastore, but our cache does not contain the parent
+        // The table exists in the Metastore, but our cache does not contain the parent
         // database. A new db will be added to the cache along with the new table. msDb
         // must be valid since tableExistsInMetaStore is true.
         try {
@@ -1065,11 +1126,11 @@ public class CatalogServiceCatalog extends Catalog {
           db = new Db(dbName, this, msDb);
           db.setCatalogVersion(incrementAndGetCatalogVersion());
           addDb(db);
-          updatedObjects.first = db;
+          dbWasAdded.setRef(true);
         } catch (TException e) {
-          // The metastore database cannot be get. Log the error and return.
+          // The Metastore database cannot be get. Log the error and return.
           LOG.error("Error executing getDatabase() metastore call: " + dbName, e);
-          return false;
+          return null;
         }
       }
     }
@@ -1084,8 +1145,12 @@ public class CatalogServiceCatalog extends Catalog {
       tableLoadingMgr_.backgroundLoad(new TTableName(dbName.toLowerCase(),
           tblName.toLowerCase()));
     }
-    updatedObjects.second = newTable;
-    return false;
+    if (dbWasAdded.getRef()) {
+      // The database should always have a lower catalog version than the table because
+      // it needs to be created before the table can be added.
+      Preconditions.checkState(db.getCatalogVersion() < newTable.getCatalogVersion());
+    }
+    return newTable.toTCatalogObject();
   }
 
   /**
@@ -1244,13 +1309,16 @@ public class CatalogServiceCatalog extends Catalog {
 
   /**
    * Reloads metadata for the partition defined by the partition spec
-   * 'partitionSpec' in table 'tbl'. Returns the table object with partition
-   * metadata reloaded
+   * 'partitionSpec' in table 'tbl'. Returns the resulting table's TCatalogObject after
+   * the partition metadata was reloaded.
    */
-  public Table reloadPartition(Table tbl, List<TPartitionKeyValue> partitionSpec)
+  public TCatalogObject reloadPartition(Table tbl, List<TPartitionKeyValue> partitionSpec)
       throws CatalogException {
-    catalogLock_.writeLock().lock();
-    synchronized (tbl) {
+    if (!tryLockTable(tbl)) {
+      throw new CatalogException(String.format("Error reloading partition of table %s " +
+          "due to lock contention", tbl.getFullName()));
+    }
+    try {
       long newCatalogVersion = incrementAndGetCatalogVersion();
       catalogLock_.writeLock().unlock();
       HdfsTable hdfsTable = (HdfsTable) tbl;
@@ -1261,10 +1329,8 @@ public class CatalogServiceCatalog extends Catalog {
       String partitionName = hdfsPartition == null
           ? HdfsTable.constructPartitionName(partitionSpec)
           : hdfsPartition.getPartitionName();
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(String.format("Refreshing Partition metadata: %s %s",
-            hdfsTable.getFullName(), partitionName));
-      }
+      LOG.info(String.format("Refreshing partition metadata: %s %s",
+          hdfsTable.getFullName(), partitionName));
       try (MetaStoreClient msClient = getMetaStoreClient()) {
         org.apache.hadoop.hive.metastore.api.Partition hmsPartition = null;
         try {
@@ -1277,7 +1343,7 @@ public class CatalogServiceCatalog extends Catalog {
             hdfsTable.dropPartition(partitionSpec);
             hdfsTable.setCatalogVersion(newCatalogVersion);
           }
-          return hdfsTable;
+          return hdfsTable.toTCatalogObject();
         } catch (Exception e) {
           throw new CatalogException("Error loading metadata for partition: "
               + hdfsTable.getFullName() + " " + partitionName, e);
@@ -1285,7 +1351,12 @@ public class CatalogServiceCatalog extends Catalog {
         hdfsTable.reloadPartition(hdfsPartition, hmsPartition);
       }
       hdfsTable.setCatalogVersion(newCatalogVersion);
-      return hdfsTable;
+      LOG.info(String.format("Refreshed partition metadata: %s %s",
+          hdfsTable.getFullName(), partitionName));
+      return hdfsTable.toTCatalogObject();
+    } finally {
+      Preconditions.checkState(!catalogLock_.isWriteLockedByCurrentThread());
+      tbl.getLock().unlock();
     }
   }
 }

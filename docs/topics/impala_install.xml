@@ -32,27 +32,53 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">installation</indexterm>
-      <indexterm audience="Cloudera">pseudo-distributed cluster</indexterm>
-      <indexterm audience="Cloudera">cluster</indexterm>
-      <indexterm audience="Cloudera">DataNodes</indexterm>
-      <indexterm audience="Cloudera">NameNode</indexterm>
-      <indexterm audience="Cloudera">Cloudera Manager</indexterm>
-      <indexterm audience="Cloudera">impalad</indexterm>
-      <indexterm audience="Cloudera">impala-shell</indexterm>
-      <indexterm audience="Cloudera">statestored</indexterm>
-      Impala is an open-source add-on to the Cloudera Enterprise Core that returns rapid responses to
-      queries.
+      <indexterm audience="hidden">installation</indexterm>
+      <indexterm audience="hidden">pseudo-distributed cluster</indexterm>
+      <indexterm audience="hidden">cluster</indexterm>
+      <indexterm audience="hidden">DataNodes</indexterm>
+      <indexterm audience="hidden">NameNode</indexterm>
+      <indexterm audience="hidden">impalad</indexterm>
+      <indexterm audience="hidden">impala-shell</indexterm>
+      <indexterm audience="hidden">statestored</indexterm>
+      Impala is an open-source analytic database for Apache Hadoop
+      that returns rapid responses to queries.
     </p>
 
-    <note>
-      <p>
-        Under CDH 5, Impala is included as part of the CDH installation and no separate steps are needed.
-        <ph audience="standalone">Therefore, the instruction steps in this section apply to CDH 4 only.</ph>
-      </p>
-    </note>
+    <p>
+      Follow these steps to set up Impala on a cluster by building from source:
+    </p>
 
-    <p outputclass="toc inpage"/>
+<!-- Steps adapted from http://impala.apache.org/downloads.html -->
+
+    <ul>
+      <li>
+        <p>
+          Download the latest release. See
+          <xref href="http://impala.apache.org/downloads.html" scope="external" format="html">the Impala downloads page</xref>
+          for the link to the latest release.
+        </p>
+      </li>
+      <li>
+        <p>
+          Check the <filepath>README.md</filepath> file for a pointer
+          to the build instructions.
+        </p>
+      </li>
+      <li>
+        <p>
+          Please check the MD5 and SHA1 and GPG signature, the latter by using the code signing keys of the release managers.
+        </p>
+      </li>
+      <li>
+        <p>
+          Developers interested in working on Impala can clone the Impala source repository:
+<codeblock>
+git clone https://git-wip-us.apache.org/repos/asf/incubator-impala.git
+</codeblock>
+        </p>
+      </li>
+    </ul>
+
   </conbody>
 
   <concept id="install_details">

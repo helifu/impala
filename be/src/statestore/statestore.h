@@ -35,6 +35,7 @@
 #include "runtime/client-cache.h"
 #include "runtime/timestamp-value.h"
 #include "statestore/failure-detector.h"
+#include "statestore/statestore-subscriber-client-wrapper.h"
 #include "util/aligned-new.h"
 #include "util/collection-metrics.h"
 #include "util/metrics.h"
@@ -44,6 +45,8 @@
 namespace impala {
 
 class Status;
+
+typedef ClientCache<StatestoreSubscriberClientWrapper> StatestoreSubscriberClientCache;
 
 /// The Statestore is a soft-state key-value store that maintains a set of Topics, which
 /// are maps from string keys to byte array values.
@@ -105,14 +108,12 @@ class Statestore : public CacheLineAligned {
   Status RegisterSubscriber(const SubscriberId& subscriber_id,
       const TNetworkAddress& location,
       const std::vector<TTopicRegistration>& topic_registrations,
-      TUniqueId* registration_id);
+      TUniqueId* registration_id) WARN_UNUSED_RESULT;
 
   void RegisterWebpages(Webserver* webserver);
 
   /// The main processing loop. Blocks until the exit flag is set.
-  //
-  /// Returns OK unless there is an unrecoverable error.
-  Status MainLoop();
+  void MainLoop();
 
   /// Returns the Thrift API interface that proxies requests onto the local Statestore.
   const boost::shared_ptr<StatestoreServiceIf>& thrift_iface() const {
@@ -400,13 +401,13 @@ class Statestore : public CacheLineAligned {
 
   /// Cache of subscriber clients used for UpdateState() RPCs. Only one client per
   /// subscriber should be used, but the cache helps with the client lifecycle on failure.
-  boost::scoped_ptr<ClientCache<StatestoreSubscriberClient>> update_state_client_cache_;
+  boost::scoped_ptr<StatestoreSubscriberClientCache> update_state_client_cache_;
 
   /// Cache of subscriber clients used for Heartbeat() RPCs. Separate from
   /// update_state_client_cache_ because we enable TCP-level timeouts for these calls,
   /// whereas they are not safe for UpdateState() RPCs which can take an unbounded amount
   /// of time.
-  boost::scoped_ptr<ClientCache<StatestoreSubscriberClient>> heartbeat_client_cache_;
+  boost::scoped_ptr<StatestoreSubscriberClientCache> heartbeat_client_cache_;
 
   /// Thrift API implementation which proxies requests onto this Statestore
   boost::shared_ptr<StatestoreServiceIf> thrift_iface_;
@@ -436,10 +437,10 @@ class Statestore : public CacheLineAligned {
   /// Utility method to add an update to the given thread pool, and to fail if the thread
   /// pool is already at capacity.
   Status OfferUpdate(const ScheduledSubscriberUpdate& update,
-      ThreadPool<ScheduledSubscriberUpdate>* thread_pool);
+      ThreadPool<ScheduledSubscriberUpdate>* thread_pool) WARN_UNUSED_RESULT;
 
-  /// Sends either a heartbeat or topic update message to the subscriber in 'update' at the
-  /// closest possible time to the first member of 'update'.  If is_heartbeat is true,
+  /// Sends either a heartbeat or topic update message to the subscriber in 'update' at
+  /// the closest possible time to the first member of 'update'. If is_heartbeat is true,
   /// sends a heartbeat update, otherwise the set of pending topic updates is sent. Once
   /// complete, the next update is scheduled and added to the appropriate queue.
   void DoSubscriberUpdate(bool is_heartbeat, int thread_id,
@@ -455,14 +456,15 @@ class Statestore : public CacheLineAligned {
   /// will return OK (since there was no error) and the output parameter update_skipped is
   /// set to true. Otherwise, any updates returned by the subscriber are applied to their
   /// target topics.
-  Status SendTopicUpdate(Subscriber* subscriber, bool* update_skipped);
+  Status SendTopicUpdate(Subscriber* subscriber, bool* update_skipped) WARN_UNUSED_RESULT;
 
   /// Sends a heartbeat message to subscriber. Returns false if there was some error
   /// performing the RPC.
-  Status SendHeartbeat(Subscriber* subscriber);
+  Status SendHeartbeat(Subscriber* subscriber) WARN_UNUSED_RESULT;
 
   /// Unregister a subscriber, removing all of its transient entries and evicting it from
-  /// the subscriber map. Callers must hold subscribers_lock_ prior to calling this method.
+  /// the subscriber map. Callers must hold subscribers_lock_ prior to calling this
+  /// method.
   void UnregisterSubscriber(Subscriber* subscriber);
 
   /// Populates a TUpdateStateRequest with the update state for this subscriber. Iterates

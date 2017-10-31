@@ -151,8 +151,7 @@ void DataStreamRecvr::SenderQueue::AddBatch(const TRowBatch& thrift_batch) {
   unique_lock<mutex> l(lock_);
   if (is_cancelled_) return;
 
-  int batch_size = RowBatch::GetBatchSize(thrift_batch);
-  COUNTER_ADD(recvr_->bytes_received_counter_, batch_size);
+  COUNTER_ADD(recvr_->bytes_received_counter_, RowBatch::GetSerializedSize(thrift_batch));
   DCHECK_GT(num_remaining_senders_, 0);
 
   // if there's something in the queue and this batch will push us over the
@@ -162,6 +161,7 @@ void DataStreamRecvr::SenderQueue::AddBatch(const TRowBatch& thrift_batch) {
   // received from a specific queue based on data order, and the pipeline will stall
   // if the merger is waiting for data from an empty queue that cannot be filled because
   // the limit has been reached.
+  int64_t batch_size = RowBatch::GetDeserializedSize(thrift_batch);
   while (!batch_queue_.empty() && recvr_->ExceedsLimit(batch_size) && !is_cancelled_) {
     CANCEL_SAFE_SCOPED_TIMER(recvr_->buffer_full_total_timer_, &is_cancelled_);
     VLOG_ROW << " wait removal: empty=" << (batch_queue_.empty() ? 1 : 0)
@@ -208,7 +208,7 @@ void DataStreamRecvr::SenderQueue::AddBatch(const TRowBatch& thrift_batch) {
       // Note: if this function makes a row batch, the batch *must* be added
       // to batch_queue_. It is not valid to create the row batch and destroy
       // it in this thread.
-      batch = new RowBatch(recvr_->row_desc(), thrift_batch, recvr_->mem_tracker());
+      batch = new RowBatch(recvr_->row_desc_, thrift_batch, recvr_->mem_tracker());
     }
     VLOG_ROW << "added #rows=" << batch->num_rows()
              << " batch_size=" << batch_size << "\n";
@@ -265,7 +265,7 @@ Status DataStreamRecvr::CreateMerger(const TupleRowComparator& less_than) {
   input_batch_suppliers.reserve(sender_queues_.size());
 
   // Create the merger that will a single stream of sorted rows.
-  merger_.reset(new SortedRunMerger(less_than, &row_desc_, profile_, false));
+  merger_.reset(new SortedRunMerger(less_than, row_desc_, profile_, false));
 
   for (int i = 0; i < sender_queues_.size(); ++i) {
     input_batch_suppliers.push_back(
@@ -284,8 +284,8 @@ void DataStreamRecvr::TransferAllResources(RowBatch* transfer_batch) {
 }
 
 DataStreamRecvr::DataStreamRecvr(DataStreamMgr* stream_mgr, MemTracker* parent_tracker,
-    const RowDescriptor& row_desc, const TUniqueId& fragment_instance_id,
-    PlanNodeId dest_node_id, int num_senders, bool is_merging, int total_buffer_limit,
+    const RowDescriptor* row_desc, const TUniqueId& fragment_instance_id,
+    PlanNodeId dest_node_id, int num_senders, bool is_merging, int64_t total_buffer_limit,
     RuntimeProfile* profile)
   : mgr_(stream_mgr),
     fragment_instance_id_(fragment_instance_id),
@@ -295,7 +295,6 @@ DataStreamRecvr::DataStreamRecvr(DataStreamMgr* stream_mgr, MemTracker* parent_t
     is_merging_(is_merging),
     num_buffered_bytes_(0),
     profile_(profile) {
-  mem_tracker_.reset(new MemTracker(-1, "DataStreamRecvr", parent_tracker));
   // Create one queue per sender if is_merging is true.
   int num_queues = is_merging ? num_senders : 1;
   sender_queues_.reserve(num_queues);
@@ -306,17 +305,19 @@ DataStreamRecvr::DataStreamRecvr(DataStreamMgr* stream_mgr, MemTracker* parent_t
     sender_queues_.push_back(queue);
   }
 
+  RuntimeProfile* child_profile = profile_->CreateChild("DataStreamReceiver");
+  mem_tracker_.reset(
+      new MemTracker(child_profile, -1, "DataStreamRecvr", parent_tracker));
+
   // Initialize the counters
-  bytes_received_counter_ =
-      ADD_COUNTER(profile_, "BytesReceived", TUnit::BYTES);
+  bytes_received_counter_ = ADD_COUNTER(child_profile, "BytesReceived", TUnit::BYTES);
   bytes_received_time_series_counter_ =
-      ADD_TIME_SERIES_COUNTER(profile_, "BytesReceived", bytes_received_counter_);
-  deserialize_row_batch_timer_ =
-      ADD_TIMER(profile_, "DeserializeRowBatchTimer");
-  buffer_full_wall_timer_ = ADD_TIMER(profile_, "SendersBlockedTimer");
-  buffer_full_total_timer_ = ADD_TIMER(profile_, "SendersBlockedTotalTimer(*)");
-  data_arrival_timer_ = profile_->inactive_timer();
-  first_batch_wait_total_timer_ = ADD_TIMER(profile_, "FirstBatchArrivalWaitTime");
+      ADD_TIME_SERIES_COUNTER(child_profile, "BytesReceived", bytes_received_counter_);
+  deserialize_row_batch_timer_ = ADD_TIMER(child_profile, "DeserializeRowBatchTimer");
+  buffer_full_wall_timer_ = ADD_TIMER(child_profile, "SendersBlockedTimer");
+  buffer_full_total_timer_ = ADD_TIMER(child_profile, "SendersBlockedTotalTimer(*)");
+  data_arrival_timer_ = child_profile->inactive_timer();
+  first_batch_wait_total_timer_ = ADD_TIMER(child_profile, "FirstBatchArrivalWaitTime");
 }
 
 Status DataStreamRecvr::GetNext(RowBatch* output_batch, bool* eos) {
@@ -343,15 +344,16 @@ void DataStreamRecvr::CancelStream() {
 
 void DataStreamRecvr::Close() {
   // Remove this receiver from the DataStreamMgr that created it.
-  // TODO: log error msg
-  mgr_->DeregisterRecvr(fragment_instance_id(), dest_node_id());
+  const Status status = mgr_->DeregisterRecvr(fragment_instance_id(), dest_node_id());
+  if (!status.ok()) {
+    LOG(WARNING) << "Error deregistering receiver: " << status.GetDetail();
+  }
   mgr_ = NULL;
   for (int i = 0; i < sender_queues_.size(); ++i) {
     sender_queues_[i]->Close();
   }
   merger_.reset();
-  mem_tracker_->UnregisterFromParent();
-  mem_tracker_.reset();
+  mem_tracker_->Close();
 }
 
 DataStreamRecvr::~DataStreamRecvr() {

@@ -20,7 +20,7 @@
 import os
 from itertools import product
 
-from tests.common.test_vector import TestDimension
+from tests.common.test_vector import ImpalaTestDimension
 
 WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 
@@ -85,14 +85,26 @@ class TableFormatInfo(object):
       compression_str = 'none'
     return '%s/%s' % (self.file_format, compression_str)
 
+  def db_suffix(self):
+    if self.file_format == 'text' and self.compression_codec == 'none':
+      return ''
+    elif self.compression_codec == 'none':
+      return '_%s' % (self.file_format)
+    elif self.compression_type == 'record':
+      return '_%s_record_%s' % (self.file_format, self.compression_codec)
+    else:
+      return '_%s_%s' % (self.file_format, self.compression_codec)
+
+
+
 def create_uncompressed_text_dimension(workload):
   dataset = get_dataset_from_workload(workload)
-  return TestDimension('table_format',
+  return ImpalaTestDimension('table_format',
       TableFormatInfo.create_from_string(dataset, 'text/none'))
 
 def create_parquet_dimension(workload):
   dataset = get_dataset_from_workload(workload)
-  return TestDimension('table_format',
+  return ImpalaTestDimension('table_format',
       TableFormatInfo.create_from_string(dataset, 'parquet/none'))
 
 # Available Exec Options:
@@ -123,17 +135,23 @@ def create_single_exec_option_dimension():
   """Creates an exec_option dimension that will produce a single test vector"""
   return create_exec_option_dimension(cluster_sizes=ALL_NODES_ONLY,
                                       disable_codegen_options=[False],
+                                      # Make sure codegen kicks in for functional.alltypes.
+                                      disable_codegen_rows_threshold_options=[5000],
                                       batch_sizes=[0])
 
 def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
                                  disable_codegen_options=ALL_DISABLE_CODEGEN_OPTIONS,
                                  batch_sizes=ALL_BATCH_SIZES,
-                                 sync_ddl=None, exec_single_node_option=[0]):
+                                 sync_ddl=None, exec_single_node_option=[0],
+                                 # We already run with codegen on and off explicitly -
+                                 # don't need automatic toggling.
+                                 disable_codegen_rows_threshold_options=[0]):
   exec_option_dimensions = {
       'abort_on_error': [1],
       'exec_single_node_rows_threshold': exec_single_node_option,
       'batch_size': batch_sizes,
       'disable_codegen': disable_codegen_options,
+      'disable_codegen_rows_threshold': disable_codegen_rows_threshold_options,
       'num_nodes': cluster_sizes}
 
   if sync_ddl is not None:
@@ -159,7 +177,7 @@ def create_exec_option_dimension_from_dict(exec_option_dimensions):
   exec_option_dimension_values = [dict(zip(keys, prod)) for prod in combinations]
 
   # Build a test vector out of it
-  return TestDimension('exec_option', *exec_option_dimension_values)
+  return ImpalaTestDimension('exec_option', *exec_option_dimension_values)
 
 def get_dataset_from_workload(workload):
   # TODO: We need a better way to define the workload -> dataset mapping so we can
@@ -198,7 +216,7 @@ def load_table_info_dimension(workload_name, exploration_strategy, file_formats=
         continue
       vector_values.append(TableFormatInfo(**vals))
 
-  return TestDimension('table_format', *vector_values)
+  return ImpalaTestDimension('table_format', *vector_values)
 
 def is_supported_insert_format(table_format):
   # Returns true if the given table_format is a supported Impala INSERT format

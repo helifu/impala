@@ -130,6 +130,12 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// existing profiles.
   void PrependChild(RuntimeProfile* child, bool indent = true);
 
+  /// Creates a new child profile with the given 'name'. A child profile with that name
+  /// must not already exist. If 'prepend' is true, prepended before other child profiles,
+  /// otherwise appended after other child profiles.
+  RuntimeProfile* CreateChild(
+      const std::string& name, bool indent = true, bool prepend = false);
+
   /// Sorts all children according to a custom comparator. Does not
   /// invalidate pointers to profiles.
   template <class Compare>
@@ -259,8 +265,8 @@ class RuntimeProfile { // NOLINT: This struct is not packed, but there are not s
   /// object using thrift compact binary format, then gzip compresses it and
   /// finally encodes it as base64.  This is not a lightweight operation and
   /// should not be in the hot path.
-  std::string SerializeToArchiveString() const;
-  void SerializeToArchiveString(std::stringstream* out) const;
+  Status SerializeToArchiveString(std::string* out) const WARN_UNUSED_RESULT;
+  Status SerializeToArchiveString(std::stringstream* out) const WARN_UNUSED_RESULT;
 
   /// Divides all counters by n
   void Divide(int n);

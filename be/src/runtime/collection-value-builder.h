@@ -49,7 +49,7 @@ class CollectionValueBuilder {
   /// of tuples that may be written before calling CommitTuples() in 'num_tuples'. After
   /// calling CommitTuples(), GetMemory() can be called again. Allocates if there is no
   /// free tuple memory left. Returns error status if memory limit is exceeded.
-  Status GetFreeMemory(Tuple** tuple_mem, int* num_tuples) {
+  Status GetFreeMemory(Tuple** tuple_mem, int* num_tuples) WARN_UNUSED_RESULT {
     if (tuple_desc_.byte_size() == 0) {
       // No tuple memory necessary, so caller can write as many tuples as 'num_tuples'
       // field can count.
@@ -60,7 +60,8 @@ class CollectionValueBuilder {
       DCHECK_GE(buffer_size_, bytes_written);
       if (buffer_size_ == bytes_written) {
         // Double tuple buffer
-        int64_t new_buffer_size = max<int64_t>(buffer_size_ * 2, tuple_desc_.byte_size());
+        int64_t new_buffer_size =
+            std::max<int64_t>(buffer_size_ * 2, tuple_desc_.byte_size());
         uint8_t* new_buf = pool_->TryAllocate(new_buffer_size);
         if (UNLIKELY(new_buf == NULL)) {
           *tuple_mem = NULL;
@@ -113,4 +114,3 @@ class CollectionValueBuilder {
 }
 
 #endif
-

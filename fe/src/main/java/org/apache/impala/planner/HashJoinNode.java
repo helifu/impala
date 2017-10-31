@@ -19,9 +19,6 @@ package org.apache.impala.planner;
 
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
@@ -37,6 +34,9 @@ import org.apache.impala.thrift.THashJoinNode;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.BitUtil;
+
+import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -47,8 +47,6 @@ import com.google.common.collect.Lists;
  * inversion (for outer/semi/cross joins) it could also be the left child.
  */
 public class HashJoinNode extends JoinNode {
-  private final static Logger LOG = LoggerFactory.getLogger(HashJoinNode.class);
-
   public HashJoinNode(PlanNode outer, PlanNode inner, boolean isStraightJoin,
       DistributionMode distrMode, JoinOperator joinOp,
       List<BinaryPredicate> eqJoinConjuncts, List<Expr> otherJoinConjuncts) {
@@ -57,6 +55,9 @@ public class HashJoinNode extends JoinNode {
     Preconditions.checkNotNull(eqJoinConjuncts);
     Preconditions.checkState(joinOp_ != JoinOperator.CROSS_JOIN);
   }
+
+  @Override
+  public boolean isBlockingJoinNode() { return true; }
 
   @Override
   public List<BinaryPredicate> getEqJoinConjuncts() { return eqJoinConjuncts_; }
@@ -162,6 +163,22 @@ public class HashJoinNode extends JoinNode {
         if (i + 1 != eqJoinConjuncts_.size()) output.append(", ");
       }
       output.append("\n");
+
+      // Optionally print FK/PK equi-join conjuncts.
+      if (joinOp_.isInnerJoin() || joinOp_.isOuterJoin()) {
+        if (detailLevel.ordinal() > TExplainLevel.STANDARD.ordinal()) {
+          output.append(detailPrefix + "fk/pk conjuncts: ");
+          if (fkPkEqJoinConjuncts_ == null) {
+            output.append("none");
+          } else if (fkPkEqJoinConjuncts_.isEmpty()) {
+            output.append("assumed fk/pk");
+          } else {
+            output.append(Joiner.on(", ").join(fkPkEqJoinConjuncts_));
+          }
+          output.append("\n");
+        }
+      }
+
       if (!otherJoinConjuncts_.isEmpty()) {
         output.append(detailPrefix + "other join predicates: ")
         .append(getExplainString(otherJoinConjuncts_) + "\n");
@@ -179,15 +196,52 @@ public class HashJoinNode extends JoinNode {
   }
 
   @Override
-  public void computeCosts(TQueryOptions queryOptions) {
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+    long perInstanceMemEstimate;
+    long perInstanceDataBytes;
+    int numInstances = fragment_.getNumInstances(queryOptions.getMt_dop());
     if (getChild(1).getCardinality() == -1 || getChild(1).getAvgRowSize() == -1
-        || numNodes_ == 0) {
-      perHostMemCost_ = DEFAULT_PER_HOST_MEM;
-      return;
+        || numInstances <= 0) {
+      perInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
+      perInstanceDataBytes = -1;
+    } else {
+      perInstanceDataBytes = (long) Math.ceil(getChild(1).cardinality_
+          * getChild(1).avgRowSize_);
+      // Assume the rows are evenly divided among instances.
+      // TODO-MT: this estimate is not quite right with parallel plans. Fix it before
+      // we allow executing parallel plans with joins.
+      if (distrMode_ == DistributionMode.PARTITIONED) {
+        perInstanceDataBytes /= numInstances;
+      }
+      perInstanceMemEstimate = (long) Math.ceil(
+          perInstanceDataBytes * PlannerContext.HASH_TBL_SPACE_OVERHEAD);
     }
-    perHostMemCost_ =
-        (long) Math.ceil(getChild(1).cardinality_ * getChild(1).avgRowSize_
-          * PlannerContext.HASH_TBL_SPACE_OVERHEAD);
-    if (distrMode_ == DistributionMode.PARTITIONED) perHostMemCost_ /= numNodes_;
+
+    // Must be kept in sync with PartitionedHashJoinBuilder::MinReservation() in be.
+    final int PARTITION_FANOUT = 16;
+    long minBuffers = PARTITION_FANOUT + 1
+        + (joinOp_ == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN ? 3 : 0);
+
+    long bufferSize = queryOptions.getDefault_spillable_buffer_size();
+    if (perInstanceDataBytes != -1) {
+      long bytesPerBuffer = perInstanceDataBytes / PARTITION_FANOUT;
+      // Scale down the buffer size if we think there will be excess free space with the
+      // default buffer size, e.g. if the right side is a small dimension table.
+      bufferSize = Math.min(bufferSize, Math.max(
+          queryOptions.getMin_spillable_buffer_size(),
+          BitUtil.roundUpToPowerOf2(bytesPerBuffer)));
+    }
+
+    // Two of the buffers need to be buffers large enough to hold the maximum-sized row
+    // to serve as input and output buffers while repartitioning.
+    long maxRowBufferSize =
+        computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
+    long perInstanceMinBufferBytes =
+        bufferSize * (minBuffers - 2) + maxRowBufferSize * 2;
+    nodeResourceProfile_ = new ResourceProfileBuilder()
+        .setMemEstimateBytes(perInstanceMemEstimate)
+        .setMinReservationBytes(perInstanceMinBufferBytes)
+        .setSpillableBufferBytes(bufferSize)
+        .setMaxRowBufferBytes(maxRowBufferSize).build();
   }
 }

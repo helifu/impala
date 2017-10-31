@@ -55,3 +55,88 @@ select count(int_col) from functional_kudu.tinyinttable
 ---- TYPES
 BIGINT
 ====
+---- QUERY
+# IMPALA-4859: Test Kudu IS NULL/IS NOT NULL pushdown
+select count(*) from functional_kudu.alltypesagg where id < 10 and float_col is null;
+---- RESULTS
+2
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*) from functional_kudu.alltypesagg where id < 10 and float_col is not null;
+---- RESULTS
+9
+---- TYPES
+BIGINT
+====
+---- QUERY
+# alltypes.id is primary key/not nullable, verify IS NOT NULL/IS NULL pushdown works
+select count(*) from functional_kudu.alltypes where id is not null;
+---- RESULTS
+7300
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*) from functional_kudu.alltypes where id is null;
+---- RESULTS
+0
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Push down TIMESTAMP binary predicates
+select id, timestamp_col from functional_kudu.alltypes where
+timestamp_col <= cast('2009-01-01 00:08:00.28' as timestamp) and
+timestamp_col >= cast('2009-01-01 00:04:00.6' as timestamp)
+order by id;
+---- RESULTS
+4,2009-01-01 00:04:00.600000000
+5,2009-01-01 00:05:00.100000000
+6,2009-01-01 00:06:00.150000000
+7,2009-01-01 00:07:00.210000000
+8,2009-01-01 00:08:00.280000000
+---- TYPES
+INT, TIMESTAMP
+====
+---- QUERY
+# Out-of-range TIMESTAMP predicate (evaluates to NULL)
+select id, timestamp_col from functional_kudu.alltypes where
+timestamp_col > cast('1000-01-01 00:00:00.00' as timestamp)
+---- RESULTS
+---- TYPES
+INT, TIMESTAMP
+====
+---- QUERY
+select id, timestamp_col from functional_kudu.alltypes where
+timestamp_col < cast('2009-01-01 00:08:00.28' as timestamp) and
+timestamp_col > cast('2009-01-01 00:04:00.6' as timestamp)
+order by id;
+---- RESULTS
+5,2009-01-01 00:05:00.100000000
+6,2009-01-01 00:06:00.150000000
+7,2009-01-01 00:07:00.210000000
+---- TYPES
+INT, TIMESTAMP
+====
+---- QUERY
+select id, timestamp_col from functional_kudu.alltypes where
+timestamp_col = cast('2009-01-01 00:08:00.28' as timestamp);
+---- RESULTS
+8,2009-01-01 00:08:00.280000000
+---- TYPES
+INT, TIMESTAMP
+====
+---- QUERY
+# Push down TIMESTAMP IN list predicates
+select id, timestamp_col from functional_kudu.alltypes where
+timestamp_col in (cast('2010-03-01 00:00:00' as timestamp),
+                  cast('2010-03-01 00:01:00' as timestamp))
+order by id;
+---- RESULTS
+4240,2010-03-01 00:00:00
+4241,2010-03-01 00:01:00
+---- TYPES
+INT, TIMESTAMP
+====

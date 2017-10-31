@@ -36,10 +36,12 @@
 #include <sstream>
 #include "gen-cpp/Types_types.h"
 #include "rpc/TAcceptQueueServer.h"
+#include "rpc/auth-provider.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-server.h"
 #include "rpc/thrift-thread.h"
 #include "util/debug-util.h"
+#include "util/metrics.h"
 #include "util/network-util.h"
 #include "util/os-util.h"
 #include "util/uid-util.h"
@@ -58,16 +60,39 @@ using namespace apache::thrift::server;
 using namespace apache::thrift::transport;
 using namespace apache::thrift;
 
-DEFINE_int32(rpc_cnxn_attempts, 10, "Deprecated");
-DEFINE_int32(rpc_cnxn_retry_interval_ms, 2000, "Deprecated");
+DEFINE_int32_hidden(rpc_cnxn_attempts, 10, "Deprecated");
+DEFINE_int32_hidden(rpc_cnxn_retry_interval_ms, 2000, "Deprecated");
 
 DECLARE_bool(enable_accept_queue_server);
 DECLARE_string(principal);
 DECLARE_string(keytab_file);
 DECLARE_string(ssl_client_ca_certificate);
 DECLARE_string(ssl_server_certificate);
+DECLARE_string(ssl_cipher_list);
 
 namespace impala {
+
+// Specifies the allowed set of values for --ssl_minimum_version. To keep consistent with
+// Apache Kudu, specifying a single version enables all versions including and succeeding
+// that one (e.g. TLSv1.1 enables v1.1 and v1.2). Specifying TLSv1.1_only enables only
+// v1.1.
+map<string, SSLProtocol> SSLProtoVersions::PROTO_MAP = {
+#if OPENSSL_VERSION_NUMBER >= 0x10001000L
+    {"tlsv1.2", TLSv1_2_plus}, {"tlsv1.2_only", TLSv1_2}, {"tlsv1.1", TLSv1_1_plus},
+    {"tlsv1.1_only", TLSv1_1},
+#endif
+    {"tlsv1", TLSv1_0_plus}, {"tlsv1_only", TLSv1_0}};
+
+Status SSLProtoVersions::StringToProtocol(const string& in, SSLProtocol* protocol) {
+  for (const auto& proto : SSLProtoVersions::PROTO_MAP) {
+    if (iequals(in, proto.first)) {
+      *protocol = proto.second;
+      return Status::OK();
+    }
+  }
+
+  return Status(Substitute("Unknown TLS version: '$0'", in));
+}
 
 bool EnableInternalSslConnections() {
   // Enable SSL between servers only if both the client validation certificate and the
@@ -327,11 +352,14 @@ ThriftServer::ThriftServer(const string& name,
   }
 }
 
+namespace {
+
 /// Factory subclass to override getPassword() which provides a password string to Thrift
 /// to decrypt the private key file.
 class ImpalaSslSocketFactory : public TSSLSocketFactory {
  public:
-  ImpalaSslSocketFactory(const string& password) : password_(password) { }
+  ImpalaSslSocketFactory(SSLProtocol version, const string& password)
+    : TSSLSocketFactory(version), password_(password) {}
 
  protected:
   virtual void getPassword(string& output, int size) {
@@ -343,15 +371,17 @@ class ImpalaSslSocketFactory : public TSSLSocketFactory {
   /// The password string.
   const string password_;
 };
-
+}
 Status ThriftServer::CreateSocket(boost::shared_ptr<TServerTransport>* socket) {
   if (ssl_enabled()) {
-    // This 'factory' is only called once, since CreateSocket() is only called from
-    // Start()
-    boost::shared_ptr<TSSLSocketFactory> socket_factory(
-        new ImpalaSslSocketFactory(key_password_));
-    socket_factory->overrideDefaultPasswordCallback();
     try {
+      // This 'factory' is only called once, since CreateSocket() is only called from
+      // Start(). The c'tor may throw if there is an error initializing the SSL context.
+      boost::shared_ptr<TSSLSocketFactory> socket_factory(
+          new ImpalaSslSocketFactory(version_, key_password_));
+      socket_factory->overrideDefaultPasswordCallback();
+
+      if (!cipher_list_.empty()) socket_factory->ciphers(cipher_list_);
       socket_factory->loadCertificate(certificate_path_.c_str());
       socket_factory->loadPrivateKey(private_key_path_.c_str());
       socket->reset(new TSSLServerSocket(port_, socket_factory));
@@ -365,8 +395,9 @@ Status ThriftServer::CreateSocket(boost::shared_ptr<TServerTransport>* socket) {
   }
 }
 
-Status ThriftServer::EnableSsl(const string& certificate, const string& private_key,
-    const string& pem_password_cmd) {
+Status ThriftServer::EnableSsl(SSLProtocol version, const string& certificate,
+    const string& private_key, const string& pem_password_cmd,
+    const std::string& ciphers) {
   DCHECK(!started_);
   if (certificate.empty()) return Status(TErrorCode::SSL_CERTIFICATE_PATH_BLANK);
   if (private_key.empty()) return Status(TErrorCode::SSL_PRIVATE_KEY_PATH_BLANK);
@@ -383,6 +414,8 @@ Status ThriftServer::EnableSsl(const string& certificate, const string& private_
   ssl_enabled_ = true;
   certificate_path_ = certificate;
   private_key_path_ = private_key;
+  cipher_list_ = ciphers;
+  version_ = version;
 
   if (!pem_password_cmd.empty()) {
     if (!RunShellProcess(pem_password_cmd, &key_password_, true)) {

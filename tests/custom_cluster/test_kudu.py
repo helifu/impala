@@ -19,10 +19,10 @@ import logging
 import pytest
 from kudu.schema import INT32
 
-from tests.common import KUDU_MASTER_HOSTS
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.kudu_test_suite import KuduTestSuite
 
+KUDU_MASTER_HOSTS = pytest.config.option.kudu_master_hosts
 LOG = logging.getLogger(__name__)
 
 class TestKuduOperations(CustomClusterTestSuite, KuduTestSuite):
@@ -30,6 +30,16 @@ class TestKuduOperations(CustomClusterTestSuite, KuduTestSuite):
   @classmethod
   def get_workload(cls):
     return 'functional-query'
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(impalad_args=\
+      "--use_local_tz_for_unix_timestamp_conversions=true")
+  def test_local_tz_conversion_ops(self, vector, unique_database):
+    """IMPALA-5539: Test Kudu timestamp reads/writes are correct with the
+       use_local_tz_for_unix_timestamp_conversions flag."""
+    # These tests provide enough coverage of queries with timestamps.
+    self.run_test_case('QueryTest/kudu-scan-node', vector, use_db=unique_database)
+    self.run_test_case('QueryTest/kudu_insert', vector, use_db=unique_database)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args="-kudu_master_hosts=")

@@ -44,6 +44,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.util.MetaStoreUtil;
@@ -260,6 +261,77 @@ public class AnalyzeDDLTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestAlterTableAddMultiplePartitions() {
+    for (String cl: new String[]{"if not exists", ""}) {
+      // Add multiple partitions.
+      AnalyzesOk("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10)" +
+          " partition(year=2050, month=11)" +
+          " partition(year=2050, month=12)");
+      // Duplicate partition specifications.
+      AnalysisError("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10)" +
+          " partition(year=2050, month=11)" +
+          " partition(Month=10, YEAR=2050)",
+          "Duplicate partition spec: (month=10, year=2050)");
+
+      // Multiple partitions with locations and caching.
+      AnalyzesOk("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10) location" +
+          " '/test-warehouse/alltypes/y2050m10' cached in 'testPool'" +
+          " partition(year=2050, month=11) location" +
+          " 'hdfs://localhost:20500/test-warehouse/alltypes/y2050m11'" +
+          " cached in 'testPool' with replication = 7" +
+          " partition(year=2050, month=12) location" +
+          " 'file:///test-warehouse/alltypes/y2050m12' uncached");
+      // One of the partitions points to an invalid URI.
+      AnalysisError("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10) location" +
+          " '/test-warehouse/alltypes/y2050m10' cached in 'testPool'" +
+          " partition(year=2050, month=11) location" +
+          " 'hdfs://localhost:20500/test-warehouse/alltypes/y2050m11'" +
+          " cached in 'testPool' with replication = 7" +
+          " partition(year=2050, month=12) location" +
+          " 'fil:///test-warehouse/alltypes/y2050m12' uncached",
+          "No FileSystem for scheme: fil");
+      // One of the partitions is cached in a non-existent pool.
+      AnalysisError("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10) location" +
+          " '/test-warehouse/alltypes/y2050m10' cached in 'testPool'" +
+          " partition(year=2050, month=11) location" +
+          " 'hdfs://localhost:20500/test-warehouse/alltypes/y2050m11'" +
+          " cached in 'nonExistentTestPool' with replication = 7" +
+          " partition(year=2050, month=12) location" +
+          " 'file:///test-warehouse/alltypes/y2050m12' uncached",
+          "The specified cache pool does not exist: nonExistentTestPool");
+    }
+
+    // Test the limit for the number of partitions
+    StringBuilder stmt = new StringBuilder("alter table functional.alltypes add");
+    int year;
+    int month;
+    for (int i = 0; i < CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC; ++i) {
+      year = i/12 + 2050;
+      month = i%12 + 1;
+      stmt.append(String.format(" partition(year=%d, month=%d)", year, month));
+    }
+    AnalyzesOk(stmt.toString());
+    // Over the limit by one partition
+    year = CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC/12 + 2050;
+    month = CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC%12 + 1;
+    stmt.append(String.format(" partition(year=%d, month=%d)", year, month));
+    AnalysisError(stmt.toString(),
+        String.format("One ALTER TABLE ADD PARTITION cannot add more than %d partitions.",
+        CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC));
+
+    // If 'IF NOT EXISTS' is not used, ALTER TABLE ADD PARTITION cannot add a preexisting
+    // partition to a table.
+    AnalysisError("alter table functional.alltypes add partition(year=2050, month=1)" +
+        "partition(year=2010, month=1) partition(year=2050, month=2)",
+        "Partition spec already exists: (year=2010, month=1)");
+  }
+
+  @Test
   public void TestAlterTableAddReplaceColumns() throws AnalysisException {
     AnalyzesOk("alter table functional.alltypes add columns (new_col int)");
     AnalyzesOk("alter table functional.alltypes add columns (c1 string comment 'hi')");
@@ -406,7 +478,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
     // Cannot ALTER TABLE CHANGE COLUMN on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes CHANGE COLUMN int_col i int",
-        "ALTER TABLE CHANGE COLUMN not currently supported on HBase tables.");
+        "ALTER TABLE CHANGE/ALTER COLUMN not currently supported on HBase tables.");
   }
 
   @Test
@@ -424,7 +496,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("alter table functional.stringpartitionkey PARTITION " +
                "(string_col='partition1') set fileformat parquet");
     AnalyzesOk("alter table functional.stringpartitionkey PARTITION " +
-               "(string_col='PaRtiTion1') set location '/a/b/c'");
+               "(string_col='partition1') set location '/a/b/c'");
     AnalyzesOk("alter table functional.alltypes PARTITION (year=2010, month=11) " +
                "set tblproperties('a'='1')");
     AnalyzesOk("alter table functional.alltypes PARTITION (year<=2010, month=11) " +
@@ -433,6 +505,19 @@ public class AnalyzeDDLTest extends FrontendTestBase {
                "set serdeproperties ('a'='2')");
     AnalyzesOk("alter table functional.alltypes PARTITION (year<=2010, month=11) " +
                "set serdeproperties ('a'='2')");
+
+    AnalyzesOk("alter table functional.alltypes set tblproperties('sort.columns'='id')");
+    AnalyzesOk("alter table functional.alltypes set tblproperties(" +
+               "'sort.columns'='INT_COL,id')");
+    AnalyzesOk("alter table functional.alltypes set tblproperties(" +
+               "'sort.columns'='bool_col,int_col,id')");
+    AnalyzesOk("alter table functional.alltypes set tblproperties('sort.columns'='')");
+    AnalysisError("alter table functional.alltypes set tblproperties(" +
+               "'sort.columns'='id,int_col,id')",
+               "Duplicate column in SORT BY list: id");
+    AnalysisError("alter table functional.alltypes set tblproperties(" +
+               "'sort.columns'='ID, foo')",
+               "Could not find SORT BY column 'foo' in table.");
 
     {
       // Check that long_properties fail at the analysis layer
@@ -952,6 +1037,20 @@ public class AnalyzeDDLTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestAlterTableSortBy() {
+    AnalyzesOk("alter table functional.alltypes sort by (id)");
+    AnalyzesOk("alter table functional.alltypes sort by (int_col,id)");
+    AnalyzesOk("alter table functional.alltypes sort by (bool_col,int_col,id)");
+    AnalyzesOk("alter table functional.alltypes sort by ()");
+    AnalysisError("alter table functional.alltypes sort by (id,int_col,id)",
+        "Duplicate column in SORT BY list: id");
+    AnalysisError("alter table functional.alltypes sort by (id, foo)", "Could not find " +
+        "SORT BY column 'foo' in table.");
+    AnalysisError("alter table functional_hbase.alltypes sort by (id, foo)",
+        "ALTER TABLE SORT BY not supported on HBase tables.");
+  }
+
+  @Test
   public void TestAlterView() {
     // View-definition references a table.
     AnalyzesOk("alter view functional.alltypes_view as " +
@@ -1028,6 +1127,35 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Cannot ALTER VIEW a able.
     AnalysisError("alter view functional.alltypes rename to new_alltypes",
         "ALTER VIEW not allowed on a table: functional.alltypes");
+  }
+
+  @Test
+  public void TestAlterTableAlterColumn() throws AnalysisException {
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col set default 0");
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col set " +
+        "compression LZ4 encoding RLE");
+    AnalyzesOk("alter table functional.alltypes alter int_col set comment 'a'");
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col drop default");
+
+    AnalysisError("alter table functional_kudu.alltypes alter id set default 0",
+        "Cannot set default value for primary key column 'id'");
+    AnalysisError("alter table functional_kudu.alltypes alter id drop default",
+        "Cannot drop default value for primary key column 'id'");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set default 'a'",
+        "Default value 'a' (type: STRING) is not compatible with column 'int_col' " +
+        "(type: INT)");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set " +
+        "encoding rle compression error", "Unsupported compression algorithm 'ERROR'");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set primary key",
+        "Altering a column to be a primary key is not supported.");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set not null",
+        "Altering the nullability of a column is not supported.");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set comment 'a'",
+        "Kudu does not support column comments.");
+    AnalysisError("alter table functional.alltypes alter int_col set compression lz4",
+        "Unsupported column options for non-Kudu table: 'int_col INT COMPRESSION LZ4'");
+    AnalysisError("alter table functional.alltypes alter int_col drop default",
+        "Unsupported column option for non-Kudu table: DROP DEFAULT");
   }
 
   void checkComputeStatsStmt(String stmt) throws AnalysisException {
@@ -1295,15 +1423,20 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create table default.newtbl_DNE like parquet "
         + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
     AnalyzesOk("create table newtbl_DNE like parquet "
-        + "'/test-warehouse/schemas/zipcode_incomes.parquet' STORED AS PARQUET");
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet' stored as parquet");
     AnalyzesOk("create external table newtbl_DNE like parquet "
-        + "'/test-warehouse/schemas/zipcode_incomes.parquet' STORED AS PARQUET");
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet' sort by (id,zip) "
+        + "stored as parquet");
+    AnalyzesOk("create table newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet' sort by (id,zip)");
     AnalyzesOk("create table if not exists functional.zipcode_incomes like parquet "
         + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
     AnalyzesOk("create table if not exists newtbl_DNE like parquet "
         + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
     AnalyzesOk("create table if not exists newtbl_DNE like parquet "
         + "'/test-warehouse/schemas/decimal.parquet'");
+    AnalyzesOk("create table if not exists newtbl_DNE like parquet'"
+        + " /test-warehouse/schemas/enum/enum.parquet'");
 
     // check we error in the same situations as standard create table
     AnalysisError("create table functional.zipcode_incomes like parquet "
@@ -1454,6 +1587,13 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "partition value = 30) stored as kudu as select id, bool_col, tinyint_col, " +
         "smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, " +
         "string_col from functional.alltypestiny");
+    // Creating unpartitioned table results in a warning.
+    AnalyzesOk("create table t primary key(id) stored as kudu as select id, bool_col " +
+        "from functional.alltypestiny",
+        "Unpartitioned Kudu tables are inefficient for large data sizes.");
+    // IMPALA-5796: CTAS into a Kudu table with expr rewriting.
+    AnalyzesOk("create table t primary key(id) stored as kudu as select id, bool_col " +
+        "from functional.alltypestiny where id between 0 and 10");
     // CTAS in an external Kudu table
     AnalysisError("create external table t stored as kudu " +
         "tblproperties('kudu.table_name'='t') as select id, int_col from " +
@@ -1461,9 +1601,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "external Kudu tables.");
 
     // CTAS into Kudu tables with unsupported types
-    AnalysisError("create table t primary key (id) partition by hash partitions 3" +
-        " stored as kudu as select id, timestamp_col from functional.alltypestiny",
-        "Cannot create table 't': Type TIMESTAMP is not supported in Kudu");
     AnalysisError("create table t primary key (cs) partition by hash partitions 3" +
         " stored as kudu as select cs from functional.chars_tiny",
         "Cannot create table 't': Type CHAR(5) is not supported in Kudu");
@@ -1537,6 +1674,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "CREATE TABLE LIKE is not supported for Kudu tables");
     AnalysisError("create table tbl like functional_kudu.dimtbl", "Cloning a Kudu " +
         "table using CREATE TABLE LIKE is not supported.");
+
+    // Test sort columns.
+    AnalyzesOk("create table tbl sort by (int_col,id) like functional.alltypes");
+    AnalysisError("create table tbl sort by (int_col,foo) like functional.alltypes",
+        "Could not find SORT BY column 'foo' in table.");
   }
 
   @Test
@@ -1727,12 +1869,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Invalid column/field name: ???");
     AnalysisError("create table new_table (i int) PARTITIONED BY (`^&*` int)",
         "Invalid column/field name: ^&*");
-    // Test HMS constraint on type name length.
-    AnalyzesOk(String.format("create table t (i %s)",
-        genTypeSql(MetaStoreUtil.MAX_TYPE_NAME_LENGTH)));
-    AnalysisError(String.format("create table t (i %s)",
-        genTypeSql(MetaStoreUtil.MAX_TYPE_NAME_LENGTH + 1)),
-        "Type of column 'i' exceeds maximum type length of 4000 characters:");
     // Test HMS constraint on comment length.
     AnalyzesOk(String.format("create table t (i int comment '%s')",
         StringUtils.repeat("c", MetaStoreUtil.CREATE_MAX_COMMENT_LENGTH)));
@@ -1791,39 +1927,27 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           "Tables produced by an external data source do not support the column type: " +
           type.name());
     }
-  }
 
-  /**
-   * Generates a valid type string with exactly the given number of characters.
-   * The type is a struct with at least two fields.
-   * The given length must be at least "struct<s:int,c:int>".length() == 19.
-   */
-  private String genTypeSql(int length) {
-    Preconditions.checkState(length >= 19);
-    StringBuilder result = new StringBuilder();
-    result.append("struct<s:int");
-    // The middle fields always have a fixed length.
-    int midFieldLen = ",f000:int".length();
-    // The last field has a variable length, but this is the minimum.
-    int lastFieldMinLen = ",f:int".length();
-    int fieldIdx = 0;
-    while (result.length() < length - midFieldLen - lastFieldMinLen) {
-      String fieldStr = String.format(",f%03d:int", fieldIdx);
-      result.append(fieldStr);
-      ++fieldIdx;
-    }
-    Preconditions.checkState(result.length() == length - 1 ||
-        result.length() < length - lastFieldMinLen);
-    // Generate last field with a variable length.
-    if (result.length() < length - 1) {
-      int fieldNameLen = length - result.length() - ",:int".length() - 1;
-      Preconditions.checkState(fieldNameLen > 0);
-      String fieldStr = String.format(",%s:int", StringUtils.repeat("f", fieldNameLen));
-      result.append(fieldStr);
-    }
-    result.append(">");
-    Preconditions.checkState(result.length() == length);
-    return result.toString();
+    // Tables with sort columns
+    AnalyzesOk("create table functional.new_table (i int, j int) sort by (i)");
+    AnalyzesOk("create table functional.new_table (i int, j int) sort by (i, j)");
+    AnalyzesOk("create table functional.new_table (i int, j int) sort by (j, i)");
+
+    // 'sort.columns' property not supported in table definition.
+    AnalysisError("create table Foo (i int) sort by (i) " +
+        "tblproperties ('sort.columns'='i')", "Table definition must not contain the " +
+        "sort.columns table property. Use SORT BY (...) instead.");
+
+    // Column in sort by list must exist.
+    AnalysisError("create table functional.new_table (i int) sort by (j)", "Could not " +
+        "find SORT BY column 'j' in table.");
+
+    // Partitioned HDFS table
+    AnalyzesOk("create table functional.new_table (i int) PARTITIONED BY (d decimal)" +
+        "SORT BY (i)");
+    // Column in sort by list must not be a Hdfs partition column.
+    AnalysisError("create table functional.new_table (i int) PARTITIONED BY (d decimal)" +
+        "SORT BY (d)", "SORT BY column list must not contain partition column: 'd'");
   }
 
   @Test
@@ -1863,17 +1987,16 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("alter table functional_kudu.testtbl add columns (a int primary key)",
         "Cannot add a primary key using an ALTER TABLE ADD COLUMNS statement: " +
         "a INT PRIMARY KEY");
-    // Non-nullable columns require a default value
+    // Columns requiring a default value
     AnalyzesOk("alter table functional_kudu.testtbl add columns (a1 int not null " +
         "default 10)");
-    // Unsupported column options
-    String[] unsupportedColOptions = {"encoding rle", "compression lz4", "block_size 10"};
-    for (String colOption: unsupportedColOptions) {
-      AnalysisError(String.format("alter table functional_kudu.testtbl add columns " +
-          "(a1 int %s)", colOption), String.format("ENCODING, COMPRESSION and " +
-          "BLOCK_SIZE options cannot be specified in an ALTER TABLE ADD COLUMNS " +
-          "statement: a1 INT %s", colOption.toUpperCase()));
-    }
+    AnalyzesOk("alter table functional_kudu.testtbl add columns (a1 int null " +
+        "default 10)");
+    // Other Kudu column options
+    AnalyzesOk("alter table functional_kudu.testtbl add columns (a int encoding rle)");
+    AnalyzesOk("alter table functional_kudu.testtbl add columns (a int compression lz4)");
+    AnalyzesOk("alter table functional_kudu.testtbl add columns (a int block_size 10)");
+
     // REPLACE columns is not supported for Kudu tables
     AnalysisError("alter table functional_kudu.testtbl replace columns (a int null)",
         "ALTER TABLE REPLACE COLUMNS is not supported on Kudu tables");
@@ -1894,8 +2017,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Unsupported column options
     AnalysisError("alter table functional_kudu.testtbl change column zip zip_code int " +
         "encoding rle compression lz4 default 90000", "Unsupported column options in " +
-        "ALTER TABLE CHANGE COLUMN statement: zip_code INT ENCODING RLE COMPRESSION " +
-        "LZ4 DEFAULT 90000");
+        "ALTER TABLE CHANGE COLUMN statement: 'zip_code INT ENCODING RLE COMPRESSION " +
+        "LZ4 DEFAULT 90000'. Use ALTER TABLE ALTER COLUMN instead.");
+    AnalysisError(
+        "alter table functional_kudu.testtbl change column zip zip int comment 'comment'",
+        "Kudu does not support column comments.");
     // Changing the column type is not supported for Kudu tables
     AnalysisError("alter table functional_kudu.testtbl change column zip zip bigint",
         "Cannot change the type of a Kudu column using an ALTER TABLE CHANGE COLUMN " +
@@ -1907,6 +2033,15 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
     // ALTER TABLE RENAME TO
     AnalyzesOk("ALTER TABLE functional_kudu.testtbl RENAME TO new_testtbl");
+
+    // ALTER TABLE SORT BY
+    AnalysisError("alter table functional_kudu.alltypes sort by (int_col)",
+        "ALTER TABLE SORT BY not supported on Kudu tables.");
+
+    // ALTER TABLE SET TBLPROPERTIES for sort.columns
+    AnalysisError("alter table functional_kudu.alltypes set tblproperties(" +
+        "'sort.columns'='int_col')",
+        "'sort.columns' table property is not supported for Kudu tables.");
   }
 
   @Test
@@ -1923,6 +2058,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "partition by hash(x) partitions 8 stored as kudu");
     AnalyzesOk("create table tab (x int, y int, primary key(x, y)) " +
         "partition by hash(y) partitions 8 stored as kudu");
+    AnalyzesOk("create table tab (x timestamp, y timestamp, primary key(x)) " +
+        "partition by hash(x) partitions 8 stored as kudu");
     AnalyzesOk("create table tab (x int, y string, primary key (x)) partition by " +
         "hash (x) partitions 3, range (x) (partition values < 1, partition " +
         "1 <= values < 10, partition 10 <= values < 20, partition value = 30) " +
@@ -2067,9 +2204,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (x int) tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler')",
         CreateTableStmt.KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
-    AnalysisError("create table tab (x int primary key) stored as kudu tblproperties (" +
+    // Creating unpartitioned table results in a warning.
+    AnalyzesOk("create table tab (x int primary key) stored as kudu tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler')",
-        CreateTableStmt.KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
+        "Unpartitioned Kudu tables are inefficient for large data sizes.");
     // Invalid value for number of replicas
     AnalysisError("create table t (x int primary key) stored as kudu tblproperties (" +
         "'kudu.num_tablet_replicas'='1.1')",
@@ -2081,9 +2219,9 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (a int primary key) partition by hash (a) " +
         "partitions 3 stored as kudu location '/test-warehouse/'",
         "LOCATION cannot be specified for a Kudu table.");
-    // PARTITION BY is required for managed tables.
-    AnalysisError("create table tab (a int, primary key (a)) stored as kudu",
-        "Table partitioning must be specified for managed Kudu tables.");
+    // Creating unpartitioned table results in a warning.
+    AnalyzesOk("create table tab (a int, primary key (a)) stored as kudu",
+        "Unpartitioned Kudu tables are inefficient for large data sizes.");
     AnalysisError("create table tab (a int) stored as kudu",
         "A primary key is required for a Kudu table.");
     // Using ROW FORMAT with a Kudu table
@@ -2097,7 +2235,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
     // Test unsupported Kudu types
     List<String> unsupportedTypes = Lists.newArrayList(
-        "DECIMAL(9,0)", "TIMESTAMP", "VARCHAR(20)", "CHAR(20)",
+        "DECIMAL(9,0)", "VARCHAR(20)", "CHAR(20)",
         "STRUCT<F1:INT,F2:STRING>", "ARRAY<INT>", "MAP<STRING,STRING>");
     for (String t: unsupportedTypes) {
       String expectedError = String.format(
@@ -2123,11 +2261,22 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         for (String nul: nullability) {
           for (String def: defaultVal) {
             for (String block: blockSize) {
+              // Test analysis for a non-key column
               AnalyzesOk(String.format("create table tab (x int primary key " +
                   "not null encoding %s compression %s %s %s, y int encoding %s " +
                   "compression %s %s %s %s) partition by hash (x) " +
                   "partitions 3 stored as kudu", enc, comp, def, block, enc,
                   comp, def, nul, block));
+
+              // For a key column
+              String createTblStr = String.format("create table tab (x int primary key " +
+                  "%s encoding %s compression %s %s %s) partition by hash (x) " +
+                  "partitions 3 stored as kudu", nul, enc, comp, def, block);
+              if (nul.equals("null")) {
+                AnalysisError(createTblStr, "Primary key columns cannot be nullable");
+              } else {
+                AnalyzesOk(createTblStr);
+              }
             }
           }
         }
@@ -2202,6 +2351,61 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (i int primary key block_size 'val') " +
         "partition by hash (i) partitions 3 stored as kudu", "Invalid value " +
         "for BLOCK_SIZE: 'val'. A positive INTEGER value is expected.");
+
+    // Sort columns are not supported for Kudu tables.
+    AnalysisError("create table tab (i int, x int primary key) partition by hash(x) " +
+        "partitions 8 sort by(i) stored as kudu", "SORT BY is not supported for Kudu " +
+        "tables.");
+
+    // Range partitions with TIMESTAMP
+    AnalyzesOk("create table ts_ranges (ts timestamp primary key) " +
+        "partition by range (partition cast('2009-01-01 00:00:00' as timestamp) " +
+        "<= VALUES < '2009-01-02 00:00:00') stored as kudu");
+    AnalyzesOk("create table ts_ranges (ts timestamp primary key) " +
+        "partition by range (partition value = cast('2009-01-01 00:00:00' as timestamp" +
+        ")) stored as kudu");
+    AnalyzesOk("create table ts_ranges (ts timestamp primary key) " +
+        "partition by range (partition value = '2009-01-01 00:00:00') " +
+        "stored as kudu");
+    AnalyzesOk("create table ts_ranges (id int, ts timestamp, primary key(id, ts))" +
+        "partition by range (partition value = (9, cast('2009-01-01 00:00:00' as " +
+        "timestamp))) stored as kudu");
+    AnalyzesOk("create table ts_ranges (id int, ts timestamp, primary key(id, ts))" +
+        "partition by range (partition value = (9, '2009-01-01 00:00:00')) " +
+        "stored as kudu");
+    AnalysisError("create table ts_ranges (ts timestamp primary key, i int)" +
+        "partition by range (partition '2009-01-01 00:00:00' <= VALUES < " +
+        "'NOT A TIMESTAMP') stored as kudu",
+        "Range partition value 'NOT A TIMESTAMP' cannot be cast to target TIMESTAMP " +
+        "partitioning column.");
+    AnalysisError("create table ts_ranges (ts timestamp primary key, i int)" +
+        "partition by range (partition 100 <= VALUES < 200) stored as kudu",
+        "Range partition value 100 (type: TINYINT) is not type " +
+        "compatible with partitioning column 'ts' (type: TIMESTAMP).");
+
+    // TIMESTAMP columns with default values
+    AnalyzesOk("create table tdefault (id int primary key, ts timestamp default now())" +
+        "partition by hash(id) partitions 3 stored as kudu");
+    AnalyzesOk("create table tdefault (id int primary key, ts timestamp default " +
+        "unix_micros_to_utc_timestamp(1230768000000000)) partition by hash(id) " +
+        "partitions 3 stored as kudu");
+    AnalyzesOk("create table tdefault (id int primary key, " +
+        "ts timestamp not null default '2009-01-01 00:00:00') " +
+        "partition by hash(id) partitions 3 stored as kudu");
+    AnalyzesOk("create table tdefault (id int primary key, " +
+        "ts timestamp not null default cast('2009-01-01 00:00:00' as timestamp)) " +
+        "partition by hash(id) partitions 3 stored as kudu");
+    AnalysisError("create table tdefault (id int primary key, ts timestamp " +
+        "default null) partition by hash(id) partitions 3 stored as kudu",
+        "NULL cannot be cast to a TIMESTAMP literal.");
+    AnalysisError("create table tdefault (id int primary key, " +
+        "ts timestamp not null default cast('00:00:00' as timestamp)) " +
+        "partition by hash(id) partitions 3 stored as kudu",
+        "CAST('00:00:00' AS TIMESTAMP) cannot be cast to a TIMESTAMP literal.");
+    AnalysisError("create table tdefault (id int primary key, " +
+        "ts timestamp not null default '2009-1 foo') " +
+        "partition by hash(id) partitions 3 stored as kudu",
+        "String '2009-1 foo' cannot be cast to a TIMESTAMP literal.");
   }
 
   @Test
@@ -2231,7 +2435,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "'kudu.table_name'='t')", CreateTableStmt.KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
     AnalysisError("create external table t stored as kudu tblproperties (" +
         "'storage_handler'='foo', 'kudu.table_name'='t')",
-        CreateTableStmt.KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
+        "Invalid storage handler specified for Kudu table: foo");
     // Cannot specify the number of replicas for external Kudu tables
     AnalysisError("create external table tab (x int) stored as kudu " +
         "tblproperties ('kudu.num_tablet_replicas' = '1', " +
@@ -2926,6 +3130,9 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create aggregate function foo(int) RETURNS struct<f:int> " +
         loc + "UPDATE_FN='AggUpdate'",
         "Type 'STRUCT<f:INT>' is not supported in UDFs/UDAs.");
+    AnalysisError("create aggregate function foo(int) RETURNS int " +
+        "INTERMEDIATE fixed_uda_intermediate(10) " + loc + " UPDATE_FN='foo'",
+        "Syntax error in line 1");
 
     // Test missing .ll file. TODO: reenable when we can run IR UDAs
     AnalysisError("create aggregate function foo(int) RETURNS int LOCATION " +

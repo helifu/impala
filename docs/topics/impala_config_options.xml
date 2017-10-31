@@ -34,29 +34,29 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">defaults file</indexterm>
+      <indexterm audience="hidden">defaults file</indexterm>
 
-      <indexterm audience="Cloudera">configuration file</indexterm>
+      <indexterm audience="hidden">configuration file</indexterm>
 
-      <indexterm audience="Cloudera">options</indexterm>
+      <indexterm audience="hidden">options</indexterm>
 
-      <indexterm audience="Cloudera">IMPALA_STATE_STORE_PORT</indexterm>
+      <indexterm audience="hidden">IMPALA_STATE_STORE_PORT</indexterm>
 
-      <indexterm audience="Cloudera">IMPALA_BACKEND_PORT</indexterm>
+      <indexterm audience="hidden">IMPALA_BACKEND_PORT</indexterm>
 
-      <indexterm audience="Cloudera">IMPALA_LOG_DIR</indexterm>
+      <indexterm audience="hidden">IMPALA_LOG_DIR</indexterm>
 
-      <indexterm audience="Cloudera">IMPALA_STATE_STORE_ARGS</indexterm>
+      <indexterm audience="hidden">IMPALA_STATE_STORE_ARGS</indexterm>
 
-      <indexterm audience="Cloudera">IMPALA_SERVER_ARGS</indexterm>
+      <indexterm audience="hidden">IMPALA_SERVER_ARGS</indexterm>
 
-      <indexterm audience="Cloudera">ENABLE_CORE_DUMPS</indexterm>
+      <indexterm audience="hidden">ENABLE_CORE_DUMPS</indexterm>
 
-      <indexterm audience="Cloudera">core dumps</indexterm>
+      <indexterm audience="hidden">core dumps</indexterm>
 
-      <indexterm audience="Cloudera">restarting services</indexterm>
+      <indexterm audience="hidden">restarting services</indexterm>
 
-      <indexterm audience="Cloudera">services</indexterm>
+      <indexterm audience="hidden">services</indexterm>
       The configuration options for the Impala-related daemons let you choose which hosts and
       ports to use for the services that run on a single host, specify directories for logging,
       control resource usage and security, and specify other aspects of the Impala software.
@@ -66,46 +66,14 @@ under the License.
 
   </conbody>
 
-  <concept id="config_options_cm">
-
-    <title>Configuring Impala Startup Options through Cloudera Manager</title>
-
-    <conbody>
-
-      <p>
-        If you manage your cluster through Cloudera Manager, configure the settings for all the
-        Impala-related daemons by navigating to this page:
-        <menucascade><uicontrol>Clusters</uicontrol><uicontrol>Impala</uicontrol><uicontrol>Configuration</uicontrol><uicontrol>View
-        and Edit</uicontrol></menucascade>. See the Cloudera Manager documentation for
-        <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cm_mc_impala_service.html" scope="external" format="html">instructions
-        about how to configure Impala through Cloudera Manager</xref>.
-      </p>
-
-      <p>
-        If the Cloudera Manager interface does not yet have a form field for a newly added
-        option, or if you need to use special options for debugging and troubleshooting, the
-        <uicontrol>Advanced</uicontrol> option page for each daemon includes one or more fields
-        where you can enter option names directly.
-        <ph conref="../shared/impala_common.xml#common/safety_valve"/> There is also a free-form
-        field for query options, on the top-level <uicontrol>Impala Daemon</uicontrol> options
-        page.
-      </p>
-
-    </conbody>
-
-  </concept>
-
   <concept id="config_options_noncm">
 
     <title>Configuring Impala Startup Options through the Command Line</title>
 
     <conbody>
 
-      <p>
-        When you run Impala in a non-Cloudera Manager environment, the Impala server,
-        statestore, and catalog services start up using values provided in a defaults file,
-        <filepath>/etc/default/impala</filepath>.
-      </p>
+      <p> The Impala server, statestore, and catalog services start up using values provided in a
+        defaults file, <filepath>/etc/default/impala</filepath>. </p>
 
       <p>
         This file includes information about many resources used by Impala. Most of the defaults
@@ -115,8 +83,7 @@ under the License.
         might modify includes:
       </p>
 
-<!-- Note: Update the following example for each release with the associated lines from /etc/default/impala
-           from a non-CM-managed system. -->
+<!-- Note: Update the following example for each release with the associated lines from /etc/default/impala. -->
 
 <codeblock rev="ver">IMPALA_STATE_STORE_HOST=127.0.0.1
 IMPALA_STATE_STORE_PORT=24000
@@ -131,7 +98,6 @@ IMPALA_SERVER_ARGS=" \
 -log_dir=${IMPALA_LOG_DIR} \
 -catalog_service_host=${IMPALA_CATALOG_SERVICE_HOST} \
 -state_store_port=${IMPALA_STATE_STORE_PORT} \
--use_statestore \
 -state_store_host=${IMPALA_STATE_STORE_HOST} \
 -be_port=${IMPALA_BACKEND_PORT}"
 export ENABLE_CORE_DUMPS=${ENABLE_COREDUMPS:-false}</codeblock>
@@ -185,8 +151,8 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         <li rev="1.2">
           <p>
             Catalog server address (including both the hostname and the port number). Update the
-            value of the <codeph>IMPALA_CATALOG_SERVICE_HOST</codeph> variable. Cloudera
-            recommends the catalog server be on the same host as the statestore. In that
+            value of the <codeph>IMPALA_CATALOG_SERVICE_HOST</codeph> variable. Where
+            practical, run the catalog server on the same host as the statestore. In that
             recommended configuration, the <cmdname>impalad</cmdname> daemon cannot refer to the
             catalog server using the loopback address. If the catalog service is hosted on a
             machine with an IP address of 192.168.0.27, add the following line:
@@ -212,14 +178,14 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
 <codeblock>export IMPALA_SERVER_ARGS=${IMPALA_SERVER_ARGS:- \
     -log_dir=${IMPALA_LOG_DIR} \
     -state_store_port=${IMPALA_STATE_STORE_PORT} \
-    -use_statestore -state_store_host=${IMPALA_STATE_STORE_HOST} \
+    -state_store_host=${IMPALA_STATE_STORE_HOST} \
     -be_port=${IMPALA_BACKEND_PORT}}</codeblock>
           <p>
             to:
           </p>
 <codeblock>export IMPALA_SERVER_ARGS=${IMPALA_SERVER_ARGS:- \
     -log_dir=${IMPALA_LOG_DIR} -state_store_port=${IMPALA_STATE_STORE_PORT} \
-    -use_statestore -state_store_host=${IMPALA_STATE_STORE_HOST} \
+    -state_store_host=${IMPALA_STATE_STORE_HOST} \
     -be_port=${IMPALA_BACKEND_PORT} -mem_limit=70%}</codeblock>
           <p>
             You can specify the memory limit using absolute notation such as
@@ -234,19 +200,12 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         </li>
 
         <li>
-          <p>
-            Core dump enablement. To enable core dumps on systems not managed by Cloudera
-            Manager, change:
-          </p>
+          <p> Core dump enablement. To enable core dumps, change: </p>
 <codeblock>export ENABLE_CORE_DUMPS=${ENABLE_COREDUMPS:-false}</codeblock>
           <p>
             to:
           </p>
 <codeblock>export ENABLE_CORE_DUMPS=${ENABLE_COREDUMPS:-true}</codeblock>
-          <p>
-            On systems managed by Cloudera Manager, enable the <uicontrol>Enable Core
-            Dump</uicontrol> setting for the Impala service.
-          </p>
 
           <note conref="../shared/impala_common.xml#common/core_dump_considerations"/>
         </li>
@@ -301,7 +260,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
           </p>
         </li>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
         <li rev="1.2">
           <p>
           Options for resource management, in conjunction with the YARN component. These options include
@@ -326,7 +285,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         </li>
       </ul>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
       <p conref="impala_resource_management.xml#rm_options/resource_management_impalad_options"/>
 -->
 
@@ -339,11 +298,11 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         </p>
       </note>
 
-      <p audience="Cloudera" outputclass="toc inpage"/>
+      <p audience="hidden" outputclass="toc inpage"/>
 
     </conbody>
 
-    <concept audience="Cloudera" id="config_options_impalad_details">
+    <concept audience="hidden" id="config_options_impalad_details">
 
       <title>Configuration Options for impalad Daemon</title>
 
@@ -372,8 +331,8 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
           <li rev="1.2">
             <p>
               Catalog server address. Update the <codeph>IMPALA_CATALOG_SERVICE_HOST</codeph>
-              variable, including both the hostname and the port number in the value. Cloudera
-              recommends the catalog server be on the same host as the statestore. In that
+              variable, including both the hostname and the port number in the value. Where
+              practical, run the catalog server on the same host as the statestore. In that
               recommended configuration, the <cmdname>impalad</cmdname> daemon cannot refer to
               the catalog server using the loopback address. If the catalog service is hosted on
               a machine with an IP address of 192.168.0.27, add the following line:
@@ -397,14 +356,14 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
 <codeblock>export IMPALA_SERVER_ARGS=${IMPALA_SERVER_ARGS:- \
     -log_dir=${IMPALA_LOG_DIR} \
     -state_store_port=${IMPALA_STATE_STORE_PORT} \
-    -use_statestore -state_store_host=${IMPALA_STATE_STORE_HOST} \
+    -state_store_host=${IMPALA_STATE_STORE_HOST} \
     -be_port=${IMPALA_BACKEND_PORT}}</codeblock>
             <p>
               to:
             </p>
 <codeblock>export IMPALA_SERVER_ARGS=${IMPALA_SERVER_ARGS:- \
     -log_dir=${IMPALA_LOG_DIR} -state_store_port=${IMPALA_STATE_STORE_PORT} \
-    -use_statestore -state_store_host=${IMPALA_STATE_STORE_HOST} \
+    -state_store_host=${IMPALA_STATE_STORE_HOST} \
     -be_port=${IMPALA_BACKEND_PORT} -mem_limit=70%}</codeblock>
             <p>
               You can specify the memory limit using absolute notation such as
@@ -472,7 +431,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
             <cmdname>impala-shell</cmdname>.
           </li>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
           <li rev="1.2">
             Options for resource management, in conjunction with the YARN component. These options
             include <codeph>-enable_rm</codeph> and <codeph>-cgroup_hierarchy_path</codeph>.
@@ -493,7 +452,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
           </li>
         </ul>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
         <p conref="impala_resource_management.xml#rm_options/resource_management_impalad_options"/>
 -->
 
@@ -510,7 +469,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
 
     </concept>
 
-    <concept audience="Cloudera" id="config_options_statestored_details">
+    <concept audience="hidden" id="config_options_statestored_details">
 
       <title>Configuration Options for statestored Daemon</title>
 
@@ -522,7 +481,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
 
     </concept>
 
-    <concept audience="Cloudera" id="config_options_catalogd_details">
+    <concept audience="hidden" id="config_options_catalogd_details">
 
       <title>Configuration Options for catalogd Daemon</title>
 
@@ -550,9 +509,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         <codeph>http://<varname>impala_hostname</varname>:25010/varz</codeph> for the
         <cmdname>statestored</cmdname> daemon, or
         <codeph>http://<varname>impala_hostname</varname>:25020/varz</codeph> for the
-        <cmdname>catalogd</cmdname> daemon. In the Cloudera Manager interface, you can see the
-        link to the appropriate <uicontrol><varname>service_name</varname> Web UI</uicontrol>
-        page when you look at the status page for a specific daemon on a specific host.
+        <cmdname>catalogd</cmdname> daemon.
       </p>
 
     </conbody>

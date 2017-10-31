@@ -31,7 +31,9 @@
 #include "util/container-util.h"
 #include "util/debug-util.h"
 #include "util/periodic-counter-updater.h"
+#include "util/pretty-printer.h"
 #include "util/redactor.h"
+#include "util/scope-exit-trigger.h"
 
 #include "common/names.h"
 
@@ -433,6 +435,15 @@ void RuntimeProfile::PrependChild(RuntimeProfile* child, bool indent) {
   AddChildLocked(child, indent, children_.begin());
 }
 
+RuntimeProfile* RuntimeProfile::CreateChild(const string& name, bool indent,
+    bool prepend) {
+  lock_guard<SpinLock> l(children_lock_);
+  DCHECK(child_map_.find(name) == child_map_.end());
+  RuntimeProfile* child = pool_->Add(new RuntimeProfile(pool_, name));
+  AddChildLocked(child, indent, prepend ? children_.begin() : children_.end());
+  return child;
+}
+
 void RuntimeProfile::GetChildren(vector<RuntimeProfile*>* children) {
   children->clear();
   lock_guard<SpinLock> l(children_lock_);
@@ -713,37 +724,39 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
   }
 }
 
-string RuntimeProfile::SerializeToArchiveString() const {
+Status RuntimeProfile::SerializeToArchiveString(string* out) const {
   stringstream ss;
-  SerializeToArchiveString(&ss);
-  return ss.str();
+  RETURN_IF_ERROR(SerializeToArchiveString(&ss));
+  *out = ss.str();
+  return Status::OK();
 }
 
-void RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
+Status RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
+  Status status;
   TRuntimeProfileTree thrift_object;
   const_cast<RuntimeProfile*>(this)->ToThrift(&thrift_object);
   ThriftSerializer serializer(true);
   vector<uint8_t> serialized_buffer;
-  Status status = serializer.Serialize(&thrift_object, &serialized_buffer);
-  if (!status.ok()) return;
+  RETURN_IF_ERROR(serializer.Serialize(&thrift_object, &serialized_buffer));
 
   // Compress the serialized thrift string.  This uses string keys and is very
   // easy to compress.
   scoped_ptr<Codec> compressor;
-  status = Codec::CreateCompressor(NULL, false, THdfsCompression::DEFAULT, &compressor);
-  DCHECK(status.ok()) << status.GetDetail();
-  if (!status.ok()) return;
+  RETURN_IF_ERROR(
+      Codec::CreateCompressor(NULL, false, THdfsCompression::DEFAULT, &compressor));
+  const auto close_compressor =
+      MakeScopeExitTrigger([&compressor]() { compressor->Close(); });
 
   vector<uint8_t> compressed_buffer;
   compressed_buffer.resize(compressor->MaxOutputLen(serialized_buffer.size()));
   int64_t result_len = compressed_buffer.size();
-  uint8_t* compressed_buffer_ptr = &compressed_buffer[0];
-  compressor->ProcessBlock(true, serialized_buffer.size(), &serialized_buffer[0],
-      &result_len, &compressed_buffer_ptr);
+  uint8_t* compressed_buffer_ptr = compressed_buffer.data();
+  RETURN_IF_ERROR(compressor->ProcessBlock(true, serialized_buffer.size(),
+      serialized_buffer.data(), &result_len, &compressed_buffer_ptr));
   compressed_buffer.resize(result_len);
 
   Base64Encode(compressed_buffer, out);
-  compressor->Close();
+  return Status::OK();;
 }
 
 void RuntimeProfile::ToThrift(TRuntimeProfileTree* tree) const {
@@ -752,13 +765,10 @@ void RuntimeProfile::ToThrift(TRuntimeProfileTree* tree) const {
 }
 
 void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
-  nodes->reserve(nodes->size() + children_.size());
-
   int index = nodes->size();
   nodes->push_back(TRuntimeProfileNode());
   TRuntimeProfileNode& node = (*nodes)[index];
   node.name = name_;
-  node.num_children = children_.size();
   node.metadata = metadata_;
   node.indent = true;
 
@@ -830,6 +840,7 @@ void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
   {
     lock_guard<SpinLock> l(children_lock_);
     children = children_;
+    node.num_children = children_.size();
   }
   for (int i = 0; i < children.size(); ++i) {
     int child_idx = nodes->size();

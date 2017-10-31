@@ -20,10 +20,10 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
-import org.apache.impala.planner.DataPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -266,7 +266,6 @@ public class AggregateInfo extends AggregateInfoBase {
   public AggregateInfo getSecondPhaseDistinctAggInfo() {
     return secondPhaseDistinctAggInfo_;
   }
-  public AggPhase getAggPhase() { return aggPhase_; }
   public boolean isMerge() { return aggPhase_.isMerge(); }
   public boolean isDistinctAgg() { return secondPhaseDistinctAggInfo_ != null; }
   public ExprSubstitutionMap getIntermediateSmap() { return intermediateTupleSmap_; }
@@ -295,22 +294,6 @@ public class AggregateInfo extends AggregateInfoBase {
       result.add(aggregateExprs_.get(i));
     }
     return result;
-  }
-
-  /**
-   * Append ids of all slots that are being referenced in the process
-   * of performing the aggregate computation described by this AggregateInfo.
-   */
-  public void getRefdSlots(List<SlotId> ids) {
-    Preconditions.checkState(outputTupleDesc_ != null);
-    if (groupingExprs_ != null) {
-      Expr.getIds(groupingExprs_, null, ids);
-    }
-    Expr.getIds(aggregateExprs_, null, ids);
-    // The backend assumes that the entire aggTupleDesc is materialized
-    for (int i = 0; i < outputTupleDesc_.getSlots().size(); ++i) {
-      ids.add(outputTupleDesc_.getSlots().get(i).getId());
-    }
   }
 
   /**
@@ -669,11 +652,23 @@ public class AggregateInfo extends AggregateInfoBase {
   }
 
   /**
+   * Returns true if there is a single count(*) materialized aggregate expression.
+   */
+  public boolean hasCountStarOnly() {
+    if (getMaterializedAggregateExprs().size() != 1) return false;
+    if (isDistinctAgg()) return false;
+    FunctionCallExpr origExpr = getMaterializedAggregateExprs().get(0);
+    if (!origExpr.getFnName().getFunction().equalsIgnoreCase("count")) return false;
+    return origExpr.getParams().isStar();
+  }
+
+  /**
    * Validates the internal state of this agg info: Checks that the number of
    * materialized slots of the output tuple corresponds to the number of materialized
    * aggregate functions plus the number of grouping exprs. Also checks that the return
    * types of the aggregate and grouping exprs correspond to the slots in the output
-   * tuple.
+   * tuple and that the input types stored in the merge aggregation are consistent
+   * with the input exprs.
    */
   public void checkConsistency() {
     ArrayList<SlotDescriptor> slots = outputTupleDesc_.getSlots();
@@ -707,20 +702,24 @@ public class AggregateInfo extends AggregateInfoBase {
               slotType.toString()));
       ++slotIdx;
     }
+    if (mergeAggInfo_ != null) {
+      // Check that the argument types in mergeAggInfo_ are consistent with input exprs.
+      for (int i = 0; i < aggregateExprs_.size(); ++i) {
+        FunctionCallExpr mergeAggExpr = mergeAggInfo_.aggregateExprs_.get(i);
+        mergeAggExpr.validateMergeAggFn(aggregateExprs_.get(i));
+      }
+    }
   }
 
-  /**
-   * Returns DataPartition derived from grouping exprs.
-   * Returns unpartitioned spec if no grouping.
-   * TODO: this won't work when we start supporting range partitions,
-   * because we could derive both hash and order-based partitions
-   */
-  public DataPartition getPartition() {
-    if (groupingExprs_.isEmpty()) {
-      return DataPartition.UNPARTITIONED;
-    } else {
-      return DataPartition.hashPartitioned(groupingExprs_);
+  /// Return true if any aggregate functions have a serialize function.
+  /// Only valid to call once analyzed.
+  public boolean needsSerialize() {
+    for (FunctionCallExpr aggregateExpr: aggregateExprs_) {
+      Preconditions.checkState(aggregateExpr.isAnalyzed());
+      AggregateFunction fn = (AggregateFunction)aggregateExpr.getFn();
+      if (fn.getSerializeFnSymbol() != null) return true;
     }
+    return false;
   }
 
   @Override

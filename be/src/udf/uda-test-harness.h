@@ -19,6 +19,9 @@
 #ifndef IMPALA_UDA_TEST_HARNESS_H
 #define IMPALA_UDA_TEST_HARNESS_H
 
+// THIS FILE IS USED BY THE STANDALONE IMPALA UDF DEVELOPMENT KIT.
+// IT MUST BE BUILDABLE WITH C++98 AND WITHOUT ANY INTERNAL IMPALA HEADERS.
+
 #include <string>
 #include <sstream>
 #include <vector>
@@ -41,7 +44,7 @@ enum UdaExecutionMode {
 template<typename RESULT, typename INTERMEDIATE>
 class UdaTestHarnessBase {
  public:
-  virtual ~UdaTestHarnessBase() = default;
+  virtual ~UdaTestHarnessBase() {}
 
   typedef void (*InitFn)(FunctionContext* context, INTERMEDIATE* result);
 
@@ -144,7 +147,7 @@ class UdaTestHarnessBase {
 template<typename RESULT, typename INTERMEDIATE, typename INPUT>
 class UdaTestHarness : public UdaTestHarnessBase<RESULT, INTERMEDIATE> {
  public:
-  virtual ~UdaTestHarness() = default;
+  virtual ~UdaTestHarness() {}
 
   typedef void (*UpdateFn)(FunctionContext* context, const INPUT& input,
       INTERMEDIATE* result);

@@ -77,23 +77,8 @@
 #include <stdint.h>     // for uintptr_t
 #include <string.h>
 #include <algorithm>
-using std::copy;
-using std::max;
-using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
-#include <ext/hash_map>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_map;     // hacky way to make sure we import standard hash<> fns
-#include <ext/hash_set>
-using __gnu_cxx::hash;
-using __gnu_cxx::hash_set;
 #include <string>
-using std::string;
 #include <utility>
-using std::make_pair;
-using std::pair;
 
 #include "gutil/casts.h"
 #include "gutil/int128.h"
@@ -106,40 +91,6 @@ using std::pair;
 #include "gutil/hash/jenkins_lookup2.h"
 #include "gutil/hash/legacy_hash.h"
 #include "gutil/hash/string_hash.h"
-
-#include <ext/hash_set>
-namespace __gnu_cxx {
-
-
-// STLport and MSVC 10.0 above already define these.
-#if !defined(_STLP_LONG_LONG) && !(defined(_MSC_VER) && _MSC_VER >= 1600)
-
-#if defined(_MSC_VER)
-// MSVC's stl implementation with _MSC_VER less than 1600 doesn't have
-// this hash struct. STLport already defines this.
-template <typename T>
-struct hash {
-  size_t operator()(const T& t) const;
-};
-#endif  // defined(_MSC_VER)
-
-template<> struct hash<int64> {
-  size_t operator()(int64 x) const { return static_cast<size_t>(x); }
-};
-
-template<> struct hash<uint64> {
-  size_t operator()(uint64 x) const { return static_cast<size_t>(x); }
-};
-
-#endif  // !defined(_STLP_LONG_LONG) && !(defined(_MSC_VER) && _MSC_VER >= 1600)
-
-template<> struct hash<bool> {
-  size_t operator()(bool x) const { return static_cast<size_t>(x); }
-};
-
-
-}  // namespace __gnu_cxx
-
 
 
 // ----------------------------------------------------------------------
@@ -186,10 +137,10 @@ inline uint64 CombineFingerprintHalves(uint32 hi, uint32 lo) {
   return result;
 }
 
-inline uint64 Fingerprint(const string& s) {
+inline uint64 Fingerprint(const std::string& s) {
   return Fingerprint(s.data(), static_cast<uint32>(s.size()));
 }
-inline uint64 Hash64StringWithSeed(const string& s, uint64 c) {
+inline uint64 Hash64StringWithSeed(const std::string& s, uint64 c) {
   return Hash64StringWithSeed(s.data(), static_cast<uint32>(s.size()), c);
 }
 inline uint64 Fingerprint(schar c) {
@@ -231,9 +182,7 @@ inline uint64 FingerprintCat(uint64 fp1, uint64 fp2) {
   return Hash64NumWithSeed(fp1, fp2);
 }
 
-#include <ext/hash_set>
-namespace __gnu_cxx {
-
+namespace std {
 
 // This intended to be a "good" hash function.  It may change from time to time.
 template<> struct hash<uint128> {
@@ -252,97 +201,25 @@ template<> struct hash<uint128> {
       return c;
     }
   }
-  // Less than operator for MSVC use.
-  bool operator()(const uint128& a, const uint128& b) const {
-    return a < b;
-  }
-  static const size_t bucket_size = 4;  // These are required by MSVC
   static const size_t min_buckets = 8;  // 4 and 8 are defaults.
 };
-
-// Avoid collision with definition in port_hash.h (via port.h).
-#ifndef HAVE_DEFINED_HASH_FOR_POINTERS
-#define HAVE_DEFINED_HASH_FOR_POINTERS
-// Hash pointers as if they were int's, but bring more entropy to
-// the lower bits.
-template<class T> struct hash<T*> {
-  size_t operator()(T *x) const {
-    size_t k = reinterpret_cast<size_t>(x);
-    return k + (k >> 6);
-  }
-};
-#endif  // HAVE_DEFINED_HASH_FOR_POINTERS
-
-#if defined(__GNUC__)
-// Use our nice hash function for strings
-template<class _CharT, class _Traits, class _Alloc>
-struct hash<std::basic_string<_CharT, _Traits, _Alloc> > {
-  size_t operator()(const std::basic_string<_CharT, _Traits, _Alloc>& k) const {
-    return HashTo32(k.data(), static_cast<uint32>(k.length()));
-  }
-};
-
-// they don't define a hash for const string at all
-template<> struct hash<const string> {
-  size_t operator()(const string& k) const {
-    return HashTo32(k.data(), static_cast<uint32>(k.length()));
-  }
-};
-#endif  // defined(__GNUC__)
-
-// MSVC's STL requires an ever-so slightly different decl
-#if defined(STL_MSVC)
-template<> struct hash<char const*> {
-  size_t operator()(char const* const k) const {
-    return HashTo32(k, strlen(k));
-  }
-  // Less than operator:
-  bool operator()(char const* const a, char const* const b) const {
-    return strcmp(a, b) < 0;
-  }
-  static const size_t bucket_size = 4;  // These are required by MSVC
-  static const size_t min_buckets = 8;  // 4 and 8 are defaults.
-};
-
-// MSVC 10.0 and above have already defined this.
-#if !defined(_MSC_VER) || _MSC_VER < 1600
-template<> struct hash<string> {
-  size_t operator()(const string& k) const {
-    return HashTo32(k.data(), k.length());
-  }
-  // Less than operator:
-  bool operator()(const string& a, const string& b) const {
-    return a < b;
-  }
-  static const size_t bucket_size = 4;  // These are required by MSVC
-  static const size_t min_buckets = 8;  // 4 and 8 are defaults.
-};
-#endif  // !defined(_MSC_VER) || _MSC_VER < 1600
-
-#endif  // defined(STL_MSVC)
 
 // Hasher for STL pairs. Requires hashers for both members to be defined
 template<class First, class Second>
 struct hash<pair<First, Second> > {
   size_t operator()(const pair<First, Second>& p) const {
-    size_t h1 = hash<First>()(p.first);
-    size_t h2 = hash<Second>()(p.second);
+    size_t h1 = std::hash<First>()(p.first);
+    size_t h2 = std::hash<Second>()(p.second);
     // The decision below is at compile time
     return (sizeof(h1) <= sizeof(uint32)) ?
             Hash32NumWithSeed(h1, h2)
             : Hash64NumWithSeed(h1, h2);
   }
-  // Less than operator for MSVC.
-  bool operator()(const pair<First, Second>& a,
-                  const pair<First, Second>& b) const {
-    return a < b;
-  }
-  static const size_t bucket_size = 4;  // These are required by MSVC
   static const size_t min_buckets = 8;  // 4 and 8 are defaults.
 };
 
 
-}  // namespace __gnu_cxx
+}  // namespace std
 
 
 // If you want an excellent string hash function, and you don't mind if it
@@ -413,24 +290,5 @@ struct GoodFastHash<const std::basic_string<_CharT, _Traits, _Alloc> > {
   static const size_t bucket_size = 4;  // These are required by MSVC
   static const size_t min_buckets = 8;  // 4 and 8 are defaults.
 };
-
-// Extern template declarations.
-//
-// gcc only for now.  msvc and others: this technique is likely to work with
-// your compiler too.  changelists welcome.
-//
-// This technique is limited to template specializations whose hash key
-// functions are declared in this file.
-
-#if defined(__GNUC__)
-#include <ext/hash_set>
-namespace __gnu_cxx {
-
-extern template class hash_set<string>;
-extern template class hash_map<string, string>;
-
-}  // namespace __gnu_cxx
-
-#endif  // defined(__GNUC__)
 
 #endif  // UTIL_HASH_HASH_H_

@@ -21,6 +21,7 @@
 import os
 import pexpect
 import pytest
+import re
 import shutil
 import signal
 import socket
@@ -231,6 +232,42 @@ class TestImpalaShellInteractive(object):
       assert query in result.stderr, "'%s' not in '%s'" % (query, result.stderr)
 
   @pytest.mark.execute_serially
+  def test_rerun(self):
+    """Smoke test for the 'rerun' command"""
+    # Clear history first.
+    if os.path.exists(SHELL_HISTORY_FILE):
+      os.remove(SHELL_HISTORY_FILE)
+    assert not os.path.exists(SHELL_HISTORY_FILE)
+    child_proc = pexpect.spawn(SHELL_CMD)
+    child_proc.expect(":21000] >")
+    self._expect_with_cmd(child_proc, "@1", ("Command index out of range"))
+    self._expect_with_cmd(child_proc, "rerun -1", ("Command index out of range"))
+    self._expect_with_cmd(child_proc, "select 'first_command'", ("first_command"))
+    self._expect_with_cmd(child_proc, "rerun 1", ("first_command"))
+    self._expect_with_cmd(child_proc, "@ -1", ("first_command"))
+    self._expect_with_cmd(child_proc, "select 'second_command'", ("second_command"))
+    child_proc.sendline('history;')
+    child_proc.expect(":21000] >")
+    assert '[1]: select \'first_command\';' in child_proc.before;
+    assert '[2]: select \'second_command\';' in child_proc.before;
+    assert '[3]: history;' in child_proc.before;
+    # Rerunning command should not add an entry into history.
+    assert '[4]' not in child_proc.before;
+    self._expect_with_cmd(child_proc, "@0", ("Command index out of range"))
+    self._expect_with_cmd(child_proc, "rerun   4", ("Command index out of range"))
+    self._expect_with_cmd(child_proc, "@-4", ("Command index out of range"))
+    self._expect_with_cmd(child_proc, " @ 3 ", ("second_command"))
+    self._expect_with_cmd(child_proc, "@-3", ("first_command"))
+    self._expect_with_cmd(child_proc, "@",
+                          ("Command index to be rerun must be an integer."))
+    self._expect_with_cmd(child_proc, "@1foo",
+                          ("Command index to be rerun must be an integer."))
+    self._expect_with_cmd(child_proc, "@1 2",
+                          ("Command index to be rerun must be an integer."))
+    self._expect_with_cmd(child_proc, "rerun1", ("Syntax error"))
+    child_proc.sendline('quit;')
+
+  @pytest.mark.execute_serially
   def test_tip(self):
     """Smoke test for the TIP command"""
     # Temporarily add impala_shell module to path to get at TIPS list for verification
@@ -286,6 +323,20 @@ class TestImpalaShellInteractive(object):
     full_path = "%s/tests/shell/doesntexist.cmds" % os.environ['IMPALA_HOME']
     result = run_impala_shell_interactive("source %s;" % full_path)
     assert "No such file or directory" in result.stderr
+
+  @pytest.mark.execute_serially
+  def test_zero_row_fetch(self):
+    # IMPALA-4418: DROP and USE are generally exceptional statements where
+    # the client does not fetch. However, when preceded by a comment, the
+    # Impala shell treats them like any other statement and will try to
+    # fetch - receiving 0 rows. For statements returning 0 rows we do not
+    # want an empty line in stdout.
+    result = run_impala_shell_interactive("-- foo \n use default;")
+    assert "Fetched 0 row(s)" in result.stderr
+    assert re.search('> \[', result.stdout)
+    result = run_impala_shell_interactive("select * from functional.alltypes limit 0;")
+    assert "Fetched 0 row(s)" in result.stderr
+    assert re.search('> \[', result.stdout)
 
 def run_impala_shell_interactive(input_lines, shell_args=None):
   """Runs a command in the Impala shell interactively."""

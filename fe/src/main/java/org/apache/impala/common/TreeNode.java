@@ -67,6 +67,22 @@ public abstract class TreeNode<NodeType extends TreeNode<NodeType>> {
   }
 
   /**
+   * Return list of all nodes of the tree rooted at 'this', obtained
+   * through post-order traversal.
+   */
+  public <C extends TreeNode<NodeType>> ArrayList<C> getNodesPostOrder() {
+    ArrayList<C> result = new ArrayList<C>();
+    getNodesPostOrderAux(result);
+    return result;
+  }
+
+  protected <C extends TreeNode<NodeType>> void getNodesPostOrderAux(
+      ArrayList<C> result) {
+    for (NodeType child: children_) child.getNodesPostOrderAux(result);
+    result.add((C) this);
+  }
+
+  /**
    * Count the total number of nodes in this tree. Leaf node will return 1.
    * Non-leaf node will include all its children.
    */
@@ -154,6 +170,15 @@ public abstract class TreeNode<NodeType extends TreeNode<NodeType>> {
   public boolean contains(Class cl) {
     if (cl.equals(getClass())) return true;
     for (NodeType child: children_) if (child.contains(cl)) return true;
+    return false;
+  }
+
+  /**
+   * Returns true if this node or any of its children is 'node'.
+   */
+  public boolean contains(NodeType node) {
+    if (this == node) return true;
+    for (NodeType child: children_) if (child.contains(node)) return true;
     return false;
   }
 

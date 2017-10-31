@@ -38,7 +38,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">DESCRIBE statement</indexterm>
+      <indexterm audience="hidden">DESCRIBE statement</indexterm>
       The <codeph>DESCRIBE</codeph> statement displays metadata about a table, such as the column names and their
       data types.
       <ph rev="2.3.0">In <keyword keyref="impala23_full"/> and higher, you can specify the name of a complex type column, which takes
@@ -577,7 +577,7 @@ Query finished, fetching results ...
 |                              | NULL                                       | NULL       |
 | # Detailed Table Information | NULL                                       | NULL       |
 | Database:                    | describe_formatted                         | NULL       |
-| Owner:                       | cloudera                                   | NULL       |
+| Owner:                       | doc_demo                                   | NULL       |
 | CreateTime:                  | Mon Jul 22 17:03:16 EDT 2013               | NULL       |
 | LastAccessTime:              | UNKNOWN                                    | NULL       |
 | Protect Mode:                | None                                       | NULL       |
@@ -625,7 +625,7 @@ Query finished, fetching results ...
 |                              | NULL                         | NULL                 |
 | # Detailed Table Information | NULL                         | NULL                 |
 | Database:                    | describe_formatted           | NULL                 |
-| Owner:                       | cloudera                     | NULL                 |
+| Owner:                       | doc_demo                     | NULL                 |
 | CreateTime:                  | Mon Jul 22 16:56:38 EDT 2013 | NULL                 |
 | LastAccessTime:              | UNKNOWN                      | NULL                 |
 | Protect Mode:                | None                         | NULL                 |
@@ -648,7 +648,7 @@ Query finished, fetching results ...
 | View Expanded Text:          | SELECT x, upper(s) FROM t1   | NULL                 |
 +------------------------------+------------------------------+----------------------+
 Returned 28 row(s) in 0.03s
-[localhost:21000] &gt; create external table t2 (x int, y int, s string) stored as parquet location '/user/cloudera/sample_data';
+[localhost:21000] &gt; create external table t2 (x int, y int, s string) stored as parquet location '/user/doc_demo/sample_data';
 [localhost:21000] &gt; describe formatted t2;
 Query: describe formatted t2
 Query finished, fetching results ...
@@ -663,12 +663,12 @@ Query finished, fetching results ...
 |                              | NULL                                               | NULL       |
 | # Detailed Table Information | NULL                                               | NULL       |
 | Database:                    | describe_formatted                                 | NULL       |
-| Owner:                       | cloudera                                           | NULL       |
+| Owner:                       | doc_demo                                           | NULL       |
 | CreateTime:                  | Mon Jul 22 17:01:47 EDT 2013                       | NULL       |
 | LastAccessTime:              | UNKNOWN                                            | NULL       |
 | Protect Mode:                | None                                               | NULL       |
 | Retention:                   | 0                                                  | NULL       |
-| Location:                    | hdfs://127.0.0.1:8020/user/cloudera/sample_data    | NULL       |
+| Location:                    | hdfs://127.0.0.1:8020/user/doc_demo/sample_data    | NULL       |
 | Table Type:                  | EXTERNAL_TABLE                                     | NULL       |
 | Table Parameters:            | NULL                                               | NULL       |
 |                              | EXTERNAL                                           | TRUE       |
@@ -676,8 +676,8 @@ Query finished, fetching results ...
 |                              | NULL                                               | NULL       |
 | # Storage Information        | NULL                                               | NULL       |
 | SerDe Library:               | org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe | NULL       |
-| InputFormat:                 | com.cloudera.impala.hive.serde.ParquetInputFormat  | NULL       |
-| OutputFormat:                | com.cloudera.impala.hive.serde.ParquetOutputFormat | NULL       |
+| InputFormat:                 | org.apache.impala.hive.serde.ParquetInputFormat    | NULL       |
+| OutputFormat:                | org.apache.impala.hive.serde.ParquetOutputFormat   | NULL       |
 | Compressed:                  | No                                                 | NULL       |
 | Num Buckets:                 | 0                                                  | NULL       |
 | Bucket Columns:              | []                                                 | NULL       |
@@ -688,7 +688,7 @@ Returned 27 row(s) in 0.17s</codeblock>
     <p conref="../shared/impala_common.xml#common/cancel_blurb_no"/>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
-    <p rev="CDH-19187">
+    <p rev="">
       The user ID that the <cmdname>impalad</cmdname> daemon runs under,
       typically the <codeph>impala</codeph> user, must have read and execute
       permissions for all directories that are part of the table.
@@ -696,6 +696,91 @@ Returned 27 row(s) in 0.17s</codeblock>
       The directories could be widely scattered because a partition can reside
       in an arbitrary HDFS directory based on its <codeph>LOCATION</codeph> attribute.)
     </p>
+
+    <p rev="kudu" conref="../shared/impala_common.xml#common/kudu_blurb"/>
+
+    <p rev="kudu">
+      The information displayed for Kudu tables includes the additional attributes
+      that are only applicable for Kudu tables:
+    </p>
+    <ul rev="kudu">
+      <li>
+        Whether or not the column is part of the primary key. Every Kudu table
+        has a <codeph>true</codeph> value here for at least one column. There
+        could be multiple <codeph>true</codeph> values, for tables with
+        composite primary keys.
+      </li>
+      <li>
+        Whether or not the column is nullable. Specified by the <codeph>NULL</codeph>
+        or <codeph>NOT NULL</codeph> attributes on the <codeph>CREATE TABLE</codeph> statement.
+        Columns that are part of the primary key are automatically non-nullable.
+      </li>
+      <li>
+        The default value, if any, for the column. Specified by the <codeph>DEFAULT</codeph>
+        attribute on the <codeph>CREATE TABLE</codeph> statement. If the default value is
+        <codeph>NULL</codeph>, that is not indicated in this column. It is implied by
+        <codeph>nullable</codeph> being true and no other default value specified.
+      </li>
+      <li>
+        The encoding used for values in the column. Specified by the <codeph>ENCODING</codeph>
+        attribute on the <codeph>CREATE TABLE</codeph> statement.
+      </li>
+      <li>
+        The compression used for values in the column. Specified by the <codeph>COMPRESSION</codeph>
+        attribute on the <codeph>CREATE TABLE</codeph> statement.
+      </li>
+      <li>
+        The block size (in bytes) used for the underlying Kudu storage layer for the column.
+        Specified by the <codeph>BLOCK_SIZE</codeph> attribute on the <codeph>CREATE TABLE</codeph>
+        statement.
+      </li>
+    </ul>
+
+    <p rev="kudu">
+      The following example shows <codeph>DESCRIBE</codeph> output for a simple Kudu table, with
+      a single-column primary key and all column attributes left with their default values:
+    </p>
+
+<codeblock rev="kudu">
+describe million_rows;
++------+--------+---------+-------------+----------+---------------+---------------+---------------------+------------+
+| name | type   | comment | primary_key | nullable | default_value | encoding      | compression         | block_size |
++------+--------+---------+-------------+----------+---------------+---------------+---------------------+------------+
+| id   | string |         | true        | false    |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| s    | string |         | false       | false    |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
++------+--------+---------+-------------+----------+---------------+---------------+---------------------+------------+
+</codeblock>
+
+    <p rev="kudu">
+      The following example shows <codeph>DESCRIBE</codeph> output for a Kudu table with a
+      two-column primary key, and Kudu-specific attributes applied to some columns:
+    </p>
+
+<codeblock rev="kudu">
+create table kudu_describe_example
+(
+  c1 int, c2 int,
+  c3 string, c4 string not null, c5 string default 'n/a', c6 string default '',
+  c7 bigint not null, c8 bigint null default null, c9 bigint default -1 encoding bit_shuffle,
+  primary key(c1,c2)
+)
+partition by hash (c1, c2) partitions 10 stored as kudu;
+
+describe kudu_describe_example;
++------+--------+---------+-------------+----------+---------------+---------------+---------------------+------------+
+| name | type   | comment | primary_key | nullable | default_value | encoding      | compression         | block_size |
++------+--------+---------+-------------+----------+---------------+---------------+---------------------+------------+
+| c1   | int    |         | true        | false    |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c2   | int    |         | true        | false    |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c3   | string |         | false       | true     |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c4   | string |         | false       | false    |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c5   | string |         | false       | true     | n/a           | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c6   | string |         | false       | true     |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c7   | bigint |         | false       | false    |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c8   | bigint |         | false       | true     |               | AUTO_ENCODING | DEFAULT_COMPRESSION | 0          |
+| c9   | bigint |         | false       | true     | -1            | BIT_SHUFFLE   | DEFAULT_COMPRESSION | 0          |
++------+--------+---------+-------------+----------+---------------+---------------+---------------------+------------+
+</codeblock>
 
     <p conref="../shared/impala_common.xml#common/related_info"/>
 

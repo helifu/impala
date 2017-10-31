@@ -161,7 +161,7 @@ select real_words(letters) from word_games;</codeblock>
 
         <p>
           Impala supports UDFs written in C++, in addition to supporting existing Hive UDFs written in Java.
-          <ph rev="upstream">Cloudera</ph> recommends using C++ UDFs because the compiled native code can yield higher performance, with
+          Where practical, use C++ UDFs because the compiled native code can yield higher performance, with
           UDF execution time often 10x faster for a C++ UDF than the equivalent Java UDF.
         </p>
       </conbody>
@@ -204,7 +204,7 @@ select real_words(letters) from word_games;</codeblock>
             Typically, a Java UDF will execute several times slower in Impala than the equivalent native UDF
             written in C++.
           </li>
-          <li rev="2.5.0 IMPALA-2843 CDH-39148">
+          <li rev="2.5.0 IMPALA-2843">
             In <keyword keyref="impala25_full"/> and higher, you can transparently call Hive Java UDFs through Impala,
             or call Impala Java UDFs through Hive. This feature does not apply to built-in Hive functions.
             Any Impala Java UDFs created with older versions must be re-created using new <codeph>CREATE FUNCTION</codeph>
@@ -233,8 +233,8 @@ select real_words(letters) from word_games;</codeblock>
         <ol>
           <li>
             Take a copy of the Hive JAR file containing the Hive built-in functions. For example, the path might be
-            like <filepath>/usr/lib/hive/lib/hive-exec-0.10.0-cdh4.2.0.jar</filepath>, with different version
-            numbers corresponding to your specific level of CDH.
+            like <filepath>/usr/lib/hive/lib/hive-exec-0.10.0.jar</filepath>, with different version
+            numbers corresponding to your specific level of <keyword keyref="distro"/>.
           </li>
 
           <li>
@@ -270,6 +270,10 @@ select real_words(letters) from word_games;</codeblock>
           </li>
         </ol>
 
+        <note>
+          <p conref="../shared/impala_common.xml#common/refresh_functions_tip"/>
+        </note>
+
         <example>
 
           <title>Java UDF Example: Reusing lower() Function</title>
@@ -282,7 +286,7 @@ select real_words(letters) from word_games;</codeblock>
             <codeph>WHERE</codeph> clause), directly on a column, and on the results of a string expression:
           </p>
 
-<!-- To do: adapt for signatureless syntax per CDH-39148 / IMPALA-2843. -->
+<!-- To do: adapt for signatureless syntax per IMPALA-2843. -->
 <codeblock>[localhost:21000] &gt; create database udfs;
 [localhost:21000] &gt; use udfs;
 localhost:21000] &gt; create function lower(string) returns string location '/user/hive/udfs/hive.jar' symbol='org.apache.hadoop.hive.ql.udf.UDFLower';
@@ -381,14 +385,8 @@ Returned 1 row(s) in 0.11s
 +------------------+
 Returned 1 row(s) in 0.11s</codeblock>
 
-          <p>
-            You can find the sample files mentioned here in
-            <xref href="https://github.com/cloudera/impala/tree/master/be/src/udf_samples" scope="external" format="html">the
-            Impala github repo</xref>.
-<!-- Internal-only repo, don't know an external equivalent.
-and other examples demonstrating this technique in
-<xref href="http://github.sf.cloudera.com/CDH/Impala/blob/master/testdata/workloads/functional-query/queries/QueryTest/load-hive-udfs.test" scope="external" format="html">the Impala test files</xref>.
--->
+          <p audience="hidden">
+            You can find the sample files mentioned here in <xref keyref="udf_samples"/>.
           </p>
 
         </example>
@@ -407,51 +405,44 @@ and other examples demonstrating this technique in
     </conbody>
   </concept>
 
-
   <concept id="udf_demo_env">
 
     <title>Installing the UDF Development Package</title>
 
     <conbody>
 
-      <p rev="CDH-37080">
+      <p rev="">
         To develop UDFs for Impala, download and install the <codeph>impala-udf-devel</codeph> package (RHEL-based
         distributions) or <codeph>impala-udf-dev</codeph> (Ubuntu and Debian). This package contains
         header files, sample source, and build configuration files.
       </p>
 
       <ol>
-        <li>
-          Start at <xref href="https://archive.cloudera.com/cdh5/" scope="external" format="html"/> for the CDH 5
-          package, or <xref href="https://archive.cloudera.com/impala/" scope="external" format="html"/> for the CDH
-          4 package.
+        <li audience="hidden">
+          Start at <xref keyref="archive_root"/>.
         </li>
 
         <li>
-          Locate the appropriate <codeph>.repo</codeph> or list file for your operating system version, such as
-          <xref href="https://archive.cloudera.com/impala/redhat/6/x86_64/impala/cloudera-impala.repo" scope="external" format="html">the
-          <codeph>.repo</codeph> file for CDH 4 on RHEL 6</xref>.
+          Locate the appropriate <codeph>.repo</codeph> or list file for your operating system version.
         </li>
 
-        <li rev="CDH-37080">
+        <li>
           Use the familiar <codeph>yum</codeph>, <codeph>zypper</codeph>, or <codeph>apt-get</codeph> commands
           depending on your operating system. For the package name, specify <codeph>impala-udf-devel</codeph>
           (RHEL-based distributions) or <codeph>impala-udf-dev</codeph> (Ubuntu and Debian).
         </li>
       </ol>
 
+
       <note>
         The UDF development code does not rely on Impala being installed on the same machine. You can write and
-        compile UDFs on a minimal development system, then deploy them on a different one for use with Impala. If
-        you develop UDFs on a server managed by Cloudera Manager through the parcel mechanism, you still install
-        the UDF development kit through the package mechanism; this small standalone package does not interfere
-        with the parcels containing the main Impala code.
+        compile UDFs on a minimal development system, then deploy them on a different one for use with Impala.
       </note>
 
       <p>
         When you are ready to start writing your own UDFs, download the sample code and build scripts from
-        <xref href="https://github.com/cloudera/impala-udf-samples" scope="external" format="html">the Cloudera
-        sample UDF github</xref>. Then see <xref href="impala_udf.xml#udf_coding"/> for how to code UDFs, and
+        <xref keyref="udf-samples">the Impala sample UDF github</xref>.
+        Then see <xref href="impala_udf.xml#udf_coding"/> for how to code UDFs, and
         <xref href="impala_udf.xml#udf_tutorial"/> for how to build and run UDFs.
       </p>
     </conbody>
@@ -511,12 +502,11 @@ and other examples demonstrating this technique in
 
         <p>
           For the basic declarations needed to write a scalar UDF, see the header file
-          <xref href="https://github.com/cloudera/impala-udf-samples/blob/master/udf-sample.h" scope="external" format="html"><filepath>udf-sample.h</filepath></xref>
+          <xref keyref="udf-sample.h"><filepath>udf-sample.h</filepath></xref>
           within the sample build environment, which defines a simple function
           named <codeph>AddUdf()</codeph>:
         </p>
 
-<!-- Downloadable version of this file: https://raw.githubusercontent.com/cloudera/impala-udf-samples/master/udf-sample.h -->
 <codeblock>#ifndef IMPALA_UDF_SAMPLE_UDF_H
 #define IMPALA_UDF_SAMPLE_UDF_H
 
@@ -534,7 +524,6 @@ IntVal AddUdf(FunctionContext* context, const IntVal&amp; arg1, const IntVal&amp
           <filepath>udf-sample.cc</filepath> within the sample build environment:
         </p>
 
-<!-- Downloadable version of this file: https://raw.githubusercontent.com/cloudera/impala-udf-samples/master/udf-sample.cc -->
 <codeblock>#include "udf-sample.h"
 
 // In this sample we are declaring a UDF that adds two ints and returns an int.
@@ -975,14 +964,10 @@ within UDAs, you can return without specifying a value.
 -->
 
         <p>
-          <filepath>uda-sample.h</filepath>:
+          <xref keyref="uda-sample.h"><filepath>uda-sample.h</filepath></xref>:
         </p>
 
-        <p> See this file online at: <xref
-            href="https://github.com/cloudera/impala-udf-samples/blob/master/uda-sample.h"
-            scope="external" format="html" /></p>
-
-<codeblock audience="Cloudera">#ifndef SAMPLES_UDA_H
+<codeblock audience="hidden">#ifndef SAMPLES_UDA_H
 #define SAMPLES_UDA_H
 
 #include &lt;impala_udf/udf.h&gt;
@@ -992,7 +977,7 @@ using namespace impala_udf;
 // This is an example of the COUNT aggregate function.
 //
 // Usage: &gt; create aggregate function my_count(int) returns bigint
-//          location '/user/cloudera/libudasample.so' update_fn='CountUpdate';
+//          location '/user/doc_demo/libudasample.so' update_fn='CountUpdate';
 //        &gt; select my_count(col) from tbl;
 
 void CountInit(FunctionContext* context, BigIntVal* val);
@@ -1006,8 +991,8 @@ BigIntVal CountFinalize(FunctionContext* context, const BigIntVal&amp; val);
 // the StringVal intermediate type. When this UDA is registered, it would specify
 // 16 bytes (8 byte sum + 8 byte count) as the size for this buffer.
 //
-// Usage: &gt; create aggregate function my_avg(double) returns string 
-//          location '/user/cloudera/libudasample.so' update_fn='AvgUpdate';
+// Usage: &gt; create aggregate function my_avg(double) returns string
+//          location '/user/doc_demo/libudasample.so' update_fn='AvgUpdate';
 //        &gt; select cast(my_avg(col) as double) from tbl;
 
 void AvgInit(FunctionContext* context, StringVal* val);
@@ -1020,7 +1005,7 @@ StringVal AvgFinalize(FunctionContext* context, const StringVal&amp; val);
 // This is a sample of implementing the STRING_CONCAT aggregate function.
 //
 // Usage: &gt; create aggregate function string_concat(string, string) returns string
-//          location '/user/cloudera/libudasample.so' update_fn='StringConcatUpdate';
+//          location '/user/doc_demo/libudasample.so' update_fn='StringConcatUpdate';
 //        &gt; select string_concat(string_col, ",") from table;
 
 void StringConcatInit(FunctionContext* context, StringVal* val);
@@ -1034,7 +1019,7 @@ StringVal StringConcatFinalize(FunctionContext* context, const StringVal&amp; va
 // This is a example of the variance aggregate function.
 //
 // Usage: &gt; create aggregate function var(double) returns string
-//          location '/user/cloudera/libudasample.so' update_fn='VarianceUpdate';
+//          location '/user/doc_demo/libudasample.so' update_fn='VarianceUpdate';
 //        &gt; select cast(var(col) as double) from tbl;
 
 void VarianceInit(FunctionContext* context, StringVal* val);
@@ -1048,7 +1033,7 @@ StringVal VarianceFinalize(FunctionContext* context, const StringVal&amp; val);
 // more numerically stable.
 //
 // Usage: &gt; create aggregate function knuth_var(double) returns string
-//          location '/user/cloudera/libudasample.so' update_fn='KnuthVarianceUpdate';
+//          location '/user/doc_demo/libudasample.so' update_fn='KnuthVarianceUpdate';
 //        &gt; select cast(knuth_var(col) as double) from tbl;
 
 void KnuthVarianceInit(FunctionContext* context, StringVal* val);
@@ -1062,7 +1047,7 @@ StringVal KnuthVarianceFinalize(FunctionContext* context, const StringVal&amp; v
 // other steps from the Knuth variance computation.
 //
 // Usage: &gt; create aggregate function stddev(double) returns string
-//          location '/user/cloudera/libudasample.so' update_fn='KnuthVarianceUpdate'
+//          location '/user/doc_demo/libudasample.so' update_fn='KnuthVarianceUpdate'
 //          finalize_fn="StdDevFinalize";
 //        &gt; select cast(stddev(col) as double) from tbl;
 
@@ -1076,15 +1061,10 @@ StringVal ToStringVal(FunctionContext* context, const T&amp; val);
 #endif</codeblock>
 
         <p>
-          <filepath>uda-sample.cc</filepath>:
+          <xref keyref="uda-sample.cc"><filepath>uda-sample.cc</filepath></xref>:
         </p>
 
-        <p> See this file online at: <xref
-            href="https://github.com/cloudera/impala-udf-samples/blob/master/uda-sample.cc"
-            scope="external" format="html" />
-        </p>
-
-<codeblock audience="Cloudera">#include "uda-sample.h"
+<codeblock audience="hidden">#include "uda-sample.h"
 #include &lt;assert.h&gt;
 #include &lt;sstream&gt;
 
@@ -1253,7 +1233,7 @@ StringVal StringConcatFinalize(FunctionContext* context, const StringVal&amp; va
       </conbody>
     </concept>
 
-    <concept rev="2.3.0 IMPALA-1829 CDH-30572" id="udf_intermediate">
+    <concept rev="2.3.0 IMPALA-1829" id="udf_intermediate">
 
       <title>Intermediate Results for UDAs</title>
 
@@ -1278,10 +1258,8 @@ StringVal StringConcatFinalize(FunctionContext* context, const StringVal&amp; va
         <p>
           For an example of this technique, see the <codeph>trunc_sum()</codeph> aggregate function, which accumulates
           intermediate results of type <codeph>DOUBLE</codeph> and returns <codeph>BIGINT</codeph> at the end.
-          View
-          <xref href="https://github.com/cloudera/Impala/blob/cdh5-trunk/tests/query_test/test_udfs.py" scope="external" format="html">the <codeph>CREATE FUNCTION</codeph> statement</xref>
-          and
-          <xref href="http://github.com/Cloudera/Impala/blob/cdh5-trunk/be/src/testutil/test-udas.cc" scope="external" format="html">the implementation of the underlying TruncSum*() functions</xref>
+          View <xref keyref="test_udfs.py">the <codeph>CREATE FUNCTION</codeph> statement</xref>
+          and <xref keyref="test-udas.cc">the implementation of the underlying TruncSum*() functions</xref>
           on Github.
         </p>
       </conbody>
@@ -1346,7 +1324,7 @@ StringVal StringConcatFinalize(FunctionContext* context, const StringVal&amp; va
         Prerequisites for the build environment are:
       </p>
 
-<codeblock rev="CDH-37080"># Use the appropriate package installation command for your Linux distribution.
+<codeblock rev=""># Use the appropriate package installation command for your Linux distribution.
 sudo yum install gcc-c++ cmake boost-devel
 sudo yum install impala-udf-devel
 # The package name on Ubuntu and Debian is impala-udf-dev.
@@ -1456,10 +1434,10 @@ make</codeblock>
         This section demonstrates how to create and use all kinds of user-defined functions (UDFs).
       </p>
 
-      <p>
+      <p audience="hidden">
         For downloadable examples that you can experiment with, adapt, and use as templates for your own functions,
-        see <xref href="https://github.com/cloudera/impala-udf-samples" scope="external" format="html">the Cloudera
-        sample UDF github</xref>. You must have already installed the appropriate header files, as explained in
+        see <xref keyref="udf-samples" scope="external" format="html">the Impala sample UDF github</xref>.
+        You must have already installed the appropriate header files, as explained in
         <xref href="impala_udf.xml#udf_demo_env"/>.
       </p>
 

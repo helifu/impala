@@ -27,9 +27,8 @@ from getpass import getuser
 from time import sleep, time
 from optparse import OptionParser
 from testdata.common import cgroups
-from tests.common import KUDU_MASTER_HOSTS
 
-
+KUDU_MASTER_HOSTS = os.getenv('KUDU_MASTER_HOSTS', '127.0.0.1')
 DEFAULT_IMPALA_MAX_LOG_FILES = os.environ.get('IMPALA_MAX_LOG_FILES', 10)
 
 
@@ -37,6 +36,12 @@ DEFAULT_IMPALA_MAX_LOG_FILES = os.environ.get('IMPALA_MAX_LOG_FILES', 10)
 parser = OptionParser()
 parser.add_option("-s", "--cluster_size", type="int", dest="cluster_size", default=3,
                   help="Size of the cluster (number of impalad instances to start).")
+parser.add_option("-c", "--num_coordinators", type="int", dest="num_coordinators",
+                  default=3, help="Number of coordinators.")
+parser.add_option("--use_exclusive_coordinators", dest="use_exclusive_coordinators",
+                  action="store_true", default=False, help="If true, coordinators only "
+                  "coordinate queries and execute coordinator fragments. If false, "
+                  "coordinators also act as executors.")
 parser.add_option("--build_type", dest="build_type", default= 'latest',
                   help="Build type to use - debug / release / latest")
 parser.add_option("--impalad_args", dest="impalad_args", action="append", type="string",
@@ -49,7 +54,7 @@ parser.add_option("--catalogd_args", dest="catalogd_args", action="append",
                   type="string", default=[],
                   help="Additional arguments to pass to the Catalog Service at startup")
 parser.add_option("--kill", "--kill_only", dest="kill_only", action="store_true",
-                  default=False, help="Instead of starting the cluster, just kill all"\
+                  default=False, help="Instead of starting the cluster, just kill all"
                   " the running impalads and the statestored.")
 parser.add_option("--force_kill", dest="force_kill", action="store_true", default=False,
                   help="Force kill impalad and statestore processes.")
@@ -66,13 +71,13 @@ parser.add_option('--max_log_files', default=DEFAULT_IMPALA_MAX_LOG_FILES,
 parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,
                   help="Prints all output to stderr/stdout.")
 parser.add_option("--wait_for_cluster", dest="wait_for_cluster", action="store_true",
-                  default=False, help="Wait until the cluster is ready to accept "\
+                  default=False, help="Wait until the cluster is ready to accept "
                   "queries before returning.")
 parser.add_option("--log_level", type="int", dest="log_level", default=1,
                    help="Set the impalad backend logging level")
 parser.add_option("--jvm_args", dest="jvm_args", default="",
                   help="Additional arguments to pass to the JVM(s) during startup.")
-parser.add_option("--kudu_masters", default=KUDU_MASTER_HOSTS,
+parser.add_option("--kudu_master_hosts", default=KUDU_MASTER_HOSTS,
                   help="The host name or address of the Kudu master. Multiple masters "
                       "can be specified using a comma separated list.")
 
@@ -134,7 +139,7 @@ def exec_impala_process(cmd, args, stderr_log_file_path):
   os.system(cmd)
 
 def kill_cluster_processes(force=False):
-  binaries = ['catalogd', 'impalad', 'statestored', 'mini-impala-cluster']
+  binaries = ['catalogd', 'impalad', 'statestored']
   kill_matching_processes(binaries, force)
 
 def kill_matching_processes(binary_names, force=False):
@@ -178,14 +183,6 @@ def start_catalogd():
     raise RuntimeError("Unable to start catalogd. Check log or file permissions"
                        " for more details.")
 
-def start_mini_impala_cluster(cluster_size):
-  print ("Starting in-process Impala Cluster logging "
-         "to %s/mini-impala-cluster.INFO" % options.log_dir)
-  args = "-num_backends=%s %s" %\
-         (cluster_size, build_impalad_logging_args(0, 'mini-impala-cluster'))
-  stderr_log_file_path = os.path.join(options.log_dir, 'mini-impala-cluster-error.log')
-  exec_impala_process(MINI_IMPALA_CLUSTER_PATH, args, stderr_log_file_path)
-
 def build_impalad_port_args(instance_num):
   BASE_BEESWAX_PORT = 21000
   BASE_HS2_PORT = 21050
@@ -205,7 +202,10 @@ def build_jvm_args(instance_num):
   BASE_JVM_DEBUG_PORT = 30000
   return JVM_ARGS % (BASE_JVM_DEBUG_PORT + instance_num, options.jvm_args)
 
-def start_impalad_instances(cluster_size):
+def start_impalad_instances(cluster_size, num_coordinators, use_exclusive_coordinators):
+  """Start 'cluster_size' impalad instances. The first 'num_coordinator' instances will
+    act as coordinators. 'use_exclusive_coordinators' specifies whether the coordinators
+    will only execute coordinator fragments."""
   if cluster_size == 0:
     # No impalad instances should be started.
     return
@@ -237,9 +237,16 @@ def start_impalad_instances(cluster_size):
           (mem_limit,  # Goes first so --impalad_args will override it.
            build_impalad_logging_args(i, service_name), build_jvm_args(i),
            build_impalad_port_args(i), param_args)
-    if options.kudu_masters:
+    if options.kudu_master_hosts:
       # Must be prepended, otherwise the java options interfere.
-      args = "-kudu_master_hosts %s %s" % (options.kudu_masters, args)
+      args = "-kudu_master_hosts %s %s" % (options.kudu_master_hosts, args)
+
+    if i >= num_coordinators:
+      args = "-is_coordinator=false %s" % (args)
+    elif use_exclusive_coordinators:
+      # Coordinator instance that doesn't execute non-coordinator fragments
+      args = "-is_executor=false %s" % (args)
+
     stderr_log_file_path = os.path.join(options.log_dir, '%s-error.log' % service_name)
     exec_impala_process(IMPALAD_PATH, args, stderr_log_file_path)
 
@@ -282,7 +289,8 @@ def wait_for_cluster_web(timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS):
   for impalad in impala_cluster.impalads:
     impalad.service.wait_for_num_known_live_backends(options.cluster_size,
         timeout=CLUSTER_WAIT_TIMEOUT_IN_SECONDS, interval=2)
-    wait_for_catalog(impalad, timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS)
+    if impalad._get_arg_value('is_coordinator', default='true') == 'true':
+      wait_for_catalog(impalad, timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS)
 
 def wait_for_catalog(impalad, timeout_in_seconds):
   """Waits for the impalad catalog to become ready"""
@@ -327,6 +335,14 @@ if __name__ == "__main__":
     print 'Please specify a cluster size >= 0'
     sys.exit(1)
 
+  if options.num_coordinators <= 0:
+    print 'Please specify a valid number of coordinators > 0'
+    sys.exit(1)
+
+  if options.use_exclusive_coordinators and options.num_coordinators >= options.cluster_size:
+    print 'Cannot start an Impala cluster with no executors'
+    sys.exit(1)
+
   if not os.path.isdir(options.log_dir):
     print 'Log dir does not exist or is not a directory: %s' % options.log_dir
     sys.exit(1)
@@ -364,21 +380,18 @@ if __name__ == "__main__":
     # restart_only_impalad=True.
     wait_for_cluster = wait_for_cluster_cmdline
 
-  if options.inprocess:
-    # The statestore and the impalads start in the same process.
-    start_mini_impala_cluster(options.cluster_size)
-    wait_for_cluster_cmdline()
-  else:
-    try:
-      if not options.restart_impalad_only:
-        start_statestore()
-        start_catalogd()
-      start_impalad_instances(options.cluster_size)
-      # Sleep briefly to reduce log spam: the cluster takes some time to start up.
-      sleep(3)
-      wait_for_cluster()
-    except Exception, e:
-      print 'Error starting cluster: %s' % e
-      sys.exit(1)
+  try:
+    if not options.restart_impalad_only:
+      start_statestore()
+      start_catalogd()
+    start_impalad_instances(options.cluster_size, options.num_coordinators,
+                            options.use_exclusive_coordinators)
+    # Sleep briefly to reduce log spam: the cluster takes some time to start up.
+    sleep(3)
+    wait_for_cluster()
+  except Exception, e:
+    print 'Error starting cluster: %s' % e
+    sys.exit(1)
 
-  print 'Impala Cluster Running with %d nodes.' % options.cluster_size
+  print 'Impala Cluster Running with %d nodes and %d coordinators.' % (
+      options.cluster_size, options.num_coordinators)

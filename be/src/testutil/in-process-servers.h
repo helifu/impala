@@ -54,28 +54,27 @@ class InProcessImpalaServer {
   /// indicate that a statestore connection should not be used. These values are directly
   /// forwarded to the ExecEnv.
   static InProcessImpalaServer* StartWithEphemeralPorts(
-      const std::string& statestore_host = "", int statestore_port = 0);
+      const std::string& statestore_host, int statestore_port);
 
   /// Starts all servers, including the beeswax and hs2 client
-  /// servers. If use_statestore is set, a connection to the statestore
-  /// is established. If there is no error, returns Status::OK.
-  Status StartWithClientServers(int beeswax_port, int hs2_port, bool use_statestore);
+  /// servers.
+  Status StartWithClientServers(int beeswax_port, int hs2_port);
 
   /// Starts only the backend server; useful when running a cluster of
   /// InProcessImpalaServers and only one is to serve client requests.
-  Status StartAsBackendOnly(bool use_statestore);
+  Status StartAsBackendOnly();
 
   /// Blocks until the backend server exits. Returns Status::OK unless
   /// there was an error joining.
   Status Join();
 
-  ImpalaServer* impala_server() { return impala_server_; }
+  ImpalaServer* impala_server() { return impala_server_.get(); }
 
   MetricGroup* metrics() { return exec_env_->metrics(); }
 
   /// Sets the catalog on this impalad to be initialized. If we don't
   /// start up a catalogd, then there is no one to initialize it otherwise.
-  void SetCatalogInitialized();
+  Status SetCatalogInitialized();
 
   uint32_t beeswax_port() const { return beeswax_port_; }
 
@@ -92,10 +91,9 @@ class InProcessImpalaServer {
 
   uint32_t hs2_port_;
 
-  /// The ImpalaServer that handles client and backend requests. Not owned by this class;
-  /// instead it's owned via shared_ptrs in the ThriftServers. See CreateImpalaServer for
-  /// details.
-  ImpalaServer* impala_server_;
+  /// The ImpalaServer that handles client and backend requests. Ownership is shared via
+  /// shared_ptrs with the ThriftServers. See CreateImpalaServer for details.
+  boost::shared_ptr<ImpalaServer> impala_server_;
 
   /// ExecEnv holds much of the per-service state
   boost::scoped_ptr<ExecEnv> exec_env_;

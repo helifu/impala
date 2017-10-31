@@ -43,24 +43,8 @@ class DiskInfo {
     return disks_.size();
   }
 
-#if 0
-  /// Returns the number of (logical) disks the data node is using.
-  /// It is possible for this to be more than num_disks since the datanode
-  /// can be configured to have multiple data directories on the same physical
-  /// disk.
-  static int num_datanode_dirs() {
-    DCHECK(initialized_);
-    return num_datanode_dirs_;
-  }
-
-  /// Returns a 0-based disk index for the data node dirs index.
-  static int disk_id(int datanode_dir_idx) {
-    return 0;
-  }
-#endif
-
   /// Returns the 0-based disk index for 'path' (path must be a FS path, not
-  /// hdfs path).
+  /// hdfs path). Returns -1 if the disk index is unknown.
   static int disk_id(const char* path);
 
   /// Returns the device name (e.g. sda) for disk_id
@@ -70,12 +54,16 @@ class DiskInfo {
     return disks_[disk_id].name;
   }
 
+  /// Returns true if the disk with disk_id exists and is a rotational disk, is false
+  /// otherwise
   static bool is_rotational(int disk_id) {
     DCHECK_GE(disk_id, 0);
-    DCHECK_LT(disk_id, disks_.size());
+    // TODO: temporarily removed DCHECK due to an issue tracked in IMPALA-5574, put it
+    // back after its resolved
+    if (disk_id >= disks_.size()) return false;
     return disks_[disk_id].is_rotational;
   }
-  
+
   static std::string DebugString();
 
  private:
@@ -91,7 +79,7 @@ class DiskInfo {
 
     bool is_rotational;
 
-    Disk(const std::string& name = "", int id = -1, bool is_rotational = true) 
+    Disk(const std::string& name = "", int id = -1, bool is_rotational = true)
       : name(name), id(id), is_rotational(is_rotational) {}
   };
 
@@ -100,15 +88,11 @@ class DiskInfo {
 
   /// mapping of dev_ts to disk ids
   static std::map<dev_t, int> device_id_to_disk_id_;
-  
+
   /// mapping of devices names to disk ids
   static std::map<std::string, int> disk_name_to_disk_id_;
 
-  static int num_datanode_dirs_;
-
   static void GetDeviceNames();
 };
-
-
 }
 #endif

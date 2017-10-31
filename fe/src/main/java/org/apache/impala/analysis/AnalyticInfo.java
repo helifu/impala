@@ -112,7 +112,7 @@ public class AnalyticInfo extends AggregateInfoBase {
   private List<Expr> computeCommonPartitionExprs() {
     List<Expr> result = Lists.newArrayList();
     for (Expr analyticExpr: analyticExprs_) {
-      Preconditions.checkState(analyticExpr.isAnalyzed_);
+      Preconditions.checkState(analyticExpr.isAnalyzed());
       List<Expr> partitionExprs = ((AnalyticExpr) analyticExpr).getPartitionExprs();
       if (partitionExprs == null) continue;
       if (result.isEmpty()) {
@@ -123,19 +123,6 @@ public class AnalyticInfo extends AggregateInfoBase {
       }
     }
     return result;
-  }
-
-  /**
-   * Append ids of all slots that are being referenced in the process
-   * of performing the analytic computation described by this AnalyticInfo.
-   */
-  public void getRefdSlots(List<SlotId> ids) {
-    Preconditions.checkState(intermediateTupleDesc_ != null);
-    Expr.getIds(analyticExprs_, null, ids);
-    // The backend assumes that the entire intermediateTupleDesc is materialized
-    for (SlotDescriptor slotDesc: intermediateTupleDesc_.getSlots()) {
-      ids.add(slotDesc.getId());
-    }
   }
 
   @Override

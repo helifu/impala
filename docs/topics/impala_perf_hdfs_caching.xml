@@ -80,10 +80,8 @@ under the License.
 <!-- Could conref this background link; haven't decided yet the best place or if it's needed twice. -->
 
     <p>
-      For background information about how to set up and manage HDFS caching for a CDH cluster, see
-<!-- Original URL: http://www.cloudera.com/content/cloudera-content/cloudera-docs/CDH5/latest/CDH5-Installation-Guide/cdh_ig_hdfs_caching.html -->
-      <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cdh_ig_hdfs_caching.html" scope="external" format="html">the
-      CDH documentation</xref>.
+      For background information about how to set up and manage HDFS caching for a <keyword keyref="distro"/> cluster, see
+      <xref keyref="setup_hdfs_caching"/>.
     </p>
   </conbody>
 
@@ -99,7 +97,7 @@ under the License.
     <conbody>
 
       <p>
-        On <ph rev="upstream">CDH 5.1</ph> and higher, Impala can use the HDFS caching feature to make more effective use of RAM, so that
+        In <keyword keyref="impala14_full"/> and higher, Impala can use the HDFS caching feature to make more effective use of RAM, so that
         repeated queries can take advantage of data <q>pinned</q> in memory regardless of how much data is
         processed overall. The HDFS caching feature lets you designate a subset of frequently accessed data to be
         pinned permanently in memory, remaining in the cache across multiple queries and never being evicted. This
@@ -128,7 +126,7 @@ under the License.
     <conbody>
 
       <p>
-        To use HDFS caching with Impala, first set up that feature for your CDH cluster:
+        To use HDFS caching with Impala, first set up that feature for your <keyword keyref="distro"/> cluster:
       </p>
 
       <ul>
@@ -150,9 +148,7 @@ under the License.
 <codeblock>hdfs cacheadmin -addPool four_gig_pool -owner impala -limit 4000000000
 </codeblock>
           For details about the <cmdname>hdfs cacheadmin</cmdname> command, see
-<!-- Original URL: http://www.cloudera.com/content/cloudera-content/cloudera-docs/CDH5/latest/CDH5-Installation-Guide/cdh_ig_hdfs_caching.html -->
-          <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cdh_ig_hdfs_caching.html" scope="external" format="html">the
-          CDH documentation</xref>.
+          <xref keyref="setup_hdfs_caching"/>.
           </p>
         </li>
       </ul>
@@ -466,24 +462,6 @@ Found 122 entries
           CACHED</codeph>. A value of 0, or a smaller number than the overall size of the table or partition,
           indicates that the cache request has been submitted but the data has not been entirely loaded into memory
           yet. See <xref href="impala_show.xml#show"/> for details.
-        </li>
-      </ul>
-
-      <p>
-        <b>Cloudera Manager:</b>
-      </p>
-
-      <ul>
-        <li>
-          You can enable or disable HDFS caching through Cloudera Manager, using the configuration setting
-          <uicontrol>Maximum Memory Used for Caching</uicontrol> for the HDFS service. This control sets the HDFS
-          configuration parameter <codeph>dfs_datanode_max_locked_memory</codeph>, which specifies the upper limit
-          of HDFS cache size on each node.
-        </li>
-
-        <li>
-          All the other manipulation of the HDFS caching settings, such as what files are cached, is done through
-          the command line, either Impala DDL statements or the Linux <cmdname>hdfs cacheadmin</cmdname> command.
         </li>
       </ul>
 

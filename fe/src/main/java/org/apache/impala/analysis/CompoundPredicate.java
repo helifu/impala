@@ -118,10 +118,8 @@ public class CompoundPredicate extends Predicate {
   }
 
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (isAnalyzed_) return;
-    super.analyze(analyzer);
-
+  protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
+    super.analyzeImpl(analyzer);
     // Check that children are predicates.
     for (Expr e: children_) {
       if (!e.getType().isBoolean() && !e.getType().isNull()) {
@@ -158,23 +156,6 @@ public class CompoundPredicate extends Predicate {
         break;
     }
     selectivity_ = Math.max(0.0, Math.min(1.0, selectivity_));
-  }
-
-  /**
-   * Retrieve the slots bound by BinaryPredicate, InPredicate and
-   * CompoundPredicates in the subtree rooted at 'this'.
-   */
-  public ArrayList<SlotRef> getBoundSlots() {
-    ArrayList<SlotRef> slots = Lists.newArrayList();
-    for (int i = 0; i < getChildren().size(); ++i) {
-      if (getChild(i) instanceof BinaryPredicate ||
-          getChild(i) instanceof InPredicate) {
-        slots.add(((Predicate)getChild(i)).getBoundSlot());
-      } else if (getChild(i) instanceof CompoundPredicate) {
-        slots.addAll(((CompoundPredicate)getChild(i)).getBoundSlots());
-      }
-    }
-    return slots;
   }
 
   /**

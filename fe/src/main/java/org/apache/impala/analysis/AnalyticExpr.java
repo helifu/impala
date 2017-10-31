@@ -62,8 +62,6 @@ import com.google.common.collect.Lists;
  * and need to be substituted as such; example: COUNT(COUNT(..)) OVER (..)
  */
 public class AnalyticExpr extends Expr {
-  private final static Logger LOG = LoggerFactory.getLogger(AnalyticExpr.class);
-
   private FunctionCallExpr fnCall_;
   private final List<Expr> partitionExprs_;
   // These elements are modified to point to the corresponding child exprs to keep them
@@ -145,7 +143,7 @@ public class AnalyticExpr extends Expr {
    * Analytic exprs cannot be constant.
    */
   @Override
-  public boolean isConstant() { return false; }
+  protected boolean isConstantImpl() { return false; }
 
   @Override
   public Expr clone() { return new AnalyticExpr(this); }
@@ -227,6 +225,12 @@ public class AnalyticExpr extends Expr {
   static private boolean isRankingFn(Function fn) {
     return isAnalyticFn(fn, RANK) || isAnalyticFn(fn, DENSERANK) ||
         isAnalyticFn(fn, ROWNUMBER);
+  }
+
+  static private boolean isFirstOrLastValueFn(Function fn) {
+    return isAnalyticFn(fn, LAST_VALUE) || isAnalyticFn(fn, FIRST_VALUE) ||
+        isAnalyticFn(fn, LAST_VALUE_IGNORE_NULLS) ||
+        isAnalyticFn(fn, FIRST_VALUE_IGNORE_NULLS);
   }
 
   /**
@@ -417,10 +421,8 @@ public class AnalyticExpr extends Expr {
   }
 
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (isAnalyzed_) return;
+  protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     fnCall_.analyze(analyzer);
-    super.analyze(analyzer);
     type_ = getFnCall().getType();
 
     for (Expr e: partitionExprs_) {
@@ -451,16 +453,13 @@ public class AnalyticExpr extends Expr {
           "DISTINCT not allowed in analytic function: " + getFnCall().toSql());
     }
 
-    if (getFnCall().getParams().isIgnoreNulls()) {
-      String fnName = getFnCall().getFnName().getFunction();
-      if (!fnName.equals(LAST_VALUE) && !fnName.equals(FIRST_VALUE)) {
-        throw new AnalysisException("Function " + fnName.toUpperCase()
-            + " does not accept the keyword IGNORE NULLS.");
-      }
+    Function fn = getFnCall().getFn();
+    if (getFnCall().getParams().isIgnoreNulls() && !isFirstOrLastValueFn(fn)) {
+      throw new AnalysisException("Function " + fn.functionName().toUpperCase()
+          + " does not accept the keyword IGNORE NULLS.");
     }
 
     // check for correct composition of analytic expr
-    Function fn = getFnCall().getFn();
     if (!(fn instanceof AggregateFunction)) {
         throw new AnalysisException(
             "OVER clause requires aggregate or analytic function: "
@@ -475,7 +474,7 @@ public class AnalyticExpr extends Expr {
     }
 
     if (isAnalyticFn(fn) && !isAggregateFn(fn)) {
-      if (orderByElements_.isEmpty()) {
+      if (!isFirstOrLastValueFn(fn) && orderByElements_.isEmpty()) {
         throw new AnalysisException(
             "'" + getFnCall().toSql() + "' requires an ORDER BY clause");
       }

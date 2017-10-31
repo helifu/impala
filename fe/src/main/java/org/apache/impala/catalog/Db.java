@@ -365,6 +365,12 @@ public class Db implements CatalogObject {
     }
   }
 
+  public void removeAllFunctions() {
+    synchronized (functions_) {
+      functions_.clear();
+    }
+  }
+
   /**
    * Removes a Function with the matching signature string. Returns the removed Function
    * if a Function was removed as a result of this call, null otherwise.
@@ -493,7 +499,6 @@ public class Db implements CatalogObject {
   public long getCatalogVersion() { return catalogVersion_; }
   @Override
   public void setCatalogVersion(long newVersion) { catalogVersion_ = newVersion; }
-  public Catalog getParentCatalog() { return parentCatalog_; }
 
   @Override
   public boolean isLoaded() { return true; }

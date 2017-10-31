@@ -23,9 +23,12 @@
 #include <boost/functional/hash.hpp>
 
 #include "codegen/llvm-codegen.h"
+#include "common/init.h"
 #include "experiments/data-provider.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/string-value.h"
+#include "runtime/test-env.h"
+#include "service/fe-support.h"
 #include "util/benchmark.h"
 #include "util/cpu-info.h"
 #include "util/hash-util.h"
@@ -415,21 +418,35 @@ Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
 int main(int argc, char **argv) {
   CpuInfo::Init();
   cout << Benchmark::GetMachineInfo() << endl;
-  LlvmCodeGen::InitializeLlvm();
+  impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
+  impala::InitFeSupport();
+  ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm());
 
   const int NUM_ROWS = 1024;
 
-  ObjectPool obj_pool;
+  Status status;
+  RuntimeState* state;
+  TestEnv test_env;
+  status = test_env.Init();
+  if (!status.ok()) {
+    cout << "Could not init TestEnv";
+    return -1;
+  }
+  status = test_env.CreateQueryState(0, nullptr, &state);
+  if (!status.ok()) {
+    cout << "Could not create RuntimeState";
+    return -1;
+  }
+
   MemTracker tracker;
   MemPool mem_pool(&tracker);
-  RuntimeProfile int_profile(&obj_pool, "IntGen");
-  RuntimeProfile mixed_profile(&obj_pool, "MixedGen");
+  RuntimeProfile int_profile(state->obj_pool(), "IntGen");
+  RuntimeProfile mixed_profile(state->obj_pool(), "MixedGen");
   DataProvider int_provider(&mem_pool, &int_profile);
   DataProvider mixed_provider(&mem_pool, &mixed_profile);
 
-  Status status;
   scoped_ptr<LlvmCodeGen> codegen;
-  status = LlvmCodeGen::CreateImpalaCodegen(&obj_pool, NULL, "test", &codegen);
+  status = LlvmCodeGen::CreateImpalaCodegen(state, NULL, "test", &codegen);
   if (!status.ok()) {
     cout << "Could not start codegen.";
     return -1;

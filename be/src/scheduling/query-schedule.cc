@@ -36,9 +36,9 @@ using boost::uuids::uuid;
 using namespace impala;
 
 // TODO: Remove for Impala 3.0.
-DEFINE_bool(rm_always_use_defaults, false, "Deprecated");
-DEFINE_string(rm_default_memory, "4G", "Deprecated");
-DEFINE_int32(rm_default_cpu_vcores, 2, "Deprecated");
+DEFINE_bool_hidden(rm_always_use_defaults, false, "Deprecated");
+DEFINE_string_hidden(rm_default_memory, "4G", "Deprecated");
+DEFINE_int32_hidden(rm_default_cpu_vcores, 2, "Deprecated");
 
 namespace impala {
 
@@ -78,7 +78,7 @@ void QuerySchedule::Init() {
   if (request_.stmt_type == TStmtType::QUERY) {
     fragment_exec_params_[root_fragment.idx].is_coord_fragment = true;
     // the coordinator instance gets index 0, generated instance ids start at 1
-    next_instance_id_.lo = 1;
+    next_instance_id_ = CreateInstanceId(next_instance_id_, 1);
   }
 
   // find max node id
@@ -168,11 +168,13 @@ void QuerySchedule::Validate() const {
       }
     }
   }
+  // TODO: add validation for BackendExecParams
 }
 
 int64_t QuerySchedule::GetClusterMemoryEstimate() const {
-  DCHECK_GT(unique_hosts_.size(), 0);
-  const int64_t total_cluster_mem = GetPerHostMemoryEstimate() * unique_hosts_.size();
+  DCHECK_GT(per_backend_exec_params_.size(), 0);
+  const int64_t total_cluster_mem =
+      GetPerHostMemoryEstimate() * per_backend_exec_params_.size();
   DCHECK_GE(total_cluster_mem, 0); // Assume total cluster memory fits in an int64_t.
   return total_cluster_mem;
 }
@@ -190,13 +192,6 @@ int64_t QuerySchedule::GetPerHostMemoryEstimate() const {
     has_query_option = true;
   }
 
-  int64_t estimate_limit = numeric_limits<int64_t>::max();
-  bool has_estimate = false;
-  if (request_.__isset.per_host_mem_req && request_.per_host_mem_req > 0) {
-    estimate_limit = request_.per_host_mem_req;
-    has_estimate = true;
-  }
-
   int64_t per_host_mem = 0L;
   // TODO: Remove rm_initial_mem and associated logic when we're sure that clients won't
   // be affected.
@@ -204,21 +199,13 @@ int64_t QuerySchedule::GetPerHostMemoryEstimate() const {
     per_host_mem = query_options_.rm_initial_mem;
   } else if (has_query_option) {
     per_host_mem = query_option_memory_limit;
-  } else if (has_estimate) {
-    per_host_mem = estimate_limit;
   } else {
-    // If no estimate or query option, use the server-side limits anyhow.
-    bool ignored;
-    per_host_mem = ParseUtil::ParseMemSpec(FLAGS_rm_default_memory,
-        &ignored, 0);
+    DCHECK(request_.__isset.per_host_mem_estimate);
+    per_host_mem = request_.per_host_mem_estimate;
   }
   // Cap the memory estimate at the amount of physical memory available. The user's
   // provided value or the estimate from planning can each be unreasonable.
   return min(per_host_mem, MemInfo::physical_mem());
-}
-
-void QuerySchedule::SetUniqueHosts(const unordered_set<TNetworkAddress>& unique_hosts) {
-  unique_hosts_ = unique_hosts;
 }
 
 TUniqueId QuerySchedule::GetNextInstanceId() {
@@ -229,14 +216,6 @@ TUniqueId QuerySchedule::GetNextInstanceId() {
 
 const TPlanFragment& FInstanceExecParams::fragment() const {
   return fragment_exec_params.fragment;
-}
-
-int QuerySchedule::GetNumFragmentInstances() const {
-  int result = 0;
-  for (const FragmentExecParams& fragment_exec_params : fragment_exec_params_) {
-    result += fragment_exec_params.instance_exec_params.size();
-  }
-  return result;
 }
 
 const TPlanFragment* QuerySchedule::GetCoordFragment() const {
@@ -271,6 +250,14 @@ vector<int> FragmentExecParams::GetInstanceIdxs() const {
     result.push_back(GetInstanceIdx(instance_params.instance_id));
   }
   return result;
+}
+
+int QuerySchedule::GetNumFragmentInstances() const {
+  int total = 0;
+  for (const FragmentExecParams& p: fragment_exec_params_) {
+    total += p.instance_exec_params.size();
+  }
+  return total;
 }
 
 }

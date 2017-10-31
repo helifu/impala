@@ -25,6 +25,7 @@ import org.apache.impala.analysis.HdfsUri;
 import org.apache.impala.thrift.TAggregateFunction;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import com.google.common.base.Preconditions;
 
 /**
  * Internal representation of an aggregate function.
@@ -43,8 +44,6 @@ public class AggregateFunction extends Function {
   private String getValueFnSymbol_;
   private String removeFnSymbol_;
   private String finalizeFnSymbol_;
-
-  private static String BE_BUILTINS_CLASS = "AggregateFunctions";
 
   // If true, this aggregate function should ignore distinct.
   // e.g. min(distinct col) == min(col).
@@ -125,6 +124,9 @@ public class AggregateFunction extends Function {
       String serializeFnSymbol, String getValueFnSymbol, String removeFnSymbol,
       String finalizeFnSymbol, boolean ignoresDistinct, boolean isAnalyticFn,
       boolean returnsNonNullOnEmpty) {
+    Preconditions.checkState(initFnSymbol != null);
+    Preconditions.checkState(updateFnSymbol != null);
+    Preconditions.checkState(mergeFnSymbol != null);
     AggregateFunction fn = new AggregateFunction(new FunctionName(db.getName(), name),
         argTypes, retType, intermediateType, null, updateFnSymbol, initFnSymbol,
         serializeFnSymbol, mergeFnSymbol, getValueFnSymbol, removeFnSymbol,
@@ -174,8 +176,6 @@ public class AggregateFunction extends Function {
   public String getInitFnSymbol() { return initFnSymbol_; }
   public String getSerializeFnSymbol() { return serializeFnSymbol_; }
   public String getMergeFnSymbol() { return mergeFnSymbol_; }
-  public String getGetValueFnSymbol() { return getValueFnSymbol_; }
-  public String getRemoveFnSymbol() { return removeFnSymbol_; }
   public String getFinalizeFnSymbol() { return finalizeFnSymbol_; }
   public boolean ignoresDistinct() { return ignoresDistinct_; }
   public boolean isAnalyticFn() { return isAnalyticFn_; }
@@ -191,8 +191,6 @@ public class AggregateFunction extends Function {
   public void setInitFnSymbol(String fn) { initFnSymbol_ = fn; }
   public void setSerializeFnSymbol(String fn) { serializeFnSymbol_ = fn; }
   public void setMergeFnSymbol(String fn) { mergeFnSymbol_ = fn; }
-  public void setGetValueFnSymbol(String fn) { getValueFnSymbol_ = fn; }
-  public void setRemoveFnSymbol(String fn) { removeFnSymbol_ = fn; }
   public void setFinalizeFnSymbol(String fn) { finalizeFnSymbol_ = fn; }
   public void setIntermediateType(Type t) { intermediateType_ = t; }
 
@@ -222,6 +220,7 @@ public class AggregateFunction extends Function {
   public TFunction toThrift() {
     TFunction fn = super.toThrift();
     TAggregateFunction agg_fn = new TAggregateFunction();
+    agg_fn.setIs_analytic_only_fn(isAnalyticFn_ && !isAggregateFn_);
     agg_fn.setUpdate_fn_symbol(updateFnSymbol_);
     agg_fn.setInit_fn_symbol(initFnSymbol_);
     if (serializeFnSymbol_ != null) agg_fn.setSerialize_fn_symbol(serializeFnSymbol_);

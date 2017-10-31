@@ -22,33 +22,36 @@
 #include <boost/algorithm/string.hpp>
 #include <gflags/gflags.h>
 #include <gutil/strings/substitute.h>
+#include <kudu/client/client.h>
 
 #include "common/logging.h"
-#include "gen-cpp/CatalogService.h"
+#include "common/object-pool.h"
+#include "exec/kudu-util.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "runtime/backend-client.h"
+#include "runtime/bufferpool/buffer-pool.h"
+#include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/client-cache.h"
 #include "runtime/coordinator.h"
 #include "runtime/data-stream-mgr.h"
 #include "runtime/disk-io-mgr.h"
 #include "runtime/hbase-table-factory.h"
 #include "runtime/hdfs-fs-cache.h"
+#include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/query-exec-mgr.h"
 #include "runtime/thread-resource-mgr.h"
 #include "runtime/tmp-file-mgr.h"
+#include "scheduling/admission-controller.h"
 #include "scheduling/request-pool-service.h"
-#include "scheduling/simple-scheduler.h"
-#include "service/fragment-mgr.h"
+#include "scheduling/scheduler.h"
 #include "service/frontend.h"
 #include "statestore/statestore-subscriber.h"
-#include "util/debug-util.h"
 #include "util/debug-util.h"
 #include "util/default-path-handlers.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/mem-info.h"
-#include "util/mem-info.h"
-#include "util/memory-metrics.h"
 #include "util/memory-metrics.h"
 #include "util/metrics.h"
 #include "util/network-util.h"
@@ -59,14 +62,10 @@
 
 #include "common/names.h"
 
-using boost::algorithm::is_any_of;
-using boost::algorithm::split;
-using boost::algorithm::to_lower;
-using boost::algorithm::token_compress_on;
+using boost::algorithm::join;
 using namespace strings;
 
-DEFINE_bool(use_statestore, true,
-    "Use an external statestore process to manage cluster membership");
+DEFINE_bool_hidden(use_statestore, true, "Deprecated, do not use");
 DEFINE_string(catalog_service_host, "localhost",
     "hostname where CatalogService is running");
 DEFINE_bool(enable_webserver, true, "If true, debug webserver is enabled");
@@ -76,29 +75,39 @@ DEFINE_int32(state_store_subscriber_port, 23000,
     "port where StatestoreSubscriberService should be exported");
 DEFINE_int32(num_hdfs_worker_threads, 16,
     "(Advanced) The number of threads in the global HDFS operation pool");
+DEFINE_bool(disable_admission_control, false, "Disables admission control.");
+DEFINE_bool_hidden(use_krpc, false, "Used to indicate whether to use Kudu RPC for the "
+    "DataStream subsystem, or the Thrift RPC layer instead. Defaults to false. "
+    "KRPC not yet supported");
 
 DECLARE_int32(state_store_port);
 DECLARE_int32(num_threads_per_core);
 DECLARE_int32(num_cores);
 DECLARE_int32(be_port);
 DECLARE_string(mem_limit);
+DECLARE_string(buffer_pool_limit);
+DECLARE_string(buffer_pool_clean_pages_limit);
+DECLARE_int64(min_buffer_size);
+DECLARE_bool(is_coordinator);
+DECLARE_int32(webserver_port);
 
 // TODO: Remove the following RM-related flags in Impala 3.0.
-DEFINE_bool(enable_rm, false, "Deprecated");
-DEFINE_int32(llama_callback_port, 28000, "Deprecated");
-DEFINE_string(llama_host, "", "Deprecated");
-DEFINE_int32(llama_port, 15000, "Deprecated");
-DEFINE_string(llama_addresses, "", "Deprecated");
-DEFINE_int64(llama_registration_timeout_secs, 30, "Deprecated");
-DEFINE_int64(llama_registration_wait_secs, 3, "Deprecated");
-DEFINE_int64(llama_max_request_attempts, 5, "Deprecated");
-DEFINE_string(cgroup_hierarchy_path, "", "Deprecated");
-DEFINE_string(staging_cgroup, "impala_staging", "Deprecated");
-DEFINE_int32(resource_broker_cnxn_attempts, 1, "Deprecated");
-DEFINE_int32(resource_broker_cnxn_retry_interval_ms, 3000, "Deprecated");
-DEFINE_int32(resource_broker_send_timeout, 0, "Deprecated");
-DEFINE_int32(resource_broker_recv_timeout, 0, "Deprecated");
+DEFINE_bool_hidden(enable_rm, false, "Deprecated");
+DEFINE_int32_hidden(llama_callback_port, 28000, "Deprecated");
+DEFINE_string_hidden(llama_host, "", "Deprecated");
+DEFINE_int32_hidden(llama_port, 15000, "Deprecated");
+DEFINE_string_hidden(llama_addresses, "", "Deprecated");
+DEFINE_int64_hidden(llama_registration_timeout_secs, 30, "Deprecated");
+DEFINE_int64_hidden(llama_registration_wait_secs, 3, "Deprecated");
+DEFINE_int64_hidden(llama_max_request_attempts, 5, "Deprecated");
+DEFINE_string_hidden(cgroup_hierarchy_path, "", "Deprecated");
+DEFINE_string_hidden(staging_cgroup, "impala_staging", "Deprecated");
+DEFINE_int32_hidden(resource_broker_cnxn_attempts, 1, "Deprecated");
+DEFINE_int32_hidden(resource_broker_cnxn_retry_interval_ms, 3000, "Deprecated");
+DEFINE_int32_hidden(resource_broker_send_timeout, 0, "Deprecated");
+DEFINE_int32_hidden(resource_broker_recv_timeout, 0, "Deprecated");
 
+// TODO-MT: rename or retire
 DEFINE_int32(coordinator_rpc_threads, 12, "(Advanced) Number of threads available to "
     "start fragments on remote Impala daemons.");
 
@@ -120,65 +129,20 @@ const static string DEFAULT_FS = "fs.defaultFS";
 
 namespace impala {
 
-ExecEnv* ExecEnv::exec_env_ = NULL;
+struct ExecEnv::KuduClientPtr {
+  kudu::client::sp::shared_ptr<kudu::client::KuduClient> kudu_client;
+};
+
+ExecEnv* ExecEnv::exec_env_ = nullptr;
 
 ExecEnv::ExecEnv()
-  : metrics_(new MetricGroup("impala-metrics")),
-    stream_mgr_(new DataStreamMgr(metrics_.get())),
-    impalad_client_cache_(
-        new ImpalaBackendClientCache(FLAGS_backend_client_connection_num_retries, 0,
-            FLAGS_backend_client_rpc_timeout_ms, FLAGS_backend_client_rpc_timeout_ms, "",
-            !FLAGS_ssl_client_ca_certificate.empty())),
-    catalogd_client_cache_(
-        new CatalogServiceClientCache(FLAGS_catalog_client_connection_num_retries, 0,
-            FLAGS_catalog_client_rpc_timeout_ms, FLAGS_catalog_client_rpc_timeout_ms, "",
-            !FLAGS_ssl_client_ca_certificate.empty())),
-    htable_factory_(new HBaseTableFactory()),
-    disk_io_mgr_(new DiskIoMgr()),
-    webserver_(new Webserver()),
-    mem_tracker_(NULL),
-    thread_mgr_(new ThreadResourceMgr),
-    hdfs_op_thread_pool_(
-        CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
-    tmp_file_mgr_(new TmpFileMgr),
-    request_pool_service_(new RequestPoolService(metrics_.get())),
-    frontend_(new Frontend()),
-    fragment_exec_thread_pool_(new CallableThreadPool("coordinator-fragment-rpc",
-        "worker", FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max())),
-    async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
-    fragment_mgr_(new FragmentMgr()),
-    enable_webserver_(FLAGS_enable_webserver),
-    is_fe_tests_(false),
-    backend_address_(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port)) {
-  // Initialize the scheduler either dynamically (with a statestore) or statically (with
-  // a standalone single backend)
-  if (FLAGS_use_statestore) {
-    TNetworkAddress subscriber_address =
-        MakeNetworkAddress(FLAGS_hostname, FLAGS_state_store_subscriber_port);
-    TNetworkAddress statestore_address =
-        MakeNetworkAddress(FLAGS_state_store_host, FLAGS_state_store_port);
+  : ExecEnv(FLAGS_hostname, FLAGS_be_port, FLAGS_state_store_subscriber_port,
+        FLAGS_webserver_port, FLAGS_state_store_host, FLAGS_state_store_port) {}
 
-    statestore_subscriber_.reset(new StatestoreSubscriber(
-        Substitute("impalad@$0", TNetworkAddressToString(backend_address_)),
-        subscriber_address, statestore_address, metrics_.get()));
-
-    scheduler_.reset(new SimpleScheduler(statestore_subscriber_.get(),
-        statestore_subscriber_->id(), backend_address_, metrics_.get(), webserver_.get(),
-        request_pool_service_.get()));
-  } else {
-    vector<TNetworkAddress> addresses;
-    addresses.push_back(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
-    scheduler_.reset(new SimpleScheduler(
-        addresses, metrics_.get(), webserver_.get(), request_pool_service_.get()));
-  }
-  if (exec_env_ == NULL) exec_env_ = this;
-}
-
-// TODO: Need refactor to get rid of duplicated code.
 ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
     int webserver_port, const string& statestore_host, int statestore_port)
-  : metrics_(new MetricGroup("impala-metrics")),
-    stream_mgr_(new DataStreamMgr(metrics_.get())),
+  : obj_pool_(new ObjectPool),
+    metrics_(new MetricGroup("impala-metrics")),
     impalad_client_cache_(
         new ImpalaBackendClientCache(FLAGS_backend_client_connection_num_retries, 0,
             FLAGS_backend_client_rpc_timeout_ms, FLAGS_backend_client_rpc_timeout_ms, "",
@@ -190,45 +154,53 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
     htable_factory_(new HBaseTableFactory()),
     disk_io_mgr_(new DiskIoMgr()),
     webserver_(new Webserver(webserver_port)),
-    mem_tracker_(NULL),
+    pool_mem_trackers_(new PoolMemTrackerRegistry),
     thread_mgr_(new ThreadResourceMgr),
     hdfs_op_thread_pool_(
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
     tmp_file_mgr_(new TmpFileMgr),
     frontend_(new Frontend()),
-    fragment_exec_thread_pool_(new CallableThreadPool("coordinator-fragment-rpc",
-        "worker", FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max())),
+    exec_rpc_thread_pool_(new CallableThreadPool("exec-rpc-pool", "worker",
+        FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max())),
     async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
-    fragment_mgr_(new FragmentMgr()),
+    query_exec_mgr_(new QueryExecMgr()),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
-    is_fe_tests_(false),
-    backend_address_(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port)) {
+    backend_address_(MakeNetworkAddress(hostname, backend_port)) {
+
+  if (FLAGS_use_krpc) {
+    stream_mgr_.reset(new KrpcDataStreamMgr(metrics_.get()));
+  } else {
+    stream_mgr_.reset(new DataStreamMgr(metrics_.get()));
+  }
+
   request_pool_service_.reset(new RequestPoolService(metrics_.get()));
 
-  if (FLAGS_use_statestore && statestore_port > 0) {
-    TNetworkAddress subscriber_address =
-        MakeNetworkAddress(hostname, subscriber_port);
-    TNetworkAddress statestore_address =
-        MakeNetworkAddress(statestore_host, statestore_port);
+  TNetworkAddress subscriber_address = MakeNetworkAddress(hostname, subscriber_port);
+  TNetworkAddress statestore_address =
+      MakeNetworkAddress(statestore_host, statestore_port);
 
-    statestore_subscriber_.reset(new StatestoreSubscriber(
-        Substitute("impalad@$0", TNetworkAddressToString(backend_address_)),
-        subscriber_address, statestore_address, metrics_.get()));
+  statestore_subscriber_.reset(new StatestoreSubscriber(
+      Substitute("impalad@$0", TNetworkAddressToString(backend_address_)),
+      subscriber_address, statestore_address, metrics_.get()));
 
-    scheduler_.reset(new SimpleScheduler(statestore_subscriber_.get(),
+  if (FLAGS_is_coordinator) {
+    scheduler_.reset(new Scheduler(statestore_subscriber_.get(),
         statestore_subscriber_->id(), backend_address_, metrics_.get(), webserver_.get(),
         request_pool_service_.get()));
-  } else {
-    vector<TNetworkAddress> addresses;
-    addresses.push_back(MakeNetworkAddress(hostname, backend_port));
-    scheduler_.reset(new SimpleScheduler(
-        addresses, metrics_.get(), webserver_.get(), request_pool_service_.get()));
   }
-  if (exec_env_ == NULL) exec_env_ = this;
+
+  if (FLAGS_disable_admission_control) {
+    LOG(INFO) << "Admission control is disabled.";
+  } else {
+    admission_controller_.reset(new AdmissionController(statestore_subscriber_.get(),
+        request_pool_service_.get(), metrics_.get(), backend_address_));
+  }
+  exec_env_ = this;
 }
 
-
 ExecEnv::~ExecEnv() {
+  if (buffer_reservation_ != nullptr) buffer_reservation_->Close();
+  disk_io_mgr_.reset(); // Need to tear down before mem_tracker_.
 }
 
 Status ExecEnv::InitForFeTests() {
@@ -245,13 +217,14 @@ Status ExecEnv::StartServices() {
   // memory limit either based on the available physical memory, or if overcommitting
   // is turned off, we use the memory commit limit from /proc/meminfo (see
   // IMPALA-1690).
-  // --mem_limit="" means no memory limit
+  // --mem_limit="" means no memory limit. TODO: IMPALA-5653: remove this mode
   int64_t bytes_limit = 0;
   bool is_percent;
+  int64_t system_mem;
   if (MemInfo::vm_overcommit() == 2 &&
       MemInfo::commit_limit() < MemInfo::physical_mem()) {
-    bytes_limit = ParseUtil::ParseMemSpec(FLAGS_mem_limit, &is_percent,
-        MemInfo::commit_limit());
+    system_mem = MemInfo::commit_limit();
+    bytes_limit = ParseUtil::ParseMemSpec(FLAGS_mem_limit, &is_percent, system_mem);
     // There might be the case of misconfiguration, when on a system swap is disabled
     // and overcommitting is turned off the actual usable memory is less than the
     // available physical memory.
@@ -266,47 +239,73 @@ Status ExecEnv::StartServices() {
                  << "/proc/sys/vm/overcommit_memory and "
                  << "/proc/sys/vm/overcommit_ratio.";
   } else {
-    bytes_limit = ParseUtil::ParseMemSpec(FLAGS_mem_limit, &is_percent,
-        MemInfo::physical_mem());
+    system_mem = MemInfo::physical_mem();
+    bytes_limit = ParseUtil::ParseMemSpec(FLAGS_mem_limit, &is_percent, system_mem);
   }
-
+  // ParseMemSpec returns 0 to mean unlimited.
+  bool no_process_mem_limit = bytes_limit == 0;
+  if (no_process_mem_limit) {
+    LOG(WARNING) << "Configured with unlimited process memory limit (--mem_limit='"
+                 << FLAGS_mem_limit << "'). Starting in the next Impala release, "
+                 << "a process memory limit must always be specified. See IMPALA-5653.";
+  }
   if (bytes_limit < 0) {
     return Status("Failed to parse mem limit from '" + FLAGS_mem_limit + "'.");
   }
-  // Minimal IO Buffer requirements:
-  //   IO buffer (8MB default) * number of IO buffers per thread (5) *
-  //   number of threads per core * number of cores
-  int64_t min_requirement = disk_io_mgr_->max_read_buffer_size() *
-      DiskIoMgr::DEFAULT_QUEUE_CAPACITY *
-      FLAGS_num_threads_per_core * FLAGS_num_cores;
-  if (bytes_limit < min_requirement) {
-    LOG(WARNING) << "Memory limit "
-                 << PrettyPrinter::Print(bytes_limit, TUnit::BYTES)
-                 << " does not meet minimal memory requirement of "
-                 << PrettyPrinter::Print(min_requirement, TUnit::BYTES);
-  }
 
-  metrics_->Init(enable_webserver_ ? webserver_.get() : NULL);
+  if (!BitUtil::IsPowerOf2(FLAGS_min_buffer_size)) {
+    return Status(Substitute(
+        "--min_buffer_size must be a power-of-two: $0", FLAGS_min_buffer_size));
+  }
+  int64_t buffer_pool_limit = ParseUtil::ParseMemSpec(FLAGS_buffer_pool_limit,
+      &is_percent, no_process_mem_limit ? system_mem : bytes_limit);
+  if (buffer_pool_limit <= 0) {
+    return Status(Substitute("Invalid --buffer_pool_limit value, must be a percentage or "
+          "positive bytes value: $0", FLAGS_buffer_pool_limit));
+  }
+  buffer_pool_limit = BitUtil::RoundDown(buffer_pool_limit, FLAGS_min_buffer_size);
+
+  int64_t clean_pages_limit = ParseUtil::ParseMemSpec(FLAGS_buffer_pool_clean_pages_limit,
+      &is_percent, buffer_pool_limit);
+  if (clean_pages_limit <= 0) {
+    return Status(Substitute("Invalid --buffer_pool_clean_pages_limit value, must be a percentage or "
+          "positive bytes value: $0", FLAGS_buffer_pool_clean_pages_limit));
+  }
+  InitBufferPool(FLAGS_min_buffer_size, buffer_pool_limit, clean_pages_limit);
+
+  RETURN_IF_ERROR(metrics_->Init(enable_webserver_ ? webserver_.get() : nullptr));
   impalad_client_cache_->InitMetrics(metrics_.get(), "impala-server.backends");
   catalogd_client_cache_->InitMetrics(metrics_.get(), "catalog.server");
-  RETURN_IF_ERROR(RegisterMemoryMetrics(metrics_.get(), true));
+  RETURN_IF_ERROR(RegisterMemoryMetrics(
+      metrics_.get(), true, buffer_reservation_.get(), buffer_pool_.get()));
 
-#ifndef ADDRESS_SANITIZER
   // Limit of -1 means no memory limit.
-  mem_tracker_.reset(new MemTracker(TcmallocMetric::PHYSICAL_BYTES_RESERVED,
-      bytes_limit > 0 ? bytes_limit : -1, "Process"));
-
-  // Since tcmalloc does not free unused memory, we may exceed the process mem limit even
-  // if Impala is not actually using that much memory. Add a callback to free any unused
-  // memory if we hit the process limit.
-  mem_tracker_->AddGcFunction(boost::bind(&MallocExtension::ReleaseFreeMemory,
-                                          MallocExtension::instance()));
-#else
-  // tcmalloc metrics aren't defined in ASAN builds, just use the default behavior to
-  // track process memory usage (sum of all children trackers).
-  mem_tracker_.reset(new MemTracker(bytes_limit > 0 ? bytes_limit : -1, "Process"));
+  mem_tracker_.reset(new MemTracker(AggregateMemoryMetrics::TOTAL_USED,
+      no_process_mem_limit ? -1 : bytes_limit, "Process"));
+  // Add BufferPool MemTrackers for cached memory that is not tracked against queries
+  // but is included in process memory consumption.
+  obj_pool_->Add(new MemTracker(BufferPoolMetric::FREE_BUFFER_BYTES, -1,
+      "Buffer Pool: Free Buffers", mem_tracker_.get()));
+  obj_pool_->Add(new MemTracker(BufferPoolMetric::CLEAN_PAGE_BYTES, -1,
+      "Buffer Pool: Clean Pages", mem_tracker_.get()));
+  // Also need a MemTracker for unused reservations as a negative value. Unused
+  // reservations are counted against queries but not against the process memory
+  // consumption. This accounts for that difference.
+  IntGauge* negated_unused_reservation = obj_pool_->Add(new NegatedGauge<int64_t>(
+        MakeTMetricDef("negated_unused_reservation", TMetricKind::GAUGE, TUnit::BYTES),
+        BufferPoolMetric::UNUSED_RESERVATION_BYTES));
+  obj_pool_->Add(new MemTracker(negated_unused_reservation, -1,
+      "Buffer Pool: Unused Reservation", mem_tracker_.get()));
+#ifndef ADDRESS_SANITIZER
+  // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
+  // not backed by physical pages and do not contribute towards memory consumption.
+  size_t aggressive_decommit_enabled = 0;
+  MallocExtension::instance()->GetNumericProperty(
+      "tcmalloc.aggressive_memory_decommit", &aggressive_decommit_enabled);
+  if (!aggressive_decommit_enabled) {
+    return Status("TCMalloc aggressive decommit is required but is disabled.");
+  }
 #endif
-
   mem_tracker_->RegisterMetrics(metrics_.get(), "mem-tracker.process");
 
   if (bytes_limit > MemInfo::physical_mem()) {
@@ -317,8 +316,13 @@ Status ExecEnv::StartServices() {
   }
   LOG(INFO) << "Using global memory limit: "
             << PrettyPrinter::Print(bytes_limit, TUnit::BYTES);
+  LOG(INFO) << "Buffer pool limit: "
+            << PrettyPrinter::Print(buffer_pool_limit, TUnit::BYTES);
 
   RETURN_IF_ERROR(disk_io_mgr_->Init(mem_tracker_.get()));
+
+  mem_tracker_->AddGcFunction(
+      [this](int64_t bytes_to_free) { disk_io_mgr_->GcIoBuffers(bytes_to_free); });
 
   // Start services in order to ensure that dependencies between them are met
   if (enable_webserver_) {
@@ -328,21 +332,22 @@ Status ExecEnv::StartServices() {
     LOG(INFO) << "Not starting webserver";
   }
 
-  if (scheduler_ != NULL) RETURN_IF_ERROR(scheduler_->Init());
+  if (scheduler_ != nullptr) RETURN_IF_ERROR(scheduler_->Init());
+  if (admission_controller_ != nullptr) RETURN_IF_ERROR(admission_controller_->Init());
 
   // Get the fs.defaultFS value set in core-site.xml and assign it to
   // configured_defaultFs
   TGetHadoopConfigRequest config_request;
   config_request.__set_name(DEFAULT_FS);
   TGetHadoopConfigResponse config_response;
-  frontend_->GetHadoopConfig(config_request, &config_response);
+  RETURN_IF_ERROR(frontend_->GetHadoopConfig(config_request, &config_response));
   if (config_response.__isset.value) {
     default_fs_ = config_response.value;
   } else {
     default_fs_ = "hdfs://";
   }
   // Must happen after all topic registrations / callbacks are done
-  if (statestore_subscriber_.get() != NULL) {
+  if (statestore_subscriber_.get() != nullptr) {
     Status status = statestore_subscriber_->Start();
     if (!status.ok()) {
       status.AddDetail("Statestore subscriber did not start up.");
@@ -351,6 +356,41 @@ Status ExecEnv::StartServices() {
   }
 
   return Status::OK();
+}
+
+void ExecEnv::InitBufferPool(int64_t min_buffer_size, int64_t capacity,
+    int64_t clean_pages_limit) {
+  buffer_pool_.reset(new BufferPool(min_buffer_size, capacity, clean_pages_limit));
+  buffer_reservation_.reset(new ReservationTracker());
+  buffer_reservation_->InitRootTracker(nullptr, capacity);
+}
+
+Status ExecEnv::GetKuduClient(
+    const vector<string>& master_addresses, kudu::client::KuduClient** client) {
+  string master_addr_concat = join(master_addresses, ",");
+  lock_guard<SpinLock> l(kudu_client_map_lock_);
+  auto kudu_client_map_it = kudu_client_map_.find(master_addr_concat);
+  if (kudu_client_map_it == kudu_client_map_.end()) {
+    // KuduClient doesn't exist, create it
+    KuduClientPtr* kudu_client_ptr = new KuduClientPtr;
+    RETURN_IF_ERROR(CreateKuduClient(master_addresses, &kudu_client_ptr->kudu_client));
+    kudu_client_map_[master_addr_concat].reset(kudu_client_ptr);
+    *client = kudu_client_ptr->kudu_client.get();
+  } else {
+    // Return existing KuduClient
+    *client = kudu_client_map_it->second->kudu_client.get();
+  }
+  return Status::OK();
+}
+
+DataStreamMgr* ExecEnv::ThriftStreamMgr() {
+  DCHECK(!FLAGS_use_krpc);
+  return dynamic_cast<DataStreamMgr*>(stream_mgr_.get());
+}
+
+KrpcDataStreamMgr* ExecEnv::KrpcStreamMgr() {
+  DCHECK(FLAGS_use_krpc);
+  return dynamic_cast<KrpcDataStreamMgr*>(stream_mgr_.get());
 }
 
 }

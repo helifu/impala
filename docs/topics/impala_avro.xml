@@ -35,7 +35,7 @@ under the License.
   <conbody>
 
     <p rev="1.4.0">
-      <indexterm audience="Cloudera">Avro support in Impala</indexterm>
+      <indexterm audience="hidden">Avro support in Impala</indexterm>
       Impala supports using tables whose data files use the Avro file format. Impala can query Avro
       tables, and in Impala 1.4.0 and higher can create them, but currently cannot insert data into them. For
       insert operations, use Hive, then switch back to Impala to run queries.
@@ -216,8 +216,7 @@ for this information.
         <li>
           The <codeph>DECIMAL</codeph> type is defined in Avro as a <codeph>BYTE</codeph> type with the
           <codeph>logicalType</codeph> property set to <codeph>"decimal"</codeph> and a specified precision and
-          scale. Use <codeph>DECIMAL</codeph> in Avro tables only under CDH 5. The infrastructure and components
-          under CDH 4 do not have reliable <codeph>DECIMAL</codeph> support.
+          scale.
         </li>
 
         <li>
@@ -246,7 +245,7 @@ for this information.
           If there is a mismatch in column name or type, Impala uses the column definition from the Avro schema.
           Because a <codeph>CHAR</codeph> or <codeph>VARCHAR</codeph> column in Impala maps to an Avro <codeph>STRING</codeph>,
           this case is not considered a mismatch and the column is preserved as <codeph>CHAR</codeph> or <codeph>VARCHAR</codeph>
-          in the reconciled schema. <ph rev="2.7.0 IMPALA-3687 CDH-43731">Prior to <keyword keyref="impala27_full"/> the column
+          in the reconciled schema. <ph rev="2.7.0 IMPALA-3687">Prior to <keyword keyref="impala27_full"/> the column
           name and comment for such <codeph>CHAR</codeph> and <codeph>VARCHAR</codeph> columns was also taken from the SQL column definition.
           In <keyword keyref="impala27_full"/> and higher, the column name and comment from the Avro schema file take precedence for such columns,
           and only the <codeph>CHAR</codeph> or <codeph>VARCHAR</codeph> type is preserved from the SQL column definition.</ph>
@@ -255,7 +254,7 @@ for this information.
           An Impala <codeph>TIMESTAMP</codeph> column definition maps to an Avro <codeph>STRING</codeph> and is presented as a <codeph>STRING</codeph>
           in the reconciled schema, because Avro has no binary <codeph>TIMESTAMP</codeph> representation.
           As a result, no Avro table can have a <codeph>TIMESTAMP</codeph> column; this restriction is the same as
-          in earlier CDH and Impala releases.
+          in earlier Impala releases.
         </li>
         </ul>
       </p>
@@ -382,7 +381,7 @@ for this information.
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">compression</indexterm>
+        <indexterm audience="hidden">compression</indexterm>
         To enable compression for Avro tables, specify settings in the Hive shell to enable compression and to
         specify a codec, then issue a <codeph>CREATE TABLE</codeph> statement as in the preceding examples. Impala
         supports the <codeph>snappy</codeph> and <codeph>deflate</codeph> codecs for Avro tables.

@@ -53,23 +53,27 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 
 #include "codegen/codegen-anyval.h"
+#include "codegen/codegen-callgraph.h"
 #include "codegen/codegen-symbol-emitter.h"
 #include "codegen/impala-ir-data.h"
 #include "codegen/instruction-counter.h"
 #include "codegen/mcjit-mem-mgr.h"
 #include "common/logging.h"
+#include "exprs/anyval-util.h"
 #include "impala-ir/impala-ir-names.h"
 #include "runtime/descriptors.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
 #include "runtime/timestamp-value.h"
 #include "util/cpu-info.h"
 #include "util/hdfs-util.h"
 #include "util/path-builder.h"
 #include "util/runtime-profile-counters.h"
+#include "util/symbols-util.h"
 #include "util/test-info.h"
 
 #include "common/names.h"
@@ -98,79 +102,17 @@ DECLARE_string(local_library_dir);
 namespace impala {
 
 bool LlvmCodeGen::llvm_initialized_ = false;
-
 string LlvmCodeGen::cpu_name_;
 vector<string> LlvmCodeGen::cpu_attrs_;
-unordered_set<string> LlvmCodeGen::gv_ref_ir_fns_;
+string LlvmCodeGen::target_features_attr_;
+CodegenCallGraph LlvmCodeGen::shared_call_graph_;
 
 [[noreturn]] static void LlvmCodegenHandleError(
     void* user_data, const std::string& reason, bool gen_crash_diag) {
   LOG(FATAL) << "LLVM hit fatal error: " << reason.c_str();
 }
 
-bool LlvmCodeGen::IsDefinedInImpalad(const string& fn_name) {
-  void* fn_ptr = NULL;
-  Status status =
-      LibCache::instance()->GetSoFunctionPtr("", fn_name, &fn_ptr, NULL, true);
-  return status.ok();
-}
-
-void LlvmCodeGen::ParseGlobalConstant(Value* val, unordered_set<string>* ref_fns) {
-  // Parse constants to find any referenced functions.
-  vector<string> fn_names;
-  if (isa<Function>(val)) {
-    fn_names.push_back(cast<Function>(val)->getName().str());
-  } else if (isa<BlockAddress>(val)) {
-    const BlockAddress *ba = cast<BlockAddress>(val);
-    fn_names.push_back(ba->getFunction()->getName().str());
-  } else if (isa<GlobalAlias>(val)) {
-    GlobalAlias* alias = cast<GlobalAlias>(val);
-    ParseGlobalConstant(alias->getAliasee(), ref_fns);
-  } else if (isa<ConstantExpr>(val)) {
-    const ConstantExpr* ce = cast<ConstantExpr>(val);
-    if (ce->isCast()) {
-      for (User::const_op_iterator oi=ce->op_begin(); oi != ce->op_end(); ++oi) {
-        Function* fn = dyn_cast<Function>(*oi);
-        if (fn != NULL) fn_names.push_back(fn->getName().str());
-      }
-    }
-  } else if (isa<ConstantStruct>(val) || isa<ConstantArray>(val) ||
-      isa<ConstantDataArray>(val)) {
-    const Constant* val_constant = cast<Constant>(val);
-    for (int i = 0; i < val_constant->getNumOperands(); ++i) {
-      ParseGlobalConstant(val_constant->getOperand(i), ref_fns);
-    }
-  } else if (isa<ConstantVector>(val) || isa<ConstantDataVector>(val)) {
-    const Constant* val_const = cast<Constant>(val);
-    for (int i = 0; i < val->getType()->getVectorNumElements(); ++i) {
-      ParseGlobalConstant(val_const->getAggregateElement(i), ref_fns);
-    }
-  } else {
-    // Ignore constants which cannot contain function pointers. Ignore other global
-    // variables referenced by this global variable as InitializeLlvm() will parse
-    // all global variables.
-    DCHECK(isa<UndefValue>(val) || isa<ConstantFP>(val) || isa<ConstantInt>(val) ||
-        isa<GlobalVariable>(val) || isa<ConstantTokenNone>(val) ||
-        isa<ConstantPointerNull>(val) || isa<ConstantAggregateZero>(val) ||
-        isa<ConstantDataSequential>(val));
-  }
-
-  // Adds all functions not defined in Impalad native binary.
-  for (const string& fn_name: fn_names) {
-    if (!IsDefinedInImpalad(fn_name)) ref_fns->insert(fn_name);
-  }
-}
-
-void LlvmCodeGen::ParseGVForFunctions(Module* module, unordered_set<string>* ref_fns) {
-  for (GlobalVariable& gv: module->globals()) {
-    if (gv.hasInitializer() && gv.isConstant()) {
-      Constant* val = gv.getInitializer();
-      if (val->getNumOperands() > 0) ParseGlobalConstant(val, ref_fns);
-    }
-  }
-}
-
-void LlvmCodeGen::InitializeLlvm(bool load_backend) {
+Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
   DCHECK(!llvm_initialized_);
   llvm::remove_fatal_error_handler();
   llvm::install_fatal_error_handler(LlvmCodegenHandleError);
@@ -193,32 +135,41 @@ void LlvmCodeGen::InitializeLlvm(bool load_backend) {
   cpu_name_ = llvm::sys::getHostCPUName().str();
   LOG(INFO) << "CPU class for runtime code generation: " << cpu_name_;
   GetHostCPUAttrs(&cpu_attrs_);
-  LOG(INFO) << "CPU flags for runtime code generation: "
-            << boost::algorithm::join(cpu_attrs_, ",");
+  target_features_attr_ = boost::algorithm::join(cpu_attrs_, ",");
+  LOG(INFO) << "CPU flags for runtime code generation: " << target_features_attr_;
 
   // Write an empty map file for perf to find.
   if (FLAGS_perf_map) CodegenSymbolEmitter::WritePerfMap();
 
   ObjectPool init_pool;
   scoped_ptr<LlvmCodeGen> init_codegen;
-  Status status = LlvmCodeGen::CreateFromMemory(&init_pool, NULL, "init", &init_codegen);
-  ParseGVForFunctions(init_codegen->module_, &gv_ref_ir_fns_);
+  RETURN_IF_ERROR(LlvmCodeGen::CreateFromMemory(
+      nullptr, &init_pool, nullptr, "init", &init_codegen));
+  // LLVM will construct "use" lists only when the entire module is materialized.
+  RETURN_IF_ERROR(init_codegen->MaterializeModule());
 
   // Validate the module by verifying that functions for all IRFunction::Type
   // can be found.
   for (int i = IRFunction::FN_START; i < IRFunction::FN_END; ++i) {
-    DCHECK(FN_MAPPINGS[i].fn == i);
+    DCHECK_EQ(FN_MAPPINGS[i].fn, i);
     const string& fn_name = FN_MAPPINGS[i].fn_name;
-    DCHECK(init_codegen->module_->getFunction(fn_name) != NULL)
-        << "Failed to find function " << fn_name;
+    if (init_codegen->module_->getFunction(fn_name) == nullptr) {
+      return Status(Substitute("Failed to find function $0", fn_name));
+    }
   }
+
+  // Initialize the global shared call graph.
+  shared_call_graph_.Init(init_codegen->module_);
+  init_codegen->Close();
+  return Status::OK();
 }
 
-LlvmCodeGen::LlvmCodeGen(
-    ObjectPool* pool, MemTracker* parent_mem_tracker, const string& id)
-  : id_(id),
+LlvmCodeGen::LlvmCodeGen(RuntimeState* state, ObjectPool* pool,
+    MemTracker* parent_mem_tracker, const string& id)
+  : state_(state),
+    id_(id),
     profile_(pool, "CodeGen"),
-    mem_tracker_(new MemTracker(&profile_, -1, "CodeGen", parent_mem_tracker)),
+    mem_tracker_(pool->Add(new MemTracker(&profile_, -1, "CodeGen", parent_mem_tracker))),
     optimizations_enabled_(false),
     is_corrupt_(false),
     is_compiled_(false),
@@ -238,9 +189,10 @@ LlvmCodeGen::LlvmCodeGen(
   num_instructions_ = ADD_COUNTER(&profile_, "NumInstructions", TUnit::UNIT);
 }
 
-Status LlvmCodeGen::CreateFromFile(ObjectPool* pool, MemTracker* parent_mem_tracker,
-    const string& file, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
-  codegen->reset(new LlvmCodeGen(pool, parent_mem_tracker, id));
+Status LlvmCodeGen::CreateFromFile(RuntimeState* state, ObjectPool* pool,
+    MemTracker* parent_mem_tracker, const string& file, const string& id,
+    scoped_ptr<LlvmCodeGen>* codegen) {
+  codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_.total_time_counter());
 
   unique_ptr<Module> loaded_module;
@@ -249,9 +201,9 @@ Status LlvmCodeGen::CreateFromFile(ObjectPool* pool, MemTracker* parent_mem_trac
   return (*codegen)->Init(std::move(loaded_module));
 }
 
-Status LlvmCodeGen::CreateFromMemory(ObjectPool* pool, MemTracker* parent_mem_tracker,
-    const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
-  codegen->reset(new LlvmCodeGen(pool, parent_mem_tracker, id));
+Status LlvmCodeGen::CreateFromMemory(RuntimeState* state, ObjectPool* pool,
+    MemTracker* parent_mem_tracker, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
+  codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_.total_time_counter());
 
   // Select the appropriate IR version. We cannot use LLVM IR with SSE4.2 instructions on
@@ -329,19 +281,18 @@ Status LlvmCodeGen::LinkModule(const string& file) {
   // The module data layout must match the one selected by the execution engine.
   new_module->setDataLayout(execution_engine_->getDataLayout());
 
-  // Record all IR functions in 'new_module' referenced by the module's global variables
-  // if they are not defined in the Impalad native code. They must be materialized to
-  // avoid linking error.
-  unordered_set<string> ref_fns;
-  ParseGVForFunctions(new_module.get(), &ref_fns);
-
-  // Record all the materializable functions in the new module before linking.
-  // Linking the new module to the main module (i.e. 'module_') may materialize
-  // functions in the new module. These materialized functions need to be parsed
-  // to materialize any functions they call in 'module_'.
-  unordered_set<string> materializable_fns;
+  // Parse all functions' names from the new module and find those which also exist in
+  // the main module. They are declarations in the new module or duplicated definitions
+  // of the same function in both modules. For the latter case, it's unclear which one
+  // the linker will choose. Materialize these functions in the main module in case they
+  // are chosen by the linker or referenced by functions in the new module. Note that
+  // linkModules() will materialize functions defined only in the new module.
   for (Function& fn: new_module->functions()) {
-    if (fn.isMaterializable()) materializable_fns.insert(fn.getName().str());
+    const string& fn_name = fn.getName();
+    if (shared_call_graph_.GetCallees(fn_name) != nullptr) {
+      Function* local_fn = module_->getFunction(fn_name);
+      RETURN_IF_ERROR(MaterializeFunction(local_fn));
+    }
   }
 
   bool error = Linker::linkModules(*module_, std::move(new_module));
@@ -352,23 +303,6 @@ Status LlvmCodeGen::LinkModule(const string& file) {
   }
   linked_modules_.insert(file);
 
-  for (const string& fn_name: ref_fns) {
-    Function* fn = module_->getFunction(fn_name);
-    // The global variable from source module which references 'fn' can have private
-    // linkage and it may not be linked into 'module_'.
-    if (fn != NULL && fn->isMaterializable()) {
-      RETURN_IF_ERROR(MaterializeFunction(fn));
-      materializable_fns.erase(fn->getName().str());
-    }
-  }
-  // Parse functions in the source module materialized during linking and materialize
-  // their callees. Do it after linking so LLVM has "merged" functions defined in both
-  // modules. LLVM may not link in functions (and their callees) from source module if
-  // they're defined in destination module already.
-  for (const string& fn_name: materializable_fns) {
-    Function* fn = module_->getFunction(fn_name);
-    if (fn != NULL && !fn->isMaterializable()) RETURN_IF_ERROR(MaterializeCallees(fn));
-  }
   return Status::OK();
 }
 
@@ -379,9 +313,12 @@ void LlvmCodeGen::StripGlobalCtorsDtors(llvm::Module* module) {
   if (destructors != NULL) destructors->eraseFromParent();
 }
 
-Status LlvmCodeGen::CreateImpalaCodegen(ObjectPool* pool, MemTracker* parent_mem_tracker,
-    const string& id, scoped_ptr<LlvmCodeGen>* codegen_ret) {
-  RETURN_IF_ERROR(CreateFromMemory(pool, parent_mem_tracker, id, codegen_ret));
+Status LlvmCodeGen::CreateImpalaCodegen(RuntimeState* state,
+    MemTracker* parent_mem_tracker, const string& id,
+    scoped_ptr<LlvmCodeGen>* codegen_ret) {
+  DCHECK(state != nullptr);
+  RETURN_IF_ERROR(CreateFromMemory(
+      state, state->obj_pool(), parent_mem_tracker, id, codegen_ret));
   LlvmCodeGen* codegen = codegen_ret->get();
 
   // Parse module for cross compiled functions and types
@@ -389,25 +326,25 @@ Status LlvmCodeGen::CreateImpalaCodegen(ObjectPool* pool, MemTracker* parent_mem
   SCOPED_TIMER(codegen->prepare_module_timer_);
 
   // Get type for StringValue
-  codegen->string_val_type_ = codegen->GetType(StringValue::LLVM_CLASS_NAME);
+  codegen->string_value_type_ = codegen->GetType(StringValue::LLVM_CLASS_NAME);
 
   // Get type for TimestampValue
-  codegen->timestamp_val_type_ = codegen->GetType(TimestampValue::LLVM_CLASS_NAME);
+  codegen->timestamp_value_type_ = codegen->GetType(TimestampValue::LLVM_CLASS_NAME);
 
   // Verify size is correct
   const DataLayout& data_layout = codegen->execution_engine()->getDataLayout();
   const StructLayout* layout =
-      data_layout.getStructLayout(static_cast<StructType*>(codegen->string_val_type_));
+      data_layout.getStructLayout(static_cast<StructType*>(codegen->string_value_type_));
   if (layout->getSizeInBytes() != sizeof(StringValue)) {
     DCHECK_EQ(layout->getSizeInBytes(), sizeof(StringValue));
     return Status("Could not create llvm struct type for StringVal");
   }
 
-  // Materialize functions implicitly referenced by the global variables.
-  for (const string& fn_name : gv_ref_ir_fns_) {
+  // Materialize functions referenced by the global variables.
+  for (const string& fn_name : shared_call_graph_.fns_referenced_by_gv()) {
     Function* fn = codegen->module_->getFunction(fn_name);
-    DCHECK(fn != NULL);
-    codegen->MaterializeFunction(fn);
+    DCHECK(fn != nullptr);
+    RETURN_IF_ERROR(codegen->MaterializeFunction(fn));
   }
   return Status::OK();
 }
@@ -469,13 +406,20 @@ void LlvmCodeGen::SetupJITListeners() {
 }
 
 LlvmCodeGen::~LlvmCodeGen() {
-  if (memory_manager_ != NULL) mem_tracker_->Release(memory_manager_->bytes_tracked());
-  if (mem_tracker_->parent() != NULL) mem_tracker_->UnregisterFromParent();
-  mem_tracker_.reset();
+  DCHECK(execution_engine_ == nullptr) << "Must Close() before destruction";
+}
+
+void LlvmCodeGen::Close() {
+  if (memory_manager_ != nullptr) {
+    mem_tracker_->Release(memory_manager_->bytes_tracked());
+    memory_manager_ = nullptr;
+  }
+  if (mem_tracker_ != nullptr) mem_tracker_->Close();
 
   // Execution engine executes callback on event listener, so tear down engine first.
   execution_engine_.reset();
   symbol_emitter_.reset();
+  module_ = nullptr;
 }
 
 void LlvmCodeGen::EnableOptimizations(bool enable) {
@@ -526,14 +470,17 @@ Type* LlvmCodeGen::GetType(const ColumnType& type) {
       return Type::getDoubleTy(context());
     case TYPE_STRING:
     case TYPE_VARCHAR:
-      return string_val_type_;
+      return string_value_type_;
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      // Represent this as an array of bytes.
+      return ArrayType::get(GetType(TYPE_TINYINT), type.len);
     case TYPE_CHAR:
       // IMPALA-3207: Codegen for CHAR is not yet implemented, this should not
       // be called for TYPE_CHAR.
       DCHECK(false) << "NYI";
       return NULL;
     case TYPE_TIMESTAMP:
-      return timestamp_val_type_;
+      return timestamp_value_type_;
     case TYPE_DECIMAL:
       return Type::getIntNTy(context(), type.GetByteSize() * 8);
     default:
@@ -564,6 +511,10 @@ PointerType* LlvmCodeGen::GetPtrType(Type* type) {
 
 PointerType* LlvmCodeGen::GetPtrPtrType(Type* type) {
   return PointerType::get(PointerType::get(type, 0), 0);
+}
+
+PointerType* LlvmCodeGen::GetPtrPtrType(const string& name) {
+  return PointerType::get(GetPtrType(name), 0);
 }
 
 // Llvm doesn't let you create a PointerValue from a c-side ptr.  Instead
@@ -642,22 +593,6 @@ void LlvmCodeGen::CreateIfElseBlocks(Function* fn, const string& if_name,
   *else_block = BasicBlock::Create(context(), else_name, fn, insert_before);
 }
 
-Status LlvmCodeGen::MaterializeCallees(Function* fn) {
-  for (inst_iterator iter = inst_begin(fn); iter != inst_end(fn); ++iter) {
-    Instruction* instr = &*iter;
-    Function* called_fn = NULL;
-    if (isa<CallInst>(instr)) {
-      CallInst* call_instr = reinterpret_cast<CallInst*>(instr);
-      called_fn = call_instr->getCalledFunction();
-    } else if (isa<InvokeInst>(instr)) {
-      InvokeInst* invoke_instr = reinterpret_cast<InvokeInst*>(instr);
-      called_fn = invoke_instr->getCalledFunction();
-    }
-    if (called_fn != NULL) RETURN_IF_ERROR(MaterializeFunctionHelper(called_fn));
-  }
-  return Status::OK();
-}
-
 Status LlvmCodeGen::MaterializeFunctionHelper(Function *fn) {
   DCHECK(!is_compiled_);
   if (fn->isIntrinsic() || !fn->isMaterializable()) return Status::OK();
@@ -670,7 +605,15 @@ Status LlvmCodeGen::MaterializeFunctionHelper(Function *fn) {
 
   // Materialized functions are marked as not materializable by LLVM.
   DCHECK(!fn->isMaterializable());
-  RETURN_IF_ERROR(MaterializeCallees(fn));
+  SetCPUAttrs(fn);
+  const unordered_set<string>* callees = shared_call_graph_.GetCallees(fn->getName());
+  if (callees != nullptr) {
+    for (const string& callee : *callees) {
+      Function* callee_fn = module_->getFunction(callee);
+      DCHECK(callee_fn != nullptr);
+      RETURN_IF_ERROR(MaterializeFunctionHelper(callee_fn));
+    }
+  }
   return Status::OK();
 }
 
@@ -702,8 +645,6 @@ Function* LlvmCodeGen::GetFunction(IRFunction::Type ir_type, bool clone) {
       LOG(ERROR) << "Unable to locate function " << fn_name;
       return NULL;
     }
-    // Mixing "NoInline" with "AlwaysInline" will lead to compilation failure.
-    if (!fn->hasFnAttribute(Attribute::NoInline)) fn->addFnAttr(Attribute::AlwaysInline);
     loaded_functions_[ir_type] = fn;
   }
   Status status = MaterializeFunction(fn);
@@ -716,17 +657,19 @@ Function* LlvmCodeGen::GetFunction(IRFunction::Type ir_type, bool clone) {
 bool LlvmCodeGen::VerifyFunction(Function* fn) {
   if (is_corrupt_) return false;
 
-  // Check that there are no calls to Expr::GetConstant(). These should all have been
-  // inlined via Expr::InlineConstants().
+  // Check that there are no calls to FunctionContextImpl::GetConstFnAttr(). These should all
+  // have been inlined via InlineConstFnAttrs().
   for (inst_iterator iter = inst_begin(fn); iter != inst_end(fn); ++iter) {
     Instruction* instr = &*iter;
     if (!isa<CallInst>(instr)) continue;
     CallInst* call_instr = reinterpret_cast<CallInst*>(instr);
     Function* called_fn = call_instr->getCalledFunction();
-    // look for call to Expr::GetConstant()
-    if (called_fn != NULL &&
-        called_fn->getName().find(Expr::GET_CONSTANT_INT_SYMBOL_PREFIX) != string::npos) {
-      LOG(ERROR) << "Found call to Expr::GetConstant*(): " << Print(call_instr);
+
+    // Look for call to FunctionContextImpl::GetConstFnAttr().
+    if (called_fn != nullptr &&
+        called_fn->getName() == FunctionContextImpl::GET_CONST_FN_ATTR_SYMBOL) {
+      LOG(ERROR) << "Found call to FunctionContextImpl::GetConstFnAttr(): "
+                 << Print(call_instr);
       is_corrupt_ = true;
       break;
     }
@@ -764,7 +707,18 @@ bool LlvmCodeGen::VerifyFunction(Function* fn) {
 
 void LlvmCodeGen::SetNoInline(llvm::Function* function) const {
   function->removeFnAttr(llvm::Attribute::AlwaysInline);
+  function->removeFnAttr(llvm::Attribute::InlineHint);
   function->addFnAttr(llvm::Attribute::NoInline);
+}
+
+void LlvmCodeGen::SetCPUAttrs(llvm::Function* function) {
+  // Set all functions' "target-cpu" and "target-features" to match the
+  // host's CPU's features. It's assumed that the functions don't use CPU
+  // features which the host doesn't support. CreateFromMemory() checks
+  // the features of the host's CPU and loads the module compatible with
+  // the host's CPU.
+  function->addFnAttr("target-cpu", cpu_name_);
+  function->addFnAttr("target-features", target_features_attr_);
 }
 
 LlvmCodeGen::FnPrototype::FnPrototype(
@@ -802,8 +756,116 @@ Function* LlvmCodeGen::FnPrototype::GeneratePrototype(
   return fn;
 }
 
-int LlvmCodeGen::ReplaceCallSites(Function* caller, Function* new_fn,
-    const string& target_name) {
+Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
+    const ColumnType* return_type, const std::vector<ColumnType>& arg_types,
+    int num_fixed_args, bool has_varargs, Function** llvm_fn,
+    LibCacheEntry** cache_entry) {
+  DCHECK_GE(arg_types.size(), num_fixed_args);
+  DCHECK(has_varargs || arg_types.size() == num_fixed_args);
+  DCHECK(!has_varargs || arg_types.size() > num_fixed_args);
+  // from_utc_timestamp() and to_utc_timestamp() have inline ASM that cannot be JIT'd.
+  // TimestampFunctions::AddSub() contains a try/catch which doesn't work in JIT'd
+  // code. Always use the interpreted version of these functions.
+  // TODO: fix these built-in functions so we don't need 'broken_builtin' below.
+  bool broken_builtin = fn.name.function_name == "from_utc_timestamp"
+      || fn.name.function_name == "to_utc_timestamp"
+      || symbol.find("AddSub") != string::npos;
+  if (fn.binary_type == TFunctionBinaryType::NATIVE
+      || (fn.binary_type == TFunctionBinaryType::BUILTIN && broken_builtin)) {
+    // In this path, we are calling a precompiled native function, either a UDF
+    // in a .so or a builtin using the UDF interface.
+    void* fn_ptr;
+    Status status = LibCache::instance()->GetSoFunctionPtr(
+        fn.hdfs_location, symbol, &fn_ptr, cache_entry);
+    if (!status.ok() && fn.binary_type == TFunctionBinaryType::BUILTIN) {
+      // Builtins symbols should exist unless there is a version mismatch.
+      status.AddDetail(
+          ErrorMsg(TErrorCode::MISSING_BUILTIN, fn.name.function_name, symbol).msg());
+    }
+    RETURN_IF_ERROR(status);
+    DCHECK(fn_ptr != NULL);
+
+    // Per the x64 ABI, DecimalVals are returned via a DecimalVal* output argument.
+    // So, the return type is void.
+    bool is_decimal = return_type != NULL && return_type->type == TYPE_DECIMAL;
+    Type* llvm_return_type = return_type == NULL || is_decimal ?
+        void_type() :
+        CodegenAnyVal::GetLoweredType(this, *return_type);
+
+    // Convert UDF function pointer to Function*. Start by creating a function
+    // prototype for it.
+    FnPrototype prototype(this, symbol, llvm_return_type);
+
+    if (is_decimal) {
+      // Per the x64 ABI, DecimalVals are returned via a DecmialVal* output argument
+      Type* output_type = CodegenAnyVal::GetUnloweredPtrType(this, *return_type);
+      prototype.AddArgument("output", output_type);
+    }
+
+    // The "FunctionContext*" argument.
+    prototype.AddArgument("ctx", GetPtrType("class.impala_udf::FunctionContext"));
+
+    // The "fixed" arguments for the UDF function, followed by the variable arguments,
+    // if any.
+    for (int i = 0; i < num_fixed_args; ++i) {
+      Type* arg_type = CodegenAnyVal::GetUnloweredPtrType(this, arg_types[i]);
+      prototype.AddArgument(Substitute("fixed_arg_$0", i), arg_type);
+    }
+
+    if (has_varargs) {
+      prototype.AddArgument("num_var_arg", GetType(TYPE_INT));
+      // Get the vararg type from the first vararg.
+      prototype.AddArgument(
+          "var_arg", CodegenAnyVal::GetUnloweredPtrType(this, arg_types[num_fixed_args]));
+    }
+
+    // Create a Function* with the generated type. This is only a function
+    // declaration, not a definition, since we do not create any basic blocks or
+    // instructions in it.
+    *llvm_fn = prototype.GeneratePrototype(NULL, NULL, false);
+
+    // Associate the dynamically loaded function pointer with the Function* we defined.
+    // This tells LLVM where the compiled function definition is located in memory.
+    execution_engine_->addGlobalMapping(*llvm_fn, fn_ptr);
+  } else if (fn.binary_type == TFunctionBinaryType::BUILTIN) {
+    // In this path, we're running a builtin with the UDF interface. The IR is
+    // in the llvm module. Builtin functions may use Expr::GetConstant(). Clone the
+    // function so that we can replace constants in the copied function.
+    *llvm_fn = GetFunction(symbol, true);
+    if (*llvm_fn == NULL) {
+      // Builtins symbols should exist unless there is a version mismatch.
+      return Status(Substitute("Builtin '$0' with symbol '$1' does not exist. Verify "
+                               "that all your impalads are the same version.",
+          fn.name.function_name, symbol));
+    }
+    // Rename the function to something more readable than the mangled name.
+    string demangled_name = SymbolsUtil::DemangleNoArgs((*llvm_fn)->getName().str());
+    (*llvm_fn)->setName(demangled_name);
+  } else {
+    // We're running an IR UDF.
+    DCHECK_EQ(fn.binary_type, TFunctionBinaryType::IR);
+
+    string local_path;
+    RETURN_IF_ERROR(LibCache::instance()->GetLocalLibPath(
+        fn.hdfs_location, LibCache::TYPE_IR, &local_path));
+    // Link the UDF module into this query's main module so the UDF's functions are
+    // available in the main module.
+    RETURN_IF_ERROR(LinkModule(local_path));
+
+    *llvm_fn = GetFunction(symbol, true);
+    if (*llvm_fn == NULL) {
+      return Status(Substitute("Unable to load function '$0' from LLVM module '$1'",
+          symbol, fn.hdfs_location));
+    }
+    // Rename the function to something more readable than the mangled name.
+    string demangled_name = SymbolsUtil::DemangleNoArgs((*llvm_fn)->getName().str());
+    (*llvm_fn)->setName(demangled_name);
+  }
+  return Status::OK();
+}
+
+int LlvmCodeGen::ReplaceCallSites(
+    Function* caller, Function* new_fn, const string& target_name) {
   DCHECK(!is_compiled_);
   DCHECK(caller->getParent() == module_);
   DCHECK(caller != NULL);
@@ -843,6 +905,47 @@ int LlvmCodeGen::ReplaceCallSitesWithBoolConst(llvm::Function* caller, bool cons
   return ReplaceCallSitesWithValue(caller, replacement, target_name);
 }
 
+int LlvmCodeGen::InlineConstFnAttrs(const FunctionContext::TypeDesc& ret_type,
+    const vector<FunctionContext::TypeDesc>& arg_types, Function* fn) {
+  int replaced = 0;
+  for (inst_iterator iter = inst_begin(fn), end = inst_end(fn); iter != end; ) {
+    // Increment iter now so we don't mess it up modifying the instruction below
+    Instruction* instr = &*(iter++);
+
+    // Look for call instructions
+    if (!isa<CallInst>(instr)) continue;
+    CallInst* call_instr = cast<CallInst>(instr);
+    Function* called_fn = call_instr->getCalledFunction();
+
+    // Look for call to FunctionContextImpl::GetConstFnAttr().
+    if (called_fn == nullptr ||
+        called_fn->getName() != FunctionContextImpl::GET_CONST_FN_ATTR_SYMBOL) {
+      continue;
+    }
+
+    // 't' and 'i' arguments must be constant
+    ConstantInt* t_arg = dyn_cast<ConstantInt>(call_instr->getArgOperand(1));
+    ConstantInt* i_arg = dyn_cast<ConstantInt>(call_instr->getArgOperand(2));
+    // This optimization is only applied to built-ins which should have constant args.
+    DCHECK(t_arg != nullptr)
+        << "Non-constant 't' argument to FunctionContextImpl::GetConstFnAttr()";
+    DCHECK(i_arg != nullptr)
+        << "Non-constant 'i' argument to FunctionContextImpl::GetConstFnAttr";
+
+    // Replace the called function with the appropriate constant
+    FunctionContextImpl::ConstFnAttr t_val =
+        static_cast<FunctionContextImpl::ConstFnAttr>(t_arg->getSExtValue());
+    int i_val = static_cast<int>(i_arg->getSExtValue());
+    DCHECK(state_ != nullptr);
+    // All supported constants are currently integers.
+    call_instr->replaceAllUsesWith(ConstantInt::get(GetType(TYPE_INT),
+        FunctionContextImpl::GetConstFnAttr(state_, ret_type, arg_types, t_val, i_val)));
+    call_instr->eraseFromParent();
+    ++replaced;
+  }
+  return replaced;
+}
+
 void LlvmCodeGen::FindCallSites(Function* caller, const string& target_name,
       vector<CallInst*>* results) {
   for (inst_iterator iter = inst_begin(caller); iter != inst_end(caller); ++iter) {
@@ -874,10 +977,7 @@ Function* LlvmCodeGen::CloneFunction(Function* fn) {
 }
 
 Function* LlvmCodeGen::FinalizeFunction(Function* function) {
-  if (LIKELY(!function->hasFnAttribute(llvm::Attribute::NoInline))) {
-    function->addFnAttr(llvm::Attribute::AlwaysInline);
-  }
-
+  SetCPUAttrs(function);
   if (!VerifyFunction(function)) {
     function->eraseFromParent(); // deletes function
     return NULL;
@@ -886,13 +986,11 @@ Function* LlvmCodeGen::FinalizeFunction(Function* function) {
   return function;
 }
 
-Status LlvmCodeGen::MaterializeModule(Module* module) {
-  std::error_code err = module->materializeAll();
+Status LlvmCodeGen::MaterializeModule() {
+  std::error_code err = module_->materializeAll();
   if (UNLIKELY(err)) {
-    stringstream err_msg;
-    err_msg << "Failed to complete materialization of module " << module->getName().str()
-        << ": " << err.message();
-    return Status(err_msg.str());
+    return Status(Substitute("Failed to materialize module $0: $1",
+        module_->getName().str(), err.message()));
   }
   return Status::OK();
 }
@@ -919,7 +1017,7 @@ Status LlvmCodeGen::FinalizeLazyMaterialization() {
   // All unused functions are now not materializable so it should be quick to call
   // materializeAll(). We need to call this function in order to destroy the
   // materializer so that DCE will not assert fail.
-  return MaterializeModule(module_);
+  return MaterializeModule();
 }
 
 Status LlvmCodeGen::FinalizeModule() {
@@ -1005,7 +1103,9 @@ Status LlvmCodeGen::OptimizeModule() {
   pass_builder.OptLevel = 2;
   // Don't optimize for code size (this corresponds to -O2/-O3)
   pass_builder.SizeLevel = 0;
-  pass_builder.Inliner = createFunctionInliningPass();
+  // Use a threshold equivalent to adding InlineHint on all functions.
+  // This results in slightly better performance than the default threshold (225).
+  pass_builder.Inliner = createFunctionInliningPass(325);
 
   // The TargetIRAnalysis pass is required to provide information about the target
   // machine to optimisation passes, e.g. the cost model.
@@ -1145,10 +1245,16 @@ void LlvmCodeGen::CodegenDebugTrace(LlvmBuilder* builder, const char* str,
   builder->CreateCall(printf, calling_args);
 }
 
-void LlvmCodeGen::GetSymbols(unordered_set<string>* symbols) {
-  for (const Function& fn: module_->functions()) {
+Status LlvmCodeGen::GetSymbols(const string& file, const string& module_id,
+    unordered_set<string>* symbols) {
+  ObjectPool pool;
+  scoped_ptr<LlvmCodeGen> codegen;
+  RETURN_IF_ERROR(CreateFromFile(nullptr, &pool, nullptr, file, module_id, &codegen));
+  for (const Function& fn: codegen->module_->functions()) {
     if (fn.isMaterializable()) symbols->insert(fn.getName());
   }
+  codegen->Close();
+  return Status::OK();
 }
 
 // TODO: cache this function (e.g. all min(int, int) are identical).
@@ -1301,20 +1407,19 @@ void LlvmCodeGen::CodegenClearNullBits(LlvmBuilder* builder, Value* tuple_ptr,
   CodegenMemset(builder, null_bytes_ptr, 0, tuple_desc.num_null_bytes());
 }
 
-Value* LlvmCodeGen::CodegenAllocate(LlvmBuilder* builder, MemPool* pool, Value* size,
-    const char* name) {
-  DCHECK(pool != NULL);
-  DCHECK(size->getType()->isIntegerTy());
-  DCHECK_LE(size->getType()->getIntegerBitWidth(), 64);
-  // Extend 'size' to i64 if necessary
-  if (size->getType()->getIntegerBitWidth() < 64) {
-    size = builder->CreateSExt(size, bigint_type());
+Value* LlvmCodeGen::CodegenMemPoolAllocate(LlvmBuilder* builder, Value* pool_val,
+    Value* size_val, const char* name) {
+  DCHECK(pool_val != nullptr);
+  DCHECK(size_val->getType()->isIntegerTy());
+  DCHECK_LE(size_val->getType()->getIntegerBitWidth(), 64);
+  DCHECK_EQ(pool_val->getType(), GetPtrType(MemPool::LLVM_CLASS_NAME));
+  // Extend 'size_val' to i64 if necessary
+  if (size_val->getType()->getIntegerBitWidth() < 64) {
+    size_val = builder->CreateSExt(size_val, bigint_type());
   }
   Function* allocate_fn = GetFunction(IRFunction::MEMPOOL_ALLOCATE, false);
-  PointerType* pool_type = GetPtrType(MemPool::LLVM_CLASS_NAME);
-  Value* pool_val = CastPtrToLlvmPtr(pool_type, pool);
   Value* alignment = GetIntConstant(TYPE_INT, MemPool::DEFAULT_ALIGNMENT);
-  Value* fn_args[] = {pool_val, size, alignment};
+  Value* fn_args[] = {pool_val, size_val, alignment};
   return builder->CreateCall(allocate_fn, fn_args, name);
 }
 
@@ -1324,6 +1429,13 @@ Value* LlvmCodeGen::CodegenArrayAt(LlvmBuilder* builder, Value* array, int idx,
       << Print(array->getType());
   Value* ptr = builder->CreateConstGEP1_32(array, idx);
   return builder->CreateLoad(ptr, name);
+}
+
+Value* LlvmCodeGen::CodegenCallFunction(LlvmBuilder* builder,
+    IRFunction::Type ir_type, ArrayRef<Value*> args, const char* name) {
+  Function* fn = GetFunction(ir_type, false);
+  DCHECK(fn != nullptr);
+  return builder->CreateCall(fn, args, name);
 }
 
 void LlvmCodeGen::ClearHashFns() {

@@ -17,6 +17,7 @@
 
 #include "exec/exec-node.h"
 
+#include <memory>
 #include <sstream>
 #include <unistd.h>  // for sleep()
 
@@ -26,19 +27,20 @@
 #include "codegen/llvm-codegen.h"
 #include "common/object-pool.h"
 #include "common/status.h"
-#include "exprs/expr.h"
-#include "exec/aggregation-node.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "exec/analytic-eval-node.h"
 #include "exec/data-source-scan-node.h"
 #include "exec/empty-set-node.h"
 #include "exec/exchange-node.h"
-#include "exec/hash-join-node.h"
 #include "exec/hbase-scan-node.h"
-#include "exec/hdfs-scan-node.h"
 #include "exec/hdfs-scan-node-mt.h"
+#include "exec/hdfs-scan-node.h"
+#include "exec/kudu-scan-node-mt.h"
 #include "exec/kudu-scan-node.h"
 #include "exec/kudu-util.h"
 #include "exec/nested-loop-join-node.h"
+#include "exec/partial-sort-node.h"
 #include "exec/partitioned-aggregation-node.h"
 #include "exec/partitioned-hash-join-node.h"
 #include "exec/select-node.h"
@@ -48,21 +50,29 @@
 #include "exec/topn-node.h"
 #include "exec/union-node.h"
 #include "exec/unnest-node.h"
+#include "exprs/expr.h"
+#include "gutil/strings/substitute.h"
 #include "runtime/descriptors.h"
-#include "runtime/mem-tracker.h"
+#include "runtime/exec-env.h"
+#include "runtime/initial-reservations.h"
 #include "runtime/mem-pool.h"
+#include "runtime/mem-tracker.h"
+#include "runtime/query-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
+#include "util/string-parser.h"
 
 #include "common/names.h"
 
 using namespace llvm;
+using strings::Substitute;
 
-// TODO: remove when we remove hash-join-node.cc and aggregation-node.cc
-DEFINE_bool(enable_partitioned_hash_join, true, "Enable partitioned hash join");
-DEFINE_bool(enable_partitioned_aggregation, true, "Enable partitioned hash agg");
+DECLARE_int32(be_port);
+DECLARE_string(hostname);
+DEFINE_bool_hidden(enable_partitioned_hash_join, true, "Deprecated - has no effect");
+DEFINE_bool_hidden(enable_partitioned_aggregation, true, "Deprecated - has no effect");
 
 namespace impala {
 
@@ -72,46 +82,39 @@ int ExecNode::GetNodeIdFromProfile(RuntimeProfile* p) {
   return p->metadata();
 }
 
-ExecNode::RowBatchQueue::RowBatchQueue(int max_batches) :
-    BlockingQueue<RowBatch*>(max_batches) {
+ExecNode::RowBatchQueue::RowBatchQueue(int max_batches)
+  : BlockingQueue<unique_ptr<RowBatch>>(max_batches) {
 }
 
 ExecNode::RowBatchQueue::~RowBatchQueue() {
   DCHECK(cleanup_queue_.empty());
 }
 
-void ExecNode::RowBatchQueue::AddBatch(RowBatch* batch) {
-  if (!BlockingPut(batch)) {
+void ExecNode::RowBatchQueue::AddBatch(unique_ptr<RowBatch> batch) {
+  if (!BlockingPut(move(batch))) {
     lock_guard<SpinLock> l(lock_);
-    cleanup_queue_.push_back(batch);
+    cleanup_queue_.push_back(move(batch));
   }
 }
 
-bool ExecNode::RowBatchQueue::AddBatchWithTimeout(RowBatch* batch,
-    int64_t timeout_micros) {
-  return BlockingPutWithTimeout(batch, timeout_micros);
-}
-
-RowBatch* ExecNode::RowBatchQueue::GetBatch() {
-  RowBatch* result = NULL;
+unique_ptr<RowBatch> ExecNode::RowBatchQueue::GetBatch() {
+  unique_ptr<RowBatch> result;
   if (BlockingGet(&result)) return result;
-  return NULL;
+  return unique_ptr<RowBatch>();
 }
 
 int ExecNode::RowBatchQueue::Cleanup() {
   int num_io_buffers = 0;
 
-  RowBatch* batch = NULL;
+  unique_ptr<RowBatch> batch = NULL;
   while ((batch = GetBatch()) != NULL) {
     num_io_buffers += batch->num_io_buffers();
-    delete batch;
+    batch.reset();
   }
 
   lock_guard<SpinLock> l(lock_);
-  for (list<RowBatch*>::iterator it = cleanup_queue_.begin();
-      it != cleanup_queue_.end(); ++it) {
-    num_io_buffers += (*it)->num_io_buffers();
-    delete *it;
+  for (const unique_ptr<RowBatch>& row_batch: cleanup_queue_) {
+    num_io_buffers += row_batch->num_io_buffers();
   }
   cleanup_queue_.clear();
   return num_io_buffers;
@@ -122,6 +125,7 @@ ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
     type_(tnode.node_type),
     pool_(pool),
     row_descriptor_(descs, tnode.row_tuples, tnode.nullable_tuples),
+    resource_profile_(tnode.resource_profile),
     debug_phase_(TExecNodePhase::INVALID),
     debug_action_(TDebugAction::WAIT),
     limit_(tnode.limit),
@@ -139,26 +143,26 @@ ExecNode::~ExecNode() {
 
 Status ExecNode::Init(const TPlanNode& tnode, RuntimeState* state) {
   RETURN_IF_ERROR(
-      Expr::CreateExprTrees(pool_, tnode.conjuncts, &conjunct_ctxs_));
+      ScalarExpr::Create(tnode.conjuncts, row_descriptor_, state, &conjuncts_));
   return Status::OK();
 }
 
 Status ExecNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::PREPARE, state));
   DCHECK(runtime_profile_.get() != NULL);
-  rows_returned_counter_ =
-      ADD_COUNTER(runtime_profile_, "RowsReturned", TUnit::UNIT);
   mem_tracker_.reset(new MemTracker(runtime_profile_.get(), -1, runtime_profile_->name(),
       state->instance_mem_tracker()));
   expr_mem_tracker_.reset(new MemTracker(-1, "Exprs", mem_tracker_.get(), false));
-
+  expr_mem_pool_.reset(new MemPool(expr_mem_tracker_.get()));
+  rows_returned_counter_ = ADD_COUNTER(runtime_profile_, "RowsReturned", TUnit::UNIT);
   rows_returned_rate_ = runtime_profile()->AddDerivedCounter(
       ROW_THROUGHPUT_COUNTER, TUnit::UNIT_PER_SECOND,
       bind<int64_t>(&RuntimeProfile::UnitsPerSecond, rows_returned_counter_,
-        runtime_profile()->total_time_counter()));
-
-  RETURN_IF_ERROR(Expr::Prepare(conjunct_ctxs_, state, row_desc(), expr_mem_tracker()));
-  AddExprCtxsToFree(conjunct_ctxs_);
+          runtime_profile()->total_time_counter()));
+  RETURN_IF_ERROR(ScalarExprEvaluator::Create(conjuncts_, state, pool_, expr_mem_pool(),
+      &conjunct_evals_));
+  DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
+  AddEvaluatorsToFree(conjunct_evals_);
   for (int i = 0; i < children_.size(); ++i) {
     RETURN_IF_ERROR(children_[i]->Prepare(state));
   }
@@ -175,7 +179,8 @@ void ExecNode::Codegen(RuntimeState* state) {
 
 Status ExecNode::Open(RuntimeState* state) {
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
-  return Expr::Open(conjunct_ctxs_, state);
+  DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
+  return ScalarExprEvaluator::Open(conjunct_evals_, state);
 }
 
 Status ExecNode::Reset(RuntimeState* state) {
@@ -196,14 +201,77 @@ void ExecNode::Close(RuntimeState* state) {
   for (int i = 0; i < children_.size(); ++i) {
     children_[i]->Close(state);
   }
-  Expr::Close(conjunct_ctxs_, state);
 
-  if (mem_tracker() != NULL && mem_tracker()->consumption() != 0) {
-    LOG(WARNING) << "Query " << state->query_id() << " may have leaked memory." << endl
-                 << state->instance_mem_tracker()->LogUsage();
-    DCHECK_EQ(mem_tracker()->consumption(), 0)
-        << "Leaked memory." << endl << state->instance_mem_tracker()->LogUsage();
+  ScalarExprEvaluator::Close(conjunct_evals_, state);
+  ScalarExpr::Close(conjuncts_);
+  if (expr_mem_pool() != nullptr) expr_mem_pool_->FreeAll();
+  if (buffer_pool_client_.is_registered()) {
+    VLOG_FILE << id_ << " returning reservation " << resource_profile_.min_reservation;
+    state->query_state()->initial_reservations()->Return(
+        &buffer_pool_client_, resource_profile_.min_reservation);
+    state->exec_env()->buffer_pool()->DeregisterClient(&buffer_pool_client_);
   }
+  if (expr_mem_tracker_ != nullptr) expr_mem_tracker_->Close();
+  if (mem_tracker_ != nullptr) {
+    if (mem_tracker()->consumption() != 0) {
+      LOG(WARNING) << "Query " << state->query_id() << " may have leaked memory." << endl
+          << state->instance_mem_tracker()->LogUsage(MemTracker::UNLIMITED_DEPTH);
+      DCHECK_EQ(mem_tracker()->consumption(), 0)
+          << "Leaked memory." << endl
+          << state->instance_mem_tracker()->LogUsage(MemTracker::UNLIMITED_DEPTH);
+    }
+    mem_tracker_->Close();
+  }
+}
+
+Status ExecNode::ClaimBufferReservation(RuntimeState* state) {
+  DCHECK(!buffer_pool_client_.is_registered());
+  BufferPool* buffer_pool = ExecEnv::GetInstance()->buffer_pool();
+  // Check the minimum buffer size in case the minimum buffer size used by the planner
+  // doesn't match this backend's.
+  if (resource_profile_.__isset.spillable_buffer_size &&
+      resource_profile_.spillable_buffer_size < buffer_pool->min_buffer_len()) {
+    return Status(Substitute("Spillable buffer size for node $0 of $1 bytes is less "
+                             "than the minimum buffer pool buffer size of $2 bytes",
+        id_, resource_profile_.spillable_buffer_size, buffer_pool->min_buffer_len()));
+  }
+
+  RETURN_IF_ERROR(buffer_pool->RegisterClient(
+      Substitute("$0 id=$1 ptr=$2", PrintPlanNodeType(type_), id_, this),
+      state->query_state()->file_group(), state->instance_buffer_reservation(),
+      mem_tracker(), resource_profile_.max_reservation, runtime_profile(),
+      &buffer_pool_client_));
+  VLOG_FILE << id_ << " claiming reservation " << resource_profile_.min_reservation;
+  state->query_state()->initial_reservations()->Claim(
+      &buffer_pool_client_, resource_profile_.min_reservation);
+  if (debug_action_ == TDebugAction::SET_DENY_RESERVATION_PROBABILITY &&
+      (debug_phase_ == TExecNodePhase::PREPARE || debug_phase_ == TExecNodePhase::OPEN)) {
+    // We may not have been able to enable the debug action at the start of Prepare() or
+    // Open() because the client is not registered then. Do it now to be sure that it is
+    // effective.
+    RETURN_IF_ERROR(EnableDenyReservationDebugAction());
+  }
+  return Status::OK();
+}
+
+Status ExecNode::ReleaseUnusedReservation() {
+  return buffer_pool_client_.DecreaseReservationTo(resource_profile_.min_reservation);
+}
+
+Status ExecNode::EnableDenyReservationDebugAction() {
+  DCHECK_EQ(debug_action_, TDebugAction::SET_DENY_RESERVATION_PROBABILITY);
+  DCHECK(buffer_pool_client_.is_registered());
+  // Parse [0.0, 1.0] probability.
+  StringParser::ParseResult parse_result;
+  double probability = StringParser::StringToFloat<double>(
+      debug_action_param_.c_str(), debug_action_param_.size(), &parse_result);
+  if (parse_result != StringParser::PARSE_SUCCESS || probability < 0.0
+      || probability > 1.0) {
+    return Status(Substitute(
+        "Invalid SET_DENY_RESERVATION_PROBABILITY param: '$0'", debug_action_param_));
+  }
+  buffer_pool_client_.SetDebugDenyIncreaseReservation(probability);
+  return Status::OK();
 }
 
 Status ExecNode::CreateTree(
@@ -271,7 +339,6 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
   stringstream error_msg;
   switch (tnode.node_type) {
     case TPlanNodeType::HDFS_SCAN_NODE:
-      *node = pool->Add(new HdfsScanNode(pool, tnode, descs));
       if (tnode.hdfs_scan_node.use_mt_scan_node) {
         DCHECK_GT(state->query_options().mt_dop, 0);
         *node = pool->Add(new HdfsScanNodeMt(pool, tnode, descs));
@@ -289,27 +356,20 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
       break;
     case TPlanNodeType::KUDU_SCAN_NODE:
       RETURN_IF_ERROR(CheckKuduAvailability());
-      *node = pool->Add(new KuduScanNode(pool, tnode, descs));
+      if (tnode.kudu_scan_node.use_mt_scan_node) {
+        DCHECK_GT(state->query_options().mt_dop, 0);
+        *node = pool->Add(new KuduScanNodeMt(pool, tnode, descs));
+      } else {
+        DCHECK(state->query_options().mt_dop == 0
+            || state->query_options().num_scanner_threads == 1);
+        *node = pool->Add(new KuduScanNode(pool, tnode, descs));
+      }
       break;
     case TPlanNodeType::AGGREGATION_NODE:
-      if (FLAGS_enable_partitioned_aggregation) {
-        *node = pool->Add(new PartitionedAggregationNode(pool, tnode, descs));
-      } else {
-        *node = pool->Add(new AggregationNode(pool, tnode, descs));
-      }
+      *node = pool->Add(new PartitionedAggregationNode(pool, tnode, descs));
       break;
     case TPlanNodeType::HASH_JOIN_NODE:
-      // The (old) HashJoinNode does not support left-anti, right-semi, and right-anti
-      // joins.
-      if (tnode.hash_join_node.join_op == TJoinOp::LEFT_ANTI_JOIN ||
-          tnode.hash_join_node.join_op == TJoinOp::RIGHT_SEMI_JOIN ||
-          tnode.hash_join_node.join_op == TJoinOp::RIGHT_ANTI_JOIN ||
-          tnode.hash_join_node.join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN ||
-          FLAGS_enable_partitioned_hash_join) {
-        *node = pool->Add(new PartitionedHashJoinNode(pool, tnode, descs));
-      } else {
-        *node = pool->Add(new HashJoinNode(pool, tnode, descs));
-      }
+      *node = pool->Add(new PartitionedHashJoinNode(pool, tnode, descs));
       break;
     case TPlanNodeType::NESTED_LOOP_JOIN_NODE:
       *node = pool->Add(new NestedLoopJoinNode(pool, tnode, descs));
@@ -324,9 +384,12 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
       *node = pool->Add(new SelectNode(pool, tnode, descs));
       break;
     case TPlanNodeType::SORT_NODE:
-      if (tnode.sort_node.use_top_n) {
+      if (tnode.sort_node.type == TSortType::PARTIAL) {
+        *node = pool->Add(new PartialSortNode(pool, tnode, descs));
+      } else if (tnode.sort_node.type == TSortType::TOPN) {
         *node = pool->Add(new TopNNode(pool, tnode, descs));
       } else {
+        DCHECK(tnode.sort_node.type == TSortType::TOTAL);
         *node = pool->Add(new SortNode(pool, tnode, descs));
       }
       break;
@@ -340,13 +403,6 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
       *node = pool->Add(new SingularRowSrcNode(pool, tnode, descs));
       break;
     case TPlanNodeType::SUBPLAN_NODE:
-      if (!FLAGS_enable_partitioned_hash_join || !FLAGS_enable_partitioned_aggregation) {
-        error_msg << "Query referencing nested types is not supported because the "
-            << "--enable_partitioned_hash_join and/or --enable_partitioned_aggregation "
-            << "Impala Daemon start-up flags are set to false.\nTo enable nested types "
-            << "support please set those flags to true (they are enabled by default).";
-        return Status(error_msg.str());
-      }
       *node = pool->Add(new SubplanNode(pool, tnode, descs));
       break;
     case TPlanNodeType::UNNEST_NODE:
@@ -365,16 +421,17 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
   return Status::OK();
 }
 
-void ExecNode::SetDebugOptions(
-    int node_id, TExecNodePhase::type phase, TDebugAction::type action,
-    ExecNode* root) {
-  if (root->id_ == node_id) {
-    root->debug_phase_ = phase;
-    root->debug_action_ = action;
-    return;
+void ExecNode::SetDebugOptions(const TDebugOptions& debug_options, ExecNode* root) {
+  DCHECK(debug_options.__isset.node_id);
+  DCHECK(debug_options.__isset.phase);
+  DCHECK(debug_options.__isset.action);
+  if (debug_options.node_id == -1 || root->id_ == debug_options.node_id) {
+    root->debug_phase_ = debug_options.phase;
+    root->debug_action_ = debug_options.action;
+    root->debug_action_param_ = debug_options.action_param;
   }
   for (int i = 0; i < root->children_.size(); ++i) {
-    SetDebugOptions(node_id, phase, action, root->children_[i]);
+    SetDebugOptions(debug_options, root->children_[i]);
   }
 }
 
@@ -385,7 +442,7 @@ string ExecNode::DebugString() const {
 }
 
 void ExecNode::DebugString(int indentation_level, stringstream* out) const {
-  *out << " conjuncts=" << Expr::DebugString(conjunct_ctxs_);
+  *out << " conjuncts=" << ScalarExpr::DebugString(conjuncts_);
   for (int i = 0; i < children_.size(); ++i) {
     *out << "\n";
     children_[i]->DebugString(indentation_level + 1, out);
@@ -412,50 +469,53 @@ void ExecNode::InitRuntimeProfile(const string& name) {
   runtime_profile_->set_metadata(id_);
 }
 
-Status ExecNode::ExecDebugAction(TExecNodePhase::type phase, RuntimeState* state) {
-  DCHECK(phase != TExecNodePhase::INVALID);
-  if (debug_phase_ != phase) return Status::OK();
+Status ExecNode::ExecDebugActionImpl(TExecNodePhase::type phase, RuntimeState* state) {
+  DCHECK_EQ(debug_phase_, phase);
   if (debug_action_ == TDebugAction::FAIL) {
     return Status(TErrorCode::INTERNAL_ERROR, "Debug Action: FAIL");
-  }
-  if (debug_action_ == TDebugAction::WAIT) {
+  } else if (debug_action_ == TDebugAction::WAIT) {
     while (!state->is_cancelled()) {
       sleep(1);
     }
     return Status::CANCELLED;
-  }
-  if (debug_action_ == TDebugAction::INJECT_ERROR_LOG) {
+  } else if (debug_action_ == TDebugAction::INJECT_ERROR_LOG) {
     state->LogError(
         ErrorMsg(TErrorCode::INTERNAL_ERROR, "Debug Action: INJECT_ERROR_LOG"));
     return Status::OK();
-  }
-  if (debug_action_ == TDebugAction::MEM_LIMIT_EXCEEDED) {
+  } else if (debug_action_ == TDebugAction::MEM_LIMIT_EXCEEDED) {
     return mem_tracker()->MemLimitExceeded(state, "Debug Action: MEM_LIMIT_EXCEEDED");
+  } else {
+    DCHECK_EQ(debug_action_, TDebugAction::SET_DENY_RESERVATION_PROBABILITY);
+    // We can only enable the debug action right if the buffer pool client is registered.
+    // If the buffer client is not registered at this point (e.g. if phase is PREPARE or
+    // OPEN), then we will enable the debug action at the time when the client is
+    // registered.
+    if (buffer_pool_client_.is_registered()) {
+      RETURN_IF_ERROR(EnableDenyReservationDebugAction());
+    }
   }
   return Status::OK();
 }
 
-bool ExecNode::EvalConjuncts(ExprContext* const* ctxs, int num_ctxs, TupleRow* row) {
-  for (int i = 0; i < num_ctxs; ++i) {
-    BooleanVal v = ctxs[i]->GetBooleanVal(row);
-    if (v.is_null || !v.val) return false;
+bool ExecNode::EvalConjuncts(
+    ScalarExprEvaluator* const* evals, int num_conjuncts, TupleRow* row) {
+  for (int i = 0; i < num_conjuncts; ++i) {
+    if (!EvalPredicate(evals[i], row)) return false;
   }
   return true;
 }
 
 Status ExecNode::QueryMaintenance(RuntimeState* state) {
-  FreeLocalAllocations();
+  ScalarExprEvaluator::FreeLocalAllocations(evals_to_free_);
   return state->CheckQueryState();
 }
 
-void ExecNode::AddExprCtxsToFree(const vector<ExprContext*>& ctxs) {
-  for (int i = 0; i < ctxs.size(); ++i) AddExprCtxToFree(ctxs[i]);
+void ExecNode::AddEvaluatorToFree(ScalarExprEvaluator* eval) {
+  evals_to_free_.push_back(eval);
 }
 
-void ExecNode::AddExprCtxsToFree(const SortExecExprs& sort_exec_exprs) {
-  AddExprCtxsToFree(sort_exec_exprs.sort_tuple_slot_expr_ctxs());
-  AddExprCtxsToFree(sort_exec_exprs.lhs_ordering_expr_ctxs());
-  AddExprCtxsToFree(sort_exec_exprs.rhs_ordering_expr_ctxs());
+void ExecNode::AddEvaluatorsToFree(const vector<ScalarExprEvaluator*>& evals) {
+  for (ScalarExprEvaluator* eval : evals) AddEvaluatorToFree(eval);
 }
 
 void ExecNode::AddCodegenDisabledMessage(RuntimeState* state) {
@@ -470,15 +530,19 @@ bool ExecNode::IsNodeCodegenDisabled() const {
   return disable_codegen_;
 }
 
-// Codegen for EvalConjuncts.  The generated signature is
-// For a node with two conjunct predicates
-// define i1 @EvalConjuncts(%"class.impala::ExprContext"** %ctxs, i32 %num_ctxs,
-//                          %"class.impala::TupleRow"* %row) #20 {
+// Codegen for EvalConjuncts.  The generated signature is the same as EvalConjuncts().
+//
+// For a node with two conjunct predicates:
+//
+// define i1 @EvalConjuncts(%"class.impala::ScalarExprEvaluator"** %evals, i32 %num_evals,
+//                          %"class.impala::TupleRow"* %row) #34 {
 // entry:
-//   %ctx_ptr = getelementptr %"class.impala::ExprContext"** %ctxs, i32 0
-//   %ctx = load %"class.impala::ExprContext"** %ctx_ptr
-//   %result = call i16 @Eq_StringVal_StringValWrapper3(
-//       %"class.impala::ExprContext"* %ctx, %"class.impala::TupleRow"* %row)
+//   %eval_ptr = getelementptr inbounds %"class.impala::ScalarExprEvaluator"*,
+//       %"class.impala::ScalarExprEvaluator"** %evals, i32 0
+//   %eval = load %"class.impala::ScalarExprEvaluator"*,
+//       %"class.impala::ScalarExprEvaluator"** %eval_ptr
+//   %result = call i16 @"impala::Operators::Eq_BigIntVal_BigIntValWrapper"(
+//       %"class.impala::ScalarExprEvaluator"* %eval, %"class.impala::TupleRow"* %row)
 //   %is_null = trunc i16 %result to i1
 //   %0 = ashr i16 %result, 8
 //   %1 = trunc i16 %0 to i8
@@ -488,30 +552,32 @@ bool ExecNode::IsNodeCodegenDisabled() const {
 //   br i1 %return_false, label %false, label %continue
 //
 // continue:                                         ; preds = %entry
-//   %ctx_ptr2 = getelementptr %"class.impala::ExprContext"** %ctxs, i32 1
-//   %ctx3 = load %"class.impala::ExprContext"** %ctx_ptr2
-//   %result4 = call i16 @Gt_BigIntVal_BigIntValWrapper5(
-//       %"class.impala::ExprContext"* %ctx3, %"class.impala::TupleRow"* %row)
-//   %is_null5 = trunc i16 %result4 to i1
-//   %2 = ashr i16 %result4, 8
-//   %3 = trunc i16 %2 to i8
-//   %val6 = trunc i8 %3 to i1
-//   %is_false7 = xor i1 %val6, true
-//   %return_false8 = or i1 %is_null5, %is_false7
-//   br i1 %return_false8, label %false, label %continue1
+//  %eval_ptr2 = getelementptr inbounds %"class.impala::ScalarExprEvaluator"*,
+//      %"class.impala::ScalarExprEvaluator"** %evals, i32 1
+//  %eval3 = load %"class.impala::ScalarExprEvaluator"*,
+//      %"class.impala::ScalarExprEvaluator"** %eval_ptr2
+//  %result4 = call i16 @"impala::Operators::Eq_StringVal_StringValWrapper"(
+//      %"class.impala::ScalarExprEvaluator"* %eval3, %"class.impala::TupleRow"* %row)
+//  %is_null5 = trunc i16 %result4 to i1
+//  %2 = ashr i16 %result4, 8
+//  %3 = trunc i16 %2 to i8
+//  %val6 = trunc i8 %3 to i1
+//  %is_false7 = xor i1 %val6, true
+//  %return_false8 = or i1 %is_null5, %is_false
+//  br i1 %return_false8, label %false, label %continue1
 //
 // continue1:                                        ; preds = %continue
-//   ret i1 true
+//  ret i1 true
 //
 // false:                                            ; preds = %continue, %entry
-//   ret i1 false
+//  ret i1 false
 // }
+//
 Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
-    const vector<ExprContext*>& conjunct_ctxs, Function** fn, const char* name) {
-  Function* conjunct_fns[conjunct_ctxs.size()];
-  for (int i = 0; i < conjunct_ctxs.size(); ++i) {
-    RETURN_IF_ERROR(
-        conjunct_ctxs[i]->root()->GetCodegendComputeFn(codegen, &conjunct_fns[i]));
+    const vector<ScalarExpr*>& conjuncts, Function** fn, const char* name) {
+  Function* conjunct_fns[conjuncts.size()];
+  for (int i = 0; i < conjuncts.size(); ++i) {
+    RETURN_IF_ERROR(conjuncts[i]->GetCodegendComputeFn(codegen, &conjunct_fns[i]));
     if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
       // Avoid bloating EvalConjuncts by inlining everything into it.
       codegen->SetNoInline(conjunct_fns[i]);
@@ -519,43 +585,36 @@ Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
   }
 
   // Construct function signature to match
-  // bool EvalConjuncts(Expr** exprs, int num_exprs, TupleRow* row)
-  Type* tuple_row_type = codegen->GetType(TupleRow::LLVM_CLASS_NAME);
-  Type* expr_ctx_type = codegen->GetType(ExprContext::LLVM_CLASS_NAME);
-
-  DCHECK(tuple_row_type != NULL);
-  DCHECK(expr_ctx_type != NULL);
-
-  PointerType* tuple_row_ptr_type = PointerType::get(tuple_row_type, 0);
-  PointerType* expr_ctx_ptr_type = PointerType::get(expr_ctx_type, 0);
+  // bool EvalConjuncts(ScalarExprEvaluator**, int, TupleRow*)
+  PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
+  Type* eval_type = codegen->GetType(ScalarExprEvaluator::LLVM_CLASS_NAME);
 
   LlvmCodeGen::FnPrototype prototype(codegen, name, codegen->GetType(TYPE_BOOLEAN));
   prototype.AddArgument(
-      LlvmCodeGen::NamedVariable("ctxs", PointerType::get(expr_ctx_ptr_type, 0)));
+      LlvmCodeGen::NamedVariable("evals", codegen->GetPtrPtrType(eval_type)));
   prototype.AddArgument(
-      LlvmCodeGen::NamedVariable("num_ctxs", codegen->GetType(TYPE_INT)));
+      LlvmCodeGen::NamedVariable("num_evals", codegen->GetType(TYPE_INT)));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
 
   LlvmBuilder builder(codegen->context());
   Value* args[3];
   *fn = prototype.GeneratePrototype(&builder, args);
-  Value* ctxs_arg = args[0];
+  Value* evals_arg = args[0];
   Value* tuple_row_arg = args[2];
 
-  if (conjunct_ctxs.size() > 0) {
+  if (conjuncts.size() > 0) {
     LLVMContext& context = codegen->context();
     BasicBlock* false_block = BasicBlock::Create(context, "false", *fn);
 
-    for (int i = 0; i < conjunct_ctxs.size(); ++i) {
+    for (int i = 0; i < conjuncts.size(); ++i) {
       BasicBlock* true_block = BasicBlock::Create(context, "continue", *fn, false_block);
-
-      Value* ctx_arg_ptr = builder.CreateConstGEP1_32(ctxs_arg, i, "ctx_ptr");
-      Value* ctx_arg = builder.CreateLoad(ctx_arg_ptr, "ctx");
-      Value* expr_args[] = { ctx_arg, tuple_row_arg };
+      Value* eval_arg_ptr = builder.CreateInBoundsGEP(NULL, evals_arg,
+          codegen->GetIntConstant(TYPE_INT, i), "eval_ptr");
+      Value* eval_arg = builder.CreateLoad(eval_arg_ptr, "eval");
 
       // Call conjunct_fns[i]
-      CodegenAnyVal result = CodegenAnyVal::CreateCallWrapped(
-          codegen, &builder, conjunct_ctxs[i]->root()->type(), conjunct_fns[i], expr_args,
+      CodegenAnyVal result = CodegenAnyVal::CreateCallWrapped(codegen, &builder,
+          conjuncts[i]->type(), conjunct_fns[i], {eval_arg, tuple_row_arg},
           "result");
 
       // Return false if result.is_null || !result
@@ -576,7 +635,7 @@ Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
   }
 
   // Avoid inlining EvalConjuncts into caller if it is large.
-  if (conjunct_ctxs.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
+  if (conjuncts.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
     codegen->SetNoInline(*fn);
   }
 

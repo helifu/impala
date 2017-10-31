@@ -38,16 +38,19 @@ import org.apache.impala.analysis.SqlScanner;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Catalog;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.service.Frontend;
 import org.apache.impala.testutil.ImpaladTestCatalog;
 import org.apache.impala.testutil.TestUtils;
@@ -56,6 +59,8 @@ import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -75,6 +80,16 @@ public class FrontendTestBase {
   protected final List<Db> testDbs_ = Lists.newArrayList();
   protected final List<Table> testTables_ = Lists.newArrayList();
 
+  @BeforeClass
+  public static void setUp() throws Exception {
+    RuntimeEnv.INSTANCE.setTestEnv(true);
+  }
+
+  @AfterClass
+  public static void cleanUp() throws Exception {
+    RuntimeEnv.INSTANCE.setTestEnv(false);
+  }
+
   protected Analyzer createAnalyzer(String defaultDb) {
     TQueryCtx queryCtx =
         TestUtils.createQueryContext(defaultDb, System.getProperty("user.name"));
@@ -84,7 +99,7 @@ public class FrontendTestBase {
 
   protected Analyzer createAnalyzer(TQueryOptions queryOptions) {
     TQueryCtx queryCtx = TestUtils.createQueryContext();
-    queryCtx.request.query_options = queryOptions;
+    queryCtx.client_request.query_options = queryOptions;
     return new Analyzer(catalog_, queryCtx,
         AuthorizationConfig.createAuthDisabledConfig());
   }
@@ -151,23 +166,48 @@ public class FrontendTestBase {
   }
 
   /**
-   * Add a new dummy table to the catalog based on the given CREATE TABLE sql.
-   * The dummy table only has the column definitions and no other metadata.
+   * Add a new dummy table to the catalog based on the given CREATE TABLE sql. The
+   * returned table only has its metadata partially set, but is capable of being planned.
+   * Only HDFS tables and external Kudu tables are supported.
    * Returns the new dummy table.
    * The test tables are registered in testTables_ and removed in the @After method.
    */
   protected Table addTestTable(String createTableSql) {
     CreateTableStmt createTableStmt = (CreateTableStmt) AnalyzesOk(createTableSql);
-    // Currently does not support partitioned tables.
-    Preconditions.checkState(createTableStmt.getPartitionColumnDefs().isEmpty());
     Db db = catalog_.getDb(createTableStmt.getDb());
     Preconditions.checkNotNull(db, "Test tables must be created in an existing db.");
-    HdfsTable dummyTable = new HdfsTable(null, db,
-        createTableStmt.getTbl(), createTableStmt.getOwner());
-    List<ColumnDef> columnDefs = createTableStmt.getColumnDefs();
-    for (int i = 0; i < columnDefs.size(); ++i) {
-      ColumnDef colDef = columnDefs.get(i);
-      dummyTable.addColumn(new Column(colDef.getColName(), colDef.getType(), i));
+    org.apache.hadoop.hive.metastore.api.Table msTbl =
+        CatalogOpExecutor.createMetaStoreTable(createTableStmt.toThrift());
+    Table dummyTable = Table.fromMetastoreTable(db, msTbl);
+    if (dummyTable instanceof HdfsTable) {
+      List<ColumnDef> columnDefs = Lists.newArrayList(
+          createTableStmt.getPartitionColumnDefs());
+      dummyTable.setNumClusteringCols(columnDefs.size());
+      columnDefs.addAll(createTableStmt.getColumnDefs());
+      for (int i = 0; i < columnDefs.size(); ++i) {
+        ColumnDef colDef = columnDefs.get(i);
+        dummyTable.addColumn(new Column(colDef.getColName(), colDef.getType(), i));
+      }
+      try {
+        HdfsTable hdfsTable = (HdfsTable) dummyTable;
+        hdfsTable.addDefaultPartition(msTbl.getSd());
+      } catch (CatalogException e) {
+        e.printStackTrace();
+        fail("Failed to add test table:\n" + createTableSql);
+      }
+    } else if (dummyTable instanceof KuduTable) {
+      if (!Table.isExternalTable(msTbl)) {
+        fail("Failed to add table, external kudu table expected:\n" + createTableSql);
+      }
+      try {
+        KuduTable kuduTable = (KuduTable) dummyTable;
+        kuduTable.loadSchemaFromKudu();
+      } catch (ImpalaRuntimeException e) {
+        e.printStackTrace();
+        fail("Failed to add test table:\n" + createTableSql);
+      }
+    } else {
+      fail("Test table type not supported:\n" + createTableSql);
     }
     db.addTable(dummyTable);
     testTables_.add(dummyTable);
@@ -244,8 +284,8 @@ public class FrontendTestBase {
     try {
       AnalysisContext analysisCtx = new AnalysisContext(catalog_,
           TestUtils.createQueryContext(Catalog.DEFAULT_DB,
-              System.getProperty("user.name")),
-              AuthorizationConfig.createAuthDisabledConfig());
+            System.getProperty("user.name")),
+          AuthorizationConfig.createAuthDisabledConfig());
       analysisCtx.analyze(stmt, analyzer);
       AnalysisContext.AnalysisResult analysisResult = analysisCtx.getAnalysisResult();
       if (expectedWarning != null) {

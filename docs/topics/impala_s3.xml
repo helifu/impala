@@ -39,9 +39,9 @@ under the License.
     <note conref="../shared/impala_common.xml#common/s3_production"/>
 
     <p rev="2.2.0">
-      <indexterm audience="Cloudera">S3 with Impala</indexterm>
+      <indexterm audience="hidden">S3 with Impala</indexterm>
 
-      <indexterm audience="Cloudera">Amazon S3 with Impala</indexterm>
+      <indexterm audience="hidden">Amazon S3 with Impala</indexterm>
       You can use Impala to query data residing on the Amazon S3 filesystem. This capability allows convenient
       access to a storage system that is remotely managed, accessible from anywhere, and integrated with various
       cloud-based services. Impala can query files in any supported file format from S3. The S3 storage location
@@ -108,7 +108,7 @@ under the License.
             form of the <codeph>CREATE TABLE</codeph> statement, can copy data from an HDFS table or another S3
             table into an S3 table. The <xref href="impala_s3_skip_insert_staging.xml#s3_skip_insert_staging"/>
             query option chooses whether or not to use a fast code path for these write operations to S3,
-            with the tradeoff of potential inconsistency in the case of a failure during the statement. 
+            with the tradeoff of potential inconsistency in the case of a failure during the statement.
           </p>
         </li>
       </ul>
@@ -126,10 +126,10 @@ under the License.
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">fs.s3a.access.key configuration setting</indexterm>
-        <indexterm audience="Cloudera">fs.s3a.secret.key configuration setting</indexterm>
-        <indexterm audience="Cloudera">access.key configuration setting</indexterm>
-        <indexterm audience="Cloudera">secret.key configuration setting</indexterm>
+        <indexterm audience="hidden">fs.s3a.access.key configuration setting</indexterm>
+        <indexterm audience="hidden">fs.s3a.secret.key configuration setting</indexterm>
+        <indexterm audience="hidden">access.key configuration setting</indexterm>
+        <indexterm audience="hidden">secret.key configuration setting</indexterm>
         To allow Impala to access data in S3, specify values for the following configuration settings in your
         <filepath>core-site.xml</filepath> file:
       </p>
@@ -148,37 +148,16 @@ under the License.
 </codeblock>
 
       <p>
-        As of CDH 5.8, these settings do not have corresponding controls in the Cloudera Manager user interface.
-        Specify them in the <uicontrol>HDFS Client Advanced Configuration Snippet (Safety Valve) for
-        core-site.xml</uicontrol> field. After specifying the credentials, restart both the Impala and Hive
-        services. (Restarting Hive is required because Impala queries, <codeph>CREATE TABLE</codeph> statements,
-        and so on go through the Hive metastore.)
+        After specifying the credentials, restart both the Impala and
+        Hive services. (Restarting Hive is required because Impala queries, CREATE TABLE statements, and so on go
+        through the Hive metastore.)
       </p>
-
-<!--
-      <p rev="CDH-39914 IMPALA-3306">
-        In <keyword keyref="impala26_full"/> and higher, you can specify the S3 access key and secret key through
-        configuration settings for the <cmdname>impalad</cmdname> daemon.
-        Rather than specifying the keys themselves on the command line or in startup scripts,
-        you specify the commands to retrieve the keys as <cmdname>impalad</cmdname>
-        startup options. For clusters not managed by Cloudera Manager, use the
-        <codeph>-
-        -s3a_access_key_cmd</codeph> and <codeph>-
-        -s3a_secret_key_cmd</codeph>
-        startup options for the <cmdname>impalad</cmdname> daemon.
-        For clusters managed by Cloudera Manager, set the
-        <codeph>s3a_access_key_cmd</codeph> and <codeph>s3a_secret_key_cmd</codeph>
-        configuration settings and restart the Impala and Hive services.
-        (Restarting Hive is required because Impala queries, <codeph>CREATE TABLE</codeph> statements,
-        and so on go through the Hive metastore.)
-      </p>
--->
 
       <note type="important">
 <!--
       <ul>
         <li>
-          <p rev="CDH-39914 IMPALA-3306">
+          <p rev="IMPALA-3306">
             The <codeph>s3a_access_key_cmd</codeph> and <codeph>s3a_secret_key_cmd</codeph> settings
             for <cmdname>impalad</cmdname> only allow Impala to access S3. You must still include the credentials in the
             client <filepath>hdfs-site.xml</filepath> configuration file to allow S3 access for the Hive metastore,
@@ -199,7 +178,7 @@ under the License.
 -->
         <!-- Overriding with a new first list bullet following clarification by Sailesh.
         <li>
-          <p rev="CDH-39914 IMPALA-3306">
+          <p rev="IMPALA-3306">
             Prior to <keyword keyref="impala26_full"/> an alternative way to specify the keys was by
             including the fields <codeph>fs.s3a.access.key</codeph> and <codeph>fs.s3a.secret.key</codeph>
             in a configuration file such as <filepath>core-site.xml</filepath> or <filepath>hdfs-site.xml</filepath>.
@@ -237,7 +216,7 @@ under the License.
 
     </conbody>
 
-    <concept id="s3_dml" rev="2.6.0 CDH-39913 IMPALA-1878">
+    <concept id="s3_dml" rev="2.6.0 IMPALA-1878">
       <title>Using Impala DML Statements for S3 Data</title>
       <conbody>
         <p conref="../shared/impala_common.xml#common/s3_dml"/>
@@ -700,7 +679,7 @@ under the License.
         filesystem in the cluster.
       </p>
 
-      <p rev="2.6.0 CDH-39913 IMPALA-1878">
+      <p rev="2.6.0 IMPALA-1878">
         Prior to <keyword keyref="impala26_full"/> Impala could not perform DML operations (<codeph>INSERT</codeph>,
         <codeph>LOAD DATA</codeph>, or <codeph>CREATE TABLE AS SELECT</codeph>) where the destination is a table
         or partition located on an S3 filesystem. This restriction is lifted in <keyword keyref="impala26_full"/> and higher.
@@ -727,7 +706,7 @@ under the License.
 
   </concept>
 
-  <concept id="s3_best_practices" rev="2.6.0 CDH-33310 CDH-39913 IMPALA-1878">
+  <concept id="s3_best_practices" rev="2.6.0 IMPALA-1878">
     <title>Best Practices for Using Impala with S3</title>
     <prolog>
       <metadata>

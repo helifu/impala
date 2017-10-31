@@ -35,7 +35,7 @@ under the License.
   <conbody>
 
     <p>
-      <indexterm audience="Cloudera">Text support in Impala</indexterm>
+      <indexterm audience="hidden">Text support in Impala</indexterm>
       Impala supports using text files as the storage format for input and output. Text files are a
       convenient format to use for interchange with other applications or scripts that produce or read delimited
       text files, such as CSV or TSV with commas or tabs for delimiters.
@@ -439,11 +439,11 @@ INSERT INTO csv SELECT * FROM other_file_format_table;</codeblock>
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">LZO support in Impala</indexterm>
+        <indexterm audience="hidden">LZO support in Impala</indexterm>
 
-        <indexterm audience="Cloudera">compression</indexterm>
-        Impala supports using text data files that employ LZO compression. <ph rev="upstream">Cloudera</ph> recommends compressing
-        text data files when practical. Impala queries are usually I/O-bound; reducing the amount of data read from
+        <indexterm audience="hidden">compression</indexterm>
+        Impala supports using text data files that employ LZO compression. Where practical, apply compression to
+        text data files. Impala queries are usually I/O-bound; reducing the amount of data read from
         disk typically speeds up a query, despite the extra CPU work to uncompress the data in memory.
       </p>
 
@@ -475,65 +475,18 @@ INSERT INTO csv SELECT * FROM other_file_format_table;</codeblock>
 
         <p>
           Before using LZO-compressed tables in Impala, do the following one-time setup for each machine in the
-          cluster. Install the necessary packages using either the Cloudera public repository, a private repository
-          you establish, or by using packages. You must do these steps manually, whether or not the cluster is
-          managed by the Cloudera Manager product.
+          cluster. Install the necessary packages using either the public repository, a private repository
+          you establish, or by using packages. You must do these steps manually, whether or not you
+          are using cluster management software.
         </p>
 
         <ol>
           <li>
             <b>Prepare your systems to work with LZO by downloading and installing the appropriate libraries:</b>
-            <p>
-              <b>On systems managed by Cloudera Manager using parcels:</b>
-            </p>
-
-            <p>
-              See the setup instructions for the LZO parcel in the Cloudera Manager documentation for
-              <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/cm_ig_install_gpl_extras.html" scope="external" format="html">Cloudera
-              Manager 5</xref>.
-            </p>
-
-            <p>
-              <b>On systems managed by Cloudera Manager using packages, or not managed by Cloudera Manager:</b>
-            </p>
 
             <p>
               Download and install the appropriate file to each machine on which you intend to use LZO with Impala.
-              These files all come from the Cloudera
-              <xref href="https://archive.cloudera.com/gplextras/redhat/5/x86_64/gplextras/" scope="external" format="html">GPL
-              extras</xref> download site. Install the:
             </p>
-            <ul>
-              <li>
-                <xref href="https://archive.cloudera.com/gplextras/redhat/5/x86_64/gplextras/cloudera-gplextras4.repo" scope="external" format="repo">Red
-                Hat 5 repo file</xref> to <filepath>/etc/yum.repos.d/</filepath>.
-              </li>
-
-              <li>
-                <xref href="https://archive.cloudera.com/gplextras/redhat/6/x86_64/gplextras/cloudera-gplextras4.repo" scope="external" format="repo">Red
-                Hat 6 repo file</xref> to <filepath>/etc/yum.repos.d/</filepath>.
-              </li>
-
-              <li>
-                <xref href="https://archive.cloudera.com/gplextras/sles/11/x86_64/gplextras/cloudera-gplextras4.repo" scope="external" format="repo">SUSE
-                repo file</xref> to <filepath>/etc/zypp/repos.d/</filepath>.
-              </li>
-
-              <li>
-                <xref href="https://archive.cloudera.com/gplextras/ubuntu/lucid/amd64/gplextras/cloudera.list" scope="external" format="list">Ubuntu
-                10.04 list file</xref> to <filepath>/etc/apt/sources.list.d/</filepath>.
-              </li>
-
-              <li>
-                <xref href="https://archive.cloudera.com/gplextras/ubuntu/precise/amd64/gplextras/cloudera.list" scope="external" format="list">Ubuntu
-                12.04 list file</xref> to <filepath>/etc/apt/sources.list.d/</filepath>.
-              </li>
-
-              <li>
-                <xref href="https://archive.cloudera.com/gplextras/debian/squeeze/amd64/gplextras/cloudera.list" scope="external" format="list">Debian
-                list file</xref> to <filepath>/etc/apt/sources.list.d/</filepath>.
-              </li>
-            </ul>
           </li>
 
           <li>
@@ -546,8 +499,8 @@ INSERT INTO csv SELECT * FROM other_file_format_table;</codeblock>
 
             <note rev="1.2.0">
               <p rev="1.2.0">
-                <ph rev="upstream">The name of the Hadoop LZO package changed between CDH 4 and CDH 5. In CDH 4, the package name was
-                <codeph>hadoop-lzo-cdh4</codeph>. In CDH 5 and higher, the package name is <codeph>hadoop-lzo</codeph>.</ph>
+                The name of the Hadoop LZO package changed in the distant past.
+                Currently, the package name is <codeph>hadoop-lzo</codeph>.
               </p>
             </note>
 
@@ -571,7 +524,7 @@ $ sudo apt-get install hadoop-lzo
 $ sudo apt-get install impala-lzo</codeblock>
             <note>
               <p>
-                The level of the <codeph>impala-lzo-cdh4</codeph> package is closely tied to the version of Impala
+                The level of the <codeph>impala-lzo</codeph> package is closely tied to the version of Impala
                 you use. Any time you upgrade Impala, re-do the installation command for
                 <codeph>impala-lzo</codeph> on each applicable machine to make sure you have the appropriate
                 version of that package.
@@ -610,10 +563,6 @@ drwxr-xr-x. 2 root root 4096 Oct 28 15:46 conf.pseudo</codeblock>
           </li>
 
           <li>
-            <!-- To do:
-              Link to CM or other doc where that procedure is explained.
-              Run through the procedure in CM and cite the relevant safety valves to put the XML into.
-            -->
             Restart the MapReduce and Impala services.
           </li>
         </ol>
@@ -676,8 +625,8 @@ hive&gt; INSERT INTO TABLE lzo_t SELECT col1, col2 FROM uncompressed_text_table;
           Run the indexer using a command like the following:
         </p>
 
-<codeblock>$ hadoop jar /usr/lib/hadoop/lib/hadoop-lzo-cdh4-0.4.15-gplextras.jar
-  com.hadoop.compression.lzo.DistributedLzoIndexer /hdfs_location_of_table/</codeblock>
+<codeblock>$ hadoop jar /usr/lib/hadoop/lib/hadoop-lzo-<varname>version</varname>-gplextras.jar
+  com.hadoop.compression.lzo.DistributedLzoIndexer /<varname>hdfs_location_of_table</varname>/</codeblock>
 
         <note>
           If the path of the JAR file in the preceding example is not recognized, do a <cmdname>find</cmdname>
@@ -725,13 +674,13 @@ hive&gt; INSERT INTO TABLE lzo_t SELECT col1, col2 FROM uncompressed_text_table;
     <conbody>
 
       <p>
-        <indexterm audience="Cloudera">gzip support in Impala</indexterm>
+        <indexterm audience="hidden">gzip support in Impala</indexterm>
 
-        <indexterm audience="Cloudera">bzip2 support in Impala</indexterm>
+        <indexterm audience="hidden">bzip2 support in Impala</indexterm>
 
-        <indexterm audience="Cloudera">Snappy support in Impala</indexterm>
+        <indexterm audience="hidden">Snappy support in Impala</indexterm>
 
-        <indexterm audience="Cloudera">compression</indexterm>
+        <indexterm audience="hidden">compression</indexterm>
         In Impala 2.0 and later, Impala supports using text data files that employ gzip, bzip2, or Snappy
         compression. These compression types are primarily for convenience within an existing ETL pipeline rather
         than maximum performance. Although it requires less I/O to read compressed text than the equivalent
@@ -815,7 +764,7 @@ $ hdfs dfs -ls 'hdfs://127.0.0.1:8020/user/hive/warehouse/file_formats.db/csv_co
 
   </concept>
 
-  <concept audience="Cloudera" id="txtfile_data_types">
+  <concept audience="hidden" id="txtfile_data_types">
 
     <title>Data Type Considerations for Text Tables</title>
 

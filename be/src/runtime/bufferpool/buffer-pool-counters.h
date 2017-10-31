@@ -25,21 +25,35 @@ namespace impala {
 /// A set of counters for each buffer pool client.
 struct BufferPoolClientCounters {
  public:
-  /// Amount of time spent trying to get a buffer.
-  RuntimeProfile::Counter* get_buffer_time;
+  /// Total amount of time spent inside BufferAllocator::AllocateBuffer().
+  RuntimeProfile::Counter* alloc_time;
+
+  /// Number of buffers allocated via BufferAllocator::AllocateBuffer().
+  RuntimeProfile::Counter* cumulative_allocations;
+
+  /// Bytes of buffers allocated via BufferAllocator::AllocateBuffer().
+  RuntimeProfile::Counter* cumulative_bytes_alloced;
 
   /// Amount of time spent waiting for reads from disk to complete.
   RuntimeProfile::Counter* read_wait_time;
 
+  /// Total number of read I/O operations issued.
+  RuntimeProfile::Counter* read_io_ops;
+
+  /// Total bytes read from disk.
+  RuntimeProfile::Counter* bytes_read;
+
   /// Amount of time spent waiting for writes to disk to complete.
   RuntimeProfile::Counter* write_wait_time;
 
-  /// The peak total size of unpinned buffers.
-  RuntimeProfile::HighWaterMarkCounter* peak_unpinned_bytes;
+  /// Total number of write I/O operations issued.
+  RuntimeProfile::Counter* write_io_ops;
 
-  /// The total bytes of data unpinned. Every time a page's pin count goes from 1 to 0,
-  /// this counter is incremented by the page size.
-  RuntimeProfile::Counter* total_unpinned_bytes;
+  /// Total bytes written to disk.
+  RuntimeProfile::Counter* bytes_written;
+
+  /// The peak total size of unpinned pages.
+  RuntimeProfile::HighWaterMarkCounter* peak_unpinned_bytes;
 };
 
 }

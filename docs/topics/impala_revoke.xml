@@ -40,7 +40,7 @@ under the License.
   <conbody>
 
     <p rev="2.0.0">
-      <indexterm audience="Cloudera">REVOKE statement</indexterm>
+      <indexterm audience="hidden">REVOKE statement</indexterm>
 <!-- Copied from Sentry docs. Turn into conref. I did some rewording for clarity. -->
       The <codeph>REVOKE</codeph> statement revokes roles or privileges on a specified object from groups. Only
       Sentry administrative users can revoke the role from a group. The revocation has a cascading effect. For
@@ -66,8 +66,7 @@ object_type ::= TABLE | DATABASE | SERVER | URI
     <p rev="2.3.0 collevelauth">
       The ability to grant or revoke <codeph>SELECT</codeph> privilege on specific columns is available
       in <keyword keyref="impala23_full"/> and higher. See
-      <xref audience="integrated" href="sg_hive_sql.xml#concept_c2q_4qx_p4/col_level_auth_sentry"/><xref audience="standalone" href="https://www.cloudera.com/documentation/enterprise/latest/topics/sg_hive_sql.html" format="html" scope="external"/>
-      for details.
+      <xref keyref="sg_hive_sql"/> for details.
     </p>
 
     <p conref="../shared/impala_common.xml#common/privileges_blurb"/>
@@ -84,12 +83,12 @@ object_type ::= TABLE | DATABASE | SERVER | URI
     <p>
       <ul>
         <li>
-          The Impala <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> statements are available in CDH 5.2 and
+          The Impala <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> statements are available in <keyword keyref="impala20_full"/> and
           higher.
         </li>
 
         <li>
-          In <ph rev="upstream">CDH 5.1</ph> and higher, Impala makes use of any roles and privileges specified by the
+          In <keyword keyref="impala14_full"/> and higher, Impala makes use of any roles and privileges specified by the
           <codeph>GRANT</codeph> and <codeph>REVOKE</codeph> statements in Hive, when your system is configured to
           use the Sentry service instead of the file-based policy mechanism.
         </li>
@@ -107,6 +106,9 @@ object_type ::= TABLE | DATABASE | SERVER | URI
     <p conref="../shared/impala_common.xml#common/cancel_blurb_no"/>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb_no"/>
+
+    <p rev="2.8.0" conref="../shared/impala_common.xml#common/kudu_blurb"/>
+    <p conref="../shared/impala_common.xml#common/kudu_sentry_limitations"/>
 
     <p conref="../shared/impala_common.xml#common/related_info"/>
 

@@ -40,7 +40,7 @@ under the License.
   <conbody>
 
     <p rev="2.1.0">
-      <indexterm audience="Cloudera">DROP STATS statement</indexterm>
+      <indexterm audience="hidden">DROP STATS statement</indexterm>
       Removes the specified statistics from a table or partition. The statistics were originally created by the
       <codeph>COMPUTE STATS</codeph> or <codeph>COMPUTE INCREMENTAL STATS</codeph> statement.
     </p>
@@ -104,7 +104,7 @@ DROP INCREMENTAL STATS [<varname>database_name</varname>.]<varname>table_name</v
     <p conref="../shared/impala_common.xml#common/cancel_blurb_no"/>
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
-    <p rev="CDH-19187">
+    <p rev="">
       The user ID that the <cmdname>impalad</cmdname> daemon runs under,
       typically the <codeph>impala</codeph> user, does not need any
       particular HDFS permissions to perform this statement.
@@ -183,7 +183,7 @@ show column stats item_partitioned;
     <note>
       (It is possible that the row count might be preserved in future after a <codeph>DROP INCREMENTAL
       STATS</codeph> statement. Check the resolution of the issue
-      <xref href="https://issues.cloudera.org/browse/IMPALA-1615" scope="external" format="html">IMPALA-1615</xref>.)
+      <xref keyref="IMPALA-1615">IMPALA-1615</xref>.)
     </note>
 
 <codeblock>drop incremental stats item_partitioned partition (i_category='Sports');

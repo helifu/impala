@@ -20,9 +20,6 @@ package org.apache.impala.planner;
 import java.util.Collections;
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
@@ -50,14 +47,15 @@ import com.google.common.base.Preconditions;
  * right input.
  */
 public class NestedLoopJoinNode extends JoinNode {
-  private final static Logger LOG = LoggerFactory.getLogger(NestedLoopJoinNode.class);
-
   public NestedLoopJoinNode(PlanNode outer, PlanNode inner, boolean isStraightJoin,
       DistributionMode distrMode, JoinOperator joinOp, List<Expr> otherJoinConjuncts) {
     super(outer, inner, isStraightJoin, distrMode, joinOp,
         Collections.<BinaryPredicate>emptyList(), otherJoinConjuncts,
         "NESTED LOOP JOIN");
   }
+
+  @Override
+  public boolean isBlockingJoinNode() { return true; }
 
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
@@ -76,14 +74,16 @@ public class NestedLoopJoinNode extends JoinNode {
   }
 
   @Override
-  public void computeCosts(TQueryOptions queryOptions) {
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+    long perInstanceMemEstimate;
     if (getChild(1).getCardinality() == -1 || getChild(1).getAvgRowSize() == -1
         || numNodes_ == 0) {
-      perHostMemCost_ = DEFAULT_PER_HOST_MEM;
-      return;
+      perInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
+    } else {
+      perInstanceMemEstimate =
+          (long) Math.ceil(getChild(1).cardinality_ * getChild(1).avgRowSize_);
     }
-    perHostMemCost_ =
-        (long) Math.ceil(getChild(1).cardinality_ * getChild(1).avgRowSize_);
+    nodeResourceProfile_ = ResourceProfile.noReservation(perInstanceMemEstimate);
   }
 
   @Override

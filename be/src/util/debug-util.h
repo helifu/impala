@@ -64,6 +64,7 @@ std::string PrintPlanNodeType(const TPlanNodeType::type& type);
 std::string PrintTCatalogObjectType(const TCatalogObjectType::type& type);
 std::string PrintTDdlType(const TDdlType::type& type);
 std::string PrintTCatalogOpType(const TCatalogOpType::type& type);
+std::string PrintTReplicaPreference(const TReplicaPreference::type& type);
 std::string PrintTSessionType(const TSessionType::type& type);
 std::string PrintTStmtType(const TStmtType::type& type);
 std::string PrintQueryState(const beeswax::QueryState::type& type);
@@ -103,6 +104,9 @@ std::string GetVersionString(bool compact = false);
 /// Note: there is a libc bug that causes this not to work on 64 bit machines
 /// for recursive calls.
 std::string GetStackTrace();
+
+/// Returns the backend name in "host:port" form suitable for human consumption.
+std::string GetBackendString();
 
 // FILE_CHECKs are conditions that we expect to be true but could fail due to a malformed
 // input file. They differentiate these cases from DCHECKs, which indicate conditions that

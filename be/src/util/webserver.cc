@@ -34,6 +34,8 @@
 
 #include "common/logging.h"
 #include "rpc/thrift-util.h"
+#include "runtime/exec-env.h"
+#include "service/impala-server.h"
 #include "thirdparty/mustache/mustache.h"
 #include "util/asan.h"
 #include "util/coding-util.h"
@@ -54,6 +56,7 @@ typedef sig_t sighandler_t;
 #endif
 
 using boost::algorithm::is_any_of;
+using boost::algorithm::join;
 using boost::algorithm::split;
 using boost::algorithm::trim_right;
 using boost::algorithm::to_lower;
@@ -80,8 +83,8 @@ DEFINE_string(webserver_certificate_file, "",
     "The location of the debug webserver's SSL certificate file, in .pem format. If "
     "empty, webserver SSL support is not enabled");
 DEFINE_string(webserver_private_key_file, "", "The full path to the private key used as a"
-    " counterpart to the public key contained in --ssl_server_certificate. If "
-    "--ssl_server_certificate is set, this option must be set as well.");
+    " counterpart to the public key contained in --webserver_certificate_file. If "
+    "--webserver_certificate_file is set, this option must be set as well.");
 DEFINE_string(webserver_private_key_password_cmd, "", "A Unix command whose output "
     "returns the password used to decrypt the Webserver's certificate private key file "
     "specified in --webserver_private_key_file. If the .PEM key file is not "
@@ -96,6 +99,10 @@ DEFINE_string(webserver_password_file, "",
 
 DEFINE_string(webserver_x_frame_options, "DENY",
     "webserver will add X-Frame-Options HTTP header with this value");
+
+DECLARE_bool(is_coordinator);
+DECLARE_string(ssl_minimum_version);
+DECLARE_string(ssl_cipher_list);
 
 static const char* DOC_FOLDER = "/www/";
 static const int DOC_FOLDER_LEN = strlen(DOC_FOLDER);
@@ -116,7 +123,7 @@ static const char* ERROR_KEY = "__error_msg__";
 const char* GetDefaultDocumentRoot() {
   stringstream ss;
   char* impala_home = getenv("IMPALA_HOME");
-  if (impala_home == NULL) {
+  if (impala_home == nullptr) {
     return ""; // Empty document root means don't serve static files
   } else {
     ss << impala_home;
@@ -152,7 +159,7 @@ string BuildHeaderString(ResponseCode response, ContentType content_type) {
 }
 
 Webserver::Webserver()
-    : context_(NULL),
+    : context_(nullptr),
       error_handler_(UrlHandler(bind<void>(&Webserver::ErrorHandler, this, _1, _2),
           "error.tmpl", false)) {
   http_address_ = MakeNetworkAddress(
@@ -161,7 +168,7 @@ Webserver::Webserver()
 }
 
 Webserver::Webserver(const int port)
-    : context_(NULL),
+    : context_(nullptr),
       error_handler_(UrlHandler(bind<void>(&Webserver::ErrorHandler, this, _1, _2),
           "error.tmpl", false)) {
   http_address_ = MakeNetworkAddress("0.0.0.0", port);
@@ -169,23 +176,6 @@ Webserver::Webserver(const int port)
 
 Webserver::~Webserver() {
   Stop();
-}
-
-void Webserver::RootHandler(const ArgumentMap& args, Document* document) {
-  Value version(GetVersionString().c_str(), document->GetAllocator());
-  document->AddMember("version", version, document->GetAllocator());
-  Value cpu_info(CpuInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("cpu_info", cpu_info, document->GetAllocator());
-  Value mem_info(MemInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("mem_info", mem_info, document->GetAllocator());
-  Value disk_info(DiskInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("disk_info", disk_info, document->GetAllocator());
-  Value os_info(OsInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("os_info", os_info, document->GetAllocator());
-  Value process_state_info(ProcessStateInfo().DebugString().c_str(),
-    document->GetAllocator());
-  document->AddMember("process_state_info", process_state_info,
-    document->GetAllocator());
 }
 
 void Webserver::ErrorHandler(const ArgumentMap& args, Document* document) {
@@ -253,6 +243,10 @@ Status Webserver::Start() {
 
   string key_password;
   if (IsSecure()) {
+    // Impala initializes OpenSSL (see authentication.h).
+    options.push_back("ssl_global_init");
+    options.push_back("false");
+
     options.push_back("ssl_certificate");
     options.push_back(FLAGS_webserver_certificate_file.c_str());
 
@@ -268,6 +262,13 @@ Status Webserver::Start() {
         options.push_back("ssl_private_key_password");
         options.push_back(key_password.c_str());
       }
+    }
+
+    options.push_back("ssl_min_version");
+    options.push_back(FLAGS_ssl_minimum_version.c_str());
+    if (!FLAGS_ssl_cipher_list.empty()) {
+      options.push_back("ssl_ciphers");
+      options.push_back(FLAGS_ssl_cipher_list.c_str());
     }
   }
 
@@ -296,7 +297,7 @@ Status Webserver::Start() {
   options.push_back("no");
 
   // Options must be a NULL-terminated list
-  options.push_back(NULL);
+  options.push_back(nullptr);
 
   // squeasel ignores SIGCHLD and we need it to run kinit. This means that since
   // squeasel does not reap its own children CGI programs must be avoided.
@@ -312,35 +313,30 @@ Status Webserver::Start() {
   // pointer to this server in the per-server state, and register a static method as the
   // default callback. That method unpacks the pointer to this and calls the real
   // callback.
-  context_ = sq_start(&callbacks, reinterpret_cast<void*>(this), &options[0]);
+  context_ = sq_start(&callbacks, reinterpret_cast<void*>(this), options.data());
 
   // Restore the child signal handler so wait() works properly.
   signal(SIGCHLD, sig_chld);
 
-  if (context_ == NULL) {
+  if (context_ == nullptr) {
     stringstream error_msg;
     error_msg << "Webserver: Could not start on address " << http_address_;
     return Status(error_msg.str());
   }
-
-  UrlCallback default_callback =
-      bind<void>(mem_fn(&Webserver::RootHandler), this, _1, _2);
-
-  RegisterUrlCallback("/", "root.tmpl", default_callback, false);
 
   LOG(INFO) << "Webserver started";
   return Status::OK();
 }
 
 void Webserver::Stop() {
-  if (context_ != NULL) {
+  if (context_ != nullptr) {
     sq_stop(context_);
-    context_ = NULL;
+    context_ = nullptr;
   }
 }
 
 void Webserver::GetCommonJson(Document* document) {
-  DCHECK(document != NULL);
+  DCHECK(document != nullptr);
   Value obj(kObjectType);
   obj.AddMember("process-name", google::ProgramInvocationShortName(),
       document->GetAllocator());
@@ -361,7 +357,7 @@ void Webserver::GetCommonJson(Document* document) {
 
 int Webserver::LogMessageCallbackStatic(const struct sq_connection* connection,
     const char* message) {
-  if (message != NULL) {
+  if (message != nullptr) {
     LOG(INFO) << "Webserver: " << message;
   }
   return PROCESSING_COMPLETE;
@@ -385,7 +381,7 @@ int Webserver::BeginRequestCallback(struct sq_connection* connection,
   }
 
   map<string, string> arguments;
-  if (request_info->query_string != NULL) {
+  if (request_info->query_string != nullptr) {
     BuildArgumentMap(request_info->query_string, &arguments);
   }
 
@@ -393,7 +389,7 @@ int Webserver::BeginRequestCallback(struct sq_connection* connection,
   UrlHandlerMap::const_iterator it = url_handlers_.find(request_info->uri);
   ResponseCode response = OK;
   ContentType content_type = HTML;
-  const UrlHandler* url_handler = NULL;
+  const UrlHandler* url_handler = nullptr;
   if (it == url_handlers_.end()) {
     response = NOT_FOUND;
     arguments[ERROR_KEY] = Substitute("No URI handler for '$0'", request_info->uri);

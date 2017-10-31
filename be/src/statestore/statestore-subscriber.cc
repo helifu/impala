@@ -31,6 +31,7 @@
 #include "gen-cpp/StatestoreService_types.h"
 #include "rpc/rpc-trace.h"
 #include "rpc/thrift-util.h"
+#include "statestore/statestore-service-client-wrapper.h"
 #include "util/time.h"
 #include "util/debug-util.h"
 
@@ -38,6 +39,7 @@
 
 using boost::posix_time::seconds;
 using namespace apache::thrift;
+using namespace apache::thrift::transport;
 using namespace strings;
 
 DEFINE_int32(statestore_subscriber_timeout_seconds, 30, "The amount of time (in seconds)"
@@ -46,7 +48,13 @@ DEFINE_int32(statestore_subscriber_cnxn_attempts, 10, "The number of times to re
     "RPC connection to the statestore. A setting of 0 means retry indefinitely");
 DEFINE_int32(statestore_subscriber_cnxn_retry_interval_ms, 3000, "The interval, in ms, "
     "to wait between attempts to make an RPC connection to the statestore.");
+
 DECLARE_string(ssl_client_ca_certificate);
+DECLARE_string(ssl_server_certificate);
+DECLARE_string(ssl_private_key);
+DECLARE_string(ssl_private_key_password_cmd);
+DECLARE_string(ssl_cipher_list);
+DECLARE_string(ssl_minimum_version);
 
 namespace impala {
 
@@ -60,7 +68,7 @@ const string CALLBACK_METRIC_PATTERN = "statestore-subscriber.topic-$0.processin
 // statestore after a failure.
 const int32_t SLEEP_INTERVAL_MS = 5000;
 
-typedef ClientConnection<StatestoreServiceClient> StatestoreConnection;
+typedef ClientConnection<StatestoreServiceClientWrapper> StatestoreServiceConn;
 
 // Proxy class for the subscriber heartbeat thrift API, which
 // translates RPCs into method calls on the local subscriber object.
@@ -138,7 +146,7 @@ Status StatestoreSubscriber::AddTopic(const Statestore::TopicId& topic_id,
 
 Status StatestoreSubscriber::Register() {
   Status client_status;
-  StatestoreConnection client(client_cache_.get(), statestore_address_, &client_status);
+  StatestoreServiceConn client(client_cache_.get(), statestore_address_, &client_status);
   RETURN_IF_ERROR(client_status);
 
   TRegisterSubscriberRequest request;
@@ -153,8 +161,8 @@ Status StatestoreSubscriber::Register() {
   request.subscriber_location = heartbeat_address_;
   request.subscriber_id = subscriber_id_;
   TRegisterSubscriberResponse response;
-  RETURN_IF_ERROR(
-      client.DoRpc(&StatestoreServiceClient::RegisterSubscriber, request, &response));
+  RETURN_IF_ERROR(client.DoRpc(&StatestoreServiceClientWrapper::RegisterSubscriber,
+      request, &response));
   Status status = Status(response.status);
   if (status.ok()) connected_to_statestore_metric_->set_value(true);
   if (response.__isset.registration_id) {
@@ -187,9 +195,24 @@ Status StatestoreSubscriber::Start() {
         new RpcEventHandler("statestore-subscriber", metrics_));
     processor->setEventHandler(event_handler);
 
-    heartbeat_server_.reset(new ThriftServer("StatestoreSubscriber", processor,
-        heartbeat_address_.port, NULL, NULL, 5));
+    ThriftServerBuilder builder(
+        "StatestoreSubscriber", processor, heartbeat_address_.port);
+    if (EnableInternalSslConnections()) {
+      SSLProtocol ssl_version;
+      RETURN_IF_ERROR(
+          SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));
+      LOG(INFO) << "Enabling SSL for Statestore subscriber";
+      builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
+          .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
+          .ssl_version(ssl_version)
+          .cipher_list(FLAGS_ssl_cipher_list);
+    }
+
+    ThriftServer* server;
+    RETURN_IF_ERROR(builder.Build(&server));
+    heartbeat_server_.reset(server);
     RETURN_IF_ERROR(heartbeat_server_->Start());
+
     LOG(INFO) << "Registering with statestore";
     status = Register();
     if (status.ok()) {
@@ -252,7 +275,7 @@ void StatestoreSubscriber::RecoveryModeChecker() {
       // we would otherwise have to cache updates here.
       last_recovery_duration_metric_->set_value(
           recovery_timer.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
-      last_recovery_time_metric_->set_value(TimestampValue::LocalTime().DebugString());
+      last_recovery_time_metric_->set_value(TimestampValue::LocalTime().ToString());
     }
 
     SleepForMs(SLEEP_INTERVAL_MS);

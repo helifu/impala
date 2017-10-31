@@ -22,9 +22,9 @@ import time
 from test_ddl_base import TestDdlBase
 from tests.common.impala_test_suite import LOG
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIf, SkipIfLocal, SkipIfOldAggsJoins
+from tests.common.skip import SkipIf, SkipIfADLS, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
-from tests.util.filesystem_utils import WAREHOUSE, IS_HDFS, IS_LOCAL, IS_S3
+from tests.util.filesystem_utils import WAREHOUSE, IS_HDFS, IS_LOCAL, IS_S3, IS_ADLS
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(TestDdlBase):
@@ -53,11 +53,13 @@ class TestDdlStatements(TestDdlBase):
         format(getpass.getuser(), unique_database))
     # Drop the table (with purge) and make sure it doesn't exist in trash
     self.client.execute("drop table {0}.t2 purge".format(unique_database))
-    if not IS_S3:
+    if not IS_S3 and not IS_ADLS:
       # In S3, deletes are eventual. So even though we dropped the table, the files
-      # belonging to this table will still be visible for some unbounded time. This
+      # belonging to this table may still be visible for some unbounded time. This
       # happens only with PURGE. A regular DROP TABLE is just a copy of files which is
       # consistent.
+      # The ADLS Python client is not strongly consistent, so these files may still be
+      # visible after a DROP. (Remove after IMPALA-5335 is resolved)
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t2/".\
           format(unique_database))
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t2/t2.txt".\
@@ -82,6 +84,7 @@ class TestDdlStatements(TestDdlBase):
     self.filesystem_client.delete_file_dir(
         "test-warehouse/{0}.db/data_t3".format(unique_database), recursive=True)
 
+  @SkipIfADLS.eventually_consistent
   @SkipIfLocal.hdfs_client
   def test_drop_cleans_hdfs_dirs(self, unique_database):
     self.client.execute('use default')
@@ -129,6 +132,7 @@ class TestDdlStatements(TestDdlBase):
     # Re-create database to make unique_database teardown succeed.
     self._create_db(unique_database)
 
+  @SkipIfADLS.eventually_consistent
   @SkipIfLocal.hdfs_client
   def test_truncate_cleans_hdfs_files(self, unique_database):
     # Verify the db directory exists
@@ -192,7 +196,6 @@ class TestDdlStatements(TestDdlBase):
   # supported if old joins and aggs are enabled. Since we do not get any meaningful
   # additional coverage by running a DDL test under the old aggs and joins, it can be
   # skipped.
-  @SkipIfOldAggsJoins.nested_types
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_create_table(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -253,6 +256,11 @@ class TestDdlStatements(TestDdlBase):
         file_data='1984')
     self.run_test_case('QueryTest/alter-table', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
+    # The following tests require HDFS caching which is supported only in the HDFS
+    # filesystem.
+    if IS_HDFS:
+      self.run_test_case('QueryTest/alter-table-hdfs-caching', vector,
+          use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_alter_set_column_stats(self, vector, unique_database):
@@ -286,11 +294,13 @@ class TestDdlStatements(TestDdlBase):
     # Drop the partition (with purge) and make sure it doesn't exist in trash
     self.client.execute("alter table {0}.t1 drop partition(j=2) purge".\
         format(unique_database));
-    if not IS_S3:
+    if not IS_S3 and not IS_ADLS:
       # In S3, deletes are eventual. So even though we dropped the partition, the files
-      # belonging to this partition will still be visible for some unbounded time. This
+      # belonging to this partition may still be visible for some unbounded time. This
       # happens only with PURGE. A regular DROP TABLE is just a copy of files which is
       # consistent.
+      # The ADLS Python client is not strongly consistent, so these files may still be
+      # visible after a DROP. (Remove after IMPALA-5335 is resolved)
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=2/j2.txt".\
           format(unique_database))
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=2".\
@@ -408,7 +418,7 @@ class TestLibCache(TestDdlBase):
   @classmethod
   def add_test_dimensions(cls):
     super(TestLibCache, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
 
   def test_create_drop_function(self, vector, unique_database):
     """This will create, run, and drop the same function repeatedly, exercising the

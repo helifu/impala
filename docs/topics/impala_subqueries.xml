@@ -35,7 +35,7 @@ under the License.
   <conbody>
 
     <p rev="2.0.0">
-      <indexterm audience="Cloudera">subqueries</indexterm>
+      <indexterm audience="hidden">subqueries</indexterm>
       A <term>subquery</term> is a query that is nested within another query. Subqueries let queries on one table
       dynamically adapt based on the contents of another table. This technique provides great flexibility and
       expressive power for SQL queries.
@@ -227,7 +227,7 @@ Therefore, this is not an efficient construct to use with Impala queries for HBa
     </p>
 
     <p>
-      <b>Added in:</b> Subqueries are substantially enhanced starting in Impala 2.0 for CDH 4, and CDH 5.2.0. Now,
+      <b>Added in:</b> Subqueries are substantially enhanced starting in Impala 2.0. Now,
       they can be used in the <codeph>WHERE</codeph> clause, in combination with clauses such as
       <codeph>EXISTS</codeph> and <codeph>IN</codeph>, rather than just in the <codeph>FROM</codeph> clause.
     </p>
@@ -312,6 +312,9 @@ Therefore, this is not an efficient construct to use with Impala queries for HBa
           <codeph><varname>database_name</varname>.<varname>table_name</varname>.<varname>column_name</varname></codeph>)
           when referring to any column from the outer query block within a subquery.
         </p>
+      </li>
+      <li>
+        <p conref="../shared/impala_common.xml#common/tablesample_caveat"/>
       </li>
     </ul>
 

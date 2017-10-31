@@ -24,9 +24,20 @@
 #include "runtime/decimal-value.h"
 #include "udf/udf.h"
 
-using namespace impala_udf;
-
 namespace impala {
+
+using impala_udf::FunctionContext;
+using impala_udf::AnyVal;
+using impala_udf::BooleanVal;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
 
 class Expr;
 struct ExprValue;
@@ -104,7 +115,7 @@ class DecimalOperators {
   };
 
   /// Evaluates a round from 'val' and returns the result, using the rounding rule of
-  /// 'type'.
+  /// 'op. Returns DecimalVal::null() on overflow.
   static DecimalVal RoundDecimal(FunctionContext* context,
       const DecimalVal& val, int val_precision, int val_scale, int output_precision,
       int output_scale, const DecimalRoundOp& op);

@@ -21,7 +21,8 @@
 #include <boost/scoped_ptr.hpp>
 #include <kudu/client/client.h>
 
-#include "exec/kudu-scan-node.h"
+#include "common/object-pool.h"
+#include "exec/kudu-scan-node-base.h"
 #include "runtime/descriptors.h"
 
 namespace impala {
@@ -36,7 +37,7 @@ class Tuple;
 /// by GetNext() until it reaches eos, and the caller may open another scan token.
 class KuduScanner {
  public:
-  KuduScanner(KuduScanNode* scan_node, RuntimeState* state);
+  KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state);
 
   /// Prepares this scanner for execution.
   /// Does not actually open a kudu::client::KuduScanner.
@@ -61,14 +62,16 @@ class KuduScanner {
  private:
   /// Handles the case where the projection is empty (e.g. count(*)).
   /// Does this by adding sets of rows to 'row_batch' instead of adding one-by-one.
-  Status HandleEmptyProjection(RowBatch* row_batch, bool* batch_done);
+  Status HandleEmptyProjection(RowBatch* row_batch);
 
   /// Decodes rows previously fetched from kudu, now in 'cur_rows_' into a RowBatch.
   ///  - 'batch' is the batch that will point to the new tuples.
   ///  - *tuple_mem should be the location to output tuples.
-  ///  - Sets 'batch_done' to true to indicate that the batch was filled to capacity or
-  ///    the limit was reached.
-  Status DecodeRowsIntoRowBatch(RowBatch* batch, Tuple** tuple_mem, bool* batch_done);
+  /// Returns OK when one of the following conditions occur:
+  ///  - cur_kudu_batch_ is fully consumed
+  ///  - batch is full
+  ///  - scan_node_ limit has been reached
+  Status DecodeRowsIntoRowBatch(RowBatch* batch, Tuple** tuple_mem);
 
   /// Fetches the next batch of rows from the current kudu::client::KuduScanner.
   Status GetNextScannerBatch();
@@ -81,8 +84,15 @@ class KuduScanner {
     return reinterpret_cast<Tuple*>(mem + scan_node_->tuple_desc()->byte_size());
   }
 
-  KuduScanNode* scan_node_;
+  KuduScanNodeBase* scan_node_;
   RuntimeState* state_;
+
+  /// For objects which have the same life time as the scanner.
+  ObjectPool obj_pool_;
+
+  /// MemPool used for expression evaluators in this scanner. Need to be local
+  /// to each scanner as MemPool is not thread safe.
+  boost::scoped_ptr<MemPool> expr_mem_pool_;
 
   /// The kudu::client::KuduScanner for the current scan token. A new KuduScanner is
   /// created for each scan token using KuduScanToken::DeserializeIntoScanner().
@@ -98,7 +108,11 @@ class KuduScanner {
   int64_t last_alive_time_micros_;
 
   /// The scanner's cloned copy of the conjuncts to apply.
-  vector<ExprContext*> conjunct_ctxs_;
+  vector<ScalarExprEvaluator*> conjunct_evals_;
+
+  /// Timestamp slots in the tuple descriptor of the scan node. Used to convert Kudu
+  /// UNIXTIME_MICRO values inline.
+  vector<const SlotDescriptor*> timestamp_slots_;
 };
 
 } /// namespace impala

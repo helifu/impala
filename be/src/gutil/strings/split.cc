@@ -14,7 +14,7 @@ using std::iterator_traits;
 using std::numeric_limits;
 
 #include "gutil/integral_types.h"
-#include <glog/logging.h>
+#include <common/logging.h>
 #include "gutil/logging-inl.h"
 #include "gutil/macros.h"
 #include "gutil/strtoint.h"
@@ -118,7 +118,7 @@ namespace {
 // the following overloads:
 // - vector<string>           - for better performance
 // - map<string, string>      - to change append semantics
-// - hash_map<string, string> - to change append semantics
+// - unordered_map<string, string> - to change append semantics
 template <typename Container, typename Splitter>
 void AppendToImpl(Container* container, Splitter splitter) {
   Container c = splitter;  // Calls implicit conversion operator.
@@ -133,12 +133,12 @@ void AppendToImpl(vector<string>* container, Splitter splitter) {
   vector<StringPiece> vsp = splitter;  // Calls implicit conversion operator.
   size_t container_size = container->size();
   container->resize(container_size + vsp.size());
-  for (size_t i = 0; i < vsp.size(); ++i) {
-    vsp[i].CopyToString(&(*container)[container_size++]);
+  for (const auto& sp : vsp) {
+    sp.CopyToString(&(*container)[container_size++]);
   }
 }
 
-// Here we define two AppendToImpl() overloads for map<> and hash_map<>. Both of
+// Here we define two AppendToImpl() overloads for map<> and unordered_map<>. Both of
 // these overloads call through to this AppendToMap() function. This is needed
 // because inserting a duplicate key into a map does NOT overwrite the previous
 // value, which was not the behavior of the split1 Split*() functions. Consider
@@ -150,7 +150,7 @@ void AppendToImpl(vector<string>* container, Splitter splitter) {
 //   ASSERT_EQ(m["a"], "1");  // <-- "a" has value "1" not "2".
 //
 // Due to this behavior of map::insert, we can't rely on a normal std::inserter
-// for a maps. Instead, maps and hash_maps need to be special cased to implement
+// for a maps. Instead, maps and unordered_maps need to be special cased to implement
 // the desired append semantic of inserting an existing value overwrites the
 // previous value.
 //
@@ -172,7 +172,7 @@ void AppendToImpl(map<string, string>* map_container, Splitter splitter) {
 }
 
 template <typename Splitter>
-void AppendToImpl(hash_map<string, string>* map_container, Splitter splitter) {
+void AppendToImpl(unordered_map<string, string>* map_container, Splitter splitter) {
   AppendToMap(map_container, splitter);
 }
 
@@ -420,7 +420,7 @@ void SplitStringUsing(const string& full,
 }
 
 void SplitStringToHashsetUsing(const string& full, const char* delim,
-                               hash_set<string>* result) {
+                               unordered_set<string>* result) {
   AppendTo(result, strings::Split(full, AnyOf(delim), strings::SkipEmpty()));
 }
 
@@ -435,7 +435,7 @@ void SplitStringToMapUsing(const string& full, const char* delim,
 }
 
 void SplitStringToHashmapUsing(const string& full, const char* delim,
-                               hash_map<string, string>* result) {
+                               unordered_map<string, string>* result) {
   AppendTo(result, strings::Split(full, AnyOf(delim), strings::SkipEmpty()));
 }
 
@@ -464,7 +464,7 @@ void SplitStringPieceToVector(const StringPiece& full,
 // ----------------------------------------------------------------------
 
 vector<char*>* SplitUsing(char* full, const char* delim) {
-  vector<char*>* vec = new vector<char*>;
+  auto vec = new vector<char*>;
   SplitToVector(full, delim, vec, true);        // Omit empty strings
   return vec;
 }
@@ -472,12 +472,12 @@ vector<char*>* SplitUsing(char* full, const char* delim) {
 void SplitToVector(char* full, const char* delim, vector<char*>* vec,
                    bool omit_empty_strings) {
   char* next  = full;
-  while ((next = gstrsep(&full, delim)) != NULL) {
+  while ((next = gstrsep(&full, delim)) != nullptr) {
     if (omit_empty_strings && next[0] == '\0') continue;
     vec->push_back(next);
   }
   // Add last element (or full string if no delimeter found):
-  if (full != NULL) {
+  if (full != nullptr) {
     vec->push_back(full);
   }
 }
@@ -485,12 +485,12 @@ void SplitToVector(char* full, const char* delim, vector<char*>* vec,
 void SplitToVector(char* full, const char* delim, vector<const char*>* vec,
                    bool omit_empty_strings) {
   char* next  = full;
-  while ((next = gstrsep(&full, delim)) != NULL) {
+  while ((next = gstrsep(&full, delim)) != nullptr) {
     if (omit_empty_strings && next[0] == '\0') continue;
     vec->push_back(next);
   }
   // Add last element (or full string if no delimeter found):
-  if (full != NULL) {
+  if (full != nullptr) {
     vec->push_back(full);
   }
 }
@@ -588,8 +588,8 @@ void SplitStringWithEscapingToSet(const string &full,
 
 void SplitStringWithEscapingToHashset(const string &full,
                                       const strings::CharSet& delimiters,
-                                      hash_set<string> *result) {
-  std::insert_iterator< hash_set<string> > it(*result, result->end());
+                                      unordered_set<string> *result) {
+  std::insert_iterator< unordered_set<string> > it(*result, result->end());
   SplitStringWithEscapingToIterator(full, delimiters, false, &it);
 }
 
@@ -691,7 +691,7 @@ DEFINE_SPLIT_ONE_NUMBER_TOKEN(HexUint64, uint64, strtou64_16)
 bool SplitRange(const char* rangestr, int* from, int* to) {
   // We need to do the const-cast because strol takes a char**, not const char**
   char* val = const_cast<char*>(rangestr);
-  if (val == NULL || EOS(*val))  return true;  // we'll say nothingness is ok
+  if (val == nullptr || EOS(*val))  return true;  // we'll say nothingness is ok
 
   if ( val[0] == '-' && EOS(val[1]) )    // CASE 1: -
     return true;                         // nothing changes
@@ -871,7 +871,7 @@ char* SplitStructuredLineInternal(char* line,
   if (!expected_to_close.empty()) {
     return current;  // Missing closing symbol(s)
   }
-  return NULL;  // Success
+  return nullptr;  // Success
 }
 
 bool SplitStructuredLineInternal(StringPiece line,
@@ -1004,10 +1004,10 @@ bool SplitStringIntoKeyValuePairs(const string& line,
   SplitStringUsing(line, key_value_pair_delimiters.c_str(), &pairs);
 
   bool success = true;
-  for (size_t i = 0; i < pairs.size(); ++i) {
+  for (const auto& pair : pairs) {
     string key;
     vector<string> value;
-    if (!SplitStringIntoKeyValues(pairs[i],
+    if (!SplitStringIntoKeyValues(pair,
                                   key_value_delimiters,
                                   "", &key, &value)) {
       // Don't return here, to allow for keys without associated
@@ -1033,7 +1033,7 @@ bool SplitStringIntoKeyValuePairs(const string& line,
 // --------------------------------------------------------------------
 const char* SplitLeadingDec32Values(const char *str, vector<int32> *result) {
   for (;;) {
-    char *end = NULL;
+    char *end = nullptr;
     long value = strtol(str, &end, 10);
     if (end == str)
       break;
@@ -1053,7 +1053,7 @@ const char* SplitLeadingDec32Values(const char *str, vector<int32> *result) {
 
 const char* SplitLeadingDec64Values(const char *str, vector<int64> *result) {
   for (;;) {
-    char *end = NULL;
+    char *end = nullptr;
     const int64 value = strtoll(str, &end, 10);
     if (end == str)
       break;

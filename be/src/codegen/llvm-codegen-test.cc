@@ -24,9 +24,12 @@
 #include "common/init.h"
 #include "common/object-pool.h"
 #include "runtime/string-value.h"
+#include "runtime/test-env.h"
+#include "service/fe-support.h"
 #include "util/cpu-info.h"
 #include "util/hash-util.h"
 #include "util/path-builder.h"
+#include "util/scope-exit-trigger.h"
 #include "util/test-info.h"
 
 #include "common/names.h"
@@ -38,34 +41,43 @@ namespace impala {
 
 class LlvmCodeGenTest : public testing:: Test {
  protected:
+  scoped_ptr<TestEnv> test_env_;
+  RuntimeState* runtime_state_;
+
+  virtual void SetUp() {
+    test_env_.reset(new TestEnv());
+    ASSERT_OK(test_env_->Init());
+    ASSERT_OK(test_env_->CreateQueryState(0, nullptr, &runtime_state_));
+  }
+
+  virtual void TearDown() {
+    runtime_state_ = NULL;
+    test_env_.reset();
+  }
+
   static void LifetimeTest() {
     ObjectPool pool;
     Status status;
     for (int i = 0; i < 10; ++i) {
-      LlvmCodeGen object1(&pool, NULL, "Test");
-      LlvmCodeGen object2(&pool, NULL, "Test");
-      LlvmCodeGen object3(&pool, NULL, "Test");
+      LlvmCodeGen object1(NULL, &pool, NULL, "Test");
+      LlvmCodeGen object2(NULL, &pool, NULL, "Test");
+      LlvmCodeGen object3(NULL, &pool, NULL, "Test");
 
       ASSERT_OK(object1.Init(unique_ptr<Module>(new Module("Test", object1.context()))));
       ASSERT_OK(object2.Init(unique_ptr<Module>(new Module("Test", object2.context()))));
       ASSERT_OK(object3.Init(unique_ptr<Module>(new Module("Test", object3.context()))));
+
+      object1.Close();
+      object2.Close();
+      object3.Close();
     }
   }
 
   // Wrapper to call private test-only methods on LlvmCodeGen object
-  static Status CreateFromFile(
-      ObjectPool* pool, const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
-    return LlvmCodeGen::CreateFromFile(pool, NULL, filename, "test", codegen);
-  }
-
-  static LlvmCodeGen* CreateCodegen(ObjectPool* pool) {
-    LlvmCodeGen* codegen = pool->Add(new LlvmCodeGen(pool, NULL, "Test"));
-    if (codegen != NULL) {
-      Status status =
-          codegen->Init(unique_ptr<Module>(new Module("Test", codegen->context())));
-      if (!status.ok()) return NULL;
-    }
-    return codegen;
+  Status CreateFromFile(const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
+    RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(runtime_state_,
+        runtime_state_->obj_pool(), NULL, filename, "test", codegen));
+    return (*codegen)->MaterializeModule();
   }
 
   static void ClearHashFns(LlvmCodeGen* codegen) {
@@ -103,11 +115,10 @@ TEST_F(LlvmCodeGenTest, MultithreadedLifetime) {
 
 // Test loading a non-existent file
 TEST_F(LlvmCodeGenTest, BadIRFile) {
-  ObjectPool pool;
   string module_file = "NonExistentFile.ir";
   scoped_ptr<LlvmCodeGen> codegen;
-  EXPECT_FALSE(
-      LlvmCodeGenTest::CreateFromFile(&pool, module_file.c_str(), &codegen).ok());
+  EXPECT_FALSE(CreateFromFile(module_file.c_str(), &codegen).ok());
+  codegen->Close();
 }
 
 // IR for the generated linner loop
@@ -158,7 +169,6 @@ Function* CodegenInnerLoop(LlvmCodeGen* codegen, int64_t* jitted_counter, int de
 //   5. Updated the jitted loop in place with another jitted inner loop function
 //   6. Run the loop and make sure the updated is called.
 TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
-  ObjectPool pool;
   const string loop_call_name("_Z21DefaultImplementationv");
   const string loop_name("_Z8TestLoopi");
   typedef void (*TestLoopFn)(int);
@@ -168,7 +178,7 @@ TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
 
   // Part 1: Load the module and make sure everything is loaded correctly.
   scoped_ptr<LlvmCodeGen> codegen;
-  ASSERT_OK(LlvmCodeGenTest::CreateFromFile(&pool, module_file.c_str(), &codegen));
+  ASSERT_OK(CreateFromFile(module_file.c_str(), &codegen));
   EXPECT_TRUE(codegen.get() != NULL);
 
   Function* loop_call = codegen->GetFunction(loop_call_name, false);
@@ -232,6 +242,7 @@ TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
   TestLoopFn new_loop_fn2 = reinterpret_cast<TestLoopFn>(new_loop2);
   new_loop_fn2(5);
   EXPECT_EQ(0, jitted_counter);
+  codegen->Close();
 }
 
 // Test function for c++/ir interop for strings.  Function will do:
@@ -284,10 +295,8 @@ Function* CodegenStringTest(LlvmCodeGen* codegen) {
 // struct.  Just create a simple StringValue struct and make sure the IR can read it
 // and modify it.
 TEST_F(LlvmCodeGenTest, StringValue) {
-  ObjectPool pool;
-
   scoped_ptr<LlvmCodeGen> codegen;
-  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, NULL, "test", &codegen));
+  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(runtime_state_, NULL, "test", &codegen));
   EXPECT_TRUE(codegen.get() != NULL);
 
   string str("Test");
@@ -323,14 +332,13 @@ TEST_F(LlvmCodeGenTest, StringValue) {
   int32_t* bytes = reinterpret_cast<int32_t*>(&str_val);
   EXPECT_EQ(1, bytes[2]);   // str_val.len
   EXPECT_EQ(0, bytes[3]);   // padding
+  codegen->Close();
 }
 
 // Test calling memcpy intrinsic
 TEST_F(LlvmCodeGenTest, MemcpyTest) {
-  ObjectPool pool;
-
   scoped_ptr<LlvmCodeGen> codegen;
-  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, NULL, "test", &codegen));
+  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(runtime_state_, NULL, "test", &codegen));
   ASSERT_TRUE(codegen.get() != NULL);
 
   LlvmCodeGen::FnPrototype prototype(codegen.get(), "MemcpyTest", codegen->void_type());
@@ -362,12 +370,11 @@ TEST_F(LlvmCodeGenTest, MemcpyTest) {
   test_fn(dst, src, 4);
 
   EXPECT_EQ(memcmp(src, dst, 4), 0);
+  codegen->Close();
 }
 
 // Test codegen for hash
 TEST_F(LlvmCodeGenTest, HashTest) {
-  ObjectPool pool;
-
   // Values to compute hash on
   const char* data1 = "test string";
   const char* data2 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -377,8 +384,10 @@ TEST_F(LlvmCodeGenTest, HashTest) {
   // Loop to test both the sse4 on/off paths
   for (int i = 0; i < 2; ++i) {
     scoped_ptr<LlvmCodeGen> codegen;
-    ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, NULL, "test", &codegen));
+    ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(runtime_state_, NULL, "test", &codegen));
     ASSERT_TRUE(codegen.get() != NULL);
+    const auto close_codegen =
+        MakeScopeExitTrigger([&codegen]() { codegen->Close(); });
 
     Value* llvm_data1 =
         codegen->CastPtrToLlvmPtr(codegen->ptr_type(), const_cast<char*>(data1));
@@ -451,7 +460,8 @@ TEST_F(LlvmCodeGenTest, HashTest) {
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
-  impala::InitCommonRuntime(argc, argv, false, impala::TestInfo::BE_TEST);
-  impala::LlvmCodeGen::InitializeLlvm();
+  impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
+  impala::InitFeSupport(false);
+  ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
   return RUN_ALL_TESTS();
 }

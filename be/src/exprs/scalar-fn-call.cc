@@ -19,26 +19,24 @@
 
 #include <vector>
 #include <gutil/strings/substitute.h>
-#include <llvm/IR/Attributes.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
+#include <llvm/IR/Attributes.h>
 
 #include <boost/preprocessor/punctuation/comma_if.hpp>
-#include <boost/preprocessor/repetition/repeat.hpp>
 #include <boost/preprocessor/repetition/enum_params.hpp>
+#include <boost/preprocessor/repetition/repeat.hpp>
 #include <boost/preprocessor/repetition/repeat_from_to.hpp>
 
 #include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
 #include "exprs/anyval-util.h"
-#include "exprs/expr-context.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/runtime-state.h"
 #include "runtime/types.h"
 #include "udf/udf-internal.h"
 #include "util/debug-util.h"
-#include "util/dynamic-util.h"
-#include "util/symbols-util.h"
 
 #include "common/names.h"
 
@@ -59,7 +57,7 @@ using std::pair;
 #define MAX_INTERP_ARGS 20
 
 ScalarFnCall::ScalarFnCall(const TExprNode& node)
-  : Expr(node),
+  : ScalarExpr(node),
     vararg_start_idx_(node.__isset.vararg_start_idx ? node.vararg_start_idx : -1),
     scalar_fn_wrapper_(NULL),
     prepare_fn_(NULL),
@@ -80,9 +78,9 @@ Status ScalarFnCall::LoadPrepareAndCloseFn(LlvmCodeGen* codegen) {
   return Status::OK();
 }
 
-Status ScalarFnCall::Prepare(RuntimeState* state, const RowDescriptor& desc,
-    ExprContext* context) {
-  RETURN_IF_ERROR(Expr::Prepare(state, desc, context));
+Status ScalarFnCall::Init(const RowDescriptor& desc, RuntimeState* state) {
+  // Initialize children first.
+  RETURN_IF_ERROR(ScalarExpr::Init(desc, state));
 
   if (fn_.scalar_fn.symbol.empty()) {
     // This path is intended to only be used during development to test FE
@@ -96,16 +94,10 @@ Status ScalarFnCall::Prepare(RuntimeState* state, const RowDescriptor& desc,
   }
 
   // Check if the function takes CHAR as input or returns CHAR.
-  FunctionContext::TypeDesc return_type = AnyValUtil::ColumnTypeToTypeDesc(type_);
-  vector<FunctionContext::TypeDesc> arg_types;
   bool has_char_arg_or_result = type_.type == TYPE_CHAR;
-  for (int i = 0; i < children_.size(); ++i) {
-    arg_types.push_back(AnyValUtil::ColumnTypeToTypeDesc(children_[i]->type_));
+  for (int i = 0; !has_char_arg_or_result && i < children_.size(); ++i) {
     has_char_arg_or_result |= children_[i]->type_.type == TYPE_CHAR;
   }
-
-  fn_context_index_ =
-      context->Register(state, return_type, arg_types, ComputeVarArgsBufferSize());
 
   // Use the interpreted path and call the builtin without codegen if any of the
   // followings is true:
@@ -157,50 +149,63 @@ Status ScalarFnCall::Prepare(RuntimeState* state, const RowDescriptor& desc,
     state->AddScalarFnToCodegen(this);
   }
 
-  // For IR UDF, the loading of the Prepare() and Close() functions is deferred until
+  // For IR UDF, the loading of the Init() and CloseContext() functions is deferred until
   // first time GetCodegendComputeFn() is invoked.
   if (!is_ir_udf) RETURN_IF_ERROR(LoadPrepareAndCloseFn(NULL));
   return Status::OK();
 }
 
-Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
-    FunctionContext::FunctionStateScope scope) {
+Status ScalarFnCall::OpenEvaluator(FunctionContext::FunctionStateScope scope,
+    RuntimeState* state, ScalarExprEvaluator* eval) const {
   // Opens and inits children
-  RETURN_IF_ERROR(Expr::Open(state, ctx, scope));
-  FunctionContext* fn_ctx = ctx->fn_context(fn_context_index_);
+  RETURN_IF_ERROR(ScalarExpr::OpenEvaluator(scope, state, eval));
+  DCHECK_GE(fn_ctx_idx_, 0);
+  FunctionContext* fn_ctx = eval->fn_context(fn_ctx_idx_);
+  bool is_interpreted = scalar_fn_wrapper_ == nullptr;
 
-  if (scalar_fn_wrapper_ == NULL) {
+  if (is_interpreted) {
     // We're in the interpreted path (i.e. no JIT). Populate our FunctionContext's
     // staging_input_vals, which will be reused across calls to scalar_fn_.
-    DCHECK(scalar_fn_ != NULL);
+    DCHECK(scalar_fn_ != nullptr);
     vector<AnyVal*>* input_vals = fn_ctx->impl()->staging_input_vals();
     for (int i = 0; i < NumFixedArgs(); ++i) {
       AnyVal* input_val;
-      RETURN_IF_ERROR(AllocateAnyVal(state, ctx->pool_.get(), children_[i]->type(),
+      RETURN_IF_ERROR(AllocateAnyVal(state, eval->mem_pool(), children_[i]->type(),
           "Could not allocate expression value", &input_val));
       input_vals->push_back(input_val);
     }
   }
 
   // Only evaluate constant arguments at the top level of function contexts.
-  // If 'ctx' was cloned, the constant values were copied from the parent.
+  // If 'eval' was cloned, the constant values were copied from the parent.
   if (scope == FunctionContext::FRAGMENT_LOCAL) {
     vector<AnyVal*> constant_args;
-    for (int i = 0; i < children_.size(); ++i) {
+    for (const ScalarExpr* child : children()) {
       AnyVal* const_val;
-      RETURN_IF_ERROR(children_[i]->GetConstVal(state, ctx, &const_val));
+      RETURN_IF_ERROR(eval->GetConstValue(state, *child, &const_val));
       constant_args.push_back(const_val);
     }
     fn_ctx->impl()->SetConstantArgs(move(constant_args));
+
+    // If we're calling MathFunctions::RoundUpTo(), we need to set output_scale_
+    // which determines how many decimal places are printed.
+    // TODO: Move this to Expr initialization.
+    if (this == &eval->root()) {
+      if (fn_.name.function_name == "round" && type_.type == TYPE_DOUBLE) {
+        DCHECK_EQ(children_.size(), 2);
+        IntVal* scale_arg = reinterpret_cast<IntVal*>(constant_args[1]);
+        if (scale_arg != nullptr) eval->output_scale_ = scale_arg->val;
+      }
+    }
   }
 
-  if (scalar_fn_wrapper_ == NULL) {
+  if (is_interpreted) {
     // Now we have the constant values, cache them so that the interpreted path can
     // call the UDF without reevaluating the arguments. 'staging_input_vals' and
     // 'varargs_buffer' in the FunctionContext are used to pass fixed and variable-length
     // arguments respectively. 'non_constant_args()' in the FunctionContext will contain
     // pointers to the remaining (non-constant) children that are evaluated for every row.
-    vector<pair<Expr*, AnyVal*>> non_constant_args;
+    vector<pair<ScalarExpr*, AnyVal*>> non_constant_args;
     uint8_t* varargs_buffer = fn_ctx->impl()->varargs_buffer();
     for (int i = 0; i < children_.size(); ++i) {
       AnyVal* input_arg;
@@ -216,15 +221,15 @@ Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
       // are evaluated. This means that setting enable_expr_rewrites=false will also
       // disable caching of non-literal constant expressions, which gives the old
       // behaviour (before this caching optimisation was added) of repeatedly evaluating
-      // exprs that are constant according to IsConstant(). For exprs that are not truly
-      // constant (yet IsConstant() returns true for) e.g. non-deterministic UDFs, this
+      // exprs that are constant according to is_constant(). For exprs that are not truly
+      // constant (yet is_constant() returns true for) e.g. non-deterministic UDFs, this
       // means that setting enable_expr_rewrites=false works as a safety valve to get
       // back the old behaviour, before constant expr folding or caching was added.
       // TODO: once we can annotate UDFs as non-deterministic (IMPALA-4606), we should
-      // be able to trust IsConstant() and switch back to that.
+      // be able to trust is_constant() and switch back to that.
       if (children_[i]->IsLiteral()) {
         const AnyVal* constant_arg = fn_ctx->impl()->constant_args()[i];
-        DCHECK(constant_arg != NULL);
+        DCHECK(constant_arg != nullptr);
         memcpy(input_arg, constant_arg, arg_bytes);
       } else {
         non_constant_args.emplace_back(children_[i], input_arg);
@@ -233,7 +238,7 @@ Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
     fn_ctx->impl()->SetNonConstantArgs(move(non_constant_args));
   }
 
-  if (prepare_fn_ != NULL) {
+  if (prepare_fn_ != nullptr) {
     if (scope == FunctionContext::FRAGMENT_LOCAL) {
       prepare_fn_(fn_ctx, FunctionContext::FRAGMENT_LOCAL);
       if (fn_ctx->has_error()) return Status(fn_ctx->error_msg());
@@ -242,39 +247,20 @@ Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
     if (fn_ctx->has_error()) return Status(fn_ctx->error_msg());
   }
 
-  // If we're calling MathFunctions::RoundUpTo(), we need to set output_scale_, which
-  // determines how many decimal places are printed.
-  // TODO: revisit this. We should be able to do this if the scale argument is
-  // non-constant.
-  if (fn_.name.function_name == "round" && type_.type == TYPE_DOUBLE) {
-    DCHECK_EQ(children_.size(), 2);
-    if (children_[1]->IsConstant()) {
-      IntVal scale_arg = children_[1]->GetIntVal(ctx, NULL);
-      output_scale_ = scale_arg.val;
-    }
-  }
-
   return Status::OK();
 }
 
-void ScalarFnCall::Close(RuntimeState* state, ExprContext* context,
-                         FunctionContext::FunctionStateScope scope) {
-  if (fn_context_index_ != -1 && close_fn_ != NULL) {
-    FunctionContext* fn_ctx = context->fn_context(fn_context_index_);
+void ScalarFnCall::CloseEvaluator(FunctionContext::FunctionStateScope scope,
+    RuntimeState* state, ScalarExprEvaluator* eval) const {
+  DCHECK_GE(fn_ctx_idx_, 0);
+  if (close_fn_ != NULL) {
+    FunctionContext* fn_ctx = eval->fn_context(fn_ctx_idx_);
     close_fn_(fn_ctx, FunctionContext::THREAD_LOCAL);
     if (scope == FunctionContext::FRAGMENT_LOCAL) {
       close_fn_(fn_ctx, FunctionContext::FRAGMENT_LOCAL);
     }
   }
-  Expr::Close(state, context, scope);
-}
-
-bool ScalarFnCall::IsConstant() const {
-  if (fn_.name.function_name == "rand" || fn_.name.function_name == "random"
-      || fn_.name.function_name == "uuid" || fn_.name.function_name == "sleep") {
-    return false;
-  }
-  return Expr::IsConstant();
+  ScalarExpr::CloseEvaluator(scope, state, eval);
 }
 
 // Dynamically loads the pre-compiled UDF and codegens a function that calls each child's
@@ -319,28 +305,35 @@ Status ScalarFnCall::GetCodegendComputeFn(LlvmCodeGen* codegen, Function** fn) {
     }
   }
 
-  if (fn_.binary_type == TFunctionBinaryType::IR) {
-    string local_path;
-    RETURN_IF_ERROR(LibCache::instance()->GetLocalLibPath(
-        fn_.hdfs_location, LibCache::TYPE_IR, &local_path));
-    // Link the UDF module into this query's main module (essentially copy the UDF
-    // module into the main module) so the UDF's functions are available in the main
-    // module.
-    RETURN_IF_ERROR(codegen->LinkModule(local_path));
-    // Load the Prepare() and Close() functions from the LLVM module.
-    RETURN_IF_ERROR(LoadPrepareAndCloseFn(codegen));
+  vector<ColumnType> arg_types;
+  for (const Expr* child : children_) arg_types.push_back(child->type());
+  Function* udf;
+  RETURN_IF_ERROR(codegen->LoadFunction(fn_, fn_.scalar_fn.symbol, &type_, arg_types,
+      NumFixedArgs(), vararg_start_idx_ != -1, &udf, &cache_entry_));
+  // Inline constants into the function if it has an IR body.
+  if (!udf->isDeclaration()) {
+    codegen->InlineConstFnAttrs(AnyValUtil::ColumnTypeToTypeDesc(type_),
+        AnyValUtil::ColumnTypesToTypeDescs(arg_types), udf);
+    udf = codegen->FinalizeFunction(udf);
+    if (udf == NULL) {
+      return Status(
+          TErrorCode::UDF_VERIFY_FAILED, fn_.scalar_fn.symbol, fn_.hdfs_location);
+    }
   }
 
-  Function* udf;
-  RETURN_IF_ERROR(GetUdf(codegen, &udf));
+  if (fn_.binary_type == TFunctionBinaryType::IR) {
+    // LoadFunction() should have linked the IR module into 'codegen'. Now load the
+    // Prepare() and Close() functions from 'codegen'.
+    RETURN_IF_ERROR(LoadPrepareAndCloseFn(codegen));
+  }
 
   // Create wrapper that computes args and calls UDF
   stringstream fn_name;
   fn_name << udf->getName().str() << "Wrapper";
 
   Value* args[2];
-  *fn = CreateIrFunctionPrototype(codegen, fn_name.str(), &args);
-  Value* expr_ctx = args[0];
+  *fn = CreateIrFunctionPrototype(fn_name.str(), codegen, &args);
+  Value* eval = args[0];
   Value* row = args[1];
   BasicBlock* block = BasicBlock::Create(codegen->context(), "entry", *fn);
   LlvmBuilder builder(block);
@@ -349,12 +342,11 @@ Status ScalarFnCall::GetCodegendComputeFn(LlvmCodeGen* codegen, Function** fn) {
   vector<Value*> udf_args;
 
   // First argument is always FunctionContext*.
-  // Index into our registered offset in the ExprContext.
-  Value* expr_ctx_gep = builder.CreateStructGEP(NULL, expr_ctx, 1, "expr_ctx_gep");
-  Value* fn_ctxs_base = builder.CreateLoad(expr_ctx_gep, "fn_ctxs_base");
+  // Index into our registered offset in the ScalarFnEvaluator.
+  Value* eval_gep = builder.CreateStructGEP(NULL, eval, 1, "eval_gep");
+  Value* fn_ctxs_base = builder.CreateLoad(eval_gep, "fn_ctxs_base");
   // Use GEP to add our index to the base pointer
-  Value* fn_ctx_ptr =
-      builder.CreateConstGEP1_32(fn_ctxs_base, fn_context_index_, "fn_ctx_ptr");
+  Value* fn_ctx_ptr = builder.CreateConstGEP1_32(fn_ctxs_base, fn_ctx_idx_, "fn_ctx_ptr");
   Value* fn_ctx = builder.CreateLoad(fn_ctx_ptr, "fn_ctx");
   udf_args.push_back(fn_ctx);
 
@@ -374,16 +366,17 @@ Status ScalarFnCall::GetCodegendComputeFn(LlvmCodeGen* codegen, Function** fn) {
   for (int i = 0; i < GetNumChildren(); ++i) {
     Function* child_fn = NULL;
     vector<Value*> child_fn_args;
-    // Set 'child_fn' to the codegen'd function, sets child_fn = NULL if codegen fails
-    children_[i]->GetCodegendComputeFn(codegen, &child_fn);
-    if (child_fn == NULL) {
+    // Set 'child_fn' to the codegen'd function, sets child_fn == NULL if codegen fails
+    Status status = children_[i]->GetCodegendComputeFn(codegen, &child_fn);
+    if (UNLIKELY(!status.ok())) {
+      DCHECK(child_fn == NULL);
       // Set 'child_fn' to the interpreted function
       child_fn = GetStaticGetValWrapper(children_[i]->type(), codegen);
       // First argument to interpreted function is children_[i]
-      Type* expr_ptr_type = codegen->GetPtrType(Expr::LLVM_CLASS_NAME);
+      Type* expr_ptr_type = codegen->GetPtrType(ScalarExpr::LLVM_CLASS_NAME);
       child_fn_args.push_back(codegen->CastPtrToLlvmPtr(expr_ptr_type, children_[i]));
     }
-    child_fn_args.push_back(expr_ctx);
+    child_fn_args.push_back(eval);
     child_fn_args.push_back(row);
 
     // Call 'child_fn', adding the result to either 'udf_args' or 'varargs_buffer'
@@ -415,8 +408,7 @@ Status ScalarFnCall::GetCodegendComputeFn(LlvmCodeGen* codegen, Function** fn) {
     // Add the number of varargs
     udf_args.push_back(codegen->GetIntConstant(TYPE_INT, NumVarArgs()));
     // Add all the accumulated vararg inputs as one input argument.
-    PointerType* vararg_type =
-        codegen->GetPtrType(CodegenAnyVal::GetUnloweredType(codegen, VarArgsType()));
+    PointerType* vararg_type = CodegenAnyVal::GetUnloweredPtrType(codegen, VarArgsType());
     udf_args.push_back(builder.CreateBitCast(varargs_buffer, vararg_type, "varargs"));
   }
 
@@ -436,119 +428,11 @@ Status ScalarFnCall::GetCodegendComputeFn(LlvmCodeGen* codegen, Function** fn) {
   return Status::OK();
 }
 
-Status ScalarFnCall::GetUdf(LlvmCodeGen* codegen, Function** udf) {
-  // from_utc_timestamp() and to_utc_timestamp() have inline ASM that cannot be JIT'd.
-  // TimestampFunctions::AddSub() contains a try/catch which doesn't work in JIT'd
-  // code. Always use the interpreted version of these functions.
-  // TODO: fix these built-in functions so we don't need 'broken_builtin' below.
-  bool broken_builtin = fn_.name.function_name == "from_utc_timestamp" ||
-                        fn_.name.function_name == "to_utc_timestamp" ||
-                        fn_.scalar_fn.symbol.find("AddSub") != string::npos;
-  if (fn_.binary_type == TFunctionBinaryType::NATIVE ||
-      (fn_.binary_type == TFunctionBinaryType::BUILTIN && broken_builtin)) {
-    // In this path, we are code that has been statically compiled to assembly.
-    // This can either be a UDF implemented in a .so or a builtin using the UDF
-    // interface with the code in impalad.
-    void* fn_ptr;
-    Status status = LibCache::instance()->GetSoFunctionPtr(
-        fn_.hdfs_location, fn_.scalar_fn.symbol, &fn_ptr, &cache_entry_);
-    if (!status.ok() && fn_.binary_type == TFunctionBinaryType::BUILTIN) {
-      // Builtins symbols should exist unless there is a version mismatch.
-      status.AddDetail(ErrorMsg(TErrorCode::MISSING_BUILTIN,
-          fn_.name.function_name, fn_.scalar_fn.symbol).msg());
-    }
-    RETURN_IF_ERROR(status);
-    DCHECK(fn_ptr != NULL);
-
-    // Per the x64 ABI, DecimalVals are returned via a DecmialVal* output argument.
-    // So, the return type is void.
-    bool is_decimal = type().type == TYPE_DECIMAL;
-    Type* return_type = is_decimal ? codegen->void_type() :
-                                     CodegenAnyVal::GetLoweredType(codegen, type());
-
-    // Convert UDF function pointer to Function*. Start by creating a function
-    // prototype for it.
-    LlvmCodeGen::FnPrototype prototype(codegen, fn_.scalar_fn.symbol, return_type);
-
-    if (is_decimal) {
-      // Per the x64 ABI, DecimalVals are returned via a DecmialVal* output argument
-      Type* output_type =
-          codegen->GetPtrType(CodegenAnyVal::GetUnloweredType(codegen, type()));
-      prototype.AddArgument("output", output_type);
-    }
-
-    // The "FunctionContext*" argument.
-    prototype.AddArgument("ctx",
-        codegen->GetPtrType("class.impala_udf::FunctionContext"));
-
-    // The "fixed" arguments for the UDF function.
-    for (int i = 0; i < NumFixedArgs(); ++i) {
-      stringstream arg_name;
-      arg_name << "fixed_arg_" << i;
-      Type* arg_type = codegen->GetPtrType(
-          CodegenAnyVal::GetUnloweredType(codegen, children_[i]->type()));
-      prototype.AddArgument(arg_name.str(), arg_type);
-    }
-    // The varargs for the UDF function if there is any.
-    if (NumVarArgs() > 0) {
-      Type* vararg_type = CodegenAnyVal::GetUnloweredPtrType(
-          codegen, children_[vararg_start_idx_]->type());
-      prototype.AddArgument("num_var_arg", codegen->GetType(TYPE_INT));
-      prototype.AddArgument("var_arg", vararg_type);
-    }
-
-    // Create a Function* with the generated type. This is only a function
-    // declaration, not a definition, since we do not create any basic blocks or
-    // instructions in it.
-    *udf = prototype.GeneratePrototype(NULL, NULL, false);
-
-    // Associate the dynamically loaded function pointer with the Function* we defined.
-    // This tells LLVM where the compiled function definition is located in memory.
-    codegen->execution_engine()->addGlobalMapping(*udf, fn_ptr);
-  } else if (fn_.binary_type == TFunctionBinaryType::BUILTIN) {
-    // In this path, we're running a builtin with the UDF interface. The IR is
-    // in the llvm module.
-    *udf = codegen->GetFunction(fn_.scalar_fn.symbol, false);
-    if (*udf == NULL) {
-      // Builtins symbols should exist unless there is a version mismatch.
-      stringstream ss;
-      ss << "Builtin '" << fn_.name.function_name << "' with symbol '"
-         << fn_.scalar_fn.symbol << "' does not exist. "
-         << "Verify that all your impalads are the same version.";
-      return Status(ss.str());
-    }
-    // Builtin functions may use Expr::GetConstant(). Clone the function in case we need
-    // to use it again, and rename it to something more manageable than the mangled name.
-    string demangled_name = SymbolsUtil::DemangleNoArgs((*udf)->getName().str());
-    *udf = codegen->CloneFunction(*udf);
-    (*udf)->setName(demangled_name);
-    InlineConstants(codegen, *udf);
-    *udf = codegen->FinalizeFunction(*udf);
-    DCHECK(*udf != NULL);
-  } else {
-    // We're running an IR UDF.
-    DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::IR);
-    *udf = codegen->GetFunction(fn_.scalar_fn.symbol, false);
-    if (*udf == NULL) {
-      stringstream ss;
-      ss << "Unable to locate function " << fn_.scalar_fn.symbol << " from LLVM module "
-         << fn_.hdfs_location;
-      return Status(ss.str());
-    }
-    *udf = codegen->FinalizeFunction(*udf);
-    if (*udf == NULL) {
-      return Status(
-          TErrorCode::UDF_VERIFY_FAILED, fn_.scalar_fn.symbol, fn_.hdfs_location);
-    }
-  }
-  return Status::OK();
-}
-
 Status ScalarFnCall::GetFunction(LlvmCodeGen* codegen, const string& symbol, void** fn) {
-  if (fn_.binary_type == TFunctionBinaryType::NATIVE ||
-      fn_.binary_type == TFunctionBinaryType::BUILTIN) {
-    return LibCache::instance()->GetSoFunctionPtr(fn_.hdfs_location, symbol, fn,
-        &cache_entry_);
+  if (fn_.binary_type == TFunctionBinaryType::NATIVE
+      || fn_.binary_type == TFunctionBinaryType::BUILTIN) {
+    return LibCache::instance()->GetSoFunctionPtr(
+        fn_.hdfs_location, symbol, fn, &cache_entry_);
   } else {
     DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::IR);
     DCHECK(codegen != NULL);
@@ -565,20 +449,21 @@ Status ScalarFnCall::GetFunction(LlvmCodeGen* codegen, const string& symbol, voi
 }
 
 void ScalarFnCall::EvaluateNonConstantChildren(
-    ExprContext* context, const TupleRow* row) {
-  FunctionContext* fn_ctx = context->fn_context(fn_context_index_);
-  for (pair<Expr*, AnyVal*> child : fn_ctx->impl()->non_constant_args()) {
-    void* val = context->GetValue(child.first, row);
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
+  FunctionContext* fn_ctx = eval->fn_context(fn_ctx_idx_);
+  for (pair<ScalarExpr*, AnyVal*> child : fn_ctx->impl()->non_constant_args()) {
+    void* val = eval->GetValue(*(child.first), row);
     AnyValUtil::SetAnyVal(val, child.first->type(), child.second);
   }
 }
 
 template<typename RETURN_TYPE>
-RETURN_TYPE ScalarFnCall::InterpretEval(ExprContext* context, const TupleRow* row) {
+RETURN_TYPE ScalarFnCall::InterpretEval(ScalarExprEvaluator* eval,
+    const TupleRow* row) const {
   DCHECK(scalar_fn_ != NULL) << DebugString();
-  FunctionContext* fn_ctx = context->fn_context(fn_context_index_);
+  FunctionContext* fn_ctx = eval->fn_context(fn_ctx_idx_);
   vector<AnyVal*>* input_vals = fn_ctx->impl()->staging_input_vals();
-  EvaluateNonConstantChildren(context, row);
+  EvaluateNonConstantChildren(eval, row);
 
   if (vararg_start_idx_ == -1) {
     switch (children_.size()) {
@@ -592,7 +477,7 @@ RETURN_TYPE ScalarFnCall::InterpretEval(ExprContext* context, const TupleRow* ro
    // case X:
    //     typedef RETURN_TYPE (*ScalarFnX)(FunctionContext*, const AnyVal& a1, ...,
    //         const AnyVal& aX);
-   //     return reinterpret_cast<ScalarFnn>(scalar_fn_)(fn_ctx, *(*input_vals)[0], ...,
+   //     return reinterpret_cast<ScalarFnX>(scalar_fn_)(fn_ctx, *(*input_vals)[0], ...,
    //         *(*input_vals)[X-1]);
 #define SCALAR_FN_TYPE(n) BOOST_PP_CAT(ScalarFn, n)
 #define INTERP_SCALAR_FN(z, n, unused)                                       \
@@ -636,102 +521,112 @@ RETURN_TYPE ScalarFnCall::InterpretEval(ExprContext* context, const TupleRow* ro
   return RETURN_TYPE::null();
 }
 
-typedef BooleanVal (*BooleanWrapper)(ExprContext*, const TupleRow*);
-typedef TinyIntVal (*TinyIntWrapper)(ExprContext*, const TupleRow*);
-typedef SmallIntVal (*SmallIntWrapper)(ExprContext*, const TupleRow*);
-typedef IntVal (*IntWrapper)(ExprContext*, const TupleRow*);
-typedef BigIntVal (*BigIntWrapper)(ExprContext*, const TupleRow*);
-typedef FloatVal (*FloatWrapper)(ExprContext*, const TupleRow*);
-typedef DoubleVal (*DoubleWrapper)(ExprContext*, const TupleRow*);
-typedef StringVal (*StringWrapper)(ExprContext*, const TupleRow*);
-typedef TimestampVal (*TimestampWrapper)(ExprContext*, const TupleRow*);
-typedef DecimalVal (*DecimalWrapper)(ExprContext*, const TupleRow*);
+typedef BooleanVal (*BooleanWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef TinyIntVal (*TinyIntWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef SmallIntVal (*SmallIntWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef IntVal (*IntWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef BigIntVal (*BigIntWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef FloatVal (*FloatWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef DoubleVal (*DoubleWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef StringVal (*StringWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef TimestampVal (*TimestampWrapper)(ScalarExprEvaluator*, const TupleRow*);
+typedef DecimalVal (*DecimalWrapper)(ScalarExprEvaluator*, const TupleRow*);
 
 // TODO: macroify this?
-BooleanVal ScalarFnCall::GetBooleanVal(ExprContext* context, const TupleRow* row) {
+BooleanVal ScalarFnCall::GetBooleanVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_BOOLEAN);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<BooleanVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<BooleanVal>(eval, row);
   BooleanWrapper fn = reinterpret_cast<BooleanWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-TinyIntVal ScalarFnCall::GetTinyIntVal(ExprContext* context, const TupleRow* row) {
+TinyIntVal ScalarFnCall::GetTinyIntVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_TINYINT);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<TinyIntVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<TinyIntVal>(eval, row);
   TinyIntWrapper fn = reinterpret_cast<TinyIntWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-SmallIntVal ScalarFnCall::GetSmallIntVal(ExprContext* context, const TupleRow* row) {
+SmallIntVal ScalarFnCall::GetSmallIntVal(
+     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_SMALLINT);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<SmallIntVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<SmallIntVal>(eval, row);
   SmallIntWrapper fn = reinterpret_cast<SmallIntWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-IntVal ScalarFnCall::GetIntVal(ExprContext* context, const TupleRow* row) {
+IntVal ScalarFnCall::GetIntVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_INT);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<IntVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<IntVal>(eval, row);
   IntWrapper fn = reinterpret_cast<IntWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-BigIntVal ScalarFnCall::GetBigIntVal(ExprContext* context, const TupleRow* row) {
+BigIntVal ScalarFnCall::GetBigIntVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_BIGINT);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<BigIntVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<BigIntVal>(eval, row);
   BigIntWrapper fn = reinterpret_cast<BigIntWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-FloatVal ScalarFnCall::GetFloatVal(ExprContext* context, const TupleRow* row) {
+FloatVal ScalarFnCall::GetFloatVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_FLOAT);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<FloatVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<FloatVal>(eval, row);
   FloatWrapper fn = reinterpret_cast<FloatWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-DoubleVal ScalarFnCall::GetDoubleVal(ExprContext* context, const TupleRow* row) {
+DoubleVal ScalarFnCall::GetDoubleVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_DOUBLE);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<DoubleVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<DoubleVal>(eval, row);
   DoubleWrapper fn = reinterpret_cast<DoubleWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-StringVal ScalarFnCall::GetStringVal(ExprContext* context, const TupleRow* row) {
+StringVal ScalarFnCall::GetStringVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK(type_.IsStringType());
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<StringVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<StringVal>(eval, row);
   StringWrapper fn = reinterpret_cast<StringWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-TimestampVal ScalarFnCall::GetTimestampVal(ExprContext* context, const TupleRow* row) {
+TimestampVal ScalarFnCall::GetTimestampVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_TIMESTAMP);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<TimestampVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<TimestampVal>(eval, row);
   TimestampWrapper fn = reinterpret_cast<TimestampWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
-DecimalVal ScalarFnCall::GetDecimalVal(ExprContext* context, const TupleRow* row) {
+DecimalVal ScalarFnCall::GetDecimalVal(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_DECIMAL);
-  DCHECK(context != NULL);
-  if (scalar_fn_wrapper_ == NULL) return InterpretEval<DecimalVal>(context, row);
+  DCHECK(eval != NULL);
+  if (scalar_fn_wrapper_ == NULL) return InterpretEval<DecimalVal>(eval, row);
   DecimalWrapper fn = reinterpret_cast<DecimalWrapper>(scalar_fn_wrapper_);
-  return fn(context, row);
+  return fn(eval, row);
 }
 
 string ScalarFnCall::DebugString() const {
   stringstream out;
   out << "ScalarFnCall(udf_type=" << fn_.binary_type << " location=" << fn_.hdfs_location
-      << " symbol_name=" << fn_.scalar_fn.symbol << Expr::DebugString() << ")";
+      << " symbol_name=" << fn_.scalar_fn.symbol <<  ScalarExpr::DebugString() << ")";
   return out.str();
 }
 

@@ -32,7 +32,7 @@ typedef std::string IpAddr;
 /// 'address'. If the IP addresses of a host don't change, then subsequent calls will
 /// always return the same address. Returns an error status if any system call failed,
 /// otherwise OK. Even if OK is returned, addresses may still be of zero length.
-Status HostnameToIpAddr(const Hostname& hostname, IpAddr* ip);
+Status HostnameToIpAddr(const Hostname& hostname, IpAddr* ip) WARN_UNUSED_RESULT;
 
 /// Finds the first non-localhost IP address in the given list. Returns
 /// true if such an address was found, false otherwise.
@@ -40,7 +40,7 @@ bool FindFirstNonLocalhost(const std::vector<std::string>& addresses, std::strin
 
 /// Sets the output argument to the system defined hostname.
 /// Returns OK if a hostname can be found, false otherwise.
-Status GetHostname(std::string* hostname);
+Status GetHostname(std::string* hostname) WARN_UNUSED_RESULT;
 
 /// Utility method because Thrift does not supply useful constructors
 TNetworkAddress MakeNetworkAddress(const std::string& hostname, int port);
@@ -64,7 +64,8 @@ std::string TNetworkAddressToString(const TNetworkAddress& address);
 /// Prints a hostport as ipaddress:port
 std::ostream& operator<<(std::ostream& out, const TNetworkAddress& hostport);
 
-/// Returns a ephemeral port that is unused when this function executes. Returns -1 on an
-/// error or if a free ephemeral port can't be found after 10 tries.
-int FindUnusedEphemeralPort();
+/// Returns a ephemeral port that is currently unused. Returns -1 on an error or if
+/// a free ephemeral port can't be found after 100 tries. If 'used_ports' is non-NULL,
+/// does not select those ports and adds the selected port to 'used_ports'.
+int FindUnusedEphemeralPort(std::vector<int>* used_ports);
 }

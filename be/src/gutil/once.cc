@@ -1,6 +1,6 @@
 // Copyright 2008 Google Inc. All Rights Reserved.
 
-#include <glog/logging.h>
+#include <common/logging.h>
 #include "gutil/logging-inl.h"
 #include "gutil/once.h"
 #include "gutil/dynamic_annotations.h"
