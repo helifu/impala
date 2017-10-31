@@ -74,10 +74,10 @@ Status KuduScanNodeBase::Init(const TPlanNode& tnode, RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Init(tnode, state));
 
   const TQueryOptions& query_options = state->query_options();
-  for (const TRuntimeFilterDesc& filter: tnode.runtime_filters) {
-    auto it = filter.planid_to_target_ndx.find(tnode.node_id);
-    DCHECK(it != filter.planid_to_target_ndx.end());
-    const TRuntimeFilterTargetDesc& target = filter.targets[it->second];
+  for (const TRuntimeFilterDesc& filter_desc: tnode.runtime_filters) {
+    auto it = filter_desc.planid_to_target_ndx.find(tnode.node_id);
+    DCHECK(it != filter_desc.planid_to_target_ndx.end());
+    const TRuntimeFilterTargetDesc& target = filter_desc.targets[it->second];
     if (state->query_options().runtime_filter_mode == TRuntimeFilterMode::LOCAL &&
         !target.is_local_target) {
       continue;
@@ -87,20 +87,21 @@ Status KuduScanNodeBase::Init(const TPlanNode& tnode, RuntimeState* state) {
       continue;
     }
 
-    FilterContext filter_ctx;
+    ScalarExpr* filter_expr;
     RETURN_IF_ERROR(
-        Expr::CreateExprTree(pool_, target.target_expr, &filter_ctx.expr_ctx));
-    filter_ctx.filter = state->filter_bank()->RegisterFilter(filter, false);
+        ScalarExpr::Create(target.target_expr, *row_desc(), state, &filter_expr));
+    filter_exprs_.push_back(filter_expr);
 
-    string filter_profile_title = Substitute("Filter $0 ($1)", filter.filter_id,
+    filter_ctxs_.emplace_back();
+    FilterContext& filter_ctx = filter_ctxs_.back();
+    filter_ctx.filter = state->filter_bank()->RegisterFilter(filter_desc, false);
+    string filter_profile_title = Substitute("Filter $0 ($1)", filter_desc.filter_id,
         PrettyPrinter::Print(filter_ctx.filter->filter_size(), TUnit::BYTES));
     RuntimeProfile* profile = state->obj_pool()->Add(
         new RuntimeProfile(state->obj_pool(), filter_profile_title));
     runtime_profile_->AddChild(profile);
     filter_ctx.stats = state->obj_pool()->Add(new FilterStats(profile,
         target.is_bound_by_partition_columns));
-
-    filter_ctxs_.push_back(filter_ctx);
   }
 
   return Status::OK();
@@ -118,6 +119,13 @@ Status KuduScanNodeBase::Prepare(RuntimeState* state) {
 
   DCHECK(state->desc_tbl().GetTupleDescriptor(tuple_id_) != NULL);
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
+
+  DCHECK_EQ(filter_exprs_.size(), filter_ctxs_.size());
+  for (int i = 0; i < filter_exprs_.size(); ++i) {
+    RETURN_IF_ERROR(ScalarExprEvaluator::Create(*filter_exprs_[i], state, pool_,
+        expr_mem_pool(), &filter_ctxs_[i].expr_eval));
+    AddEvaluatorToFree(filter_ctxs_[i].expr_eval);
+  }
 
   // Initialize the list of scan tokens to process from the TScanRangeParams.
   DCHECK(scan_range_params_ != NULL);

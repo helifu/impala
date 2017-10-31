@@ -61,6 +61,9 @@ class KuduScanNodeBase : public ScanNode {
   bool WaitForRuntimeFilters(int32_t time_ms);
 
   RuntimeState* runtime_state_;
+
+  std::vector<ScalarExpr*> filter_exprs_;
+
   std::vector<FilterContext> filter_ctxs_;
 
   /// Set to true when the initial scan ranges are issued to the IoMgr. This happens on
