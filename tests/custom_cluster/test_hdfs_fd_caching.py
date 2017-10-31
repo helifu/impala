@@ -26,6 +26,7 @@ from tests.util.filesystem_utils import (
 from time import sleep
 
 @SkipIfLocal.hdfs_fd_caching
+@SkipIfADLS.caching
 class TestHdfsFdCaching(CustomClusterTestSuite):
   """Tests that if HDFS file handle caching is enabled, file handles are actually cached
   and the associated metrics return valid results. In addition, tests that the upper bound

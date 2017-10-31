@@ -18,6 +18,7 @@
 #include "exec/kudu-scanner.h"
 
 #include <kudu/client/row_result.h>
+#include <kudu/client/value_bloomfilter.h>
 #include <thrift/protocol/TDebugProtocol.h>
 #include <vector>
 #include <string>
@@ -28,6 +29,7 @@
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.h"
+#include "runtime/runtime-filter.h"
 #include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/string-value.h"
@@ -74,8 +76,15 @@ Status KuduScanner::Open() {
     if (slot->type().type != TYPE_TIMESTAMP) continue;
     timestamp_slots_.push_back(slot);
   }
+<<<<<<< .mine
   return ScalarExprEvaluator::Clone(&obj_pool_, state_, expr_mem_pool_.get(),
       scan_node_->conjunct_evals(), &conjunct_evals_);
+
+=======
+
+  filter_ctx_pushed_down_.resize(scan_node_->filter_ctxs_.size(), false);
+  return scan_node_->GetConjunctCtxs(&conjunct_ctxs_);
+>>>>>>> .theirs
 }
 
 void KuduScanner::KeepKuduScannerAlive() {
@@ -162,10 +171,90 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
     scanner_->SetRowFormatFlags(row_format_flags);
   }
 
+  // Apply the runtime filters.
+  LOG(INFO) << "ApplyRuntimeFilters start ...";
+  RETURN_IF_ERROR(ApplyRuntimeFilters());
+
   {
     SCOPED_TIMER(state_->total_storage_wait_timer());
     KUDU_RETURN_IF_ERROR(scanner_->Open(), "Unable to open scanner");
   }
+  return Status::OK();
+}
+
+Status KuduScanner::ApplyRuntimeFilters() {
+  if (scan_node_->filter_ctxs_.empty()) return Status::OK();
+
+  // Reset.
+  vector<bool>::iterator it = filter_ctx_pushed_down_.begin();
+  for (; it != filter_ctx_pushed_down_.end(); ++it) {
+    (*it) = false;
+  }
+
+  return PushDownRuntimeFilters();
+}
+
+Status KuduScanner::PushDownRuntimeFilters() {
+  if (scan_node_->filter_ctxs_.empty()) return Status::OK();
+
+  // Tuple descriptor & Table descriptor.
+  const TupleDescriptor* tuple_desc = scan_node_->tuple_desc_;
+  const TableDescriptor* table_desc = tuple_desc->table_desc();
+  vector<bool>::iterator it = filter_ctx_pushed_down_.begin();
+  for (int i = 0; it != filter_ctx_pushed_down_.end(); ++it, ++i) {
+    if (*it) continue;
+
+    // Runtime Filter.
+    const RuntimeFilter* rf = scan_node_->filter_ctxs_[i].filter;
+    
+    // Skip the filter which is not arrived.
+    if (!(rf->HasBloomFilter())) continue;
+    // Mark True.
+    (*it) = true;
+
+    // Skip the filter which is 'ALWAYS_TRUE_FILTER'.
+    BloomFilter* bf = const_cast<BloomFilter*>(rf->GetBloomFilter());
+    if (bf == BloomFilter::ALWAYS_TRUE_FILTER) {
+      LOG(INFO) << "Scanner id:" << scan_node_->id() 
+                << " -> RuntimeFilter:  i:" << i
+                << " -> ALWAYS_TRUE_FILTER.";
+      continue;
+    }
+    // Skip the filter which size is larger than 48MB (kudu rpc max = 50MB).
+    if (bf->GetHeapSpaceUsed() > 48*1024*1024) {
+      LOG(INFO) << "Scanner id:" << scan_node_->id() 
+                << " -> RuntimeFilter:  i:" << i
+                << " -> Larger than 48 MB"
+                << " -> size:" << bf->GetHeapSpaceUsed();
+      continue;
+    }
+
+    string column_name;
+    const TRuntimeFilterDesc& desc = rf->filter_desc();
+    const auto iter = desc.planid_to_target_ndx.find(scan_node_->id());
+    CHECK(iter != desc.planid_to_target_ndx.end());
+    const TRuntimeFilterTargetDesc& target = desc.targets[iter->second];
+    TSlotId slot_id = target.target_expr.nodes[0].slot_ref.slot_id;
+    std::vector<SlotDescriptor*>::const_iterator slot = tuple_desc->slots().begin();
+    for (; slot != tuple_desc->slots().end(); ++slot){
+      if ((*slot)->id() == slot_id) {
+        int col_idx = (*slot)->col_pos();
+        column_name = table_desc->col_descs()[col_idx].name();
+        break;
+      }
+    }
+    CHECK(!column_name.empty());
+
+    kudu::client::KuduValueBloomFilter* b = kudu::client::KuduValueBloomFilterBuilder().Build(bf);
+    kudu::client::KuduPredicate* p =  scan_node_->table_->NewBloomFilterPredicate(column_name, b);
+    scanner_->AddConjunctPredicate(p);
+    LOG(INFO) << "Scanner id:" << scan_node_->id() 
+              << " -> RuntimeFilter:  i:" << i 
+              << " -> Pushed down"
+              << " -> column_name:" << column_name 
+              << " -> size:" << bf->GetHeapSpaceUsed();
+  }
+
   return Status::OK();
 }
 
@@ -227,6 +316,11 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
       }
     }
 
+    // Evaluate runtime filters that haven't been pushed down to Kudu.
+    /*if (!EvalRuntimeFilters(reinterpret_cast<TupleRow*>(output_row))) {
+        continue;
+    }*/
+
     // Evaluate the conjuncts that haven't been pushed down to Kudu. Conjunct evaluation
     // is performed directly on the Kudu tuple because its memory layout is identical to
     // Impala's. We only copy the surviving tuples to Impala's output row batch.
@@ -254,6 +348,10 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
 Status KuduScanner::GetNextScannerBatch() {
   SCOPED_TIMER(state_->total_storage_wait_timer());
   int64_t now = MonotonicMicros();
+
+  // Continue to push down the runtime filters.
+  RETURN_IF_ERROR(PushDownRuntimeFilters());
+
   KUDU_RETURN_IF_ERROR(scanner_->NextBatch(&cur_kudu_batch_), "Unable to advance iterator");
   COUNTER_ADD(scan_node_->kudu_round_trips(), 1);
   cur_kudu_batch_num_read_ = 0;

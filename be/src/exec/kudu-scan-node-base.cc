@@ -18,6 +18,8 @@
 #include "exec/kudu-scan-node-base.h"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/foreach.hpp>
+
 #include <kudu/client/row_result.h>
 #include <kudu/client/schema.h>
 #include <kudu/client/value.h>
@@ -27,13 +29,17 @@
 #include "exec/kudu-scanner.h"
 #include "exec/kudu-util.h"
 #include "exprs/expr.h"
+#include "exprs/expr-context.h"
+#include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-pool.h"
 #include "runtime/query-state.h"
+#include "runtime/runtime-filter.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
+#include "util/jni-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/runtime-profile-counters.h"
 
@@ -41,6 +47,10 @@
 
 using kudu::client::KuduClient;
 using kudu::client::KuduTable;
+using boost::algorithm::join;
+
+DEFINE_int32(kudu_runtime_filter_wait_time_ms, 1000, "(Advanced) the maximum time, in ms, "
+             "that a scan node will wait for expected runtime filters to arrive.");
 
 namespace impala {
 
@@ -59,6 +69,42 @@ KuduScanNodeBase::KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode,
 
 KuduScanNodeBase::~KuduScanNodeBase() {
   DCHECK(is_closed());
+}
+
+Status KuduScanNodeBase::Init(const TPlanNode& tnode, RuntimeState* state) {
+  RETURN_IF_ERROR(ExecNode::Init(tnode, state));
+
+  const TQueryOptions& query_options = state->query_options();
+  for (const TRuntimeFilterDesc& filter: tnode.runtime_filters) {
+    auto it = filter.planid_to_target_ndx.find(tnode.node_id);
+    DCHECK(it != filter.planid_to_target_ndx.end());
+    const TRuntimeFilterTargetDesc& target = filter.targets[it->second];
+    if (state->query_options().runtime_filter_mode == TRuntimeFilterMode::LOCAL &&
+        !target.is_local_target) {
+      continue;
+    }
+    if (query_options.disable_row_runtime_filtering &&
+        !target.is_bound_by_partition_columns) {
+      continue;
+    }
+
+    FilterContext filter_ctx;
+    RETURN_IF_ERROR(
+        Expr::CreateExprTree(pool_, target.target_expr, &filter_ctx.expr_ctx));
+    filter_ctx.filter = state->filter_bank()->RegisterFilter(filter, false);
+
+    string filter_profile_title = Substitute("Filter $0 ($1)", filter.filter_id,
+        PrettyPrinter::Print(filter_ctx.filter->filter_size(), TUnit::BYTES));
+    RuntimeProfile* profile = state->obj_pool()->Add(
+        new RuntimeProfile(state->obj_pool(), filter_profile_title));
+    runtime_profile_->AddChild(profile);
+    filter_ctx.stats = state->obj_pool()->Add(new FilterStats(profile,
+        target.is_bound_by_partition_columns));
+
+    filter_ctxs_.push_back(filter_ctx);
+  }
+
+  return Status::OK();
 }
 
 Status KuduScanNodeBase::Prepare(RuntimeState* state) {
@@ -105,6 +151,7 @@ Status KuduScanNodeBase::Open(RuntimeState* state) {
 
   KUDU_RETURN_IF_ERROR(client_->OpenTable(table_desc->table_name(), &table_),
       "Unable to open Kudu table");
+
   return Status::OK();
 }
 
@@ -123,10 +170,47 @@ bool KuduScanNodeBase::HasScanToken() {
   return (next_scan_token_idx_ < scan_tokens_.size());
 }
 
+bool KuduScanNodeBase::WaitForRuntimeFilters(int32_t time_ms) {
+  vector<string> arrived_filter_ids;
+  int32_t start = MonotonicMillis();
+  for (auto& ctx: filter_ctxs_) {
+    if (ctx.filter->WaitForArrival(time_ms)) {
+      arrived_filter_ids.push_back(Substitute("$0", ctx.filter->id()));
+    }
+  }
+  int32_t end = MonotonicMillis();
+  const string& wait_time = PrettyPrinter::Print(end - start, TUnit::TIME_MS);
+
+  if (arrived_filter_ids.size() == filter_ctxs_.size()) {
+    runtime_profile()->AddInfoString("Runtime filters",
+        Substitute("All filters arrived. Waited $0", wait_time));
+    VLOG_QUERY << "Filters arrived. Waited " << wait_time;
+    return true;
+  }
+
+  const string& filter_str = Substitute("Only following filters arrived: $0, waited $1",
+      join(arrived_filter_ids, ", "), wait_time);
+  runtime_profile()->AddInfoString("Runtime filters", filter_str);
+  VLOG_QUERY << filter_str;
+  return false;
+}
+
 const string* KuduScanNodeBase::GetNextScanToken() {
   if (!HasScanToken()) return nullptr;
   const string* token = &scan_tokens_[next_scan_token_idx_++];
   return token;
+}
+
+Status KuduScanNodeBase::IssueRuntimeFilters(RuntimeState* state) {
+  DCHECK(!initial_ranges_issued_);
+  initial_ranges_issued_ = true;
+
+  int32 wait_time_ms = FLAGS_kudu_runtime_filter_wait_time_ms;
+  if (state->query_options().runtime_filter_wait_time_ms > 0) {
+      wait_time_ms = state->query_options().runtime_filter_wait_time_ms;
+  }
+  if (filter_ctxs_.size() > 0) WaitForRuntimeFilters(wait_time_ms);
+  return Status::OK();
 }
 
 void KuduScanNodeBase::StopAndFinalizeCounters() {

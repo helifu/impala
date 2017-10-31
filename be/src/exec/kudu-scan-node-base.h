@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 #include <kudu/client/client.h>
 
+#include "exec/filter-context.h"
 #include "exec/scan-node.h"
 #include "runtime/descriptors.h"
 
@@ -38,7 +39,7 @@ class KuduScanNodeBase : public ScanNode {
  public:
   KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
   ~KuduScanNodeBase();
-
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
@@ -56,8 +57,20 @@ class KuduScanNodeBase : public ScanNode {
   /// Returns the next scan token. Returns NULL if there are no more scan tokens.
   /// Not thread safe, access must be synchronized.
   const std::string* GetNextScanToken();
+  //Status TransformFilterToKuduBF(impala_kudu::BloomFiltersPB& kudu_bf);
+  bool WaitForRuntimeFilters(int32_t time_ms);
 
   RuntimeState* runtime_state_;
+  std::vector<FilterContext> filter_ctxs_;
+
+  /// Set to true when the initial scan ranges are issued to the IoMgr. This happens on
+  /// the first call to GetNext(). The token manager, in a different thread, will read
+  /// this variable.
+  bool initial_ranges_issued_;
+
+  /// Waits for runtime filters if necessary.
+  /// Only valid to call if !initial_ranges_issued_. Sets initial_ranges_issued_ to true.
+  Status IssueRuntimeFilters(RuntimeState* state);
 
   /// Stops periodic counters and aggregates counter values for the entire scan node.
   /// This should be called as soon as the scan node is complete to get the most accurate
