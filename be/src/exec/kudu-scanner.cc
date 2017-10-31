@@ -76,15 +76,10 @@ Status KuduScanner::Open() {
     if (slot->type().type != TYPE_TIMESTAMP) continue;
     timestamp_slots_.push_back(slot);
   }
-<<<<<<< .mine
-  return ScalarExprEvaluator::Clone(&obj_pool_, state_, expr_mem_pool_.get(),
-      scan_node_->conjunct_evals(), &conjunct_evals_);
-
-=======
 
   filter_ctx_pushed_down_.resize(scan_node_->filter_ctxs_.size(), false);
-  return scan_node_->GetConjunctCtxs(&conjunct_ctxs_);
->>>>>>> .theirs
+  return ScalarExprEvaluator::Clone(&obj_pool_, state_, expr_mem_pool_.get(),
+      scan_node_->conjunct_evals(), &conjunct_evals_);
 }
 
 void KuduScanner::KeepKuduScannerAlive() {
