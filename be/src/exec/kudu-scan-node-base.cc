@@ -28,7 +28,8 @@
 
 #include "exec/kudu-scanner.h"
 #include "exec/kudu-util.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-pool.h"
