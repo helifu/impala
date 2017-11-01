@@ -46,7 +46,7 @@ KuduScanNodeMt::~KuduScanNodeMt() {
 Status KuduScanNodeMt::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(KuduScanNodeBase::Open(state));
-  scanner_.reset(new KuduScanner(this, runtime_state_));
+  scanner_.reset(new KuduScanner(this, runtime_state_, NULL));
   RETURN_IF_ERROR(scanner_->Open());
   return Status::OK();
 }

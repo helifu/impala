@@ -37,7 +37,7 @@ class Tuple;
 /// by GetNext() until it reaches eos, and the caller may open another scan token.
 class KuduScanner {
  public:
-  KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state);
+  KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state, const vector<FilterContext>* filter_ctxs);
 
   /// Prepares this scanner for execution.
   /// Does not actually open a kudu::client::KuduScanner.
@@ -122,6 +122,7 @@ class KuduScanner {
   /// The value 'true' means the filter context has been pushed down, else not.
   /// The size of this vector equals to the size of 'filter_ctxs_'.
   vector<bool> filter_ctx_pushed_down_;
+  const std::vector<FilterContext>* filter_ctxs_;
 };
 
 } /// namespace impala

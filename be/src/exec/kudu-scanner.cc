@@ -62,12 +62,13 @@ namespace impala {
 
 const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 
-KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
+KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state, const vector<FilterContext>* filter_ctxs)
   : scan_node_(scan_node),
     state_(state),
     expr_mem_pool_(new MemPool(scan_node->expr_mem_tracker())),
     cur_kudu_batch_num_read_(0),
-    last_alive_time_micros_(0) {
+    last_alive_time_micros_(0),
+    filter_ctxs_(filter_ctxs) {
 }
 
 Status KuduScanner::Open() {
@@ -77,7 +78,7 @@ Status KuduScanner::Open() {
     timestamp_slots_.push_back(slot);
   }
 
-  filter_ctx_pushed_down_.resize(scan_node_->filter_ctxs_.size(), false);
+  filter_ctx_pushed_down_.resize(filter_ctxs_->size(), false);
   return ScalarExprEvaluator::Clone(&obj_pool_, state_, expr_mem_pool_.get(),
       scan_node_->conjunct_evals(), &conjunct_evals_);
 }
@@ -178,7 +179,7 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
 }
 
 Status KuduScanner::ApplyRuntimeFilters() {
-  if (scan_node_->filter_ctxs_.empty()) return Status::OK();
+  if (filter_ctxs_->empty()) return Status::OK();
 
   // Reset.
   vector<bool>::iterator it = filter_ctx_pushed_down_.begin();
@@ -190,7 +191,7 @@ Status KuduScanner::ApplyRuntimeFilters() {
 }
 
 Status KuduScanner::PushDownRuntimeFilters() {
-  if (scan_node_->filter_ctxs_.empty()) return Status::OK();
+  if (filter_ctxs_->empty()) return Status::OK();
 
   // Tuple descriptor & Table descriptor.
   const TupleDescriptor* tuple_desc = scan_node_->tuple_desc_;
@@ -200,7 +201,7 @@ Status KuduScanner::PushDownRuntimeFilters() {
     if (*it) continue;
 
     // Runtime Filter.
-    const RuntimeFilter* rf = scan_node_->filter_ctxs_[i].filter;
+    const RuntimeFilter* rf = (*filter_ctxs_)[i].filter;
     
     // Skip the filter which is not arrived.
     if (!(rf->HasBloomFilter())) continue;

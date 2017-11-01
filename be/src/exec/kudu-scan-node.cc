@@ -205,10 +205,21 @@ void KuduScanNode::RunScannerThread(const string& name, const string* initial_to
   DCHECK(initial_token != NULL);
   SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
+
+  MemPool filter_mem_pool(expr_mem_tracker());
+  vector<FilterContext> filter_ctxs;
+  Status filter_status = Status::OK();
+  for (auto& filter_ctx: filter_ctxs_) {
+      FilterContext filter;
+      filter_status = filter.CloneFrom(filter_ctx, pool_, runtime_state_, &filter_mem_pool);
+      if (!filter_status.ok()) break;
+      filter_ctxs.push_back(filter);
+  }
+
   // Set to true if this thread observes that the number of optional threads has been
   // exceeded and is exiting early.
   bool optional_thread_exiting = false;
-  KuduScanner scanner(this, runtime_state_);
+  KuduScanner scanner(this, runtime_state_, &filter_ctxs);
 
   const string* scan_token = initial_token;
   Status status = scanner.Open();
@@ -264,6 +275,13 @@ void KuduScanNode::RunScannerThread(const string& name, const string* initial_to
   // invokes ThreadAvailableCb() which attempts to take the same lock.
   VLOG_RPC << "Thread done: " << name;
   runtime_state_->resource_pool()->ReleaseThreadToken(false);
+  if (filter_status.ok()) {
+      for (auto& ctx: filter_ctxs) {
+          ctx.expr_eval->FreeLocalAllocations();
+          ctx.expr_eval->Close(runtime_state_);
+      }
+  }
+  filter_mem_pool.FreeAll();
 }
 
 }  // namespace impala
