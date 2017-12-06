@@ -47,6 +47,7 @@ class KuduScanner {
 
   /// Fetches the next batch from the current kudu::client::KuduScanner.
   Status GetNext(RowBatch* row_batch, bool* eos);
+  Status GetNext(std::deque<RowBatch*>& row_batches, bool* eos);
 
   /// Sends a "Ping" to the Kudu TabletServer servicing the current scan, if there is
   /// one. This serves the purpose of making the TabletServer keep the server side

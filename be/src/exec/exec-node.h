@@ -224,6 +224,7 @@ class ExecNode {
     /// method returns false, the queue didn't take ownership of the batch and it must be
     /// managed externally.
     bool AddBatchWithTimeout(RowBatch* batch, int64_t timeout_micros) WARN_UNUSED_RESULT;
+    bool AddBatchesWithTimeout(std::deque<RowBatch*>& row_batches, int64_t timeout_micros);
 
     /// Gets a row batch from the queue. Returns NULL if there are no more.
     /// This function blocks.

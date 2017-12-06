@@ -93,6 +93,12 @@ bool ExecNode::RowBatchQueue::AddBatchWithTimeout(RowBatch* batch,
   return BlockingPutWithTimeout(batch, timeout_micros);
 }
 
+bool ExecNode::RowBatchQueue::AddBatchesWithTimeout(
+    std::deque<RowBatch*>& row_batches, 
+    int64_t timeout_micros) {
+  return BlockingPutWithTimeout2(std::move(row_batches), timeout_micros);
+}
+
 RowBatch* ExecNode::RowBatchQueue::GetBatch() {
   RowBatch* result = NULL;
   if (BlockingGet(&result)) return result;

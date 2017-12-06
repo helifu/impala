@@ -161,6 +161,28 @@ class BlockingQueue : public CacheLineAligned {
     return true;
   }
 
+  template <typename V>
+  bool BlockingPutWithTimeout2(std::deque<V>&& vals, int64_t timeout_micros) {
+    MonotonicStopWatch timer;
+    boost::unique_lock<boost::mutex> write_lock(put_lock_);
+    boost::system_time wtime = boost::get_system_time() +
+        boost::posix_time::microseconds(timeout_micros);
+    const struct timespec timeout = boost::detail::to_timespec(wtime);
+    bool notified = true;
+    while (!put_list_.empty() && !shutdown_ && notified) {
+      timer.Start();
+      notified = put_cv_.TimedWait(write_lock, &timeout);
+      timer.Stop();
+    }
+    total_put_wait_time_ += timer.ElapsedTime();
+    if (UNLIKELY(shutdown_)) return false;
+
+    put_list_.insert(put_list_.end(), vals.begin(), vals.end());
+    write_lock.unlock();
+    get_cv_.NotifyOne();
+    return true;
+  }
+
   /// Shut down the queue. Wakes up all threads waiting on BlockingGet or BlockingPut.
   void Shutdown() {
     {

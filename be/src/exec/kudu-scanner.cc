@@ -129,6 +129,31 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
   return Status::OK();
 }
 
+Status KuduScanner::GetNext(std::deque<RowBatch*>& row_batches, bool* eos) {
+  if (scanner_->HasMoreRows() && !scan_node_->ReachedLimit()) {
+    // Scan kudu.
+    RETURN_IF_ERROR(GetNextScannerBatch());
+
+    // Split into small batches
+    while (cur_kudu_batch_num_read_ < cur_kudu_batch_.NumRows()) {
+      RETURN_IF_CANCELLED(state_);
+      RowBatch* row_batch = new RowBatch(scan_node_->row_desc(),
+                  state_->batch_size(), scan_node_->mem_tracker());
+      int64_t tuple_buffer_size;
+      uint8_t* tuple_buffer;
+      RETURN_IF_ERROR(row_batch->ResizeAndAllocateTupleBuffer(state_, &tuple_buffer_size, &tuple_buffer));
+      Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
+      RETURN_IF_ERROR(DecodeRowsIntoRowBatch(row_batch, &tuple));
+      row_batches.emplace_back(row_batch);
+    }
+  } else {
+    CloseCurrentClientScanner();
+    *eos = true;
+  }
+
+  return Status::OK();
+}
+
 void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
   Expr::Close(conjunct_ctxs_, state_);
