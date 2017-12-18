@@ -58,6 +58,8 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
     max_row_batches = 10 * (DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS);
   }
   materialized_row_batches_.reset(new RowBatchQueue(max_row_batches));
+  row_batches_get_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueueGetWaitTime");
+  row_batches_put_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueuePutWaitTime");
 }
 
 KuduScanNode::~KuduScanNode() {
@@ -89,7 +91,13 @@ Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
     RETURN_IF_ERROR(IssueRuntimeFilters(state));
     runtimefilters_issued_barrier_.Notify();
   }
-  return GetNextInternal(state, row_batch, eos);
+
+  Status status = GetNextInternal(state, row_batch, eos);
+  if (!status.ok() || *eos) {
+      row_batches_get_timer_->Set(materialized_row_batches_->total_get_wait_time());
+      row_batches_put_timer_->Set(materialized_row_batches_->total_put_wait_time());
+  }
+  return status;
 }
 
 Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos) {
@@ -98,7 +106,7 @@ Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, b
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  SCOPED_TIMER(materialize_tuple_timer());
+  //SCOPED_TIMER(materialize_tuple_timer());
 
   // If there are no scan tokens, nothing is ever placed in the materialized
   // row batch, so exit early for this case.
@@ -121,11 +129,12 @@ Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, b
       COUNTER_SET(rows_returned_counter_, num_rows_returned_);
       *eos = true;
 
-      unique_lock<mutex> l(lock_);
+      //unique_lock<mutex> l(lock_);
       done_ = true;
       materialized_row_batches_->Shutdown();
     }
     delete materialized_batch;
+    return Status::OK();
   } else {
     *eos = true;
   }

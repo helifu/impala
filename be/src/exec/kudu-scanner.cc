@@ -64,8 +64,10 @@ const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
     state_(state),
+    assemble_rows_timer_(scan_node_->materialize_tuple_timer()),
     cur_kudu_batch_num_read_(0),
     last_alive_time_micros_(0) {
+  assemble_rows_timer_.Stop();
 }
 
 Status KuduScanner::Open() {
@@ -100,6 +102,7 @@ void KuduScanner::KeepKuduScannerAlive() {
 }
 
 Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
+  assemble_rows_timer_.Start();
   int64_t tuple_buffer_size;
   uint8_t* tuple_buffer;
   RETURN_IF_ERROR(
@@ -126,12 +129,16 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
     CloseCurrentClientScanner();
     *eos = true;
   }
+  assemble_rows_timer_.Stop();
   return Status::OK();
 }
 
 void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
   Expr::Close(conjunct_ctxs_, state_);
+
+  assemble_rows_timer_.Stop();
+  assemble_rows_timer_.ReleaseCounter();
 }
 
 Status KuduScanner::OpenNextScanToken(const string& scan_token)  {

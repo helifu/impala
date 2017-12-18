@@ -23,6 +23,8 @@
 
 #include "exec/kudu-scan-node-base.h"
 #include "runtime/descriptors.h"
+#include "runtime/scoped-buffer.h"
+#include "util/runtime-profile-counters.h"
 
 namespace impala {
 
@@ -89,6 +91,9 @@ class KuduScanner {
 
   KuduScanNodeBase* scan_node_;
   RuntimeState* state_;
+
+  /// Timer for materializing rows.
+  ScopedTimer<MonotonicStopWatch> assemble_rows_timer_;
 
   /// The kudu::client::KuduScanner for the current scan token. A new KuduScanner is
   /// created for each scan token using KuduScanToken::DeserializeIntoScanner().
