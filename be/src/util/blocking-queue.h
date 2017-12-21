@@ -49,6 +49,7 @@ class BlockingQueue : public CacheLineAligned {
   BlockingQueue(size_t max_elements)
     : shutdown_(false),
       max_elements_(max_elements),
+      put_list_size_(0),
       total_put_wait_time_(0),
       get_list_size_(0),
       total_get_wait_time_(0) {
@@ -166,18 +167,17 @@ class BlockingQueue : public CacheLineAligned {
     MonotonicStopWatch timer;
     boost::unique_lock<boost::mutex> write_lock(put_lock_);
     boost::system_time wtime = boost::get_system_time() +
-        boost::posix_time::microseconds(timeout_micros);
+        boost::posix_time::microseconds(rand()%timeout_micros);
     const struct timespec timeout = boost::detail::to_timespec(wtime);
     bool notified = true;
-    while (!put_list_.empty() && !shutdown_ && notified) {
+    while (SizeLocked(write_lock) >= max_elements_ && !shutdown_ && notified) {
       timer.Start();
       notified = put_cv_.TimedWait(write_lock, &timeout);
       timer.Stop();
     }
     total_put_wait_time_ += timer.ElapsedTime();
-    if (UNLIKELY(shutdown_)) return false;
-
     put_list_.insert(put_list_.end(), vals.begin(), vals.end());
+    put_list_size_.Store(put_list_.size());
     write_lock.unlock();
     get_cv_.NotifyOne();
     return true;
@@ -238,6 +238,9 @@ class BlockingQueue : public CacheLineAligned {
 
   /// The queue for items enqueued by BlockingPut(). Guarded by 'put_lock_'.
   std::deque<T> put_list_;
+
+  /// The size of 'put_list_'.
+  AtomicInt32 put_list_size_;
 
   /// BlockingPut()/BlockingPutWithTimeout() wait on this.
   ConditionVariable put_cv_;

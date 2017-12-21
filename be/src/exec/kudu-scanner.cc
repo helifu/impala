@@ -65,7 +65,9 @@ KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
     state_(state),
     cur_kudu_batch_num_read_(0),
-    last_alive_time_micros_(0) {
+    last_alive_time_micros_(0),
+    assemble_rows_timer_(scan_node_->materialize_tuple_timer()) {
+  assemble_rows_timer_.Stop();
 }
 
 Status KuduScanner::Open() {
@@ -143,7 +145,9 @@ Status KuduScanner::GetNext(std::deque<RowBatch*>& row_batches, bool* eos) {
       uint8_t* tuple_buffer;
       RETURN_IF_ERROR(row_batch->ResizeAndAllocateTupleBuffer(state_, &tuple_buffer_size, &tuple_buffer));
       Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
+      assemble_rows_timer_.Start();
       RETURN_IF_ERROR(DecodeRowsIntoRowBatch(row_batch, &tuple));
+      assemble_rows_timer_.Stop();
       row_batches.emplace_back(row_batch);
     }
   } else {
@@ -157,6 +161,8 @@ Status KuduScanner::GetNext(std::deque<RowBatch*>& row_batches, bool* eos) {
 void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
   Expr::Close(conjunct_ctxs_, state_);
+  assemble_rows_timer_.Stop();
+  assemble_rows_timer_.ReleaseCounter();
 }
 
 Status KuduScanner::OpenNextScanToken(const string& scan_token)  {

@@ -23,6 +23,8 @@
 
 #include "exec/kudu-scan-node-base.h"
 #include "runtime/descriptors.h"
+#include "runtime/scoped-buffer.h"
+#include "util/runtime-profile-counters.h"
 
 namespace impala {
 
@@ -115,6 +117,9 @@ class KuduScanner {
   /// The value 'true' means the filter context has been pushed down, else not.
   /// The size of this vector equals to the size of 'filter_ctxs_'.
   vector<bool> filter_ctx_pushed_down_;
+
+  /// Timer for materializing rows.  This ignores time getting the next buffer.
+  ScopedTimer<MonotonicStopWatch> assemble_rows_timer_;
 };
 
 } /// namespace impala

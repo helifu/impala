@@ -107,7 +107,7 @@ Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, b
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  SCOPED_TIMER(materialize_tuple_timer());
+  //SCOPED_TIMER(materialize_tuple_timer());
 
   // If there are no scan tokens, nothing is ever placed in the materialized
   // row batch, so exit early for this case.
@@ -130,11 +130,12 @@ Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, b
       COUNTER_SET(rows_returned_counter_, num_rows_returned_);
       *eos = true;
 
-      unique_lock<mutex> l(lock_);
+      //unique_lock<mutex> l(lock_);
       done_ = true;
       materialized_row_batches_->Shutdown();
     }
     delete materialized_batch;
+    return Status::OK();
   } else {
     *eos = true;
   }
