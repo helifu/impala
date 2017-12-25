@@ -18,6 +18,7 @@
 #ifndef IMPALA_EXEC_KUDU_SCANNER_H_
 #define IMPALA_EXEC_KUDU_SCANNER_H_
 
+#include <deque>
 #include <boost/scoped_ptr.hpp>
 #include <kudu/client/client.h>
 
@@ -25,6 +26,7 @@
 #include "runtime/descriptors.h"
 #include "runtime/scoped-buffer.h"
 #include "util/runtime-profile-counters.h"
+#include "util/thread.h"
 
 namespace impala {
 
@@ -42,7 +44,7 @@ class KuduScanner {
 
   /// Prepares this scanner for execution.
   /// Does not actually open a kudu::client::KuduScanner.
-  Status Open();
+  Status Open(int64_t id = 0);
 
   /// Opens a new kudu::client::KuduScanner using 'scan_token'.
   Status OpenNextScanToken(const std::string& scan_token);
@@ -79,7 +81,7 @@ class KuduScanner {
   Status DecodeRowsIntoRowBatch(RowBatch* batch, Tuple** tuple_mem);
 
   /// Fetches the next batch of rows from the current kudu::client::KuduScanner.
-  Status GetNextScannerBatch();
+  Status GetNextScannerBatch(kudu::client::KuduScanBatch** batch);
 
   /// Closes the current kudu::client::KuduScanner.
   void CloseCurrentClientScanner();
@@ -88,6 +90,11 @@ class KuduScanner {
     uint8_t* mem = reinterpret_cast<uint8_t*>(t);
     return reinterpret_cast<Tuple*>(mem + scan_node_->tuple_desc()->byte_size());
   }
+
+  /// Main function for scanner thread which executes kudu rpc.
+  void RunScannerThread();
+
+  kudu::client::KuduScanBatch* NextKuduScanBatch();
 
   KuduScanNodeBase* scan_node_;
   RuntimeState* state_;
@@ -100,7 +107,7 @@ class KuduScanner {
   boost::scoped_ptr<kudu::client::KuduScanner> scanner_;
 
   /// The current batch of retrieved rows.
-  kudu::client::KuduScanBatch cur_kudu_batch_;
+  kudu::client::KuduScanBatch* cur_kudu_batch_;
 
   /// The number of rows already read from cur_kudu_batch_.
   int cur_kudu_batch_num_read_;
@@ -119,6 +126,18 @@ class KuduScanner {
   /// The value 'true' means the filter context has been pushed down, else not.
   /// The size of this vector equals to the size of 'filter_ctxs_'.
   vector<bool> filter_ctx_pushed_down_;
+
+  /// 
+  boost::mutex lock_;
+  std::deque<kudu::client::KuduScanBatch*> kudu_batches_list_;
+  boost::condition_variable kudu_batches_list_cv_;
+  boost::condition_variable kudu_keepalive_cv_;
+  boost::condition_variable kudu_scan_token_cv_;
+  int kudu_batches_list_capacity_;
+  volatile bool kudu_scan_token_eos_;
+
+  volatile bool done_;
+  ThreadGroup scanner_threads_;
 };
 
 } /// namespace impala

@@ -46,6 +46,7 @@ using kudu::client::KuduClient;
 using kudu::client::KuduScanBatch;
 using kudu::client::KuduSchema;
 using kudu::client::KuduTable;
+using std::min;
 
 DEFINE_string(kudu_read_mode, "READ_LATEST", "(Advanced) Sets the Kudu scan ReadMode. "
     "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT.");
@@ -59,23 +60,35 @@ DECLARE_int32(kudu_operation_timeout_ms);
 
 namespace impala {
 
+const int MAX_BATCHES_LIST_CAPACITY = 16;
+const int MIN_BATCHES_LIST_CAPACITY = 4;
 const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 
 KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
     state_(state),
     assemble_rows_timer_(scan_node_->materialize_tuple_timer()),
+    cur_kudu_batch_(nullptr),
     cur_kudu_batch_num_read_(0),
-    last_alive_time_micros_(0) {
+    last_alive_time_micros_(0),
+    kudu_batches_list_capacity_(MIN_BATCHES_LIST_CAPACITY),
+    kudu_scan_token_eos_(true),
+    done_(false) {
   assemble_rows_timer_.Stop();
 }
 
-Status KuduScanner::Open() {
+Status KuduScanner::Open(int64_t id) {
   for (int i = 0; i < scan_node_->tuple_desc()->slots().size(); ++i) {
     const SlotDescriptor* slot = scan_node_->tuple_desc()->slots()[i];
     if (slot->type().type != TYPE_TIMESTAMP) continue;
     timestamp_slots_.push_back(slot);
   }
+
+  /// create shadow thread for calling RPC.
+  string shadow_name = Substitute("shadow-($0)", id);
+  VLOG_RPC << "Thread started: " << shadow_name;
+  scanner_threads_.AddThread(new Thread("KuduScanner", shadow_name,
+      &KuduScanner::RunScannerThread, this));
 
   filter_ctx_pushed_down_.resize(scan_node_->filter_ctxs_.size(), false);
   return scan_node_->GetConjunctCtxs(&conjunct_ctxs_);
@@ -101,35 +114,56 @@ void KuduScanner::KeepKuduScannerAlive() {
   last_alive_time_micros_ = now;
 }
 
+kudu::client::KuduScanBatch* KuduScanner::NextKuduScanBatch() {
+  if (cur_kudu_batch_) {
+    if (cur_kudu_batch_num_read_ < cur_kudu_batch_->NumRows()) {
+      return cur_kudu_batch_;
+    } else {
+      delete cur_kudu_batch_;
+    }
+  }
+
+  unique_lock<mutex> l(lock_);
+  if (kudu_batches_list_.empty()) {
+    if (kudu_scan_token_eos_) return nullptr; // current scan_token is finished.
+    ++kudu_batches_list_capacity_;
+    kudu_batches_list_capacity_ = std::min(kudu_batches_list_capacity_, MAX_BATCHES_LIST_CAPACITY);
+    kudu_keepalive_cv_.notify_one();
+    kudu_batches_list_cv_.wait(l);
+  }
+
+  if (!kudu_batches_list_.empty()) {
+    cur_kudu_batch_ = kudu_batches_list_.front();
+    kudu_batches_list_.pop_front();
+    cur_kudu_batch_num_read_ = 0;
+    return cur_kudu_batch_;
+  }
+  return nullptr;
+}
+
 Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
-  assemble_rows_timer_.Start();
   int64_t tuple_buffer_size;
   uint8_t* tuple_buffer;
   RETURN_IF_ERROR(
       row_batch->ResizeAndAllocateTupleBuffer(state_, &tuple_buffer_size, &tuple_buffer));
   Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
 
-  // Main scan loop:
-  // Tries to fill 'row_batch' with rows from cur_kudu_batch_.
-  // If there are no rows to decode, tries to get the next row batch from kudu.
-  // If this scanner has no more rows, the scanner is closed and eos is returned.
   while (!*eos) {
     RETURN_IF_CANCELLED(state_);
+    cur_kudu_batch_ = NextKuduScanBatch();
+    if (cur_kudu_batch_ == nullptr && kudu_scan_token_eos_) {
+      *eos = kudu_scan_token_eos_;
+      break;
+    }
 
-    if (cur_kudu_batch_num_read_ < cur_kudu_batch_.NumRows()) {
+    if (cur_kudu_batch_num_read_ < cur_kudu_batch_->NumRows()) {
+      assemble_rows_timer_.Start();
       RETURN_IF_ERROR(DecodeRowsIntoRowBatch(row_batch, &tuple));
+      assemble_rows_timer_.Stop();
       if (row_batch->AtCapacity()) break;
     }
-
-    if (scanner_->HasMoreRows() && !scan_node_->ReachedLimit()) {
-      RETURN_IF_ERROR(GetNextScannerBatch());
-      continue;
-    }
-
-    CloseCurrentClientScanner();
-    *eos = true;
   }
-  assemble_rows_timer_.Stop();
+
   return Status::OK();
 }
 
@@ -137,12 +171,14 @@ void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
   Expr::Close(conjunct_ctxs_, state_);
 
+  done_ = true;
+  scanner_threads_.JoinAll();
   assemble_rows_timer_.Stop();
   assemble_rows_timer_.ReleaseCounter();
 }
 
 Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
-  DCHECK(scanner_ == NULL);
+  //DCHECK(scanner_ == NULL);
   kudu::client::KuduScanner* scanner;
   KUDU_RETURN_IF_ERROR(kudu::client::KuduScanToken::DeserializeIntoScanner(
       scan_node_->kudu_client(), scan_token, &scanner),
@@ -173,6 +209,10 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
     SCOPED_TIMER(state_->total_storage_wait_timer());
     KUDU_RETURN_IF_ERROR(scanner_->Open(), "Unable to open scanner");
   }
+
+  unique_lock<mutex> l(lock_);
+  kudu_scan_token_cv_.notify_one();
+  kudu_scan_token_eos_ = false;
   return Status::OK();
 }
 
@@ -259,7 +299,7 @@ void KuduScanner::CloseCurrentClientScanner() {
 }
 
 Status KuduScanner::HandleEmptyProjection(RowBatch* row_batch) {
-  int num_rows_remaining = cur_kudu_batch_.NumRows() - cur_kudu_batch_num_read_;
+  int num_rows_remaining = cur_kudu_batch_->NumRows() - cur_kudu_batch_num_read_;
   int rows_to_add = std::min(row_batch->capacity() - row_batch->num_rows(),
       num_rows_remaining);
   cur_kudu_batch_num_read_ += rows_to_add;
@@ -276,11 +316,11 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
   // Iterate through the Kudu rows, evaluate conjuncts and deep-copy survivors into
   // 'row_batch'.
   bool has_conjuncts = !conjunct_ctxs_.empty();
-  int num_rows = cur_kudu_batch_.NumRows();
+  int num_rows = cur_kudu_batch_->NumRows();
 
   for (int krow_idx = cur_kudu_batch_num_read_; krow_idx < num_rows; ++krow_idx) {
     Tuple* kudu_tuple = const_cast<Tuple*>(reinterpret_cast<const Tuple*>(
-        cur_kudu_batch_.direct_data().data() +
+        cur_kudu_batch_->direct_data().data() +
         (krow_idx * scan_node_->row_desc().GetRowSize())));
     ++cur_kudu_batch_num_read_;
 
@@ -341,19 +381,76 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
   return state_->GetQueryStatus();
 }
 
-Status KuduScanner::GetNextScannerBatch() {
+Status KuduScanner::GetNextScannerBatch(kudu::client::KuduScanBatch** batch) {
   SCOPED_TIMER(state_->total_storage_wait_timer());
   int64_t now = MonotonicMicros();
 
   // Continue to push down the runtime filters.
   RETURN_IF_ERROR(PushDownRuntimeFilters());
 
-  KUDU_RETURN_IF_ERROR(scanner_->NextBatch(&cur_kudu_batch_), "Unable to advance iterator");
+  KUDU_RETURN_IF_ERROR(scanner_->NextBatch(*batch), "Unable to advance iterator");
   COUNTER_ADD(scan_node_->kudu_round_trips(), 1);
-  cur_kudu_batch_num_read_ = 0;
-  COUNTER_ADD(scan_node_->rows_read_counter(), cur_kudu_batch_.NumRows());
+
+  COUNTER_ADD(scan_node_->rows_read_counter(), (*batch)->NumRows());
   last_alive_time_micros_ = now;
   return Status::OK();
+}
+
+void KuduScanner::RunScannerThread() {
+  while (!done_) {
+    if (UNLIKELY(state_->is_cancelled())) break;;
+
+    if (kudu_scan_token_eos_) {
+      unique_lock<mutex> l(lock_);
+      boost::system_time timeout = boost::get_system_time() 
+          + boost::posix_time::seconds(1);
+      kudu_scan_token_cv_.timed_wait(l, timeout);
+      continue;
+    }
+
+    if (scanner_->HasMoreRows() && !scan_node_->ReachedLimit()) {
+      /// Do kudu keepalive
+      {
+        unique_lock<mutex> l(lock_);
+        if (kudu_batches_list_.size() >= kudu_batches_list_capacity_) {
+          boost::system_time timeout = boost::get_system_time() 
+              + boost::posix_time::seconds(1);
+          kudu_keepalive_cv_.timed_wait(l, timeout);
+          l.unlock();
+          KeepKuduScannerAlive();
+          continue;
+        }
+        l.unlock();
+      }
+      /// Do kudu rpc
+      {
+        kudu::client::KuduScanBatch* kudu_batch = new kudu::client::KuduScanBatch();
+        Status status = GetNextScannerBatch(&kudu_batch);
+        if (!status.ok()) {
+          CloseCurrentClientScanner();
+          unique_lock<mutex> l(lock_);
+          kudu_scan_token_eos_ = true;
+          continue;
+        }
+
+        unique_lock<mutex> l(lock_);
+        kudu_batches_list_.push_back(kudu_batch);
+        if (kudu_batches_list_.size() >= kudu_batches_list_capacity_
+            && kudu_batches_list_capacity_ > MIN_BATCHES_LIST_CAPACITY) {
+          --kudu_batches_list_capacity_;
+        }
+        kudu_batches_list_cv_.notify_one();
+        l.unlock();
+      }
+      continue;
+    } else {
+      CloseCurrentClientScanner();
+      unique_lock<mutex> l(lock_);
+      kudu_batches_list_cv_.notify_one();
+      kudu_scan_token_eos_ = true;
+    }
+  }
+  return;
 }
 
 }  // namespace impala

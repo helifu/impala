@@ -87,6 +87,9 @@ class KuduScanNode : public KuduScanNodeBase {
   /// -1 if no callback is registered.
   int thread_avail_cb_id_;
 
+  /// Maximum number of scanner threads.
+  int max_num_scanner_threads_;
+
   /// The wait time for fetching a row batch from the row batch queue.
   RuntimeProfile::Counter* row_batches_get_timer_;
 
@@ -101,7 +104,7 @@ class KuduScanNode : public KuduScanNodeBase {
   /// 'initial_token', and continues processing scan tokens returned by
   /// 'GetNextScanToken()' until there are none left, an error occurs, or the limit is
   /// reached.
-  void RunScannerThread(const std::string& name, const std::string* initial_token);
+  void RunScannerThread(const std::string& name, const std::string* initial_token, int64_t id);
 
   /// Processes a single scan token. Row batches are fetched using 'scanner' and enqueued
   /// in 'materialized_row_batches_' until the scanner reports eos, an error occurs, or

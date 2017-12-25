@@ -46,7 +46,8 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
       runtimefilters_issued_barrier_(1),
       num_active_scanners_(0),
       done_(false),
-      thread_avail_cb_id_(-1) {
+      thread_avail_cb_id_(-1),
+      max_num_scanner_threads_(CpuInfo::num_cores()) {
   DCHECK(KuduIsAvailable());
 
   int max_row_batches = FLAGS_kudu_max_row_batches;
@@ -169,7 +170,8 @@ void KuduScanNode::ThreadAvailableCb(ThreadResourceMgr::ResourcePool* pool) {
     if (done_ || !HasScanToken()) break;
 
     // Check if we can get a token.
-    if (!pool->TryAcquireThreadToken()) break;
+    if (!pool->TryAcquireThreadToken() ||
+		num_active_scanners_ >= max_num_scanner_threads_) break;
 
     ++num_active_scanners_;
     COUNTER_ADD(num_scanner_threads_started_counter_, 1);
@@ -181,7 +183,8 @@ void KuduScanNode::ThreadAvailableCb(ThreadResourceMgr::ResourcePool* pool) {
 
     VLOG_RPC << "Thread started: " << name;
     scanner_threads_.AddThread(new Thread("kudu-scan-node", name,
-        &KuduScanNode::RunScannerThread, this, name, token));
+        &KuduScanNode::RunScannerThread, this, name, token,
+        num_scanner_threads_started_counter_->value()));
   }
 }
 
@@ -189,22 +192,16 @@ Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_t
   RETURN_IF_ERROR(scanner->OpenNextScanToken(scan_token));
   bool eos = false;
   while (!eos && !done_) {
-    gscoped_ptr<RowBatch> row_batch(new RowBatch(
-        row_desc(), runtime_state_->batch_size(), mem_tracker()));
-    RETURN_IF_ERROR(scanner->GetNext(row_batch.get(), &eos));
-    while (!done_) {
-      scanner->KeepKuduScannerAlive();
-      if (materialized_row_batches_->AddBatchWithTimeout(row_batch.get(), 1000000)) {
-        ignore_result(row_batch.release());
-        break;
-      }
-    }
+    RowBatch* row_batch = new RowBatch(
+      row_desc(), runtime_state_->batch_size(), mem_tracker());
+    RETURN_IF_ERROR(scanner->GetNext(row_batch, &eos));
+    materialized_row_batches_->AddBatch(row_batch);
   }
   if (eos) scan_ranges_complete_counter()->Add(1);
   return Status::OK();
 }
 
-void KuduScanNode::RunScannerThread(const string& name, const string* initial_token) {
+void KuduScanNode::RunScannerThread(const string& name, const string* initial_token, int64_t id) {
   DCHECK(initial_token != NULL);
   SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
@@ -214,7 +211,7 @@ void KuduScanNode::RunScannerThread(const string& name, const string* initial_to
   KuduScanner scanner(this, runtime_state_);
 
   const string* scan_token = initial_token;
-  Status status = scanner.Open();
+  Status status = scanner.Open(id);
   if (status.ok()) {
     // Wake up every SCANNER_THREAD_COUNTERS to yield scanner threads back if unused, or
     // to return if there's an error.

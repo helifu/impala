@@ -60,6 +60,7 @@ const string KuduScanNodeBase::KUDU_REMOTE_TOKENS = "KuduRemoteScanTokens";
 KuduScanNodeBase::KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode,
     const DescriptorTbl& descs)
     : ScanNode(pool, tnode, descs),
+      initial_ranges_issued_(false),
       tuple_id_(tnode.kudu_scan_node.tuple_id),
       client_(nullptr),
       counters_running_(false),
@@ -204,6 +205,12 @@ const string* KuduScanNodeBase::GetNextScanToken() {
 Status KuduScanNodeBase::IssueRuntimeFilters(RuntimeState* state) {
   DCHECK(!initial_ranges_issued_);
   initial_ranges_issued_ = true;
+
+  // No need to issue ranges with limit 0.
+  if (ReachedLimit()) {
+    DCHECK_EQ(limit_, 0);
+    return Status::OK();
+  }
 
   int32 wait_time_ms = FLAGS_kudu_runtime_filter_wait_time_ms;
   if (state->query_options().runtime_filter_wait_time_ms > 0) {
