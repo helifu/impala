@@ -56,7 +56,7 @@ class KuduScanNode : public KuduScanNodeBase {
 
   // Outgoing row batches queue. Row batches are produced asynchronously by the scanner
   // threads and consumed by the main thread.
-  boost::scoped_ptr<RowBatchQueue> materialized_row_batches_;
+  //boost::scoped_ptr<RowBatchQueue> materialized_row_batches_;
 
   /// Protects access to state accessed by scanner threads, such as 'status_' or
   /// 'num_active_scanners_'.
@@ -95,15 +95,22 @@ class KuduScanNode : public KuduScanNodeBase {
   /// 'initial_token', and continues processing scan tokens returned by
   /// 'GetNextScanToken()' until there are none left, an error occurs, or the limit is
   /// reached.
-  void RunScannerThread(const std::string& name, const std::string* initial_token);
+  void RunScannerThread(const std::string& name, const std::string* initial_token, RowBatchQueue* queue);
 
   /// Processes a single scan token. Row batches are fetched using 'scanner' and enqueued
   /// in 'materialized_row_batches_' until the scanner reports eos, an error occurs, or
   /// the limit is reached.
-  Status ProcessScanToken(KuduScanner* scanner, const std::string& scan_token);
+  Status ProcessScanToken(KuduScanner* scanner, const std::string& scan_token, RowBatchQueue* queue);
 
   /// Checks for eos conditions and returns batches from materialized_row_batches_.
   Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos);
+
+  //////////////////////////////////////////////////////////////////////////
+  int max_row_batches_;
+  int row_batchs_queue_idx_;
+  std::vector<RowBatchQueue*> row_batches_queue_;
+  RuntimeProfile::Counter* row_batches_get_timer_;
+  RuntimeProfile::Counter* row_batches_put_timer_;
 };
 
 }

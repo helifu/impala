@@ -46,18 +46,19 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
       runtimefilters_issued_barrier_(1),
       num_active_scanners_(0),
       done_(false),
-      thread_avail_cb_id_(-1) {
+      thread_avail_cb_id_(-1),
+      max_row_batches_(FLAGS_kudu_max_row_batches) {
   DCHECK(KuduIsAvailable());
-
-  int max_row_batches = FLAGS_kudu_max_row_batches;
-  if (max_row_batches <= 0) {
+  if (max_row_batches_ <= 0) {
     // TODO: See comment on hdfs-scan-node.
     // This value is built the same way as it assumes that the scan node runs co-located
     // with a Kudu tablet server and that the tablet server is using disks similarly as
     // a datanode would.
-    max_row_batches = 10 * (DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS);
+    max_row_batches_ = 10 * (DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS);
   }
-  materialized_row_batches_.reset(new RowBatchQueue(max_row_batches));
+  /*materialized_row_batches_.reset(new RowBatchQueue(max_row_batches));*/
+  row_batches_get_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueueGetWaitTime");
+  row_batches_put_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueuePutWaitTime");
 }
 
 KuduScanNode::~KuduScanNode() {
@@ -89,7 +90,14 @@ Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
     RETURN_IF_ERROR(IssueRuntimeFilters(state));
     runtimefilters_issued_barrier_.Notify();
   }
-  return GetNextInternal(state, row_batch, eos);
+
+  Status status = GetNextInternal(state, row_batch, eos);
+  if (!status.ok() || *eos) {
+      unique_lock<mutex> l(lock_);
+      row_batches_put_timer_->Set(materialized_row_batches_->total_put_wait_time());
+      row_batches_get_timer_->Set(materialized_row_batches_->total_get_wait_time());
+  }
+  return status;
 }
 
 Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos) {
@@ -108,7 +116,10 @@ Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, b
   }
 
   *eos = false;
-  RowBatch* materialized_batch = materialized_row_batches_->GetBatch();
+  if (row_batchs_queue_idx_++ >= row_batches_queue_.size()) {
+    row_batchs_queue_idx_ = 0;
+  }
+  RowBatch* materialized_batch = row_batches_queue_[row_batchs_queue_idx_]->GetBatch();
   if (materialized_batch != NULL) {
     row_batch->AcquireState(materialized_batch);
     num_rows_returned_ += row_batch->num_rows();
@@ -167,16 +178,18 @@ void KuduScanNode::ThreadAvailableCb(ThreadResourceMgr::ResourcePool* pool) {
 
     // Reserve the first token so no other thread picks it up.
     const string* token = GetNextScanToken();
+    RowBatchQueue* queue = new RowBatchQueue(max_row_batches_);
+    row_batches_queue_.push_back(queue);
     string name = Substitute("scanner-thread($0)",
         num_scanner_threads_started_counter_->value());
 
     VLOG_RPC << "Thread started: " << name;
     scanner_threads_.AddThread(new Thread("kudu-scan-node", name,
-        &KuduScanNode::RunScannerThread, this, name, token));
+        &KuduScanNode::RunScannerThread, this, name, token, queue));
   }
 }
 
-Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_token) {
+Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_token, RowBatchQueue* queue) {
   RETURN_IF_ERROR(scanner->OpenNextScanToken(scan_token));
   bool eos = false;
   while (!eos && !done_) {
@@ -185,7 +198,7 @@ Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_t
     RETURN_IF_ERROR(scanner->GetNext(row_batch.get(), &eos));
     while (!done_) {
       scanner->KeepKuduScannerAlive();
-      if (materialized_row_batches_->AddBatchWithTimeout(row_batch.get(), 1000000)) {
+      if (queue->AddBatchWithTimeout(row_batch.get(), 1000000)) {
         ignore_result(row_batch.release());
         break;
       }
@@ -195,7 +208,7 @@ Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_t
   return Status::OK();
 }
 
-void KuduScanNode::RunScannerThread(const string& name, const string* initial_token) {
+void KuduScanNode::RunScannerThread(const string& name, const string* initial_token, RowBatchQueue* queue) {
   DCHECK(initial_token != NULL);
   SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
@@ -215,7 +228,7 @@ void KuduScanNode::RunScannerThread(const string& name, const string* initial_to
     // Here, even though a read of 'done_' may conflict with a write to it,
     // ProcessScanToken() will return early, as will GetNextScanToken().
     while (!done_ && scan_token != NULL) {
-      status = ProcessScanToken(&scanner, *scan_token);
+      status = ProcessScanToken(&scanner, *scan_token, queue);
       if (!status.ok()) break;
 
       // Check if the number of optional threads has been exceeded.
