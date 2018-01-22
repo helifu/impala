@@ -114,6 +114,8 @@ class KuduScanner {
   /// The value 'true' means the filter context has been pushed down, else not.
   /// The size of this vector equals to the size of 'filter_ctxs_'.
   vector<bool> filter_ctx_pushed_down_;
+
+  int row_size_;
 };
 
 } /// namespace impala

@@ -145,6 +145,9 @@ class PhjBuilder : public DataSink {
 
   std::string DebugString() const;
 
+  int expr_bytes_right() { return ht_ctx_->expr_values_cache()->expr_values_bytes_per_row(); }
+  int var_result_offset() { return ht_ctx_->expr_values_cache()->var_result_offset(); }
+
   /// Number of initial partitions to create. Must be a power of two.
   static const int PARTITION_FANOUT = 16;
 
@@ -389,6 +392,8 @@ class PhjBuilder : public DataSink {
 
   /// Number of hash collisions - unequal rows that have identical hash values
   RuntimeProfile::Counter* num_hash_collisions_;
+
+  RuntimeProfile::Counter* travel_length_;
 
   /// Total number of hash buckets across all partitions.
   RuntimeProfile::Counter* num_hash_buckets_;

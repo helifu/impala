@@ -63,6 +63,7 @@ PhjBuilder::PhjBuilder(int join_node_id, TJoinOp::type join_op,
     max_partition_level_(NULL),
     num_build_rows_partitioned_(NULL),
     num_hash_collisions_(NULL),
+    travel_length_(NULL),
     num_hash_buckets_(NULL),
     num_spilled_partitions_(NULL),
     num_repartitions_(NULL),
@@ -135,6 +136,7 @@ Status PhjBuilder::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) 
   num_build_rows_partitioned_ =
       ADD_COUNTER(profile(), "BuildRowsPartitioned", TUnit::UNIT);
   num_hash_collisions_ = ADD_COUNTER(profile(), "HashCollisions", TUnit::UNIT);
+  travel_length_ = ADD_COUNTER(profile(), "TravelLength", TUnit::UNIT);
   num_hash_buckets_ = ADD_COUNTER(profile(), "HashBuckets", TUnit::UNIT);
   num_spilled_partitions_ = ADD_COUNTER(profile(), "SpilledPartitions", TUnit::UNIT);
   num_repartitions_ = ADD_COUNTER(profile(), "NumRepartitions", TUnit::UNIT);
@@ -582,6 +584,7 @@ void PhjBuilder::Partition::Close(RowBatch* batch) {
 
   if (hash_tbl_ != NULL) {
     COUNTER_ADD(parent_->num_hash_collisions_, hash_tbl_->NumHashCollisions());
+    COUNTER_ADD(parent_->travel_length_, hash_tbl_->NumTravelLength());
     hash_tbl_->Close();
   }
 

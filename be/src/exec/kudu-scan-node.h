@@ -87,6 +87,12 @@ class KuduScanNode : public KuduScanNodeBase {
   /// -1 if no callback is registered.
   int thread_avail_cb_id_;
 
+  /// The wait time for fetching a row batch from the row batch queue.
+  RuntimeProfile::Counter* row_batches_get_timer_;
+
+  /// The wait time for enqueuing a row batch into the row batch queue.
+  RuntimeProfile::Counter* row_batches_put_timer_;
+
   /// Called when scanner threads are available for this scan node. This will
   /// try to spin up as many scanner threads as the quota allows.
   void ThreadAvailableCb(ThreadResourceMgr::ResourcePool* pool);

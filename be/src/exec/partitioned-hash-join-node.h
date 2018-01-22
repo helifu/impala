@@ -412,6 +412,10 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// hash table.
   RuntimeProfile::Counter* num_hash_table_builds_skipped_;
 
+  RuntimeProfile::Counter* num_get_next_;
+  RuntimeProfile::Counter* num_get_next_probe_;
+  RuntimeProfile::Counter* num_process_probe_;
+
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()
 

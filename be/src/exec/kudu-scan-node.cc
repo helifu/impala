@@ -58,6 +58,8 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
     max_row_batches = 10 * (DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS);
   }
   materialized_row_batches_.reset(new RowBatchQueue(max_row_batches));
+  row_batches_get_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueueGetWaitTime");
+  row_batches_put_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueuePutWaitTime");
 }
 
 KuduScanNode::~KuduScanNode() {
@@ -89,7 +91,13 @@ Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
     RETURN_IF_ERROR(IssueRuntimeFilters(state));
     runtimefilters_issued_barrier_.Notify();
   }
-  return GetNextInternal(state, row_batch, eos);
+
+  Status status = GetNextInternal(state, row_batch, eos);
+  if (!status.ok() || *eos) {
+      row_batches_get_timer_->Set(materialized_row_batches_->total_get_wait_time());
+      row_batches_put_timer_->Set(materialized_row_batches_->total_put_wait_time());
+  }
+  return status;
 }
 
 Status KuduScanNode::GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos) {

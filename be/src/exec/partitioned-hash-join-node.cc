@@ -72,6 +72,28 @@ PartitionedHashJoinNode::~PartitionedHashJoinNode() {
 Status PartitionedHashJoinNode::Init(const TPlanNode& tnode, RuntimeState* state) {
   RETURN_IF_ERROR(BlockingJoinNode::Init(tnode, state));
   DCHECK(tnode.__isset.hash_join_node);
+
+  RuntimeProfile::Counter* eq_join_counter = ADD_COUNTER(runtime_profile(), "helf-JoinCounter_Equal", TUnit::UNIT);
+  RuntimeProfile::Counter* ot_join_counter = ADD_COUNTER(runtime_profile(), "helf-JoinCounter_Other", TUnit::UNIT);
+  RuntimeProfile::Counter* conjuncts_counter = ADD_COUNTER(runtime_profile(), "helf-JoinCounter_Conjunct", TUnit::UNIT);
+  COUNTER_SET(eq_join_counter, (int)tnode.hash_join_node.eq_join_conjuncts.size());
+  COUNTER_SET(ot_join_counter, (int)tnode.hash_join_node.other_join_conjuncts.size());
+  COUNTER_SET(conjuncts_counter, (int)tnode.conjuncts.size());
+
+  RuntimeProfile::Counter* left_tuple_counter       = ADD_COUNTER(runtime_profile(), "helf-TupleCounter-left",  TUnit::UNIT);
+  RuntimeProfile::Counter* right_tuple_counter      = ADD_COUNTER(runtime_profile(), "helf-TupleCounter-right", TUnit::UNIT);
+  RuntimeProfile::Counter* left_row_desc_size       = ADD_COUNTER(runtime_profile(), "helf-RowDescSize-left", TUnit::UNIT);
+  RuntimeProfile::Counter* right_row_desc_size      = ADD_COUNTER(runtime_profile(), "helf-RowDescSize-right", TUnit::UNIT);
+  COUNTER_SET(left_tuple_counter, (int)child(0)->row_desc().tuple_descriptors().size());
+  COUNTER_SET(right_tuple_counter, (int)child(1)->row_desc().tuple_descriptors().size());
+  COUNTER_SET(left_row_desc_size, child(0)->row_desc().GetRowSize());
+  COUNTER_SET(right_row_desc_size, child(1)->row_desc().GetRowSize());
+
+  RuntimeProfile::Counter* TupleIsNullable_left = ADD_COUNTER(runtime_profile(), "helf-TupleIsNullable-left", TUnit::UNIT);
+  RuntimeProfile::Counter* TupleIsNullable_right = ADD_COUNTER(runtime_profile(), "helf-TupleIsNullable-right", TUnit::UNIT);
+  COUNTER_SET(TupleIsNullable_left, child(0)->row_desc().IsAnyTupleNullable()?1:0);
+  COUNTER_SET(TupleIsNullable_right, child(1)->row_desc().IsAnyTupleNullable()?1:0);
+
   const vector<TEqJoinCondition>& eq_join_conjuncts =
       tnode.hash_join_node.eq_join_conjuncts;
   // TODO: allow PhjBuilder to be the sink of a separate fragment. For now, PhjBuilder is
@@ -138,6 +160,21 @@ Status PartitionedHashJoinNode::Prepare(RuntimeState* state) {
   num_hash_table_builds_skipped_ =
       ADD_COUNTER(runtime_profile(), "NumHashTableBuildsSkipped", TUnit::UNIT);
   AddCodegenDisabledMessage(state);
+
+  RuntimeProfile::Counter* expr_bytes_left  = ADD_COUNTER(runtime_profile(), "helf-Expr_bytes_per_row_left", TUnit::UNIT);
+  RuntimeProfile::Counter* expr_bytes_right = ADD_COUNTER(runtime_profile(), "helf-Expr_bytes_per_row_right", TUnit::UNIT);
+  COUNTER_SET(expr_bytes_left, ht_ctx_->expr_values_cache()->expr_values_bytes_per_row());
+  COUNTER_SET(expr_bytes_right, builder_->expr_bytes_right());
+
+  RuntimeProfile::Counter* var_result_offset_left   = ADD_COUNTER(runtime_profile(), "helf-var_result_offset_left", TUnit::UNIT);
+  RuntimeProfile::Counter* var_result_offset_right  = ADD_COUNTER(runtime_profile(), "helf-var_result_offset_right", TUnit::UNIT);
+  COUNTER_SET(var_result_offset_left, ht_ctx_->expr_values_cache()->var_result_offset());
+  COUNTER_SET(var_result_offset_right, builder_->var_result_offset());
+
+  num_get_next_         = ADD_COUNTER(runtime_profile(), "helf-num_get_next", TUnit::UNIT);
+  num_get_next_probe_   = ADD_COUNTER(runtime_profile(), "helf-num_get_next_probe", TUnit::UNIT);
+  num_process_probe_    = ADD_COUNTER(runtime_profile(), "helf-process_probe", TUnit::UNIT);
+
   return Status::OK();
 }
 
@@ -189,6 +226,15 @@ Status PartitionedHashJoinNode::Open(RuntimeState* state) {
   ResetForProbe();
   DCHECK(null_aware_probe_partition_ == NULL
       || join_op_ == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+
+  RuntimeProfile::Counter* a = ADD_COUNTER(runtime_profile(), "helf-process_probe_batch_fn_", TUnit::UNIT);
+  RuntimeProfile::Counter* b = ADD_COUNTER(runtime_profile(), "helf-ht_ctx_->level", TUnit::UNIT);
+  COUNTER_SET(a, process_probe_batch_fn_==nullptr?0:1);
+  COUNTER_SET(b, ht_ctx_->level());
+
+  RuntimeProfile::Counter* c = ADD_COUNTER(runtime_profile(), "helf-join_op_", TUnit::UNIT);
+  COUNTER_SET(c, join_op_);
+
   return Status::OK();
 }
 
@@ -305,6 +351,7 @@ Status PartitionedHashJoinNode::NextProbeRowBatch(
     }
     RETURN_IF_ERROR(child(0)->GetNext(state, probe_batch_.get(), &probe_side_eos_));
     COUNTER_ADD(probe_row_counter_, probe_batch_->num_rows());
+    COUNTER_ADD(num_get_next_probe_, 1);
   } while (probe_batch_->num_rows() == 0);
 
   ResetForProbe();
@@ -500,6 +547,7 @@ Status PartitionedHashJoinNode::GetNext(RuntimeState* state, RowBatch* out_batch
     *eos = false;
   }
 
+  COUNTER_ADD(num_get_next_, 1);
   Status status = Status::OK();
   while (true) {
     DCHECK(!*eos);
@@ -555,6 +603,7 @@ Status PartitionedHashJoinNode::GetNext(RuntimeState* state, RowBatch* out_batch
       // in the xcompiled function, so call it here instead.
       int rows_added = 0;
       TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
+      COUNTER_ADD(num_process_probe_, 1);
       SCOPED_TIMER(probe_timer_);
       if (process_probe_batch_fn_ == NULL) {
         rows_added = ProcessProbeBatch(join_op_, prefetch_mode, out_batch, ht_ctx_.get(),

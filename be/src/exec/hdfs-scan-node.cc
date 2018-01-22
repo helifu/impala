@@ -197,6 +197,21 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   scanner_thread_bytes_required_ += scanner_thread_mem_usage;
   row_batches_get_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueueGetWaitTime");
   row_batches_put_timer_ = ADD_TIMER(runtime_profile(), "RowBatchQueuePutWaitTime");
+
+  RuntimeProfile::Counter* a = ADD_COUNTER(runtime_profile(), "helf-HdfsScan-RowSize", TUnit::UNIT);
+  RuntimeProfile::Counter* d = ADD_COUNTER(runtime_profile(), "helf-HdfsScan-TupleSize", TUnit::UNIT);
+  RuntimeProfile::Counter* b = ADD_COUNTER(runtime_profile(), "helf-HdfsScan-partition_key_slots", TUnit::UNIT);
+  RuntimeProfile::Counter* c = ADD_COUNTER(runtime_profile(), "helf-HdfsScan-materialized_slots", TUnit::UNIT);
+  COUNTER_SET(a, row_desc().GetRowSize());
+  COUNTER_SET(d, tuple_desc()->byte_size());
+  COUNTER_SET(b, (int)partition_key_slots_.size());
+  COUNTER_SET(c, (int)materialized_slots_.size());
+
+  runtime_profile()->AppendExecOption(row_desc().DebugString());
+  for (int i = 0; i < materialized_slots_.size(); ++i) {
+    runtime_profile()->AppendExecOption(materialized_slots_[i]->DebugString());
+  }
+
   return Status::OK();
 }
 

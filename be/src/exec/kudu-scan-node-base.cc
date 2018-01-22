@@ -129,6 +129,10 @@ Status KuduScanNodeBase::Prepare(RuntimeState* state) {
   }
   COUNTER_SET(kudu_remote_tokens_, num_remote_tokens);
 
+  RuntimeProfile::Counter* a = ADD_COUNTER(runtime_profile(), "helf-KuduScan-RowSize", TUnit::UNIT);
+  COUNTER_SET(a, row_desc().GetRowSize());
+  runtime_profile()->AppendExecOption(row_desc().DebugString());
+
   return Status::OK();
 }
 

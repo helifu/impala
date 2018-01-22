@@ -697,6 +697,7 @@ class HashTable {
 
   /// Number of hash collisions so far in the lifetime of this object
   int64_t NumHashCollisions() const { return num_hash_collisions_; }
+  int64_t NumTravelLength() const { return travel_length_; }
 
   /// stl-like iterator interface.
   class Iterator {
