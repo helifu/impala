@@ -44,10 +44,12 @@
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
+#include "codegen/codegen-anyval.h"
 
 using kudu::client::KuduClient;
 using kudu::client::KuduTable;
 using boost::algorithm::join;
+using namespace llvm;
 
 DEFINE_int32(kudu_runtime_filter_wait_time_ms, 1000, "(Advanced) the maximum time, in ms, "
              "that a scan node will wait for expected runtime filters to arrive.");
@@ -63,7 +65,8 @@ KuduScanNodeBase::KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode,
       tuple_id_(tnode.kudu_scan_node.tuple_id),
       client_(nullptr),
       counters_running_(false),
-      next_scan_token_idx_(0) {
+      next_scan_token_idx_(0),
+      process_decode_rows_into_rowbatch_fn_(NULL) {
   DCHECK(KuduIsAvailable());
 }
 
@@ -130,6 +133,22 @@ Status KuduScanNodeBase::Prepare(RuntimeState* state) {
   COUNTER_SET(kudu_remote_tokens_, num_remote_tokens);
 
   return Status::OK();
+}
+
+void KuduScanNodeBase::Codegen(RuntimeState* state) {
+  DCHECK(state->ShouldCodegen());
+  ExecNode::Codegen(state);
+  if (IsNodeCodegenDisabled()) return;
+
+  llvm::Function* fn = NULL;
+  Status status = KuduScanner::Codegen(this, conjunct_ctxs_, &fn);
+  DCHECK(!status.ok());
+  if (status.ok()) {
+    LlvmCodeGen* codegen = state->codegen();
+    DCHECK(codegen != NULL);
+    codegen->AddFunctionToJit(fn, &process_decode_rows_into_rowbatch_fn_);
+  }
+  runtime_profile()->AddCodegenMsg(status.ok(), status, "Codegen DecodeRowsIntoRowBatch");
 }
 
 Status KuduScanNodeBase::Open(RuntimeState* state) {

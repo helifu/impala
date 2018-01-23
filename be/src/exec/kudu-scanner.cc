@@ -41,11 +41,15 @@
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
+#include "codegen/codegen-anyval.h"
 
 using kudu::client::KuduClient;
 using kudu::client::KuduScanBatch;
 using kudu::client::KuduSchema;
 using kudu::client::KuduTable;
+using std::min;
+
+using namespace llvm;
 
 DEFINE_string(kudu_read_mode, "READ_LATEST", "(Advanced) Sets the Kudu scan ReadMode. "
     "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT.");
@@ -65,10 +69,16 @@ KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
     state_(state),
     cur_kudu_batch_num_read_(0),
-    last_alive_time_micros_(0) {
+    last_alive_time_micros_(0),
+    row_size_(scan_node->row_desc().GetRowSize()),
+    num_rows_(0),
+    data_(NULL),
+    decode_rows_into_rowbatch_fn_(NULL) {
 }
 
 Status KuduScanner::Open() {
+  decode_rows_into_rowbatch_fn_ = reinterpret_cast<DecodeRowsIntoRowBatchFn>(
+        scan_node_->process_decode_rows_into_rowbatch_fn_);
   for (int i = 0; i < scan_node_->tuple_desc()->slots().size(); ++i) {
     const SlotDescriptor* slot = scan_node_->tuple_desc()->slots()[i];
     if (slot->type().type != TYPE_TIMESTAMP) continue;
@@ -113,8 +123,12 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
   while (!*eos) {
     RETURN_IF_CANCELLED(state_);
 
-    if (cur_kudu_batch_num_read_ < cur_kudu_batch_.NumRows()) {
-      RETURN_IF_ERROR(DecodeRowsIntoRowBatch(row_batch, &tuple));
+    if (cur_kudu_batch_num_read_ < num_rows_) {
+      if (decode_rows_into_rowbatch_fn_ != NULL) {
+        RETURN_IF_ERROR(decode_rows_into_rowbatch_fn_(this, row_batch, &tuple));
+      } else {
+        RETURN_IF_ERROR(DecodeRowsIntoRowBatch(row_batch, &tuple));
+      }
       if (row_batch->AtCapacity()) break;
     }
 
@@ -132,6 +146,37 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
 void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
   Expr::Close(conjunct_ctxs_, state_);
+}
+
+Status KuduScanner::Codegen(KuduScanNodeBase* node,
+                            const std::vector<ExprContext*>& conjuncts,
+                            llvm::Function** process_fn) {
+  DCHECK(node->runtime_state_->ShouldCodegen());
+  LlvmCodeGen* codegen = node->runtime_state_->codegen();
+  DCHECK(codegen != NULL);
+  SCOPED_TIMER(codegen->codegen_timer());
+
+  llvm::Function* fn = codegen->GetFunction(IRFunction::KUDU_DECODE_ROWS_INTO_ROWBATCH, true);
+  DCHECK(fn != NULL);
+
+  llvm::Function* eval_conjuncts_fn;
+  RETURN_IF_ERROR(ExecNode::CodegenEvalConjuncts(codegen, conjuncts, &eval_conjuncts_fn));
+  DCHECK(eval_conjuncts_fn != NULL);
+  int replaced = codegen->ReplaceCallSites(fn, eval_conjuncts_fn, "EvalConjuncts");
+  DCHECK_EQ(replaced, 1);
+
+  llvm::Function* deep_copy_fn;
+  RETURN_IF_ERROR(Tuple::CodegenDeepCopy(codegen, *node->tuple_desc(), &deep_copy_fn));
+  DCHECK(deep_copy_fn != NULL);
+  replaced = codegen->ReplaceCallSites(fn, deep_copy_fn, "DeepCopy");
+  DCHECK_EQ(replaced, 1);
+
+  *process_fn = codegen->FinalizeFunction(fn);
+  if (*process_fn == NULL) {
+    return Status("Failed to finalize decode_rows_into_rowbatch_fn");
+  }
+
+  return Status::OK();
 }
 
 Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
@@ -258,80 +303,6 @@ Status KuduScanner::HandleEmptyProjection(RowBatch* row_batch) {
   cur_kudu_batch_num_read_ += rows_to_add;
   row_batch->CommitRows(rows_to_add);
   return Status::OK();
-}
-
-Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_mem) {
-  // Short-circuit the count(*) case.
-  if (scan_node_->tuple_desc()->slots().empty()) {
-    return HandleEmptyProjection(row_batch);
-  }
-
-  // Iterate through the Kudu rows, evaluate conjuncts and deep-copy survivors into
-  // 'row_batch'.
-  bool has_conjuncts = !conjunct_ctxs_.empty();
-  int num_rows = cur_kudu_batch_.NumRows();
-
-  for (int krow_idx = cur_kudu_batch_num_read_; krow_idx < num_rows; ++krow_idx) {
-    Tuple* kudu_tuple = const_cast<Tuple*>(reinterpret_cast<const Tuple*>(
-        cur_kudu_batch_.direct_data().data() +
-        (krow_idx * scan_node_->row_desc().GetRowSize())));
-    ++cur_kudu_batch_num_read_;
-
-    // Kudu tuples containing TIMESTAMP columns (UNIXTIME_MICROS in Kudu, stored as an
-    // int64) have 8 bytes of padding following the timestamp. Because this padding is
-    // provided, Impala can convert these unixtime values to Impala's TimestampValue
-    // format in place and copy the rows to Impala row batches.
-    // TODO: avoid mem copies with a Kudu mem 'release' mechanism, attaching mem to the
-    // batch.
-    // TODO: consider codegen for this per-timestamp col fixup
-    for (const SlotDescriptor* slot : timestamp_slots_) {
-      DCHECK(slot->type().type == TYPE_TIMESTAMP);
-      if (slot->is_nullable() && kudu_tuple->IsNull(slot->null_indicator_offset())) {
-        continue;
-      }
-      int64_t ts_micros = *reinterpret_cast<int64_t*>(
-          kudu_tuple->GetSlot(slot->tuple_offset()));
-      int64_t ts_seconds = ts_micros / MICROS_PER_SEC;
-      int64_t micros_part = ts_micros - (ts_seconds * MICROS_PER_SEC);
-      TimestampValue tv = TimestampValue::FromUnixTimeMicros(ts_seconds, micros_part);
-      if (tv.HasDateAndTime()) {
-        RawValue::Write(&tv, kudu_tuple, slot, NULL);
-      } else {
-        kudu_tuple->SetNull(slot->null_indicator_offset());
-        RETURN_IF_ERROR(state_->LogOrReturnError(
-            ErrorMsg::Init(TErrorCode::KUDU_TIMESTAMP_OUT_OF_RANGE,
-              scan_node_->table_->name(),
-              scan_node_->table_->schema().Column(slot->col_pos()).name())));
-      }
-    }
-
-    // Evaluate runtime filters that haven't been pushed down to Kudu.
-    /*if (!EvalRuntimeFilters(reinterpret_cast<TupleRow*>(output_row))) {
-        continue;
-    }*/
-
-    // Evaluate the conjuncts that haven't been pushed down to Kudu. Conjunct evaluation
-    // is performed directly on the Kudu tuple because its memory layout is identical to
-    // Impala's. We only copy the surviving tuples to Impala's output row batch.
-    if (has_conjuncts && !ExecNode::EvalConjuncts(&conjunct_ctxs_[0],
-        conjunct_ctxs_.size(), reinterpret_cast<TupleRow*>(&kudu_tuple))) {
-      continue;
-    }
-    // Deep copy the tuple, set it in a new row, and commit the row.
-    kudu_tuple->DeepCopy(*tuple_mem, *scan_node_->tuple_desc(),
-        row_batch->tuple_data_pool());
-    TupleRow* row = row_batch->GetRow(row_batch->AddRow());
-    row->SetTuple(0, *tuple_mem);
-    row_batch->CommitLastRow();
-    // If we've reached the capacity, or the LIMIT for the scan, return.
-    if (row_batch->AtCapacity() || scan_node_->ReachedLimit()) break;
-    // Move to the next tuple in the tuple buffer.
-    *tuple_mem = next_tuple(*tuple_mem);
-  }
-  ExprContext::FreeLocalAllocations(conjunct_ctxs_);
-
-  // Check the status in case an error status was set during conjunct evaluation.
-  return state_->GetQueryStatus();
 }
 
 Status KuduScanner::GetNextScannerBatch() {

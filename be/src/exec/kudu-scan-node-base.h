@@ -41,6 +41,7 @@ class KuduScanNodeBase : public ScanNode {
   ~KuduScanNodeBase();
   virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state);
+  virtual void Codegen(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
   virtual void Close(RuntimeState* state);
@@ -118,6 +119,8 @@ class KuduScanNodeBase : public ScanNode {
   const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
   kudu::client::KuduClient* kudu_client() { return client_; }
   RuntimeProfile::Counter* kudu_round_trips() const { return kudu_round_trips_; }
+
+  void* process_decode_rows_into_rowbatch_fn_;
 };
 
 }

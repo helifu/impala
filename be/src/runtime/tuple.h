@@ -176,6 +176,9 @@ class Tuple {
       const TupleDescriptor& desc, const vector<ExprContext*>& materialize_expr_ctxs,
       bool use_mem_pool, llvm::Function** fn);
 
+  static Status CodegenDeepCopy(LlvmCodeGen* codegen,
+      const TupleDescriptor& desc, llvm::Function** materialize_deepcopy_fn);
+
   /// Turn null indicator bit on. For non-nullable slots, the mask will be 0 and
   /// this is a no-op (but we don't have to branch to check is slots are nullable).
   void SetNull(const NullIndicatorOffset& offset) {

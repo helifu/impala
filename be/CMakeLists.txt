@@ -248,6 +248,8 @@ set(CLANG_INCLUDE_FLAGS
   ${CLANG_INCLUDE_FLAGS}
   "-I${CMAKE_CURRENT_SOURCE_DIR}/src"
   "-I${CMAKE_CURRENT_SOURCE_DIR}/generated-sources"
+  "-I/home/hzhelifu/kudu-client/usr/local/include"
+  "-I${GTEST_INCLUDE_DIR}"
   "-I${THRIFT_INCLUDE_DIR}"
   "-I${SQUEASEL_INCLUDE_DIR}"
   "-I${GLOG_INCLUDE_DIR}"

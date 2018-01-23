@@ -86,10 +86,10 @@ Tuple* Tuple::DeepCopy(const TupleDescriptor& desc, MemPool* pool) {
 // TODO: the logic is very similar to the other DeepCopy implementation aside from how
 // memory is allocated - can we templatise it somehow to avoid redundancy without runtime
 // overhead.
-void Tuple::DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool) {
+/*void Tuple::DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool) {
   memcpy(dst, this, desc.byte_size());
   if (desc.HasVarlenSlots()) dst->DeepCopyVarlenData(desc, pool);
-}
+}*/
 
 void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, MemPool* pool) {
   // allocate then copy all non-null string and collection slots
@@ -200,6 +200,18 @@ void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple
       coll_data += item_desc.byte_size();
     }
   }
+}
+Status Tuple::CodegenDeepCopy(
+    LlvmCodeGen* codegen, const TupleDescriptor& desc, llvm::Function** materialize_deepcopy_fn) {
+  llvm::Function* fn = codegen->GetFunction(IRFunction::TUPLE_DEEP_COPY, false);
+  DCHECK(fn != nullptr);
+
+  *materialize_deepcopy_fn = codegen->FinalizeFunction(fn);
+  if (*materialize_deepcopy_fn == NULL) {
+    return Status("Failed to finalize deep_copy_fn");
+  }
+
+  return Status::OK();
 }
 
 template <bool COLLECT_STRING_VALS, bool NO_POOL>

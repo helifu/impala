@@ -18,6 +18,8 @@
 #ifndef IMPALA_EXEC_KUDU_SCANNER_H_
 #define IMPALA_EXEC_KUDU_SCANNER_H_
 
+#include "codegen/impala-ir.h"
+
 #include <boost/scoped_ptr.hpp>
 #include <kudu/client/client.h>
 
@@ -57,6 +59,10 @@ class KuduScanner {
 
   /// Closes this scanner.
   void Close();
+
+  static Status Codegen(KuduScanNodeBase* node,
+      const std::vector<ExprContext*>& conjuncts,
+      llvm::Function** process_fn);
 
  private:
   /// Apply the runtime filters to KuduScanner.
@@ -114,6 +120,12 @@ class KuduScanner {
   /// The value 'true' means the filter context has been pushed down, else not.
   /// The size of this vector equals to the size of 'filter_ctxs_'.
   vector<bool> filter_ctx_pushed_down_;
+  static const char* LLVM_CLASS_NAME;
+  int row_size_;
+  int num_rows_;
+  const uint8_t* data_;
+  typedef Status (*DecodeRowsIntoRowBatchFn)(KuduScanner*, RowBatch*, Tuple**);
+  DecodeRowsIntoRowBatchFn decode_rows_into_rowbatch_fn_;
 };
 
 } /// namespace impala

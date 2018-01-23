@@ -216,7 +216,9 @@ ir_functions = [
   ["RUNTIME_FILTER_EVAL",
    "_ZNK6impala13RuntimeFilter4EvalEPvRKNS_10ColumnTypeE"],
   ["UNION_MATERIALIZE_BATCH",
-  "_ZN6impala9UnionNode16MaterializeBatchEPNS_8RowBatchEPPh"]
+   "_ZN6impala9UnionNode16MaterializeBatchEPNS_8RowBatchEPPh"],
+  ["KUDU_DECODE_ROWS_INTO_ROWBATCH", "_ZN6impala11KuduScanner22DecodeRowsIntoRowBatchEPNS_8RowBatchEPPNS_5TupleE"],
+  ["TUPLE_DEEP_COPY", "_ZN6impala5Tuple8DeepCopyEPS0_RKNS_15TupleDescriptorEPNS_7MemPoolE"]
 ]
 
 enums_preamble = '\
