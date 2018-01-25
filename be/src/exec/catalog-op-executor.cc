@@ -89,16 +89,20 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
 }
 
 Status CatalogOpExecutor::ExecComputeStats(
-    const TComputeStatsParams& compute_stats_params,
+    const TCatalogOpRequest& compute_stats_request,
     const TTableSchema& tbl_stats_schema, const TRowSet& tbl_stats_data,
     const TTableSchema& col_stats_schema, const TRowSet& col_stats_data) {
   // Create a new DDL request to alter the table's statistics.
   TCatalogOpRequest catalog_op_req;
   catalog_op_req.__isset.ddl_params = true;
   catalog_op_req.__set_op_type(TCatalogOpType::DDL);
+  catalog_op_req.__set_sync_ddl(compute_stats_request.sync_ddl);
   TDdlExecRequest& update_stats_req = catalog_op_req.ddl_params;
   update_stats_req.__set_ddl_type(TDdlType::ALTER_TABLE);
+  update_stats_req.__set_sync_ddl(compute_stats_request.sync_ddl);
 
+  const TComputeStatsParams& compute_stats_params =
+      compute_stats_request.ddl_params.compute_stats_params;
   TAlterTableUpdateStatsParams& update_stats_params =
       update_stats_req.alter_table_params.update_stats_params;
   update_stats_req.__isset.alter_table_params = true;
@@ -200,7 +204,15 @@ void CatalogOpExecutor::HandleDropDataSource(const TDropDataSourceParams& reques
 void CatalogOpExecutor::SetTableStats(const TTableSchema& tbl_stats_schema,
     const TRowSet& tbl_stats_data, const vector<TPartitionStats>& existing_part_stats,
     TAlterTableUpdateStatsParams* params) {
-  // Accumulate total number of rows in the table.
+  if (tbl_stats_data.rows.size() == 1 && tbl_stats_data.rows[0].colVals.size() == 1) {
+    // Unpartitioned table. Only set table stats, but no partition stats.
+    // The first column is the COUNT(*) expr of the original query.
+    params->table_stats.__set_num_rows(tbl_stats_data.rows[0].colVals[0].i64Val.value);
+    params->__isset.table_stats = true;
+    return;
+  }
+
+  // Accumulate total number of rows in the partitioned table.
   long total_num_rows = 0;
   // Set per-partition stats.
   for (const TRow& row: tbl_stats_data.rows) {
@@ -219,12 +231,12 @@ void CatalogOpExecutor::SetTableStats(const TTableSchema& tbl_stats_schema,
     params->partition_stats[partition_key_vals].stats.__set_num_rows(num_rows);
     total_num_rows += num_rows;
   }
+  params->__isset.partition_stats = true;
 
+  // Add row counts of existing partitions that are not going to be modified.
   for (const TPartitionStats& existing_stats: existing_part_stats) {
     total_num_rows += existing_stats.stats.num_rows;
   }
-
-  params->__isset.partition_stats = true;
 
   // Set per-table stats.
   params->table_stats.__set_num_rows(total_num_rows);

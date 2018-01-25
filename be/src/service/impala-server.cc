@@ -188,7 +188,8 @@ DEFINE_string(ssl_minimum_version, "tlsv1", SSL_MIN_VERSION_HELP.c_str());
 
 DEFINE_int32(idle_session_timeout, 0, "The time, in seconds, that a session may be idle"
     " for before it is closed (and all running queries cancelled) by Impala. If 0, idle"
-    " sessions are never expired.");
+    " sessions are never expired. It can be overridden by the query option"
+    " 'idle_session_timeout' for specific sessions");
 DEFINE_int32(idle_query_timeout, 0, "The time, in seconds, that a query may be idle for"
     " (i.e. no processing work is done and no updates are received from the client) "
     "before it is cancelled. If 0, idle queries are never expired. The query option "
@@ -274,7 +275,8 @@ class CancellationWork {
 
 ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     : exec_env_(exec_env),
-      thrift_serializer_(false) {
+      thrift_serializer_(false),
+      services_started_(false) {
   // Initialize default config
   InitializeConfigVariables();
 
@@ -869,7 +871,6 @@ Status ImpalaServer::ExecuteInternal(
     RETURN_IF_ERROR(RegisterQuery(session_state, *request_state));
     *registered_request_state = true;
 
-
 #ifndef NDEBUG
     // Inject a sleep to simulate metadata loading pauses for tables. This
     // is only used for testing.
@@ -950,6 +951,8 @@ Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
     }
     client_request_state_map_.insert(make_pair(query_id, request_state));
   }
+  // Metric is decremented in UnregisterQuery().
+  ImpaladMetrics::NUM_QUERIES_REGISTERED->Increment(1L);
   return Status::OK();
 }
 
@@ -1027,8 +1030,8 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
     TExecSummary t_exec_summary;
     request_state->coord()->GetTExecSummary(&t_exec_summary);
     string exec_summary = PrintExecSummary(t_exec_summary);
-    request_state->summary_profile()->AddInfoString("ExecSummary", exec_summary);
-    request_state->summary_profile()->AddInfoString("Errors",
+    request_state->summary_profile()->AddInfoStringRedacted("ExecSummary", exec_summary);
+    request_state->summary_profile()->AddInfoStringRedacted("Errors",
         request_state->coord()->GetErrorLog());
 
     const PerBackendExecParams& per_backend_params =
@@ -1049,14 +1052,15 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
     }
   }
   ArchiveQuery(*request_state);
+  ImpaladMetrics::NUM_QUERIES_REGISTERED->Increment(-1L);
   return Status::OK();
 }
 
 Status ImpalaServer::UpdateCatalogMetrics() {
   TGetDbsResult dbs;
   RETURN_IF_ERROR(exec_env_->frontend()->GetDbs(nullptr, nullptr, &dbs));
-  ImpaladMetrics::CATALOG_NUM_DBS->set_value(dbs.dbs.size());
-  ImpaladMetrics::CATALOG_NUM_TABLES->set_value(0L);
+  ImpaladMetrics::CATALOG_NUM_DBS->SetValue(dbs.dbs.size());
+  ImpaladMetrics::CATALOG_NUM_TABLES->SetValue(0L);
   for (const TDatabase& db: dbs.dbs) {
     TGetTablesResult table_names;
     RETURN_IF_ERROR(exec_env_->frontend()->GetTableNames(db.db_name, nullptr, nullptr,
@@ -1115,14 +1119,7 @@ Status ImpalaServer::CloseSessionInternal(const TUniqueId& session_id,
     discard_result(UnregisterQuery(query_id, false, &status));
   }
   // Reconfigure the poll period of session_timeout_thread_ if necessary.
-  int32_t session_timeout = session_state->session_timeout;
-  if (session_timeout > 0) {
-    lock_guard<mutex> l(session_timeout_lock_);
-    multiset<int32_t>::const_iterator itr = session_timeout_set_.find(session_timeout);
-    DCHECK(itr != session_timeout_set_.end());
-    session_timeout_set_.erase(itr);
-    session_timeout_cv_.notify_one();
-  }
+  UnregisterSessionTimeout(session_state->session_timeout);
   return Status::OK();
 }
 
@@ -1193,13 +1190,16 @@ void ImpalaServer::TransmitData(
   }
 
   if (params.eos) {
-    exec_env_->stream_mgr()->CloseSender(
+    exec_env_->ThriftStreamMgr()->CloseSender(
         params.dest_fragment_instance_id, params.dest_node_id,
         params.sender_id).SetTStatus(&return_val);
   }
 }
 
 void ImpalaServer::InitializeConfigVariables() {
+  // Set idle_session_timeout here to let the SET command return the value of
+  // the command line option FLAGS_idle_session_timeout
+  default_query_options_.__set_idle_session_timeout(FLAGS_idle_session_timeout);
   QueryOptionsMask set_query_options; // unused
   Status status = ParseQueryOptions(FLAGS_default_query_options,
       &default_query_options_, &set_query_options);
@@ -1212,17 +1212,37 @@ void ImpalaServer::InitializeConfigVariables() {
 
   map<string, string> string_map;
   TQueryOptionsToMap(default_query_options_, &string_map);
+  string_map["SUPPORT_START_OVER"] = "false";
+  PopulateQueryOptionLevels(&query_option_levels_);
   map<string, string>::const_iterator itr = string_map.begin();
   for (; itr != string_map.end(); ++itr) {
     ConfigVariable option;
     option.__set_key(itr->first);
     option.__set_value(itr->second);
+    AddOptionLevelToConfig(&option, itr->first);
     default_configs_.push_back(option);
   }
-  ConfigVariable support_start_over;
-  support_start_over.__set_key("support_start_over");
-  support_start_over.__set_value("false");
-  default_configs_.push_back(support_start_over);
+}
+
+void ImpalaServer::SessionState::UpdateTimeout() {
+  DCHECK(impala_server != nullptr);
+  int32_t old_timeout = session_timeout;
+  if (set_query_options.__isset.idle_session_timeout) {
+    session_timeout = set_query_options.idle_session_timeout;
+  } else {
+    session_timeout = server_default_query_options->idle_session_timeout;
+  }
+  if (old_timeout != session_timeout) {
+    impala_server->UnregisterSessionTimeout(old_timeout);
+    impala_server->RegisterSessionTimeout(session_timeout);
+  }
+}
+
+void ImpalaServer::AddOptionLevelToConfig(ConfigVariable* config,
+    const string& option_key) const {
+  const auto query_option_level = query_option_levels_.find(option_key);
+  DCHECK(query_option_level != query_option_levels_.end());
+  config->__set_level(query_option_level->second);
 }
 
 void ImpalaServer::SessionState::ToThrift(const TUniqueId& session_id,
@@ -1413,7 +1433,7 @@ void ImpalaServer::CatalogUpdateCallback(
       TTopicDelta& update = subscriber_topic_updates->back();
       update.topic_name = CatalogServer::IMPALA_CATALOG_TOPIC;
       update.__set_from_version(0L);
-      ImpaladMetrics::CATALOG_READY->set_value(false);
+      ImpaladMetrics::CATALOG_READY->SetValue(false);
       // Dropped all cached lib files (this behaves as if all functions and data
       // sources are dropped).
       LibCache::instance()->DropCache();
@@ -1423,8 +1443,11 @@ void ImpalaServer::CatalogUpdateCallback(
         catalog_update_info_.catalog_version = new_catalog_version;
         catalog_update_info_.catalog_topic_version = delta.to_version;
         catalog_update_info_.catalog_service_id = resp.catalog_service_id;
+        catalog_update_info_.min_catalog_object_version = resp.min_catalog_object_version;
+        LOG(INFO) << "Catalog topic update applied with version: " << new_catalog_version
+            << " new min catalog object version: " << resp.min_catalog_object_version;
       }
-      ImpaladMetrics::CATALOG_READY->set_value(new_catalog_version > 0);
+      ImpaladMetrics::CATALOG_READY->SetValue(new_catalog_version > 0);
       // TODO: deal with an error status
       discard_result(UpdateCatalogMetrics());
       // Remove all dropped objects from the library cache.
@@ -1446,16 +1469,92 @@ void ImpalaServer::CatalogUpdateCallback(
     unique_lock<mutex> unique_lock(catalog_version_lock_);
     min_subscriber_catalog_topic_version_ = delta.min_subscriber_topic_version;
   }
-  catalog_version_update_cv_.notify_all();
+  catalog_version_update_cv_.NotifyAll();
+}
+
+void ImpalaServer::WaitForCatalogUpdate(const int64_t catalog_update_version,
+    const TUniqueId& catalog_service_id) {
+  unique_lock<mutex> unique_lock(catalog_version_lock_);
+  // Wait for the update to be processed locally.
+  VLOG_QUERY << "Waiting for catalog version: " << catalog_update_version
+             << " current version: " << catalog_update_info_.catalog_version;
+  while (catalog_update_info_.catalog_version < catalog_update_version &&
+         catalog_update_info_.catalog_service_id == catalog_service_id) {
+    catalog_version_update_cv_.Wait(unique_lock);
+  }
+
+  if (catalog_update_info_.catalog_service_id != catalog_service_id) {
+    VLOG_QUERY << "Detected change in catalog service ID";
+  } else {
+    VLOG_QUERY << "Received catalog version: " << catalog_update_version;
+  }
+}
+
+void ImpalaServer::WaitForCatalogUpdateTopicPropagation(
+    const TUniqueId& catalog_service_id) {
+  unique_lock<mutex> unique_lock(catalog_version_lock_);
+  int64_t min_req_subscriber_topic_version =
+      catalog_update_info_.catalog_topic_version;
+  VLOG_QUERY << "Waiting for min subscriber topic version: "
+      << min_req_subscriber_topic_version << " current version: "
+      << min_subscriber_catalog_topic_version_;
+  while (min_subscriber_catalog_topic_version_ < min_req_subscriber_topic_version &&
+         catalog_update_info_.catalog_service_id == catalog_service_id) {
+    catalog_version_update_cv_.Wait(unique_lock);
+  }
+
+  if (catalog_update_info_.catalog_service_id != catalog_service_id) {
+    VLOG_QUERY << "Detected change in catalog service ID";
+  } else {
+    VLOG_QUERY << "Received min subscriber topic version: "
+        << min_req_subscriber_topic_version;
+  }
+}
+
+void ImpalaServer::WaitForMinCatalogUpdate(const int64_t min_req_catalog_object_version,
+    const TUniqueId& catalog_service_id) {
+  unique_lock<mutex> unique_lock(catalog_version_lock_);
+  int64_t min_catalog_object_version =
+      catalog_update_info_.min_catalog_object_version;
+  // TODO: Set a timeout to eventually break out of this loop is something goes
+  // wrong?
+  VLOG_QUERY << "Waiting for minimum catalog object version: "
+      << min_req_catalog_object_version << " current version: "
+      << min_catalog_object_version;
+  while (catalog_update_info_.min_catalog_object_version < min_req_catalog_object_version
+      && catalog_update_info_.catalog_service_id == catalog_service_id) {
+    catalog_version_update_cv_.Wait(unique_lock);
+  }
+
+  if (catalog_update_info_.catalog_service_id != catalog_service_id) {
+    VLOG_QUERY << "Detected change in catalog service ID";
+  } else {
+    VLOG_QUERY << "Updated minimum catalog object version: "
+        << min_req_catalog_object_version;
+  }
 }
 
 Status ImpalaServer::ProcessCatalogUpdateResult(
     const TCatalogUpdateResult& catalog_update_result, bool wait_for_all_subscribers) {
-  // If this update result contains catalog objects to add or remove, directly apply the
-  // updates to the local impalad's catalog cache. Otherwise, wait for a statestore
-  // heartbeat that contains this update version.
-  if (catalog_update_result.__isset.updated_catalog_objects ||
-      catalog_update_result.__isset.removed_catalog_objects) {
+  const TUniqueId& catalog_service_id = catalog_update_result.catalog_service_id;
+  if (!catalog_update_result.__isset.updated_catalog_objects &&
+      !catalog_update_result.__isset.removed_catalog_objects) {
+    // Operation with no result set. Use the version specified in
+    // 'catalog_update_result' to determine when the effects of this operation
+    // have been applied to the local catalog cache.
+    if (catalog_update_result.is_invalidate) {
+      WaitForMinCatalogUpdate(catalog_update_result.version, catalog_service_id);
+    } else {
+      WaitForCatalogUpdate(catalog_update_result.version, catalog_service_id);
+    }
+    if (wait_for_all_subscribers) {
+      // Now wait for this update to be propagated to all catalog topic subscribers.
+      // If we make it here it implies the first condition was met (the update was
+      // processed locally or the catalog service id has changed).
+      WaitForCatalogUpdateTopicPropagation(catalog_service_id);
+    }
+  } else {
+    // Operation with a result set.
     TUpdateCatalogCacheRequest update_req;
     update_req.__set_is_delta(true);
     update_req.__set_catalog_service_id(catalog_update_result.catalog_service_id);
@@ -1465,42 +1564,19 @@ Status ImpalaServer::ProcessCatalogUpdateResult(
     if (catalog_update_result.__isset.removed_catalog_objects) {
       update_req.__set_removed_objects(catalog_update_result.removed_catalog_objects);
     }
-
-     // Apply the changes to the local catalog cache.
+    // Apply the changes to the local catalog cache.
     TUpdateCatalogCacheResponse resp;
     Status status = exec_env_->frontend()->UpdateCatalogCache(
         vector<TUpdateCatalogCacheRequest>{update_req}, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     RETURN_IF_ERROR(status);
     if (!wait_for_all_subscribers) return Status::OK();
-  }
-
-  unique_lock<mutex> unique_lock(catalog_version_lock_);
-  int64_t min_req_catalog_version = catalog_update_result.version;
-  const TUniqueId& catalog_service_id = catalog_update_result.catalog_service_id;
-
-  // Wait for the update to be processed locally.
-  // TODO: What about query cancellation?
-  VLOG_QUERY << "Waiting for catalog version: " << min_req_catalog_version
-             << " current version: " << catalog_update_info_.catalog_version;
-  while (catalog_update_info_.catalog_version < min_req_catalog_version &&
-         catalog_update_info_.catalog_service_id == catalog_service_id) {
-    catalog_version_update_cv_.wait(unique_lock);
-  }
-
-  if (!wait_for_all_subscribers) return Status::OK();
-
-  // Now wait for this update to be propagated to all catalog topic subscribers.
-  // If we make it here it implies the first condition was met (the update was processed
-  // locally or the catalog service id has changed).
-  int64_t min_req_subscriber_topic_version = catalog_update_info_.catalog_topic_version;
-
-  VLOG_QUERY << "Waiting for min subscriber topic version: "
-             << min_req_subscriber_topic_version << " current version: "
-             << min_subscriber_catalog_topic_version_;
-  while (min_subscriber_catalog_topic_version_ < min_req_subscriber_topic_version &&
-         catalog_update_info_.catalog_service_id == catalog_service_id) {
-    catalog_version_update_cv_.wait(unique_lock);
+    // Wait until we receive and process the catalog update that covers the effects
+    // (catalog objects) of this operation.
+    WaitForCatalogUpdate(catalog_update_result.version, catalog_service_id);
+    // Now wait for this update to be propagated to all catalog topic
+    // subscribers.
+    WaitForCatalogUpdateTopicPropagation(catalog_service_id);
   }
   return Status::OK();
 }
@@ -1538,7 +1614,8 @@ void ImpalaServer::MembershipCallback(
     }
 
     // Register the local backend in the statestore and update the list of known backends.
-    AddLocalBackendToStatestore(subscriber_topic_updates);
+    // Only register if all ports have been opened and are ready.
+    if (services_started_.load()) AddLocalBackendToStatestore(subscriber_topic_updates);
 
     // Create a set of known backend network addresses. Used to test for cluster
     // membership by network address.
@@ -1717,8 +1794,7 @@ void ImpalaServer::ConnectionStart(
     // Beeswax only allows for one session per connection, so we can share the session ID
     // with the connection ID
     const TUniqueId& session_id = connection_context.connection_id;
-    shared_ptr<SessionState> session_state;
-    session_state.reset(new SessionState);
+    shared_ptr<SessionState> session_state = make_shared<SessionState>(this);
     session_state->closed = false;
     session_state->start_time_ms = UnixMillis();
     session_state->last_accessed_ms = UnixMillis();
@@ -1782,9 +1858,20 @@ void ImpalaServer::ConnectionEnd(
 
 void ImpalaServer::RegisterSessionTimeout(int32_t session_timeout) {
   if (session_timeout <= 0) return;
-  lock_guard<mutex> l(session_timeout_lock_);
-  session_timeout_set_.insert(session_timeout);
-  session_timeout_cv_.notify_one();
+  {
+    lock_guard<mutex> l(session_timeout_lock_);
+    session_timeout_set_.insert(session_timeout);
+  }
+  session_timeout_cv_.NotifyOne();
+}
+
+void ImpalaServer::UnregisterSessionTimeout(int32_t session_timeout) {
+  if (session_timeout > 0) {
+    lock_guard<mutex> l(session_timeout_lock_);
+    auto itr = session_timeout_set_.find(session_timeout);
+    DCHECK(itr != session_timeout_set_.end());
+    session_timeout_set_.erase(itr);
+  }
 }
 
 [[noreturn]] void ImpalaServer::ExpireSessions() {
@@ -1792,12 +1879,10 @@ void ImpalaServer::RegisterSessionTimeout(int32_t session_timeout) {
     {
       unique_lock<mutex> timeout_lock(session_timeout_lock_);
       if (session_timeout_set_.empty()) {
-        session_timeout_cv_.wait(timeout_lock);
+        session_timeout_cv_.Wait(timeout_lock);
       } else {
         // Sleep for a second before checking whether an active session can be expired.
-        const int64_t SLEEP_TIME_MS = 1000;
-        system_time deadline = get_system_time() + milliseconds(SLEEP_TIME_MS);
-        session_timeout_cv_.timed_wait(timeout_lock, deadline);
+        session_timeout_cv_.WaitFor(timeout_lock, seconds(1));
       }
     }
 
@@ -1924,14 +2009,20 @@ void ImpalaServer::RegisterSessionTimeout(int32_t session_timeout) {
   }
 }
 
-Status ImpalaServer::Init(int32_t thrift_be_port, int32_t beeswax_port, int32_t hs2_port) {
+Status ImpalaServer::Start(int32_t thrift_be_port, int32_t beeswax_port,
+   int32_t hs2_port) {
   exec_env_->SetImpalaServer(this);
-  boost::shared_ptr<ImpalaServer> handler = shared_from_this();
 
   if (!FLAGS_is_coordinator && !FLAGS_is_executor) {
     return Status("Impala does not have a valid role configured. "
         "Either --is_coordinator or --is_executor must be set to true.");
   }
+
+  // Subscribe with the statestore. Coordinators need to subscribe to the catalog topic
+  // then wait for the initial catalog update.
+  RETURN_IF_ERROR(exec_env_->StartStatestoreSubscriberService());
+
+  if (FLAGS_is_coordinator) exec_env_->frontend()->WaitForCatalog();
 
   SSLProtocol ssl_version = SSLProtocol::TLSv1_0;
   if (!FLAGS_ssl_server_certificate.empty() || EnableInternalSslConnections()) {
@@ -1939,6 +2030,7 @@ Status ImpalaServer::Init(int32_t thrift_be_port, int32_t beeswax_port, int32_t 
         SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));
   }
 
+  // Start the internal service.
   if (thrift_be_port > 0) {
     boost::shared_ptr<ImpalaInternalService> thrift_if(new ImpalaInternalService());
     boost::shared_ptr<TProcessor> be_processor(
@@ -1962,88 +2054,85 @@ Status ImpalaServer::Init(int32_t thrift_be_port, int32_t beeswax_port, int32_t 
   }
 
   if (!FLAGS_is_coordinator) {
-    // We don't start the Beeswax and HS2 servers if this impala daemon is just an
-    // executor.
-    LOG(INFO) << "Started executor Impala server on "
+    LOG(INFO) << "Initialized executor Impala server on "
               << ExecEnv::GetInstance()->backend_address();
-    return Status::OK();
-  }
+  } else {
+    // Initialize the client servers.
+    boost::shared_ptr<ImpalaServer> handler = shared_from_this();
+    if (beeswax_port > 0) {
+      boost::shared_ptr<TProcessor> beeswax_processor(
+          new ImpalaServiceProcessor(handler));
+      boost::shared_ptr<TProcessorEventHandler> event_handler(
+          new RpcEventHandler("beeswax", exec_env_->metrics()));
+      beeswax_processor->setEventHandler(event_handler);
+      ThriftServerBuilder builder(BEESWAX_SERVER_NAME, beeswax_processor, beeswax_port);
 
-  // Start the Beeswax and HS2 servers.
-  if (beeswax_port > 0) {
-    boost::shared_ptr<TProcessor> beeswax_processor(new ImpalaServiceProcessor(handler));
-    boost::shared_ptr<TProcessorEventHandler> event_handler(
-        new RpcEventHandler("beeswax", exec_env_->metrics()));
-    beeswax_processor->setEventHandler(event_handler);
-    ThriftServerBuilder builder(BEESWAX_SERVER_NAME, beeswax_processor, beeswax_port);
+      if (!FLAGS_ssl_server_certificate.empty()) {
+        LOG(INFO) << "Enabling SSL for Beeswax";
+        builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
+              .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
+              .ssl_version(ssl_version)
+              .cipher_list(FLAGS_ssl_cipher_list);
+      }
 
-    if (!FLAGS_ssl_server_certificate.empty()) {
-      LOG(INFO) << "Enabling SSL for Beeswax";
-      builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
-          .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
-          .ssl_version(ssl_version)
-          .cipher_list(FLAGS_ssl_cipher_list);
+      ThriftServer* server;
+      RETURN_IF_ERROR(
+          builder.auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
+          .metrics(exec_env_->metrics())
+          .max_concurrent_connections(FLAGS_fe_service_threads)
+          .Build(&server));
+      beeswax_server_.reset(server);
+      beeswax_server_->SetConnectionHandler(this);
     }
 
-    ThriftServer* server;
-    RETURN_IF_ERROR(
-        builder.auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
-            .metrics(exec_env_->metrics())
-            .max_concurrent_connections(FLAGS_fe_service_threads)
-            .Build(&server));
-    beeswax_server_.reset(server);
-    beeswax_server_->SetConnectionHandler(this);
-  }
+    if (hs2_port > 0) {
+      boost::shared_ptr<TProcessor> hs2_fe_processor(
+          new ImpalaHiveServer2ServiceProcessor(handler));
+      boost::shared_ptr<TProcessorEventHandler> event_handler(
+          new RpcEventHandler("hs2", exec_env_->metrics()));
+      hs2_fe_processor->setEventHandler(event_handler);
 
-  if (hs2_port > 0) {
-    boost::shared_ptr<TProcessor> hs2_fe_processor(
-        new ImpalaHiveServer2ServiceProcessor(handler));
-    boost::shared_ptr<TProcessorEventHandler> event_handler(
-        new RpcEventHandler("hs2", exec_env_->metrics()));
-    hs2_fe_processor->setEventHandler(event_handler);
+      ThriftServerBuilder builder(HS2_SERVER_NAME, hs2_fe_processor, hs2_port);
 
-    ThriftServerBuilder builder(HS2_SERVER_NAME, hs2_fe_processor, hs2_port);
+      if (!FLAGS_ssl_server_certificate.empty()) {
+        LOG(INFO) << "Enabling SSL for HiveServer2";
+        builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
+              .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
+              .ssl_version(ssl_version)
+              .cipher_list(FLAGS_ssl_cipher_list);
+      }
 
-    if (!FLAGS_ssl_server_certificate.empty()) {
-      LOG(INFO) << "Enabling SSL for HiveServer2";
-      builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
-          .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
-          .ssl_version(ssl_version)
-          .cipher_list(FLAGS_ssl_cipher_list);
+      ThriftServer* server;
+      RETURN_IF_ERROR(
+          builder.auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
+          .metrics(exec_env_->metrics())
+          .max_concurrent_connections(FLAGS_fe_service_threads)
+          .Build(&server));
+      hs2_server_.reset(server);
+      hs2_server_->SetConnectionHandler(this);
     }
-
-    ThriftServer* server;
-    RETURN_IF_ERROR(
-        builder.auth_provider(AuthManager::GetInstance()->GetExternalAuthProvider())
-            .metrics(exec_env_->metrics())
-            .max_concurrent_connections(FLAGS_fe_service_threads)
-            .Build(&server));
-    hs2_server_.reset(server);
-    hs2_server_->SetConnectionHandler(this);
-
   }
+  LOG(INFO) << "Initialized coordinator/executor Impala server on "
+      << ExecEnv::GetInstance()->backend_address();
 
-  LOG(INFO) << "Started coordinator/executor Impala server on "
-            << ExecEnv::GetInstance()->backend_address();
-
-  return Status::OK();
-}
-
-Status ImpalaServer::Start() {
-  RETURN_IF_ERROR(exec_env_->StartServices());
+  // Start the RPC services.
+  RETURN_IF_ERROR(exec_env_->StartKrpcService());
   if (thrift_be_server_.get()) {
     RETURN_IF_ERROR(thrift_be_server_->Start());
     LOG(INFO) << "Impala InternalService listening on " << thrift_be_server_->port();
   }
-
   if (hs2_server_.get()) {
     RETURN_IF_ERROR(hs2_server_->Start());
-    LOG(INFO) << "Impala HiveServer2 Service listening on " << beeswax_server_->port();
+    LOG(INFO) << "Impala HiveServer2 Service listening on " << hs2_server_->port();
   }
   if (beeswax_server_.get()) {
     RETURN_IF_ERROR(beeswax_server_->Start());
-    LOG(INFO) << "Impala Beeswax Service listening on " << hs2_server_->port();
+    LOG(INFO) << "Impala Beeswax Service listening on " << beeswax_server_->port();
   }
+  services_started_ = true;
+  ImpaladMetrics::IMPALA_SERVER_READY->SetValue(true);
+  LOG(INFO) << "Impala has started.";
+
   return Status::OK();
 }
 

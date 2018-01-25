@@ -40,7 +40,7 @@
 using boost::algorithm::ends_with;
 using boost::algorithm::to_lower;
 using namespace impala;
-using namespace llvm;
+using namespace impala::io;
 using namespace strings;
 
 const char* HdfsTextScanner::LLVM_CLASS_NAME = "class.impala::HdfsTextScanner";
@@ -57,6 +57,7 @@ HdfsTextScanner::HdfsTextScanner(HdfsScanNodeBase* scan_node, RuntimeState* stat
       byte_buffer_ptr_(nullptr),
       byte_buffer_end_(nullptr),
       byte_buffer_read_size_(0),
+      byte_buffer_filled_(false),
       only_parsing_header_(false),
       scan_state_(CONSTRUCTED),
       boundary_pool_(new MemPool(scan_node->mem_tracker())),
@@ -74,7 +75,7 @@ HdfsTextScanner::~HdfsTextScanner() {
 
 Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const vector<HdfsFileDesc*>& files) {
-  vector<DiskIoMgr::ScanRange*> compressed_text_scan_ranges;
+  vector<ScanRange*> compressed_text_scan_ranges;
   int compressed_text_files = 0;
   vector<HdfsFileDesc*> lzo_text_files;
   for (int i = 0; i < files.size(); ++i) {
@@ -95,7 +96,7 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
           // In order to decompress gzip-, snappy- and bzip2-compressed text files, we
           // need to read entire files. Only read a file if we're assigned the first split
           // to avoid reading multi-block files with multiple scanners.
-          DiskIoMgr::ScanRange* split = files[i]->splits[j];
+          ScanRange* split = files[i]->splits[j];
 
           // We only process the split that starts at offset 0.
           if (split->offset() != 0) {
@@ -114,10 +115,10 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
           DCHECK_GT(files[i]->file_length, 0);
           ScanRangeMetadata* metadata =
               static_cast<ScanRangeMetadata*>(split->meta_data());
-          DiskIoMgr::ScanRange* file_range = scan_node->AllocateScanRange(files[i]->fs,
+          ScanRange* file_range = scan_node->AllocateScanRange(files[i]->fs,
               files[i]->filename.c_str(), files[i]->file_length, 0,
               metadata->partition_id, split->disk_id(), split->expected_local(),
-              DiskIoMgr::BufferOpts(split->try_cache(), files[i]->mtime));
+              BufferOpts(split->try_cache(), files[i]->mtime));
           compressed_text_scan_ranges.push_back(file_range);
           scan_node->max_compressed_text_file_length()->Set(files[i]->file_length);
         }
@@ -166,7 +167,6 @@ void HdfsTextScanner::Close(RowBatch* row_batch) {
   if (row_batch != nullptr) {
     row_batch->tuple_data_pool()->AcquireData(template_tuple_pool_.get(), false);
     row_batch->tuple_data_pool()->AcquireData(data_buffer_pool_.get(), false);
-    context_->ReleaseCompletedResources(row_batch, true);
     if (scan_node_->HasRowBatchQueue()) {
       static_cast<HdfsScanNode*>(scan_node_)->AddMaterializedRowBatch(
           unique_ptr<RowBatch>(row_batch));
@@ -174,14 +174,13 @@ void HdfsTextScanner::Close(RowBatch* row_batch) {
   } else {
     template_tuple_pool_->FreeAll();
     data_buffer_pool_->FreeAll();
-    context_->ReleaseCompletedResources(nullptr, true);
   }
+  context_->ReleaseCompletedResources(true);
 
   // Verify all resources (if any) have been transferred or freed.
   DCHECK_EQ(template_tuple_pool_.get()->total_allocated_bytes(), 0);
   DCHECK_EQ(data_buffer_pool_.get()->total_allocated_bytes(), 0);
   DCHECK_EQ(boundary_pool_.get()->total_allocated_bytes(), 0);
-  DCHECK_EQ(context_->num_completed_io_buffers(), 0);
   if (!only_parsing_header_) {
     scan_node_->RangeComplete(THdfsFileFormat::TEXT,
         stream_->file_desc()->file_compression);
@@ -191,12 +190,6 @@ void HdfsTextScanner::Close(RowBatch* row_batch) {
 
 Status HdfsTextScanner::InitNewRange() {
   DCHECK_EQ(scan_state_, CONSTRUCTED);
-  // Compressed text does not reference data in the io buffers directly. In such case, we
-  // can recycle the buffers in the stream_ more promptly.
-  if (stream_->file_desc()->file_compression != THdfsCompression::NONE) {
-    stream_->set_contains_tuple_data(false);
-  }
-
   // Update the decompressor based on the compression type of the file in the context.
   DCHECK(stream_->file_desc()->file_compression != THdfsCompression::SNAPPY)
       << "FE should have generated SNAPPY_BLOCKED instead.";
@@ -234,6 +227,7 @@ Status HdfsTextScanner::ResetScanner() {
   boundary_row_.Clear();
   delimited_text_parser_->ParserReset();
   byte_buffer_ptr_ = byte_buffer_end_ = nullptr;
+  byte_buffer_filled_ = false;
   partial_tuple_ = nullptr;
 
   // Initialize codegen fn
@@ -271,7 +265,8 @@ Status HdfsTextScanner::FinishScanRange(RowBatch* row_batch) {
     // TODO: calling FillByteBuffer() at eof() can cause
     // ScannerContext::Stream::GetNextBuffer to DCHECK. Fix this.
     if (decompressor_.get() == nullptr && !stream_->eof()) {
-      status = FillByteBuffer(row_batch->tuple_data_pool(), &eosr, NEXT_BLOCK_READ_SIZE);
+      status =
+        FillByteBufferWrapper(row_batch->tuple_data_pool(), &eosr, NEXT_BLOCK_READ_SIZE);
     }
 
     if (!status.ok() || byte_buffer_read_size_ == 0) {
@@ -342,7 +337,7 @@ Status HdfsTextScanner::ProcessRange(RowBatch* row_batch, int* num_tuples) {
   bool eosr = stream_->eosr() || scan_state_ == PAST_SCAN_RANGE;
   while (true) {
     if (!eosr && byte_buffer_ptr_ == byte_buffer_end_) {
-      RETURN_IF_ERROR(FillByteBuffer(pool, &eosr));
+      RETURN_IF_ERROR(FillByteBufferWrapper(pool, &eosr));
     }
 
     TupleRow* tuple_row_mem = row_batch->GetRow(row_batch->AddRow());
@@ -462,20 +457,33 @@ Status HdfsTextScanner::GetNextInternal(RowBatch* row_batch) {
   return Status::OK();
 }
 
+Status HdfsTextScanner::FillByteBufferWrapper(
+    MemPool* pool, bool* eosr, int num_bytes) {
+  RETURN_IF_ERROR(FillByteBuffer(pool, eosr, num_bytes));
+  if (byte_buffer_read_size_ > 0) {
+    byte_buffer_filled_ = true;
+    byte_buffer_last_byte_ = byte_buffer_end_[-1];
+  }
+  return Status::OK();
+}
+
 Status HdfsTextScanner::FillByteBuffer(MemPool* pool, bool* eosr, int num_bytes) {
   *eosr = false;
 
   if (decompressor_.get() == nullptr) {
     Status status;
     if (num_bytes > 0) {
-      stream_->GetBytes(num_bytes, reinterpret_cast<uint8_t**>(&byte_buffer_ptr_),
-          &byte_buffer_read_size_, &status);
+      if (!stream_->GetBytes(num_bytes,
+          reinterpret_cast<uint8_t**>(&byte_buffer_ptr_), &byte_buffer_read_size_,
+          &status)) {
+        DCHECK(!status.ok());
+        return status;
+      }
     } else {
       DCHECK_EQ(num_bytes, 0);
-      status = stream_->GetBuffer(false, reinterpret_cast<uint8_t**>(&byte_buffer_ptr_),
-          &byte_buffer_read_size_);
+      RETURN_IF_ERROR(stream_->GetBuffer(false,
+          reinterpret_cast<uint8_t**>(&byte_buffer_ptr_), &byte_buffer_read_size_));
     }
-    RETURN_IF_ERROR(status);
     *eosr = stream_->eosr();
   } else if (decompressor_->supports_streaming()) {
     DCHECK_EQ(num_bytes, 0);
@@ -505,9 +513,11 @@ Status HdfsTextScanner::DecompressBufferStream(int64_t bytes_to_read,
   } else {
     DCHECK_GT(bytes_to_read, 0);
     Status status;
-    stream_->GetBytes(bytes_to_read, &compressed_buffer_ptr, &compressed_buffer_size,
-        &status, true);
-    RETURN_IF_ERROR(status);
+    if (!stream_->GetBytes(bytes_to_read, &compressed_buffer_ptr, &compressed_buffer_size,
+        &status, true)) {
+      DCHECK(!status.ok());
+      return status;
+    }
   }
   int64_t compressed_buffer_bytes_read = 0;
   bool stream_end = false;
@@ -527,8 +537,10 @@ Status HdfsTextScanner::DecompressBufferStream(int64_t bytes_to_read,
   }
   // Skip the bytes in stream_ that were decompressed.
   Status status;
-  stream_->SkipBytes(compressed_buffer_bytes_read, &status);
-  RETURN_IF_ERROR(status);
+  if (!stream_->SkipBytes(compressed_buffer_bytes_read, &status)) {
+    DCHECK(!status.ok());
+    return status;
+  }
 
   if (stream_->eosr()) {
     if (stream_end) {
@@ -578,7 +590,7 @@ Status HdfsTextScanner::FillByteBufferCompressedStream(MemPool* pool, bool* eosr
 
   if (*eosr) {
     DCHECK(stream_->eosr());
-    context_->ReleaseCompletedResources(nullptr, true);
+    context_->ReleaseCompletedResources(true);
   }
 
   return Status::OK();
@@ -594,9 +606,11 @@ Status HdfsTextScanner::FillByteBufferCompressedFile(bool* eosr) {
   DCHECK_GT(file_size, 0);
 
   Status status;
-  stream_->GetBytes(file_size, reinterpret_cast<uint8_t**>(&byte_buffer_ptr_),
-      &byte_buffer_read_size_, &status);
-  RETURN_IF_ERROR(status);
+  if (!stream_->GetBytes(file_size, reinterpret_cast<uint8_t**>(&byte_buffer_ptr_),
+      &byte_buffer_read_size_, &status)) {
+    DCHECK(!status.ok());
+    return status;
+  }
 
   // If didn't read anything, return.
   if (byte_buffer_read_size_ == 0) {
@@ -624,7 +638,7 @@ Status HdfsTextScanner::FillByteBufferCompressedFile(bool* eosr) {
       &decompressed_buffer));
 
   // Inform 'stream_' that the buffer with the compressed text can be released.
-  context_->ReleaseCompletedResources(nullptr, true);
+  context_->ReleaseCompletedResources(true);
 
   VLOG_FILE << "Decompressed " << byte_buffer_read_size_ << " to " << decompressed_len;
   byte_buffer_ptr_ = reinterpret_cast<char*>(decompressed_buffer);
@@ -648,7 +662,7 @@ Status HdfsTextScanner::FindFirstTuple(MemPool* pool) {
     // Offset maybe not point to a tuple boundary, skip ahead to the first tuple start in
     // this scan range (if one exists).
     do {
-      RETURN_IF_ERROR(FillByteBuffer(nullptr, &eosr));
+      RETURN_IF_ERROR(FillByteBufferWrapper(nullptr, &eosr));
 
       delimited_text_parser_->ParserReset();
       SCOPED_TIMER(parse_delimiter_timer_);
@@ -678,7 +692,7 @@ Status HdfsTextScanner::FindFirstTuple(MemPool* pool) {
         } else {
           // Split delimiter at the end of the current buffer, but not eosr. Advance to
           // the correct position in the next buffer.
-          RETURN_IF_ERROR(FillByteBuffer(pool, &eosr));
+          RETURN_IF_ERROR(FillByteBufferWrapper(pool, &eosr));
           DCHECK_GT(byte_buffer_read_size_, 0);
           DCHECK_EQ(*byte_buffer_ptr_, '\n');
           byte_buffer_ptr_ += 1;
@@ -703,13 +717,13 @@ Status HdfsTextScanner::CheckForSplitDelimiter(bool* split_delimiter) {
   DCHECK_EQ(byte_buffer_ptr_, byte_buffer_end_);
   *split_delimiter = false;
 
-  // Nothing in buffer
-  if (byte_buffer_read_size_ == 0) return Status::OK();
+  // Nothing was ever read for this scan range.
+  if (!byte_buffer_filled_) return Status::OK();
 
   // If the line delimiter is "\n" (meaning we also accept "\r" and "\r\n" as delimiters)
   // and the current buffer ends with '\r', this could be a "\r\n" delimiter.
   bool split_delimiter_possible = context_->partition_descriptor()->line_delim() == '\n'
-      && *(byte_buffer_end_ - 1) == '\r';
+      && byte_buffer_last_byte_ == '\r';
   if (!split_delimiter_possible) return Status::OK();
 
   // The '\r' may be escaped. If it's not the text parser will report a complete tuple.
@@ -719,8 +733,10 @@ Status HdfsTextScanner::CheckForSplitDelimiter(bool* split_delimiter) {
   Status status;
   uint8_t* next_byte;
   int64_t out_len;
-  stream_->GetBytes(1, &next_byte, &out_len, &status, /*peek*/ true);
-  RETURN_IF_ERROR(status);
+  if (!stream_->GetBytes(1, &next_byte, &out_len, &status, /*peek*/ true)) {
+    DCHECK(!status.ok());
+    return status;
+  }
 
   // No more bytes after current buffer
   if (out_len == 0) return Status::OK();
@@ -730,15 +746,15 @@ Status HdfsTextScanner::CheckForSplitDelimiter(bool* split_delimiter) {
 }
 
 // Codegen for materializing parsed data into tuples.  The function WriteCompleteTuple is
-// codegen'd using the IRBuilder for the specific tuple description.  This function
+// handcrafted using the IRBuilder for the specific tuple description.  This function
 // is then injected into the cross-compiled driving function, WriteAlignedTuples().
 Status HdfsTextScanner::Codegen(HdfsScanNodeBase* node,
-    const vector<ScalarExpr*>& conjuncts, Function** write_aligned_tuples_fn) {
+    const vector<ScalarExpr*>& conjuncts, llvm::Function** write_aligned_tuples_fn) {
   *write_aligned_tuples_fn = nullptr;
   DCHECK(node->runtime_state()->ShouldCodegen());
   LlvmCodeGen* codegen = node->runtime_state()->codegen();
   DCHECK(codegen != nullptr);
-  Function* write_complete_tuple_fn;
+  llvm::Function* write_complete_tuple_fn;
   RETURN_IF_ERROR(CodegenWriteCompleteTuple(node, codegen, conjuncts,
       &write_complete_tuple_fn));
   DCHECK(write_complete_tuple_fn != nullptr);
@@ -824,6 +840,9 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
 
   // Write complete tuples.  The current field, if any, is at the start of a tuple.
   if (num_tuples > 0) {
+    // Need to copy out strings if they may reference the original I/O buffer.
+    const bool copy_strings = !string_slot_offsets_.empty() &&
+        stream_->file_desc()->file_compression == THdfsCompression::NONE;
     int max_added_tuples = (scan_node_->limit() == -1) ?
         num_tuples : scan_node_->limit() - scan_node_->rows_returned();
     int tuples_returned = 0;
@@ -833,13 +852,13 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
       // slots and escape characters. TextConverter::WriteSlot() will be used instead.
       DCHECK(scan_node_->tuple_desc()->string_slots().empty() ||
           delimited_text_parser_->escape_char() == '\0');
-      tuples_returned = write_tuples_fn_(this, pool, row, sizeof(Tuple*), fields,
-          num_tuples, max_added_tuples, scan_node_->materialized_slots().size(),
-          num_tuples_processed);
+      tuples_returned = write_tuples_fn_(this, pool, row, fields, num_tuples,
+          max_added_tuples, scan_node_->materialized_slots().size(),
+          num_tuples_processed, copy_strings);
     } else {
-      tuples_returned = WriteAlignedTuples(pool, row, sizeof(Tuple*), fields,
-          num_tuples, max_added_tuples, scan_node_->materialized_slots().size(),
-          num_tuples_processed);
+      tuples_returned = WriteAlignedTuples(pool, row, fields, num_tuples,
+          max_added_tuples, scan_node_->materialized_slots().size(),
+          num_tuples_processed, copy_strings);
     }
     if (tuples_returned == -1) return 0;
     DCHECK_EQ(slot_idx_, 0);

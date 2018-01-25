@@ -36,11 +36,11 @@ struct TGetCatalogDeltaResponse {
   // contained no objects.
   1: required i64 max_catalog_version
 
-  // List of updated (new and modified) catalog objects for which the catalog verion is
+  // List of updated (new and modified) catalog objects whose catalog verion is
   // larger than TGetCatalotDeltaRequest.from_version.
   2: required list<CatalogObjects.TCatalogObject> updated_objects
 
-  // List of deleted catalog objects for which the catalog version is larger than
+  // List of deleted catalog objects whose catalog version is larger than
   // TGetCatalogDelta.from_version.
   3: required list<CatalogObjects.TCatalogObject> deleted_objects
 }

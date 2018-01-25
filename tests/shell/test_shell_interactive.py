@@ -22,19 +22,19 @@ import os
 import pexpect
 import pytest
 import re
-import shutil
 import signal
 import socket
 import sys
+import tempfile
 from time import sleep
 
 from tests.common.impala_service import ImpaladService
 from tests.common.skip import SkipIfLocal
 from util import assert_var_substitution, ImpalaShell
+from util import move_shell_history, restore_shell_history
 
 SHELL_CMD = "%s/bin/impala-shell.sh" % os.environ['IMPALA_HOME']
 SHELL_HISTORY_FILE = os.path.expanduser("~/.impalahistory")
-TMP_HISTORY_FILE = os.path.expanduser("~/.impalahistorytmp")
 QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
 
 class TestImpalaShellInteractive(object):
@@ -42,12 +42,12 @@ class TestImpalaShellInteractive(object):
 
   @classmethod
   def setup_class(cls):
-    if os.path.exists(SHELL_HISTORY_FILE):
-      shutil.move(SHELL_HISTORY_FILE, TMP_HISTORY_FILE)
+    cls.tempfile_name = tempfile.mktemp()
+    move_shell_history(cls.tempfile_name)
 
   @classmethod
   def teardown_class(cls):
-    if os.path.exists(TMP_HISTORY_FILE): shutil.move(TMP_HISTORY_FILE, SHELL_HISTORY_FILE)
+    restore_shell_history(cls.tempfile_name)
 
   def _expect_with_cmd(self, proc, cmd, expectations=()):
     """Executes a command on the expect process instance and verifies a set of
@@ -289,6 +289,18 @@ class TestImpalaShellInteractive(object):
     assert_var_substitution(result)
 
   @pytest.mark.execute_serially
+  def test_query_option_configuration(self):
+    rcfile_path = os.path.join(QUERY_FILE_PATH, 'impalarc_with_query_options')
+    args = '-Q MT_dop=1 --query_option=MAX_ERRORS=200 --config_file="%s"' % rcfile_path
+    cmds = "set all;"
+    result = run_impala_shell_interactive(cmds, shell_args=args)
+    assert "\tMT_DOP: 1" in result.stdout
+    assert "\tMAX_ERRORS: 200" in result.stdout
+    assert "\tEXPLAIN_LEVEL: 2" in result.stdout
+    assert "INVALID_QUERY_OPTION is not supported for the impalad being "
+    "connected to, ignoring." in result.stdout
+
+  @pytest.mark.execute_serially
   def test_source_file(self):
     cwd = os.getcwd()
     try:
@@ -296,11 +308,11 @@ class TestImpalaShellInteractive(object):
       os.chdir("%s/tests/shell/" % os.environ['IMPALA_HOME'])
       # IMPALA-5416: Test that a command following 'source' won't be run twice.
       result = run_impala_shell_interactive("source shell.cmds;select \"second command\";")
-      assert "Query: use FUNCTIONAL" in result.stderr
-      assert "Query: show TABLES" in result.stderr
+      assert "Query: USE FUNCTIONAL" in result.stderr
+      assert "Query: SHOW TABLES" in result.stderr
       assert "alltypes" in result.stdout
       # This is from shell2.cmds, the result of sourcing a file from a sourced file.
-      assert "select VERSION()" in result.stderr
+      assert "SELECT VERSION()" in result.stderr
       assert "version()" in result.stdout
       assert len(re.findall("'second command'", result.stdout)) == 1
       # IMPALA-5416: Test that two source commands on a line won't crash the shell.
@@ -313,13 +325,13 @@ class TestImpalaShellInteractive(object):
   def test_source_file_with_errors(self):
     full_path = "%s/tests/shell/shell_error.cmds" % os.environ['IMPALA_HOME']
     result = run_impala_shell_interactive("source %s;" % full_path)
-    assert "Could not execute command: use UNKNOWN_DATABASE" in result.stderr
-    assert "Query: use FUNCTIONAL" not in result.stderr
+    assert "Could not execute command: USE UNKNOWN_DATABASE" in result.stderr
+    assert "Query: USE FUNCTIONAL" not in result.stderr
 
     result = run_impala_shell_interactive("source %s;" % full_path, '-c')
-    assert "Could not execute command: use UNKNOWN_DATABASE" in result.stderr
-    assert "Query: use FUNCTIONAL" in result.stderr
-    assert "Query: show TABLES" in result.stderr
+    assert "Could not execute command: USE UNKNOWN_DATABASE" in result.stderr
+    assert "Query: USE FUNCTIONAL" in result.stderr
+    assert "Query: SHOW TABLES" in result.stderr
     assert "alltypes" in result.stdout
 
   @pytest.mark.execute_serially
@@ -341,6 +353,86 @@ class TestImpalaShellInteractive(object):
     result = run_impala_shell_interactive("select * from functional.alltypes limit 0;")
     assert "Fetched 0 row(s)" in result.stderr
     assert re.search('> \[', result.stdout)
+
+  @pytest.mark.execute_serially
+  def test_set_and_set_all(self):
+    """IMPALA-2181. Tests the outputs of SET and SET ALL commands. SET should contain the
+    REGULAR and ADVANCED options only. SET ALL should contain all the options grouped by
+    display level."""
+    shell1 = ImpalaShell()
+    shell1.send_cmd("set")
+    result = shell1.get_result()
+    assert "Query options (defaults shown in []):" in result.stdout
+    assert "ABORT_ON_ERROR" in result.stdout
+    assert "Advanced Query Options:" in result.stdout
+    assert "APPX_COUNT_DISTINCT" in result.stdout
+    assert "SUPPORT_START_OVER" in result.stdout
+    assert "Development Query Options:" not in result.stdout
+    assert "DEBUG_ACTION" not in result.stdout
+    assert "Deprecated Query Options:" not in result.stdout
+    assert "ABORT_ON_DEFAULT_LIMIT_EXCEEDED" not in result.stdout
+
+    shell2 = ImpalaShell()
+    shell2.send_cmd("set all")
+    result = shell2.get_result()
+    assert "Query options (defaults shown in []):" in result.stdout
+    assert "Advanced Query Options:" in result.stdout
+    assert "Development Query Options:" in result.stdout
+    assert "Deprecated Query Options:" in result.stdout
+    advanced_part_start_idx = result.stdout.find("Advanced Query Options")
+    development_part_start_idx = result.stdout.find("Development Query Options")
+    deprecated_part_start_idx = result.stdout.find("Deprecated Query Options")
+    advanced_part = result.stdout[advanced_part_start_idx:development_part_start_idx]
+    development_part = result.stdout[development_part_start_idx:deprecated_part_start_idx]
+    assert "ABORT_ON_ERROR" in result.stdout[:advanced_part_start_idx]
+    assert "APPX_COUNT_DISTINCT" in advanced_part
+    assert "SUPPORT_START_OVER" in advanced_part
+    assert "DEBUG_ACTION" in development_part
+    assert "ABORT_ON_DEFAULT_LIMIT_EXCEEDED" in result.stdout[deprecated_part_start_idx:]
+
+  def check_command_case_sensitivity(self, command, expected):
+    shell = ImpalaShell()
+    shell.send_cmd(command)
+    assert expected in shell.get_result().stderr
+
+  @pytest.mark.execute_serially
+  def test_unexpected_conversion_for_literal_string_to_lowercase(self):
+    # IMPALA-4664: Impala shell can accidentally convert certain literal
+    # strings to lowercase. Impala shell splits each command into tokens
+    # and then converts the first token to lowercase to figure out how it
+    # should execute the command. The splitting is done by spaces only.
+    # Thus, if the user types a TAB after the SELECT, the first token after
+    # the split becomes the SELECT plus whatever comes after it.
+    result = run_impala_shell_interactive("select'MUST_HAVE_UPPER_STRING'")
+    assert re.search('MUST_HAVE_UPPER_STRING', result.stdout)
+    result = run_impala_shell_interactive("select\t'MUST_HAVE_UPPER_STRING'")
+    assert re.search('MUST_HAVE_UPPER_STRING', result.stdout)
+    result = run_impala_shell_interactive("select\n'MUST_HAVE_UPPER_STRING'")
+    assert re.search('MUST_HAVE_UPPER_STRING', result.stdout)
+
+  @pytest.mark.execute_serially
+  def test_case_sensitive_command(self):
+    # IMPALA-2640: Make a given command case-sensitive
+    cwd = os.getcwd()
+    try:
+      self.check_command_case_sensitivity("sElEcT VERSION()", "Query: sElEcT")
+      self.check_command_case_sensitivity("sEt VaR:FoO=bOo", "Variable FOO")
+      self.check_command_case_sensitivity("sHoW tables", "Query: sHoW")
+      # Change working dir so that SOURCE command in shell_case_sensitive.cmds can
+      # find shell_case_sensitive2.cmds.
+      os.chdir("%s/tests/shell/" % os.environ['IMPALA_HOME'])
+      result = run_impala_shell_interactive(
+        "sOuRcE shell_case_sensitive.cmds; SeLeCt 'second command'")
+      print result.stderr
+      assert "Query: uSe FUNCTIONAL" in result.stderr
+      assert "Query: ShOw TABLES" in result.stderr
+      assert "alltypes" in result.stdout
+      # This is from shell_case_sensitive2.cmds, the result of sourcing a file
+      # from a sourced file.
+      print result.stderr
+      assert "SeLeCt 'second command'" in result.stderr
+    finally:
+      os.chdir(cwd)
 
 def run_impala_shell_interactive(input_lines, shell_args=None):
   """Runs a command in the Impala shell interactively."""

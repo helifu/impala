@@ -29,8 +29,6 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TSlotRef;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
@@ -91,6 +89,9 @@ public class SlotRef extends Expr {
 
   @Override
   protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
+    // TODO: derived slot refs (e.g., star-expanded) will not have rawPath set.
+    // Change construction to properly handle such cases.
+    Preconditions.checkState(rawPath_ != null);
     Path resolvedPath = null;
     try {
       resolvedPath = analyzer.resolvePath(rawPath_, PathType.SLOT_REF);
@@ -152,6 +153,26 @@ public class SlotRef extends Expr {
     return "<slot " + Integer.toString(desc_.getId().asInt()) + ">";
   }
 
+  /**
+   * Checks if this slotRef refers to an array "pos" pseudo-column.
+   *
+   * Note: checking whether the column is null distinguishes between top-level columns
+   * and nested types. This check more specifically looks just for a reference to the
+   * "pos" field of an array type.
+   */
+  public boolean isArrayPosRef() {
+    TupleDescriptor parent = getDesc().getParent();
+    if (parent == null) return false;
+    Type parentType = parent.getType();
+    if (parentType instanceof CollectionStructType) {
+      if (((CollectionStructType)parentType).isArrayStruct() &&
+          getDesc().getLabel().equals(Path.ARRAY_POS_FIELD_NAME)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   @Override
   protected void toThrift(TExprNode msg) {
     msg.node_type = TExprNodeType.SLOT_REF;
@@ -182,18 +203,29 @@ public class SlotRef extends Expr {
   }
 
   @Override
-  public boolean equals(Object obj) {
-    if (!super.equals(obj)) return false;
-    SlotRef other = (SlotRef) obj;
+  public boolean localEquals(Expr that) {
+    if (!super.localEquals(that)) return false;
+    SlotRef other = (SlotRef) that;
     // check slot ids first; if they're both set we only need to compare those
     // (regardless of how the ref was constructed)
     if (desc_ != null && other.desc_ != null) {
       return desc_.getId().equals(other.desc_.getId());
     }
-    if ((label_ == null) != (other.label_ == null)) return false;
-    if (!label_.equalsIgnoreCase(other.label_)) return false;
-    return true;
+    return label_ == null ? other.label_ == null : label_.equalsIgnoreCase(other.label_);
   }
+
+  /** Used for {@link Expr#matches(Expr, Comparator)} */
+  interface Comparator {
+    boolean matches(SlotRef a, SlotRef b);
+  }
+
+  /**
+   * A wrapper around localEquals() used for {@link #Expr#matches(Expr, Comparator)}.
+   */
+  static final Comparator SLOTREF_EQ_CMP = new Comparator() {
+    @Override
+    public boolean matches(SlotRef a, SlotRef b) { return a.localEquals(b); }
+  };
 
   @Override
   public boolean isBoundByTupleIds(List<TupleId> tids) {

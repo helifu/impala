@@ -431,7 +431,13 @@ class ImpalaTestSuite(BaseTestSuite):
         test_section['RESULTS'] = test_section['RESULTS'] \
             .replace(NAMENODE, '$NAMENODE') \
             .replace('$IMPALA_HOME', IMPALA_HOME)
-      if 'RUNTIME_PROFILE' in test_section:
+      if 'RUNTIME_PROFILE_%s' % table_format_info.file_format in test_section:
+        # If this table format has a RUNTIME_PROFILE section specifically for it, evaluate
+        # that section and ignore any general RUNTIME_PROFILE sections.
+        verify_runtime_profile(
+            test_section['RUNTIME_PROFILE_%s' % table_format_info.file_format],
+            result.runtime_profile)
+      elif 'RUNTIME_PROFILE' in test_section:
         verify_runtime_profile(test_section['RUNTIME_PROFILE'], result.runtime_profile)
 
       if 'DML_RESULTS' in test_section:
@@ -616,6 +622,19 @@ class ImpalaTestSuite(BaseTestSuite):
     assert table is not None
     self.hive_client.drop_table(db_name, table_name, True)
     self.hive_client.create_table(table)
+
+  def clone_table(self, src_tbl, dst_tbl, recover_partitions, vector):
+    src_loc = self._get_table_location(src_tbl, vector)
+    self.client.execute("create external table {0} like {1} location '{2}'"\
+        .format(dst_tbl, src_tbl, src_loc))
+    if recover_partitions:
+      self.client.execute("alter table {0} recover partitions".format(dst_tbl))
+
+  def appx_equals(self, a, b, diff_perc):
+    """Returns True if 'a' and 'b' are within 'diff_perc' percent of each other,
+    False otherwise. 'diff_perc' must be a float in [0,1]."""
+    if a == b: return True # Avoid division by 0
+    assert abs(a - b) / float(max(a,b)) <= diff_perc
 
   def _get_table_location(self, table_name, vector):
     """ Returns the HDFS location of the table """

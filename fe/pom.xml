@@ -20,43 +20,21 @@ under the License.
 -->
 
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+  <parent>
+    <groupId>org.apache.impala</groupId>
+    <artifactId>impala-parent</artifactId>
+    <version>0.1-SNAPSHOT</version>
+    <relativePath>../impala-parent/pom.xml</relativePath>
+  </parent>
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.apache.impala</groupId>
   <artifactId>impala-frontend</artifactId>
   <version>0.1-SNAPSHOT</version>
   <packaging>jar</packaging>
 
-  <name>Apache Impala (Incubating) Query Engine Frontend</name>
-
-  <properties>
-    <surefire.reports.dir>${env.IMPALA_LOGS_DIR}/fe_tests</surefire.reports.dir>
-    <jacoco.skip>true</jacoco.skip>
-    <jacoco.data.file>${env.IMPALA_FE_TEST_COVERAGE_DIR}/jacoco.exec</jacoco.data.file>
-    <jacoco.report.dir>${env.IMPALA_FE_TEST_COVERAGE_DIR}</jacoco.report.dir>
-    <test.hive.testdata>${project.basedir}/../testdata/target/AllTypes.txt</test.hive.testdata>
-    <backend.library.path>${env.IMPALA_HOME}/be/build/debug/service:${env.IMPALA_HOME}/be/build/release/service</backend.library.path>
-    <beeswax_port>21000</beeswax_port>
-    <impalad>localhost</impalad>
-    <testExecutionMode>reduced</testExecutionMode>
-    <hadoop.version>${env.IMPALA_HADOOP_VERSION}</hadoop.version>
-    <hive.version>${env.IMPALA_HIVE_VERSION}</hive.version>
-    <hive.major.version>${env.IMPALA_HIVE_MAJOR_VERSION}</hive.major.version>
-    <sentry.version>${env.IMPALA_SENTRY_VERSION}</sentry.version>
-    <hbase.version>${env.IMPALA_HBASE_VERSION}</hbase.version>
-    <parquet.version>${env.IMPALA_PARQUET_VERSION}</parquet.version>
-    <impala.extdatasrc.api.version>1.0-SNAPSHOT</impala.extdatasrc.api.version>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <kudu.version>${env.KUDU_JAVA_VERSION}</kudu.version>
-    <yarn-extras.version>${project.version}</yarn-extras.version>
-    <eclipse.output.directory>eclipse-classes</eclipse.output.directory>
-  </properties>
+  <name>Apache Impala Query Engine Frontend</name>
 
   <dependencies>
-    <dependency>
-      <groupId>org.htrace</groupId>
-      <artifactId>htrace-core</artifactId>
-      <version>3.0.4</version>
-    </dependency>
     <dependency>
       <groupId>org.apache.impala</groupId>
       <artifactId>impala-data-source-api</artifactId>
@@ -89,12 +67,6 @@ under the License.
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-azure-datalake</artifactId>
-      <version>${hadoop.version}</version>
-    </dependency>
-
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-mapreduce-client-core</artifactId>
       <version>${hadoop.version}</version>
     </dependency>
 
@@ -207,7 +179,7 @@ under the License.
     <dependency>
       <groupId>org.apache.thrift</groupId>
       <artifactId>libthrift</artifactId>
-      <version>${env.IMPALA_THRIFT_JAVA_VERSION}</version>
+      <version>${thrift.version}</version>
       <!-- libthrift depends httpcore 4.1.3 which does not work with KMS. To workaround
            this problem the dependency is excluded here and we explicitly add a newer
            httpcore dependency version. See IMPALA-4210. TODO: Find a better fix. -->
@@ -222,13 +194,13 @@ under the License.
     <dependency>
       <groupId>org.apache.httpcomponents</groupId>
       <artifactId>httpcore</artifactId>
-      <version>4.2.5</version>
+      <version>${httpcomponents.core.version}</version>
     </dependency>
 
     <dependency>
       <groupId>org.apache.thrift</groupId>
       <artifactId>libfb303</artifactId>
-      <version>${env.IMPALA_THRIFT_JAVA_VERSION}</version>
+      <version>${thrift.version}</version>
     </dependency>
 
     <dependency>
@@ -265,11 +237,6 @@ under the License.
     </dependency>
     <dependency>
       <groupId>org.apache.hive</groupId>
-      <artifactId>hive-shims</artifactId>
-      <version>${hive.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hive</groupId>
       <artifactId>hive-exec</artifactId>
       <version>${hive.version}</version>
     </dependency>
@@ -279,27 +246,12 @@ under the License.
       <artifactId>kudu-client</artifactId>
       <version>${kudu.version}</version>
     </dependency>
-    <dependency>
-      <groupId>com.stumbleupon</groupId>
-      <artifactId>async</artifactId>
-      <version>1.3.1</version>
-    </dependency>
 
     <!-- This driver supports PostgreSQL 7.2 and newer -->
     <dependency>
       <groupId>postgresql</groupId>
       <artifactId>postgresql</artifactId>
       <version>9.0-801.jdbc4</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-dbcp</groupId>
-      <artifactId>commons-dbcp</artifactId>
-      <version>1.4</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.jdo</groupId>
-      <artifactId>jdo-api</artifactId>
-      <version>3.0.1</version>
     </dependency>
     <dependency>
       <groupId>org.antlr</groupId>
@@ -322,24 +274,24 @@ under the License.
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
-      <version>1.7.5</version>
+      <version>${slf4j.version}</version>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-log4j12</artifactId>
-      <version>1.7.5</version>
+      <version>${slf4j.version}</version>
     </dependency>
 
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
-      <version>11.0.2</version>
+      <version>${guava.version}</version>
     </dependency>
 
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
-      <version>4.12</version>
+      <version>${junit.version}</version>
       <scope>test</scope>
     </dependency>
 
@@ -358,6 +310,12 @@ under the License.
       <groupId>com.github.davidmoten</groupId>
       <artifactId>flatbuffers-java</artifactId>
       <version>1.6.0.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.dropwizard.metrics</groupId>
+      <artifactId>metrics-core</artifactId>
+      <version>3.2.2</version>
     </dependency>
 
   </dependencies>
@@ -664,109 +622,6 @@ under the License.
       </plugins>
     </pluginManagement>
   </build>
-
-  <repositories>
-    <repository>
-       <id>apache.snapshots</id>
-       <name>Apache Development Snapshot Repository</name>
-        <url>https://repository.apache.org/content/repositories/snapshots/</url>
-        <releases>
-            <enabled>false</enabled>
-        </releases>
-        <snapshots>
-            <enabled>true</enabled>
-        </snapshots>
-    </repository>
-
-    <repository>
-      <id>cdh.rcs.releases.repo</id>
-      <url>https://repository.cloudera.com/content/groups/cdh-releases-rcs</url>
-      <name>CDH Releases Repository</name>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </repository>
-    <repository>
-      <id>cdh.releases.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/releases</url>
-      <name>CDH Releases Repository</name>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </repository>
-    <repository>
-      <id>cdh.snapshots.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/snapshots</url>
-      <name>CDH Snapshots Repository</name>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </repository>
-    <repository>
-      <id>cloudera.thirdparty.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/third-party</url>
-      <name>Cloudera Third Party Repository</name>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </repository>
-
-    <!-- This is needed for java-cup. TODO add the plugin to our maven repo -->
-    <repository>
-      <id>sonatype-nexus-snapshots</id>
-      <name>Sonatype Nexus Snapshots</name>
-      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </repository>
-  </repositories>
-
-  <pluginRepositories>
-    <pluginRepository>
-      <id>cloudera.thirdparty.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/third-party</url>
-      <name>Cloudera Third Party Repository</name>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </pluginRepository>
-    <pluginRepository>
-      <id>cloudera.snapshot.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/snapshots</url>
-      <name>Cloudera Snapshot Repository</name>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </pluginRepository>
-
-    <pluginRepository>
-      <id>dtrott</id>
-      <url>http://maven.davidtrott.com/repository</url>
-      <releases>
-        <enabled>true</enabled>
-      </releases>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </pluginRepository>
-
-    <!-- This is needed for the cup maven plugin. TODO add the plugin to our maven repo -->
-    <pluginRepository>
-      <id>sonatype-nexus-snapshots</id>
-      <name>Sonatype Nexus Snapshots</name>
-      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-    </pluginRepository>
-  </pluginRepositories>
 
   <profiles>
     <profile>

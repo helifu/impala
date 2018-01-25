@@ -17,24 +17,25 @@
 
 #include "exprs/aggregate-functions.h"
 
-#include <math.h>
 #include <algorithm>
 #include <map>
 #include <sstream>
 #include <utility>
+#include <cmath>
 
 #include <boost/random/ranlux.hpp>
 #include <boost/random/uniform_int.hpp>
 
 #include "codegen/impala-ir.h"
 #include "common/logging.h"
+#include "exprs/anyval-util.h"
+#include "exprs/hll-bias.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
-#include "exprs/anyval-util.h"
-#include "exprs/hll-bias.h"
+#include "util/mpfit-util.h"
 
 #include "common/names.h"
 
@@ -42,6 +43,7 @@ using boost::uniform_int;
 using boost::ranlux64_3;
 using std::make_pair;
 using std::map;
+using std::min_element;
 using std::nth_element;
 using std::pop_heap;
 using std::push_heap;
@@ -372,7 +374,11 @@ TimestampVal AggregateFunctions::TimestampAvgFinalize(FunctionContext* ctx,
   return result;
 }
 
-struct DecimalAvgState {
+// We saw some failures on the release build because GCC was emitting an instruction
+// to operate on the int128_t that assumed the pointer was aligned (typically it isn't).
+// We mark the struct with a "packed" attribute, so that the compiler does not expect it
+// to be aligned. This should not have a negative performance impact on modern CPUs.
+struct __attribute__ ((__packed__)) DecimalAvgState {
   __int128_t sum_val16; // Always uses max precision decimal.
   int64_t count;
 };
@@ -402,6 +408,7 @@ IR_ALWAYS_INLINE void AggregateFunctions::DecimalAvgAddOrRemove(FunctionContext*
   DCHECK(dst->ptr != NULL);
   DCHECK_EQ(sizeof(DecimalAvgState), dst->len);
   DecimalAvgState* avg = reinterpret_cast<DecimalAvgState*>(dst->ptr);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
 
   // Since the src and dst are guaranteed to be the same scale, we can just
   // do a simple add.
@@ -409,11 +416,25 @@ IR_ALWAYS_INLINE void AggregateFunctions::DecimalAvgAddOrRemove(FunctionContext*
   switch (ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SIZE, 0)) {
     case 4:
       avg->sum_val16 += m * src.val4;
+      if (UNLIKELY(decimal_v2 &&
+          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+        ctx->SetError("Avg computation overflowed");
+      }
       break;
     case 8:
       avg->sum_val16 += m * src.val8;
+      if (UNLIKELY(decimal_v2 &&
+          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+        ctx->SetError("Avg computation overflowed");
+      }
       break;
     case 16:
+      if (UNLIKELY(decimal_v2 && (avg->sum_val16 >= 0) == (src.val16 >= 0) &&
+          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
+        // We can't check for overflow after performing the addition like in the other
+        // cases because the result may not fit into int128.
+        ctx->SetError("Avg computation overflowed");
+      }
       avg->sum_val16 += m * src.val16;
       break;
     default:
@@ -434,6 +455,11 @@ void AggregateFunctions::DecimalAvgMerge(FunctionContext* ctx,
   DCHECK(dst->ptr != NULL);
   DCHECK_EQ(sizeof(DecimalAvgState), dst->len);
   DecimalAvgState* dst_struct = reinterpret_cast<DecimalAvgState*>(dst->ptr);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
+  bool overflow = decimal_v2 &&
+      abs(dst_struct->sum_val16) >
+      DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src_struct->sum_val16);
+  if (UNLIKELY(overflow)) ctx->SetError("Avg computation overflowed");
   dst_struct->sum_val16 += src_struct->sum_val16;
   dst_struct->count += src_struct->count;
 }
@@ -452,12 +478,16 @@ DecimalVal AggregateFunctions::DecimalAvgGetValue(FunctionContext* ctx,
   int sum_scale = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SCALE, 0);
   bool is_nan = false;
   bool overflow = false;
-  bool round = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   Decimal16Value result = sum.Divide<int128_t>(sum_scale, count, 0 /* count's scale */,
-      output_precision, output_scale, round, &is_nan, &overflow);
+      output_precision, output_scale, decimal_v2, &is_nan, &overflow);
   if (UNLIKELY(is_nan)) return DecimalVal::null();
   if (UNLIKELY(overflow)) {
-    ctx->AddWarning("Avg computation overflowed, returning NULL");
+    if (decimal_v2) {
+      ctx->SetError("Avg computation overflowed");
+    } else {
+      ctx->AddWarning("Avg computation overflowed, returning NULL");
+    }
     return DecimalVal::null();
   }
   return DecimalVal(result.value());
@@ -516,14 +546,29 @@ IR_ALWAYS_INLINE void AggregateFunctions::SumDecimalAddOrSubtract(FunctionContex
   if (src.is_null) return;
   if (dst->is_null) InitZero<DecimalVal>(ctx, dst);
   int precision = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_PRECISION, 0);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   // Since the src and dst are guaranteed to be the same scale, we can just
   // do a simple add.
   int m = subtract ? -1 : 1;
   if (precision <= 9) {
     dst->val16 += m * src.val4;
+    if (UNLIKELY(decimal_v2 &&
+        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+      ctx->SetError("Sum computation overflowed");
+    }
   } else if (precision <= 19) {
     dst->val16 += m * src.val8;
+    if (UNLIKELY(decimal_v2 &&
+        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+      ctx->SetError("Sum computation overflowed");
+    }
   } else {
+    if (UNLIKELY(decimal_v2 && (dst->val16 >= 0) == (src.val16 >= 0) &&
+        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
+      // We can't check for overflow after performing the addition like in the other
+      // cases because the result may not fit into int128.
+      ctx->SetError("Sum computation overflowed");
+    }
     dst->val16 += m * src.val16;
   }
 }
@@ -532,6 +577,10 @@ void AggregateFunctions::SumDecimalMerge(FunctionContext* ctx,
     const DecimalVal& src, DecimalVal* dst) {
   if (src.is_null) return;
   if (dst->is_null) InitZero<DecimalVal>(ctx, dst);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
+  bool overflow = decimal_v2 &&
+      abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16);
+  if (UNLIKELY(overflow)) ctx->SetError("Sum computation overflowed");
   dst->val16 += src.val16;
 }
 
@@ -551,6 +600,33 @@ void AggregateFunctions::InitNullString(FunctionContext* c, StringVal* dst) {
   dst->is_null = true;
   dst->ptr = NULL;
   dst->len = 0;
+}
+
+// For DoubleVal and FloatVal, we have to handle NaN specially.  If 'val' != 'val', then
+// 'val' must be NaN, and if any of the values that are inserted are NaN, then we return
+// NaN. So, if 'src.val != src.val', set 'dst' to it.
+template <>
+void AggregateFunctions::Min(FunctionContext*, const FloatVal& src, FloatVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val < dst->val || src.val != src.val) *dst = src;
+}
+
+template <>
+void AggregateFunctions::Max(FunctionContext*, const FloatVal& src, FloatVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val > dst->val || src.val != src.val) *dst = src;
+}
+
+template <>
+void AggregateFunctions::Min(FunctionContext*, const DoubleVal& src, DoubleVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val < dst->val || src.val != src.val) *dst = src;
+}
+
+template <>
+void AggregateFunctions::Max(FunctionContext*, const DoubleVal& src, DoubleVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val > dst->val || src.val != src.val) *dst = src;
 }
 
 template<>
@@ -1391,10 +1467,8 @@ void AggregateFunctions::HllMerge(
   }
 }
 
-uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets,
-    int32_t num_buckets) {
+uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets) {
   DCHECK(buckets != NULL);
-  DCHECK_EQ(num_buckets, HLL_LEN);
 
   // Empirical constants for the algorithm.
   float alpha = 0;
@@ -1410,9 +1484,8 @@ uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets,
 
   float harmonic_mean = 0;
   int num_zero_registers = 0;
-  // TODO: Consider improving this loop (e.g. replacing 'if' with arithmetic op).
-  for (int i = 0; i < num_buckets; ++i) {
-    harmonic_mean += powf(2.0f, -buckets[i]);
+  for (int i = 0; i < HLL_LEN; ++i) {
+    harmonic_mean += ldexp(1.0f, -buckets[i]);
     if (buckets[i] == 0) ++num_zero_registers;
   }
   harmonic_mean = 1.0f / harmonic_mean;
@@ -1433,8 +1506,188 @@ uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets,
 
 BigIntVal AggregateFunctions::HllFinalize(FunctionContext* ctx, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return BigIntVal::null();
-  uint64_t estimate = HllFinalEstimate(src.ptr, src.len);
+  uint64_t estimate = HllFinalEstimate(src.ptr);
   return estimate;
+}
+
+/// Intermediate aggregation state for the SampledNdv() function.
+/// Stores NUM_HLL_BUCKETS of the form <row_count, hll_state>.
+/// The 'row_count' keeps track of how many input rows were aggregated into that
+/// bucket, and the 'hll_state' is an intermediate aggregation state of HyperLogLog.
+/// See the header comments on the SampledNdv() function for more details.
+class SampledNdvState {
+ public:
+  /// Empirically determined number of HLL buckets. Power of two for fast modulo.
+  static const uint32_t NUM_HLL_BUCKETS = 32;
+
+  /// A bucket contains an update count and an HLL intermediate state.
+  static constexpr int64_t BUCKET_SIZE = sizeof(int64_t) + AggregateFunctions::HLL_LEN;
+
+  /// Sampling percent which was given as the second argument to SampledNdv().
+  /// Stored here to avoid existing issues with passing constant arguments to all
+  /// aggregation phases and because we convert the sampling percent argument from
+  /// decimal to double. See IMPALA-6179.
+  double sample_perc;
+
+  /// Counts the number of Update() calls. Used for determining which bucket to update.
+  int64_t total_row_count;
+
+  /// Array of buckets.
+  struct {
+    int64_t row_count;
+    uint8_t hll[AggregateFunctions::HLL_LEN];
+  } buckets[NUM_HLL_BUCKETS];
+};
+
+void AggregateFunctions::SampledNdvInit(FunctionContext* ctx, StringVal* dst) {
+  // Uses a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_EQ(dst->len, sizeof(SampledNdvState));
+  memset(dst->ptr, 0, sizeof(SampledNdvState));
+
+  DoubleVal* sample_perc = reinterpret_cast<DoubleVal*>(ctx->GetConstantArg(1));
+  if (sample_perc == nullptr) return;
+  // Guaranteed by the FE.
+  DCHECK(!sample_perc->is_null);
+  DCHECK_GE(sample_perc->val, 0.0);
+  DCHECK_LE(sample_perc->val, 1.0);
+  SampledNdvState* state = reinterpret_cast<SampledNdvState*>(dst->ptr);
+  state->sample_perc = sample_perc->val;
+}
+
+/// Incorporate the 'src' into one of the intermediate HLLs, which will be used by
+/// Finalize() to generate a set of the (x,y) data points.
+template <typename T>
+void AggregateFunctions::SampledNdvUpdate(FunctionContext* ctx, const T& src,
+    const DoubleVal& sample_perc, StringVal* dst) {
+  SampledNdvState* state = reinterpret_cast<SampledNdvState*>(dst->ptr);
+  int64_t bucket_idx = state->total_row_count % SampledNdvState::NUM_HLL_BUCKETS;
+  StringVal hll_dst = StringVal(state->buckets[bucket_idx].hll, HLL_LEN);
+  HllUpdate(ctx, src, &hll_dst);
+  ++state->buckets[bucket_idx].row_count;
+  ++state->total_row_count;
+}
+
+void AggregateFunctions::SampledNdvMerge(FunctionContext* ctx, const StringVal& src,
+    StringVal* dst) {
+  SampledNdvState* src_state = reinterpret_cast<SampledNdvState*>(src.ptr);
+  SampledNdvState* dst_state = reinterpret_cast<SampledNdvState*>(dst->ptr);
+  for (int i = 0; i < SampledNdvState::NUM_HLL_BUCKETS; ++i) {
+    StringVal src_hll = StringVal(src_state->buckets[i].hll, HLL_LEN);
+    StringVal dst_hll = StringVal(dst_state->buckets[i].hll, HLL_LEN);
+    HllMerge(ctx, src_hll, &dst_hll);
+    dst_state->buckets[i].row_count += src_state->buckets[i].row_count;
+  }
+  // Total count. Not really needed after Update() but kept for sanity checking.
+  dst_state->total_row_count += src_state->total_row_count;
+  // Propagate sampling percent to Finalize().
+  dst_state->sample_perc = src_state->sample_perc;
+}
+
+BigIntVal AggregateFunctions::SampledNdvFinalize(FunctionContext* ctx,
+    const StringVal& src) {
+  SampledNdvState* state = reinterpret_cast<SampledNdvState*>(src.ptr);
+
+  // Generate 'num_points' data points with x=row_count and y=ndv_estimate. These points
+  // are used to fit a function for the NDV growth and estimate the real NDV.
+  constexpr int num_points =
+      SampledNdvState::NUM_HLL_BUCKETS * SampledNdvState::NUM_HLL_BUCKETS;
+  int64_t counts[num_points] = { 0 };
+  int64_t ndvs[num_points] = { 0 };
+
+  int64_t min_ndv = numeric_limits<int64_t>::max();
+  int64_t min_count = numeric_limits<int64_t>::max();
+  // We have a fixed number of HLL intermediates to generate data points. Any unique
+  // subset of intermediates can be combined to create a new data point. It was
+  // empirically determined that 'num_data' points is typically sufficient and there are
+  // diminishing returns from generating additional data points.
+  // The generation method below was chosen for its simplicity. It successively merges
+  // buckets in a rolling window of size NUM_HLL_BUCKETS. Repeating the last data point
+  // where all buckets are merged biases the curve fitting to hit that data point which
+  // makes sense because that's likely the most accurate one. The number of data points
+  // are sufficient for reasonable accuracy.
+  int pidx = 0;
+  for (int i = 0; i < SampledNdvState::NUM_HLL_BUCKETS; ++i) {
+    uint8_t merged_hll_data[HLL_LEN];
+    memset(merged_hll_data, 0, HLL_LEN);
+    StringVal merged_hll(merged_hll_data, HLL_LEN);
+    int64_t merged_count = 0;
+    for (int j = 0; j < SampledNdvState::NUM_HLL_BUCKETS; ++j) {
+      int bucket_idx = (i + j) % SampledNdvState::NUM_HLL_BUCKETS;
+      merged_count += state->buckets[bucket_idx].row_count;
+      counts[pidx] = merged_count;
+      StringVal hll = StringVal(state->buckets[bucket_idx].hll, HLL_LEN);
+      HllMerge(ctx, hll, &merged_hll);
+      ndvs[pidx] = HllFinalEstimate(merged_hll.ptr);
+      ++pidx;
+    }
+    min_count = std::min(min_count, state->buckets[i].row_count);
+    min_ndv = std::min(min_ndv, ndvs[i * SampledNdvState::NUM_HLL_BUCKETS]);
+  }
+  // Based on the point-generation method above the last elements represent the data
+  // point where all buckets are merged.
+  int64_t max_count = counts[num_points - 1];
+  int64_t max_ndv = ndvs[num_points - 1];
+
+  // Scale all values to [0,1] since some objective functions require it (e.g., Sigmoid).
+  double count_scale = max_count - min_count;
+  double ndv_scale = max_ndv - min_ndv;
+  if (count_scale == 0) count_scale = 1.0;
+  if (ndv_scale == 0) ndv_scale = 1.0;
+  double scaled_counts[num_points];
+  double scaled_ndvs[num_points];
+  for (int i = 0; i < num_points; ++i) {
+    scaled_counts[i] = counts[i] / count_scale;
+    scaled_ndvs[i] = ndvs[i] / ndv_scale;
+  }
+
+  // List of objective functions. Curve fitting will select the best values for the
+  // parameters a, b, c, d.
+  vector<ObjectiveFunction> ndv_fns;
+  // Linear function: f(x) = a + b * x
+  ndv_fns.push_back(ObjectiveFunction("LIN", 2,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * x;
+      }
+  ));
+  // Logarithmic function: f(x) = a + b * log(x)
+  ndv_fns.push_back(ObjectiveFunction("LOG", 2,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * log(x);
+      }
+  ));
+  // Power function: f(x) = a + b * pow(x, c)
+  ndv_fns.push_back(ObjectiveFunction("POW", 3,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * pow(x, params[2]);
+      }
+  ));
+  // Sigmoid function: f(x) = a + b * (c / (c + pow(d, -x)))
+  ndv_fns.push_back(ObjectiveFunction("SIG", 4,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * (params[2] / (params[2] + pow(params[3], -x)));
+      }
+  ));
+
+  // Perform least mean squares fitting on all objective functions.
+  vector<ObjectiveFunction> valid_ndv_fns;
+  for (ObjectiveFunction& f: ndv_fns) {
+    if(f.LmsFit(scaled_counts, scaled_ndvs, num_points)) {
+      valid_ndv_fns.push_back(std::move(f));
+    }
+  }
+
+  // Select the best-fit function for estimating the NDV.
+  auto best_fit_fn = min_element(valid_ndv_fns.begin(), valid_ndv_fns.end(),
+      [](const ObjectiveFunction& a, const ObjectiveFunction& b) -> bool {
+        return a.GetError() < b.GetError();
+      }
+  );
+
+  // Compute the extrapolated NDV based on the extrapolated row count.
+  double extrap_count = max_count / state->sample_perc;
+  double scaled_extrap_count = extrap_count / count_scale;
+  double scaled_extrap_ndv = best_fit_fn->GetY(scaled_extrap_count);
+  return round(scaled_extrap_ndv * ndv_scale);
 }
 
 // An implementation of a simple single pass variance algorithm. A standard UDA must
@@ -2096,6 +2349,27 @@ template void AggregateFunctions::HllUpdate(
     FunctionContext*, const TimestampVal&, StringVal*);
 template void AggregateFunctions::HllUpdate(
     FunctionContext*, const DecimalVal&, StringVal*);
+
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const BooleanVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const TinyIntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const SmallIntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const IntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const BigIntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const FloatVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const DoubleVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const StringVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const TimestampVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const DecimalVal&, const DoubleVal&, StringVal*);
 
 template void AggregateFunctions::KnuthVarUpdate(
     FunctionContext*, const TinyIntVal&, StringVal*);

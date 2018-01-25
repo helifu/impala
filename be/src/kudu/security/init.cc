@@ -40,16 +40,21 @@
 
 #include "common/config.h"
 
-DECLARE_string(keytab_file);
-TAG_FLAG(keytab_file, stable);
+#ifndef __APPLE__
+static constexpr bool kDefaultSystemAuthToLocal = true;
+#else
+// macOS's Heimdal library has a no-op implementation of
+// krb5_aname_to_localname, so instead we just use the simple
+// implementation.
+static constexpr bool kDefaultSystemAuthToLocal = false;
+#endif
+DEFINE_bool_hidden(use_system_auth_to_local, kDefaultSystemAuthToLocal,
+            "When enabled, use the system krb5 library to map Kerberos principal "
+            "names to local (short) usernames. If not enabled, the first component "
+            "of the principal will be used as the short name. For example, "
+            "'kudu/foo.example.com@EXAMPLE' will map to 'kudu'.");
+TAG_FLAG(use_system_auth_to_local, advanced);
 
-DECLARE_string(principal);
-TAG_FLAG(principal, experimental);
-// This is currently tagged as unsafe because there is no way for users to configure
-// clients to expect a non-default principal. As such, configuring a server to login
-// as a different one would end up with a cluster that can't be connected to.
-// See KUDU-1884.
-TAG_FLAG(principal, unsafe);
 
 using std::mt19937;
 using std::random_device;
@@ -360,10 +365,14 @@ Status KinitContext::Kinit(const string& keytab_path, const string& principal) {
   return Status::OK();
 }
 
-Status GetConfiguredPrincipal(string* principal) {
-  string p = FLAGS_principal;
+// 'in_principal' is the user specified principal to use with Kerberos. It may have a token
+// in the string of the form '_HOST', which if present, needs to be replaced with the FQDN of the
+// current host.
+// 'out_principal' has the final principal with which one may Kinit.
+Status GetConfiguredPrincipal(const std::string& in_principal, string* out_principal) {
+  *out_principal = in_principal;
   const auto& kHostToken = "_HOST";
-  if (p.find(kHostToken) != string::npos) {
+  if (in_principal.find(kHostToken) != string::npos) {
     string hostname;
     // Try to fill in either the FQDN or hostname.
     if (!GetFQDN(&hostname).ok()) {
@@ -371,9 +380,8 @@ Status GetConfiguredPrincipal(string* principal) {
     }
     // Hosts in principal names are canonicalized to lower-case.
     std::transform(hostname.begin(), hostname.end(), hostname.begin(), tolower);
-    GlobalReplaceSubstring(kHostToken, hostname, &p);
+    GlobalReplaceSubstring(kHostToken, hostname, out_principal);
   }
-  *principal = p;
   return Status::OK();
 }
 } // anonymous namespace
@@ -405,18 +413,15 @@ Status MapPrincipalToLocalName(const std::string& principal, std::string* local_
       krb5_free_principal(g_krb5_ctx, princ);
     });
   char buf[1024];
-  krb5_error_code rc;
-#ifndef __APPLE__
-  rc = krb5_aname_to_localname(g_krb5_ctx, princ, arraysize(buf), buf);
-#else
-  // macOS's Heimdal library has a no-op implementation of
-  // krb5_aname_to_localname, so instead we fall down to below and grab the
-  // first component of the principal.
-  rc = KRB5_LNAME_NOTRANS;
-#endif
+  krb5_error_code rc = KRB5_LNAME_NOTRANS;
+  if (FLAGS_use_system_auth_to_local) {
+    rc = krb5_aname_to_localname(g_krb5_ctx, princ, arraysize(buf), buf);
+  }
   if (rc == KRB5_LNAME_NOTRANS || rc == KRB5_PLUGIN_NO_HANDLE) {
-    // No name mapping specified. We fall back to simply taking the first component
-    // of the principal, for compatibility with the default behavior of Hadoop.
+    // No name mapping specified, or krb5-based name mapping is disabled.
+    //
+    // We fall back to simply taking the first component of the principal, for
+    // compatibility with the default behavior of Hadoop.
     //
     // NOTE: KRB5_PLUGIN_NO_HANDLE isn't typically expected here, but works around
     // a bug in SSSD's auth_to_local implementation: https://pagure.io/SSSD/sssd/issue/3459
@@ -450,11 +455,12 @@ boost::optional<string> GetLoggedInUsernameFromKeytab() {
   return g_kinit_ctx->username_str();
 }
 
-Status InitKerberosForServer(const std::string& krb5ccname, bool disable_krb5_replay_cache) {
-  if (FLAGS_keytab_file.empty()) return Status::OK();
+Status InitKerberosForServer(const std::string& raw_principal, const std::string& keytab_file,
+    const std::string& krb5ccname, bool disable_krb5_replay_cache) {
+  if (keytab_file.empty()) return Status::OK();
 
   setenv("KRB5CCNAME", krb5ccname.c_str(), 1);
-  setenv("KRB5_KTNAME", FLAGS_keytab_file.c_str(), 1);
+  setenv("KRB5_KTNAME", keytab_file.c_str(), 1);
 
   if (disable_krb5_replay_cache) {
     // KUDU-1897: disable the Kerberos replay cache. The KRPC protocol includes a
@@ -465,9 +471,10 @@ Status InitKerberosForServer(const std::string& krb5ccname, bool disable_krb5_re
   }
 
   g_kinit_ctx = new KinitContext();
-  string principal;
-  RETURN_NOT_OK(GetConfiguredPrincipal(&principal));
-  RETURN_NOT_OK_PREPEND(g_kinit_ctx->Kinit(FLAGS_keytab_file, principal), "unable to kinit");
+  string configured_principal;
+  RETURN_NOT_OK(GetConfiguredPrincipal(raw_principal, &configured_principal));
+  RETURN_NOT_OK_PREPEND(g_kinit_ctx->Kinit(
+      keytab_file, configured_principal), "unable to kinit");
 
   g_kerberos_reinit_lock = new RWMutex(RWMutex::Priority::PREFER_WRITING);
   scoped_refptr<Thread> reacquire_thread;

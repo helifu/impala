@@ -87,7 +87,7 @@ public class SentryProxy {
     }
     sentryPolicyService_ = new SentryPolicyService(sentryConfig);
 
-    policyReader_.scheduleAtFixedRate(new PolicyReader(), 0,
+    policyReader_.scheduleAtFixedRate(new PolicyReader(false), 0,
         BackendConfig.INSTANCE.getSentryCatalogPollingFrequency(),
         TimeUnit.SECONDS);
   }
@@ -107,6 +107,12 @@ public class SentryProxy {
    * atomically.
    */
   private class PolicyReader implements Runnable {
+    private boolean resetVersions_;
+
+    public PolicyReader(boolean resetVersions) {
+      resetVersions_ = resetVersions;
+    }
+
     public void run() {
       synchronized (SentryProxy.this) {
         // Assume all roles should be removed. Then query the Policy Service and remove
@@ -131,18 +137,28 @@ public class SentryProxy {
             if (existingRole != null &&
                 existingRole.getGrantGroups().equals(grantGroups)) {
               role = existingRole;
+              if (resetVersions_) {
+                role.setCatalogVersion(catalog_.incrementAndGetCatalogVersion());
+              }
             } else {
               role = catalog_.addRole(sentryRole.getRoleName(), grantGroups);
             }
-
             // Assume all privileges should be removed. Privileges that still exist are
             // deleted from this set and we are left with the set of privileges that need
             // to be removed.
             Set<String> privilegesToRemove = role.getPrivilegeNames();
+            List<TSentryPrivilege> sentryPrivlist = Lists.newArrayList();
+
+            try {
+              sentryPrivlist =
+                sentryPolicyService_.listRolePrivileges(processUser_, role.getName());
+            } catch (ImpalaException e) {
+              String roleName = role.getName() != null ? role.getName(): "null";
+              LOG.error("Error listing the Role name: " + roleName, e);
+            }
 
             // Check all the privileges that are part of this role.
-            for (TSentryPrivilege sentryPriv:
-                sentryPolicyService_.listRolePrivileges(processUser_, role.getName())) {
+            for (TSentryPrivilege sentryPriv: sentryPrivlist) {
               TPrivilege thriftPriv =
                   SentryPolicyService.sentryPrivilegeToTPrivilege(sentryPriv);
               thriftPriv.setRole_id(role.getId());
@@ -153,6 +169,10 @@ public class SentryProxy {
               // We already know about this privilege (privileges cannot be modified).
               if (existingPriv != null &&
                   existingPriv.getCreateTimeMs() == sentryPriv.getCreateTime()) {
+                if (resetVersions_) {
+                  existingPriv.setCatalogVersion(
+                      catalog_.incrementAndGetCatalogVersion());
+                }
                 continue;
               }
               catalog_.addRolePrivilege(role.getName(), thriftPriv);
@@ -295,10 +315,7 @@ public class SentryProxy {
       // Update the catalog
       for (TPrivilege privilege: privileges) {
         RolePrivilege rolePriv = catalog_.removeRolePrivilege(roleName, privilege);
-        if (rolePriv == null) {
-          rolePriv = RolePrivilege.fromThrift(privilege);
-          rolePriv.setCatalogVersion(catalog_.getCatalogVersion());
-        }
+        if (rolePriv == null) continue;
         rolePrivileges.add(rolePriv);
       }
     } else {
@@ -310,12 +327,7 @@ public class SentryProxy {
       List<TPrivilege> updatedPrivileges = Lists.newArrayList();
       for (TPrivilege privilege: privileges) {
         RolePrivilege existingPriv = catalog_.getRolePrivilege(roleName, privilege);
-        if (existingPriv == null) {
-          RolePrivilege rolePriv = RolePrivilege.fromThrift(privilege);
-          rolePriv.setCatalogVersion(catalog_.getCatalogVersion());
-          rolePrivileges.add(rolePriv);
-          continue;
-        }
+        if (existingPriv == null) continue;
         TPrivilege updatedPriv = existingPriv.toThrift();
         updatedPriv.setHas_grant_opt(false);
         updatedPrivileges.add(updatedPriv);
@@ -335,9 +347,9 @@ public class SentryProxy {
    * the Catalog with any changes. Throws an ImpalaRuntimeException if there are any
    * errors executing the refresh job.
    */
-  public void refresh() throws ImpalaRuntimeException {
+  public void refresh(boolean resetVersions) throws ImpalaRuntimeException {
     try {
-      policyReader_.submit(new PolicyReader()).get();
+      policyReader_.submit(new PolicyReader(resetVersions)).get();
     } catch (Exception e) {
       // We shouldn't make it here. It means an exception leaked from the
       // AuthorizationPolicyReader.

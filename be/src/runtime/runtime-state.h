@@ -35,8 +35,6 @@ namespace impala {
 class BufferPool;
 class DataStreamRecvr;
 class DescriptorTbl;
-class DiskIoMgr;
-class DiskIoRequestContext;
 class Expr;
 class LlvmCodeGen;
 class MemTracker;
@@ -53,6 +51,10 @@ class HBaseTableFactory;
 class TPlanFragmentCtx;
 class TPlanFragmentInstanceCtx;
 class QueryState;
+
+namespace io {
+  class DiskIoMgr;
+}
 
 /// TODO: move the typedefs into a separate .h (and fix the includes for that)
 
@@ -125,7 +127,7 @@ class RuntimeState {
   HBaseTableFactory* htable_factory();
   ImpalaBackendClientCache* impalad_client_cache();
   CatalogServiceClientCache* catalogd_client_cache();
-  DiskIoMgr* io_mgr();
+  io::DiskIoMgr* io_mgr();
   MemTracker* instance_mem_tracker() { return instance_mem_tracker_.get(); }
   MemTracker* query_mem_tracker();  // reference to the query_state_'s memtracker
   ReservationTracker* instance_buffer_reservation() {
@@ -194,14 +196,6 @@ class RuntimeState {
   inline bool ShouldCodegen() const {
     return !CodegenDisabledByQueryOption() && !CodegenDisabledByHint();
   }
-
-  /// Takes ownership of a scan node's reader context and plan fragment executor will call
-  /// UnregisterReaderContexts() to unregister it when the fragment is closed. The IO
-  /// buffers may still be in use and thus the deferred unregistration.
-  void AcquireReaderContext(DiskIoRequestContext* reader_context);
-
-  /// Unregisters all reader contexts acquired through AcquireReaderContext().
-  void UnregisterReaderContexts();
 
   inline Status GetQueryStatus() {
     // Do a racy check for query_status_ to avoid unnecessary spinlock acquisition.
@@ -305,6 +299,8 @@ class RuntimeState {
   /// Release resources and prepare this object for destruction. Can only be called once.
   void ReleaseResources();
 
+  static const char* LLVM_CLASS_NAME;
+
  private:
   /// Allow TestEnv to use private methods for testing.
   friend class TestEnv;
@@ -386,12 +382,6 @@ class RuntimeState {
   /// will not necessarily be set in all error cases.
   SpinLock query_status_lock_;
   Status query_status_;
-
-  /// Reader contexts that need to be closed when the fragment is closed.
-  /// Synchronization is needed if there are multiple scan nodes in a plan fragment and
-  /// Close() may be called on them concurrently (see IMPALA-4180).
-  SpinLock reader_contexts_lock_;
-  std::vector<DiskIoRequestContext*> reader_contexts_;
 
   /// This is the node id of the root node for this plan fragment. This is used as the
   /// hash seed and has two useful properties:

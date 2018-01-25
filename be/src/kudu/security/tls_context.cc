@@ -34,6 +34,7 @@
 #include "kudu/security/crypto.h"
 #include "kudu/security/init.h"
 #include "kudu/security/openssl_util.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/security/tls_handshake.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/net/net_util.h"
@@ -50,32 +51,6 @@ DEFINE_int32_hidden(ipki_server_key_size, 2048,
              "is used for TLS connections to and from clients and other servers.");
 TAG_FLAG(ipki_server_key_size, experimental);
 
-DEFINE_string_hidden(rpc_tls_ciphers,
-              // This is the "modern compatibility" cipher list of the Mozilla Security
-              // Server Side TLS recommendations, accessed Feb. 2017, with the addition of
-              // the non ECDH/DH AES cipher suites from the "intermediate compatibility"
-              // list. These additional ciphers maintain compatibility with RHEL 6.5 and
-              // below. The DH AES ciphers are not included since we are not configured to
-              // use DH key agreement.
-              "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
-              "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
-              "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
-              "ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:"
-              "ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
-              "AES256-GCM-SHA384:AES128-GCM-SHA256:"
-              "AES256-SHA256:AES128-SHA256:"
-              "AES256-SHA:AES128-SHA",
-              "The cipher suite preferences to use for TLS-secured RPC connections. "
-              "Uses the OpenSSL cipher preference list format. See man (1) ciphers "
-              "for more information.");
-TAG_FLAG(rpc_tls_ciphers, advanced);
-
-DEFINE_string_hidden(rpc_tls_min_protocol, "TLSv1",
-              "The minimum protocol version to allow when for securing RPC "
-              "connections with TLS. May be one of 'TLSv1', 'TLSv1.1', or "
-              "'TLSv1.2'.");
-TAG_FLAG(rpc_tls_min_protocol, advanced);
-
 namespace kudu {
 namespace security {
 
@@ -89,7 +64,19 @@ template<> struct SslTypeTraits<X509_STORE_CTX> {
 };
 
 TlsContext::TlsContext()
-    : lock_(RWMutex::Priority::PREFER_READING),
+    : tls_ciphers_(kudu::security::SecurityDefaults::kDefaultTlsCiphers),
+      tls_min_protocol_(kudu::security::SecurityDefaults::kDefaultTlsMinVersion),
+      lock_(RWMutex::Priority::PREFER_READING),
+      trusted_cert_count_(0),
+      has_cert_(false),
+      is_external_cert_(false) {
+  security::InitializeOpenSSL();
+}
+
+TlsContext::TlsContext(std::string tls_ciphers, std::string tls_min_protocol)
+    : tls_ciphers_(std::move(tls_ciphers)),
+      tls_min_protocol_(std::move(tls_min_protocol)),
+      lock_(RWMutex::Priority::PREFER_READING),
       trusted_cert_count_(0),
       has_cert_(false),
       is_external_cert_(false) {
@@ -120,7 +107,7 @@ Status TlsContext::Init() {
   //   https://tools.ietf.org/html/rfc7525#section-3.3
   auto options = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION;
 
-  if (boost::iequals(FLAGS_rpc_tls_min_protocol, "TLSv1.2")) {
+  if (boost::iequals(tls_min_protocol_, "TLSv1.2")) {
 #if OPENSSL_VERSION_NUMBER < 0x10001000L
     return Status::InvalidArgument(
         "--rpc_tls_min_protocol=TLSv1.2 is not be supported on this platform. "
@@ -128,7 +115,7 @@ Status TlsContext::Init() {
 #else
     options |= SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1;
 #endif
-  } else if (boost::iequals(FLAGS_rpc_tls_min_protocol, "TLSv1.1")) {
+  } else if (boost::iequals(tls_min_protocol_, "TLSv1.1")) {
 #if OPENSSL_VERSION_NUMBER < 0x10001000L
     return Status::InvalidArgument(
         "--rpc_tls_min_protocol=TLSv1.1 is not be supported on this platform. "
@@ -136,15 +123,15 @@ Status TlsContext::Init() {
 #else
     options |= SSL_OP_NO_TLSv1;
 #endif
-  } else if (!boost::iequals(FLAGS_rpc_tls_min_protocol, "TLSv1")) {
+  } else if (!boost::iequals(tls_min_protocol_, "TLSv1")) {
     return Status::InvalidArgument("unknown value provided for --rpc_tls_min_protocol flag",
-                                   FLAGS_rpc_tls_min_protocol);
+                                   tls_min_protocol_);
   }
 
   SSL_CTX_set_options(ctx_.get(), options);
 
   OPENSSL_RET_NOT_OK(
-      SSL_CTX_set_cipher_list(ctx_.get(), FLAGS_rpc_tls_ciphers.c_str()),
+      SSL_CTX_set_cipher_list(ctx_.get(), tls_ciphers_.c_str()),
       "failed to set TLS ciphers");
 
   // Enable ECDH curves. For OpenSSL 1.1.0 and up, this is done automatically.
@@ -176,7 +163,7 @@ Status TlsContext::VerifyCertChainUnlocked(const Cert& cert) {
   X509_STORE* store = SSL_CTX_get_cert_store(ctx_.get());
   auto store_ctx = ssl_make_unique<X509_STORE_CTX>(X509_STORE_CTX_new());
 
-  OPENSSL_RET_NOT_OK(X509_STORE_CTX_init(store_ctx.get(), store, cert.GetEndOfChainX509(), nullptr),
+  OPENSSL_RET_NOT_OK(X509_STORE_CTX_init(store_ctx.get(), store, cert.GetTopOfChainX509(), nullptr),
                      "could not init X509_STORE_CTX");
   int rc = X509_verify_cert(store_ctx.get());
   if (rc != 1) {
@@ -220,7 +207,7 @@ Status TlsContext::UseCertificateAndKey(const Cert& cert, const PrivateKey& key)
 
   OPENSSL_RET_NOT_OK(SSL_CTX_use_PrivateKey(ctx_.get(), key.GetRawData()),
                      "failed to use private key");
-  OPENSSL_RET_NOT_OK(SSL_CTX_use_certificate(ctx_.get(), cert.GetEndOfChainX509()),
+  OPENSSL_RET_NOT_OK(SSL_CTX_use_certificate(ctx_.get(), cert.GetTopOfChainX509()),
                      "failed to use certificate");
   has_cert_ = true;
   return Status::OK();
@@ -349,7 +336,7 @@ Status TlsContext::GenerateSelfSignedCertAndKey() {
   // a leak. Calling this nonsense X509_check_ca() forces the X509 extensions to
   // get cached, so we don't hit the race later. 'VerifyCertChain' also has the
   // effect of triggering the racy codepath.
-  ignore_result(X509_check_ca(cert.GetEndOfChainX509()));
+  ignore_result(X509_check_ca(cert.GetTopOfChainX509()));
   ERR_clear_error(); // in case it left anything on the queue.
 
   // Step 4: Adopt the new key and cert.
@@ -357,7 +344,7 @@ Status TlsContext::GenerateSelfSignedCertAndKey() {
   CHECK(!has_cert_);
   OPENSSL_RET_NOT_OK(SSL_CTX_use_PrivateKey(ctx_.get(), key.GetRawData()),
                      "failed to use private key");
-  OPENSSL_RET_NOT_OK(SSL_CTX_use_certificate(ctx_.get(), cert.GetEndOfChainX509()),
+  OPENSSL_RET_NOT_OK(SSL_CTX_use_certificate(ctx_.get(), cert.GetTopOfChainX509()),
                      "failed to use certificate");
   has_cert_ = true;
   csr_ = std::move(csr);
@@ -397,7 +384,7 @@ Status TlsContext::AdoptSignedCert(const Cert& cert) {
     return Status::RuntimeError("certificate public key does not match the CSR public key");
   }
 
-  OPENSSL_RET_NOT_OK(SSL_CTX_use_certificate(ctx_.get(), cert.GetEndOfChainX509()),
+  OPENSSL_RET_NOT_OK(SSL_CTX_use_certificate(ctx_.get(), cert.GetTopOfChainX509()),
                      "failed to use certificate");
 
   // This should never fail since we already compared the cert's public key

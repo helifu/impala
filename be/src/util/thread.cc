@@ -23,6 +23,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 
+#include "common/thread-debug-info.h"
 #include "util/coding-util.h"
 #include "util/debug-util.h"
 #include "util/error-util.h"
@@ -193,10 +194,8 @@ Status ThreadMgr::StartInstrumentation(MetricGroup* metrics) {
   DCHECK(metrics != NULL);
   lock_guard<mutex> l(lock_);
   metrics_enabled_ = true;
-  total_threads_metric_ = metrics->AddGauge<int64_t>(
-      "thread-manager.total-threads-created", 0L);
-  current_num_threads_metric_ = metrics->AddGauge<int64_t>(
-      "thread-manager.running-threads", 0L);
+  total_threads_metric_ = metrics->AddGauge("thread-manager.total-threads-created", 0L);
+  current_num_threads_metric_ = metrics->AddGauge("thread-manager.running-threads", 0L);
   return Status::OK();
 }
 
@@ -223,7 +222,7 @@ void ThreadMgr::RemoveThread(const thread::id& boost_id, const string& category)
 void ThreadMgr::GetThreadOverview(Document* document) {
   lock_guard<mutex> l(lock_);
   if (metrics_enabled_) {
-    document->AddMember("total_threads", current_num_threads_metric_->value(),
+    document->AddMember("total_threads", current_num_threads_metric_->GetValue(),
         document->GetAllocator());
   }
   Value lst(kArrayType);
@@ -344,6 +343,9 @@ void Thread::SuperviseThread(const string& name, const string& category,
 
   thread_mgr_ref->AddThread(this_thread::get_id(), name_copy, category_copy, system_tid);
   thread_started->Set(system_tid);
+
+  ThreadDebugInfo thread_debug_info;
+  thread_debug_info.SetThreadName(name_copy);
 
   // Any reference to any parameter not copied in by value may no longer be valid after
   // this point, since the caller that is waiting on *tid != 0 may wake, take the lock and

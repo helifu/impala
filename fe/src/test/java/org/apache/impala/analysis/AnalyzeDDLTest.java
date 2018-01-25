@@ -44,7 +44,9 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.TestUtils;
+import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.kudu.ColumnSchema.CompressionAlgorithm;
@@ -244,7 +246,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "'hdfs://localhost:20500/test-warehouse/alltypes/year=2010/month=10'");
     AnalyzesOk("alter table functional.alltypes add " +
         "partition(year=2050, month=10) location " +
-        "'s3n://bucket/test-warehouse/alltypes/year=2010/month=10'");
+        "'s3a://bucket/test-warehouse/alltypes/year=2010/month=10'");
     AnalyzesOk("alter table functional.alltypes add " +
         "partition(year=2050, month=10) location " +
         "'file:///test-warehouse/alltypes/year=2010/month=10'");
@@ -463,6 +465,34 @@ public class AnalyzeDDLTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestAlterTableSetRowFormat() throws AnalysisException {
+    AnalyzesOk("alter table functional.alltypes set row format delimited " +
+        "fields terminated by ' '");
+    AnalyzesOk("alter table functional.alltypes partition (year=2010) set row format " +
+        "delimited fields terminated by ' '");
+    AnalyzesOk("alter table functional_seq.alltypes set row format delimited " +
+        "fields terminated by ' '");
+    AnalysisError("alter table functional.alltypesnopart PARTITION (month=1) " +
+        "set row format delimited fields terminated by ' '",
+        "Table is not partitioned: functional.alltypesnopart");
+    String [] unsupportedFileFormatDbs =
+      {"functional_parquet", "functional_rc", "functional_avro"};
+    for (String format: unsupportedFileFormatDbs) {
+      AnalysisError("alter table " + format + ".alltypes set row format delimited " +
+          "fields terminated by ' '", "ALTER TABLE SET ROW FORMAT is only supported " +
+          "on TEXT or SEQUENCE file formats");
+    }
+    AnalysisError("alter table functional_kudu.alltypes set row format delimited " +
+        "fields terminated by ' '", "ALTER TABLE SET ROW FORMAT is only supported " +
+        "on HDFS tables");
+    AnalysisError("alter table functional.alltypesmixedformat partition(year=2009) " +
+        "set row format delimited fields terminated by ' '",
+        "ALTER TABLE SET ROW FORMAT is only supported on TEXT or SEQUENCE file formats");
+    AnalyzesOk("alter table functional.alltypesmixedformat partition(year=2009,month=1) " +
+        "set row format delimited fields terminated by ' '");
+  }
+
+  @Test
   public void TestAlterTableSet() throws AnalysisException {
     AnalyzesOk("alter table functional.alltypes set fileformat sequencefile");
     AnalyzesOk("alter table functional.alltypes set location '/a/b'");
@@ -626,7 +656,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("alter table functional.alltypes set location " +
         "'hdfs://localhost:20500/test-warehouse/a/b'");
     AnalyzesOk("alter table functional.alltypes set location " +
-        "'s3n://bucket/test-warehouse/a/b'");
+        "'s3a://bucket/test-warehouse/a/b'");
     AnalyzesOk("alter table functional.alltypes set location " +
         "'file:///test-warehouse/a/b'");
 
@@ -1151,9 +1181,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
   public void TestComputeStats() throws AnalysisException {
     // Analyze the stmt itself as well as the generated child queries.
     checkComputeStatsStmt("compute stats functional.alltypes");
-
     checkComputeStatsStmt("compute stats functional_hbase.alltypes");
-
     // Test that complex-typed columns are ignored.
     checkComputeStatsStmt("compute stats functional.allcomplextypes");
 
@@ -1185,6 +1213,37 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "column 'col1' of type 'string' does not match the Avro-schema column " +
         "'boolean1' of type 'BOOLEAN' at position '0'.\nPlease re-create the table " +
         "with column definitions, e.g., using the result of 'SHOW CREATE TABLE'");
+
+    // Test tablesample clause with extrapolation enabled/disabled. Replace/restore the
+    // static backend config for this test to control stats extrapolation.
+    BackendConfig origInstance = BackendConfig.INSTANCE;
+    try {
+      TBackendGflags testGflags = new TBackendGflags();
+      testGflags.setEnable_stats_extrapolation(true);
+      BackendConfig.create(testGflags);
+
+      checkComputeStatsStmt("compute stats functional.alltypes tablesample system (10)");
+      checkComputeStatsStmt(
+          "compute stats functional.alltypes tablesample system (55) repeatable(1)");
+      AnalysisError("compute stats functional.alltypes tablesample system (101)",
+          "Invalid percent of bytes value '101'. " +
+          "The percent of bytes to sample must be between 0 and 100.");
+      AnalysisError("compute stats functional_kudu.alltypes tablesample system (1)",
+          "TABLESAMPLE is only supported on HDFS tables.");
+      AnalysisError("compute stats functional_hbase.alltypes tablesample system (2)",
+          "TABLESAMPLE is only supported on HDFS tables.");
+      AnalysisError(
+          "compute stats functional.alltypes_datasource tablesample system (3)",
+          "TABLESAMPLE is only supported on HDFS tables.");
+
+      testGflags.setEnable_stats_extrapolation(false);
+      BackendConfig.create(testGflags);
+      AnalysisError("compute stats functional.alltypes tablesample system (10)",
+          "COMPUTE STATS TABLESAMPLE requires --enable_stats_extrapolation=true. " +
+          "Stats extrapolation is currently disabled.");
+    } finally {
+      BackendConfig.INSTANCE = origInstance;
+    }
   }
 
   @Test
@@ -1360,7 +1419,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "CLASS 'com.bar.Foo' API_VERSION 'V1'");
     AnalyzesOk("CREATE DATA SOURCE foo LOCATION 'hdfs://localhost:20500/a/b/foo.jar' " +
         "CLASS 'com.bar.Foo' API_VERSION 'V1'");
-    AnalyzesOk("CREATE DATA SOURCE foo LOCATION 's3n://bucket/a/b/foo.jar' " +
+    AnalyzesOk("CREATE DATA SOURCE foo LOCATION 's3a://bucket/a/b/foo.jar' " +
         "CLASS 'com.bar.Foo' API_VERSION 'V1'");
 
     AnalysisError("CREATE DATA SOURCE foo LOCATION 'blah://localhost:20500/foo.jar' " +
@@ -1387,7 +1446,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create database new_db location " +
         "'hdfs://localhost:50200/test-warehouse/new_db'");
     AnalyzesOk("create database new_db location " +
-        "'s3n://bucket/test-warehouse/new_db'");
+        "'s3a://bucket/test-warehouse/new_db'");
     // Invalid URI.
     AnalysisError("create database new_db location " +
         "'blah://bucket/test-warehouse/new_db'",
@@ -1476,6 +1535,12 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "as select count(*) as CNT from functional.alltypes");
     AnalyzesOk("create table functional.tbl as select a.* from functional.alltypes a " +
         "join functional.alltypes b on (a.int_col=b.int_col) limit 1000");
+    // CTAS with a select query that requires expression rewrite (IMPALA-6307)
+    AnalyzesOk("create table functional.ctas_tbl partitioned by (year) as " +
+        "with tmp as (select a.timestamp_col, a.year from functional.alltypes a " +
+        "left join functional.alltypes b " +
+        "on b.timestamp_col between a.timestamp_col and a.timestamp_col) " +
+        "select a.timestamp_col, a.year from tmp a");
 
     // Caching operations
     AnalyzesOk("create table functional.newtbl cached in 'testPool'" +
@@ -1575,6 +1640,12 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // IMPALA-5796: CTAS into a Kudu table with expr rewriting.
     AnalyzesOk("create table t primary key(id) stored as kudu as select id, bool_col " +
         "from functional.alltypestiny where id between 0 and 10");
+    // CTAS with a select query that requires expression rewrite (IMPALA-6307)
+    AnalyzesOk("create table t primary key(year) stored as kudu as " +
+        "with tmp as (select a.timestamp_col, a.year from functional.alltypes a " +
+        "left join functional.alltypes b " +
+        "on b.timestamp_col between a.timestamp_col and a.timestamp_col) " +
+        "select a.timestamp_col, a.year from tmp a");
     // CTAS in an external Kudu table
     AnalysisError("create external table t stored as kudu " +
         "tblproperties('kudu.table_name'='t') as select id, int_col from " +
@@ -1642,7 +1713,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create table tbl like functional.alltypes location " +
         "'file:/test-warehouse/new_table'");
     AnalyzesOk("create table tbl like functional.alltypes location " +
-        "'s3n://bucket/test-warehouse/new_table'");
+        "'s3a://bucket/test-warehouse/new_table'");
     // Invalid URI values.
     AnalysisError("create table tbl like functional.alltypes location " +
         "'foofs://test-warehouse/new_table'",
@@ -1864,7 +1935,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create table tbl (i int) location " +
         "'file:///test-warehouse/new_table'");
     AnalyzesOk("create table tbl (i int) location " +
-        "'s3n://bucket/test-warehouse/new_table'");
+        "'s3a://bucket/test-warehouse/new_table'");
     AnalyzesOk("ALTER TABLE functional_seq_snap.alltypes SET LOCATION " +
         "'file://test-warehouse/new_table'");
 
@@ -2008,9 +2079,16 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Cannot change the type of a Kudu column using an ALTER TABLE CHANGE COLUMN " +
         "statement: (INT vs BIGINT)");
 
-    // Rename the underlying Kudu table
-    AnalyzesOk("ALTER TABLE functional_kudu.testtbl SET " +
-        "TBLPROPERTIES ('kudu.table_name' = 'Hans')");
+    // Rename the underlying Kudu table is not supported for managed Kudu tables
+    AnalysisError("ALTER TABLE functional_kudu.testtbl SET " +
+        "TBLPROPERTIES ('kudu.table_name' = 'Hans')",
+        "Not allowed to set 'kudu.table_name' manually for managed Kudu tables");
+
+    // TODO IMPALA-6375: Allow setting kudu.table_name for managed Kudu tables
+    // if the 'EXTERNAL' property is set to TRUE in the same step.
+    AnalysisError("ALTER TABLE functional_kudu.testtbl SET " +
+        "TBLPROPERTIES ('EXTERNAL' = 'TRUE','kudu.table_name' = 'Hans')",
+        "Not allowed to set 'kudu.table_name' manually for managed Kudu tables");
 
     // ALTER TABLE RENAME TO
     AnalyzesOk("ALTER TABLE functional_kudu.testtbl RENAME TO new_testtbl");
@@ -2171,11 +2249,14 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "partition by range(unknown_column) (partition value = 'abc') stored as kudu",
         "Column 'unknown_column' in 'RANGE (unknown_column) (PARTITION VALUE = 'abc')' " +
         "is not a key column. Only key columns can be used in PARTITION BY");
-    // Kudu table name is specified in tblproperties
+    // Kudu num_tablet_replicas is specified in tblproperties
     AnalyzesOk("create table tab (x int primary key) partition by hash (x) " +
-        "partitions 8 stored as kudu tblproperties ('kudu.table_name'='tab_1'," +
-        "'kudu.num_tablet_replicas'='1'," +
+        "partitions 8 stored as kudu tblproperties ('kudu.num_tablet_replicas'='1'," +
         "'kudu.master_addresses' = '127.0.0.1:8080, 127.0.0.1:8081')");
+    // Kudu table name is specified in tblproperties resulting in an error
+    AnalysisError("create table tab (x int primary key) partition by hash (x) " +
+        "partitions 8 stored as kudu tblproperties ('kudu.table_name'='tab')",
+        "Not allowed to set 'kudu.table_name' manually for managed Kudu tables");
     // No port is specified in kudu master address
     AnalyzesOk("create table tdata_no_port (id int primary key, name string, " +
         "valf float, vali bigint) partition by range(id) (partition values <= 10, " +

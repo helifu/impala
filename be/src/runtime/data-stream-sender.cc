@@ -33,6 +33,7 @@
 #include "runtime/mem-tracker.h"
 #include "runtime/backend-client.h"
 #include "util/aligned-new.h"
+#include "util/condition-variable.h"
 #include "util/debug-util.h"
 #include "util/network-util.h"
 #include "util/thread-pool.h"
@@ -45,7 +46,6 @@
 
 #include "common/names.h"
 
-using boost::condition_variable;
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
 using namespace apache::thrift::transport;
@@ -133,7 +133,7 @@ class DataStreamSender::Channel : public CacheLineAligned {
   // TODO: if the order of row batches does not matter, we can consider increasing
   // the number of threads.
   ThreadPool<TRowBatch*> rpc_thread_; // sender thread.
-  condition_variable rpc_done_cv_;   // signaled when rpc_in_flight_ is set to true.
+  ConditionVariable rpc_done_cv_;   // signaled when rpc_in_flight_ is set to true.
   mutex rpc_thread_lock_; // Lock with rpc_done_cv_ protecting rpc_in_flight_
   bool rpc_in_flight_;  // true if the rpc_thread_ is busy sending.
 
@@ -188,7 +188,7 @@ void DataStreamSender::Channel::TransmitData(int thread_id, const TRowBatch* bat
     unique_lock<mutex> l(rpc_thread_lock_);
     rpc_in_flight_ = false;
   }
-  rpc_done_cv_.notify_one();
+  rpc_done_cv_.NotifyOne();
 }
 
 void DataStreamSender::Channel::TransmitDataHelper(const TRowBatch* batch) {
@@ -239,7 +239,7 @@ void DataStreamSender::Channel::WaitForRpc() {
   SCOPED_TIMER(parent_->state_->total_network_send_timer());
   unique_lock<mutex> l(rpc_thread_lock_);
   while (rpc_in_flight_) {
-    rpc_done_cv_.wait(l);
+    rpc_done_cv_.Wait(l);
   }
 }
 
@@ -275,7 +275,8 @@ Status DataStreamSender::Channel::SendCurrentBatch() {
 Status DataStreamSender::Channel::GetSendStatus() {
   WaitForRpc();
   if (!rpc_status_.ok()) {
-    LOG(ERROR) << "channel send status: " << rpc_status_.GetDetail();
+    LOG(ERROR) << "channel send to " << TNetworkAddressToString(address_) << " failed: "
+               << rpc_status_.GetDetail();
   }
   return rpc_status_;
 }
@@ -311,9 +312,9 @@ Status DataStreamSender::Channel::FlushAndSendEos(RuntimeState* state) {
   VLOG_RPC << "calling TransmitData(eos=true) to terminate channel.";
   rpc_status_ = DoTransmitDataRpc(&client, params, &res);
   if (!rpc_status_.ok()) {
-    return Status(rpc_status_.code(),
-       Substitute("TransmitData(eos=true) to $0 failed:\n $1",
-        TNetworkAddressToString(address_), rpc_status_.msg().msg()));
+    LOG(ERROR) << "Failed to send EOS to " << TNetworkAddressToString(address_)
+               << " : " << rpc_status_.GetDetail();
+    return rpc_status_;
   }
   return Status(res.status);
 }
@@ -327,8 +328,9 @@ void DataStreamSender::Channel::Teardown(RuntimeState* state) {
 
 DataStreamSender::DataStreamSender(int sender_id, const RowDescriptor* row_desc,
     const TDataStreamSink& sink, const vector<TPlanFragmentDestination>& destinations,
-    int per_channel_buffer_size)
-  : DataSink(row_desc),
+    int per_channel_buffer_size, RuntimeState* state)
+  : DataSink(row_desc,
+        Substitute("DataStreamSender (dst_id=$0)", sink.dest_node_id), state),
     sender_id_(sender_id),
     partition_type_(sink.output_partition.type),
     current_channel_idx_(0),
@@ -360,10 +362,6 @@ DataStreamSender::DataStreamSender(int sender_id, const RowDescriptor* row_desc,
     srand(reinterpret_cast<uint64_t>(this));
     random_shuffle(channels_.begin(), channels_.end());
   }
-}
-
-string DataStreamSender::GetName() {
-  return Substitute("DataStreamSender (dst_id=$0)", dest_node_id_);
 }
 
 DataStreamSender::~DataStreamSender() {
@@ -464,17 +462,16 @@ Status DataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     int num_channels = channels_.size();
     for (int i = 0; i < batch->num_rows(); ++i) {
       TupleRow* row = batch->GetRow(i);
-      uint32_t hash_val = HashUtil::FNV_SEED;
-      for (int i = 0; i < partition_exprs_.size(); ++i) {
-        ScalarExprEvaluator* eval = partition_expr_evals_[i];
+      uint64_t hash_val = EXCHANGE_HASH_SEED;
+      for (int j = 0; j < partition_exprs_.size(); ++j) {
+        ScalarExprEvaluator* eval = partition_expr_evals_[j];
         void* partition_val = eval->GetValue(row);
-        // We can't use the crc hash function here because it does not result
-        // in uncorrelated hashes with different seeds.  Instead we must use
-        // fnv hash.
+        // We can't use the crc hash function here because it does not result in
+        // uncorrelated hashes with different seeds. Instead we use FastHash.
         // TODO: fix crc hash/GetHashValue()
-        DCHECK(&partition_expr_evals_[i]->root() == partition_exprs_[i]);
-        hash_val = RawValue::GetHashValueFnv(
-            partition_val, partition_exprs_[i]->type(), hash_val);
+        DCHECK(&(eval->root()) == partition_exprs_[j]);
+        hash_val = RawValue::GetHashValueFastHash(
+            partition_val, partition_exprs_[j]->type(), hash_val);
       }
       RETURN_IF_ERROR(channels_[hash_val % num_channels]->AddRow(row));
     }

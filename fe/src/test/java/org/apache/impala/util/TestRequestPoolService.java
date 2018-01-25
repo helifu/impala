@@ -45,6 +45,7 @@ import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TPoolConfig;
 import org.apache.impala.thrift.TResolveRequestPoolParams;
 import org.apache.impala.thrift.TResolveRequestPoolResult;
+import org.apache.impala.yarn.server.resourcemanager.scheduler.fair.QueuePlacementPolicy;
 import com.google.common.collect.Iterables;
 import com.google.common.io.Files;
 
@@ -116,6 +117,11 @@ public class TestRequestPoolService {
       poolService_.llamaConfWatcher_.setCheckIntervalMs(CHECK_INTERVAL_MS);
     }
     poolService_.start();
+    // Make sure that the Hadoop configuration from classpath is used for the underlying
+    // QueuePlacementPolicy.
+    QueuePlacementPolicy policy = poolService_.getAllocationConfig().getPlacementPolicy();
+    Configuration conf = policy.getConf();
+    Assert.assertTrue(conf.getBoolean("impala.core-site.overridden", false));
   }
 
   @BeforeClass
@@ -290,7 +296,7 @@ public class TestRequestPoolService {
     // the backend, but it should be observed coming from the test file here.
     checkPoolConfigResult("root.queueA", 1, 30, 100000 * ByteUnits.MEGABYTE,
         50L, "mem_limit=128m,query_timeout_s=5,not_a_valid_option=foo.bar");
-    checkPoolConfigResult("root.queueB", 5, 10, -1, 60000L, "");
+    checkPoolConfigResult("root.queueB", 5, 10, -1, 600000L, "");
     checkPoolConfigResult("root.queueC", 10, 30, 128 * ByteUnits.MEGABYTE,
         30000L, "mem_limit=2048m,query_timeout_s=60");
   }

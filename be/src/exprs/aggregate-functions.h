@@ -200,9 +200,26 @@ class AggregateFunctions {
   static void HllMerge(FunctionContext*, const StringVal& src, StringVal* dst);
   static BigIntVal HllFinalize(FunctionContext*, const StringVal& src);
 
-  /// Utility method to compute the final result of an HLL estimation from num_buckets
-  /// estimates.
-  static uint64_t HllFinalEstimate(const uint8_t* buckets, int32_t num_buckets);
+  /// Utility method to compute the final result of an HLL estimation.
+  /// Assumes HLL_LEN number of buckets.
+  static uint64_t HllFinalEstimate(const uint8_t* buckets);
+
+  /// Estimates the number of distinct values (NDV) based on a sample of data and the
+  /// corresponding sampling rate. The main idea of this function is to collect several
+  /// (x,y) data points where x is the number of rows and y is the corresponding NDV
+  /// estimate. These data points are used to fit an objective function to the data such
+  /// that the true NDV can be extrapolated.
+  /// This aggregate function maintains a fixed number of HyperLogLog intermediates.
+  /// The Update() phase updates the intermediates in a round-robin fashion.
+  /// The Merge() phase combines the corresponding intermediates.
+  /// The Finalize() phase generates (x,y) data points, performs curve fitting, and
+  /// computes the estimated true NDV.
+  static void SampledNdvInit(FunctionContext*, StringVal* dst);
+  template <typename T>
+  static void SampledNdvUpdate(FunctionContext*, const T& src,
+      const DoubleVal& sample_perc, StringVal* dst);
+  static void SampledNdvMerge(FunctionContext*, const StringVal& src, StringVal* dst);
+  static BigIntVal SampledNdvFinalize(FunctionContext*, const StringVal& src);
 
   /// Knuth's variance algorithm, more numerically stable than canonical stddev
   /// algorithms; reference implementation:

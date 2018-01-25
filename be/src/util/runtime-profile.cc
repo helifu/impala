@@ -291,9 +291,22 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
       if (it == time_series_counter_map_.end()) {
         time_series_counter_map_[c.name] =
             pool_->Add(new TimeSeriesCounter(c.name, c.unit, c.period_ms, c.values));
-        it = time_series_counter_map_.find(c.name);
       } else {
         it->second->samples_.SetSamples(c.period_ms, c.values);
+      }
+    }
+  }
+
+  {
+    lock_guard<SpinLock> l(event_sequence_lock_);
+    for (int i = 0; i < node.event_sequences.size(); ++i) {
+      const TEventSequence& seq = node.event_sequences[i];
+      EventSequenceMap::iterator it = event_sequence_map_.find(seq.name);
+      if (it == event_sequence_map_.end()) {
+        event_sequence_map_[seq.name] =
+            pool_->Add(new EventSequence(seq.timestamps, seq.labels));
+      } else {
+        it->second->AddNewerEvents(seq.timestamps, seq.labels);
       }
     }
   }
@@ -466,14 +479,17 @@ void RuntimeProfile::AddInfoString(const string& key, const string& value) {
   return AddInfoStringInternal(key, value, false);
 }
 
+void RuntimeProfile::AddInfoStringRedacted(const string& key, const string& value) {
+  return AddInfoStringInternal(key, value, false, true);
+}
+
 void RuntimeProfile::AppendInfoString(const string& key, const string& value) {
   return AddInfoStringInternal(key, value, true);
 }
 
 void RuntimeProfile::AddInfoStringInternal(
-    const string& key, const string& value, bool append) {
-  // Values may contain sensitive data, such as a query.
-  const string& info = RedactCopy(value);
+    const string& key, const string& value, bool append, bool redact) {
+  const string& info = redact ? RedactCopy(value): value;
   lock_guard<SpinLock> l(info_strings_lock_);
   InfoStrings::iterator it = info_strings_.find(key);
   if (it == info_strings_.end()) {
@@ -758,7 +774,9 @@ Status RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
       MakeScopeExitTrigger([&compressor]() { compressor->Close(); });
 
   vector<uint8_t> compressed_buffer;
-  compressed_buffer.resize(compressor->MaxOutputLen(serialized_buffer.size()));
+  int64_t max_compressed_size = compressor->MaxOutputLen(serialized_buffer.size());
+  DCHECK_GT(max_compressed_size, 0);
+  compressed_buffer.resize(max_compressed_size);
   int64_t result_len = compressed_buffer.size();
   uint8_t* compressed_buffer_ptr = compressed_buffer.data();
   RETURN_IF_ERROR(compressor->ProcessBlock(true, serialized_buffer.size(),
@@ -1053,7 +1071,11 @@ string RuntimeProfile::TimeSeriesCounter::DebugString() const {
   return ss.str();
 }
 
-void RuntimeProfile::EventSequence::ToThrift(TEventSequence* seq) const {
+void RuntimeProfile::EventSequence::ToThrift(TEventSequence* seq) {
+  lock_guard<SpinLock> l(lock_);
+  /// It's possible that concurrent events can be logged out of sequence so we sort the
+  /// events before serializing them.
+  SortEvents();
   for (const EventSequence::Event& ev: events_) {
     seq->labels.push_back(ev.first);
     seq->timestamps.push_back(ev.second);

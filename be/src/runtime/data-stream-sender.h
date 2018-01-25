@@ -60,11 +60,9 @@ class DataStreamSender : public DataSink {
   DataStreamSender(int sender_id, const RowDescriptor* row_desc,
       const TDataStreamSink& tsink,
       const std::vector<TPlanFragmentDestination>& destinations,
-      int per_channel_buffer_size);
+      int per_channel_buffer_size, RuntimeState* state);
 
   virtual ~DataStreamSender();
-
-  virtual std::string GetName();
 
   /// Must be called before other API calls, and before the codegen'd IR module is
   /// compiled (i.e. in an ExecNode's Prepare() function).
@@ -95,15 +93,15 @@ class DataStreamSender : public DataSink {
   /// used to maintain metrics.
   Status SerializeBatch(RowBatch* src, TRowBatch* dest, int num_receivers = 1);
 
-  /// Return total number of bytes sent in TRowBatch.data. If batches are
-  /// broadcast to multiple receivers, they are counted once per receiver.
-  int64_t GetNumDataBytesSent() const;
-
  protected:
   friend class DataStreamTest;
 
   virtual Status Init(const std::vector<TExpr>& thrift_output_exprs,
       const TDataSink& tsink, RuntimeState* state);
+
+  /// Return total number of bytes sent in TRowBatch.data. If batches are
+  /// broadcast to multiple receivers, they are counted once per receiver.
+  int64_t GetNumDataBytesSent() const;
 
  private:
   class Channel;
@@ -153,6 +151,9 @@ class DataStreamSender : public DataSink {
   /// Used for Kudu partitioning to round-robin rows that don't correspond to a partition
   /// or when errors are encountered.
   int next_unknown_partition_;
+
+  /// An arbitrary hash seed used for exchanges.
+  static constexpr uint64_t EXCHANGE_HASH_SEED = 0x66bd68df22c3ef37;
 };
 
 }

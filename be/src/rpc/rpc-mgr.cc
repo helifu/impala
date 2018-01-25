@@ -20,30 +20,37 @@
 #include "exec/kudu-util.h"
 #include "kudu/rpc/acceptor_pool.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/service_if.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
+#include "util/auth-util.h"
 #include "util/cpu-info.h"
 #include "util/network-util.h"
 
 #include "common/names.h"
 
-using kudu::rpc::MessengerBuilder;
-using kudu::rpc::Messenger;
-using kudu::rpc::AcceptorPool;
-using kudu::rpc::RpcController;
-using kudu::rpc::ServiceIf;
-using kudu::rpc::ServicePool;
-using kudu::Sockaddr;
 using kudu::HostPort;
 using kudu::MetricEntity;
+using kudu::MonoDelta;
+using kudu::rpc::AcceptorPool;
+using kudu::rpc::MessengerBuilder;
+using kudu::rpc::Messenger;
+using kudu::rpc::RpcController;
+using kudu::rpc::ServiceIf;
+using kudu::Sockaddr;
 
 DECLARE_string(hostname);
+DECLARE_string(principal);
+DECLARE_string(be_principal);
 
 DEFINE_int32(num_acceptor_threads, 2,
     "Number of threads dedicated to accepting connection requests for RPC services");
 DEFINE_int32(num_reactor_threads, 0,
     "Number of threads dedicated to managing network IO for RPC services. If left at "
     "default value 0, it will be set to number of CPU cores.");
+DEFINE_int32(rpc_retry_interval_ms, 5,
+    "Time in millisecond of waiting before retrying an RPC when remote is busy");
 
 namespace impala {
 
@@ -54,6 +61,24 @@ Status RpcMgr::Init() {
   int num_reactor_threads =
       FLAGS_num_reactor_threads > 0 ? FLAGS_num_reactor_threads : CpuInfo::num_cores();
   bld.set_num_reactors(num_reactor_threads).set_metric_entity(entity);
+
+  // Disable idle connection detection by setting keepalive_time to -1. Idle connections
+  // tend to be closed and re-opened around the same time, which may lead to negotiation
+  // timeout. Please see IMPALA-5557 for details. Until KUDU-279 is fixed, closing idle
+  // connections is also racy and leads to query failures.
+  bld.set_connection_keepalive_time(MonoDelta::FromMilliseconds(-1));
+
+  if (IsKerberosEnabled()) {
+    string internal_principal;
+    RETURN_IF_ERROR(GetInternalKerberosPrincipal(&internal_principal));
+
+    string service_name, unused_hostname, unused_realm;
+    RETURN_IF_ERROR(ParseKerberosPrincipal(internal_principal, &service_name,
+        &unused_hostname, &unused_realm));
+    bld.set_sasl_proto_name(service_name);
+    // TODO: Once the Messenger can take more options pertaining to 'rpc_authentication'
+    // and more, we need to explicitly set those options here. (KUDU-2228)
+  }
   KUDU_RETURN_IF_ERROR(bld.Build(&messenger_), "Could not build messenger");
   return Status::OK();
 }
@@ -62,16 +87,18 @@ Status RpcMgr::RegisterService(int32_t num_service_threads, int32_t service_queu
     unique_ptr<ServiceIf> service_ptr) {
   DCHECK(is_inited()) << "Must call Init() before RegisterService()";
   DCHECK(!services_started_) << "Cannot call RegisterService() after StartServices()";
-  scoped_refptr<ServicePool> service_pool =
-      new ServicePool(gscoped_ptr<ServiceIf>(service_ptr.release()),
+  scoped_refptr<ImpalaServicePool> service_pool =
+      new ImpalaServicePool(std::move(service_ptr),
           messenger_->metric_entity(), service_queue_depth);
   // Start the thread pool first before registering the service in case the startup fails.
-  KUDU_RETURN_IF_ERROR(
-      service_pool->Init(num_service_threads), "Service pool failed to start");
+  RETURN_IF_ERROR(
+      service_pool->Init(num_service_threads));
   KUDU_RETURN_IF_ERROR(
       messenger_->RegisterService(service_pool->service_name(), service_pool),
       "Could not register service");
-  service_pools_.push_back(service_pool);
+
+  VLOG_QUERY << "Registered KRPC service: " << service_pool->service_name();
+  service_pools_.push_back(std::move(service_pool));
 
   return Status::OK();
 }

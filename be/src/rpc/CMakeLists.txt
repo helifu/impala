@@ -22,10 +22,13 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/rpc")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/rpc")
 
 # Mark the protobuf files as generated
+set_source_files_properties(${COMMON_PROTO_SRCS} PROPERTIES GENERATED TRUE)
 set_source_files_properties(${RPC_TEST_PROTO_SRCS} PROPERTIES GENERATED TRUE)
 
 add_library(Rpc
   authentication.cc
+  ${COMMON_PROTO_SRCS}
+  impala-service-pool.cc
   rpc-mgr.cc
   rpc-trace.cc
   TAcceptQueueServer.cpp
@@ -46,6 +49,8 @@ ADD_BE_TEST(authentication-test)
 ADD_BE_TEST(rpc-mgr-test)
 add_dependencies(rpc-mgr-test rpc_test_proto)
 target_link_libraries(rpc-mgr-test rpc_test_proto)
+target_link_libraries(rpc-mgr-test security-test-for-impala)
+target_link_libraries(rpc-mgr-test ${KRB5_REALM_OVERRIDE})
 
 add_library(rpc_test_proto ${RPC_TEST_PROTO_SRCS})
 add_dependencies(rpc_test_proto rpc_test_proto_tgt krpc)

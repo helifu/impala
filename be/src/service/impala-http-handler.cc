@@ -104,6 +104,9 @@ void ImpalaHttpHandler::RegisterHandlers(Webserver* webserver) {
   webserver->RegisterUrlCallback("/query_backends", "query_backends.tmpl",
       MakeCallback(this, &ImpalaHttpHandler::QueryBackendsHandler), false);
 
+  webserver->RegisterUrlCallback("/query_finstances", "query_finstances.tmpl",
+      MakeCallback(this, &ImpalaHttpHandler::QueryFInstancesHandler), false);
+
   webserver->RegisterUrlCallback("/cancel_query", "common-pre.tmpl",
       MakeCallback(this, &ImpalaHttpHandler::CancelQueryHandler), false);
 
@@ -292,15 +295,19 @@ void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& r
       document->GetAllocator());
   value->AddMember("stmt_type", stmt_type, document->GetAllocator());
 
-  Value start_time(ToStringFromUnixMicros(record.start_time_us).c_str(),
-      document->GetAllocator());
+  Value start_time(ToStringFromUnixMicros(record.start_time_us,
+      TimePrecision::Nanosecond).c_str(), document->GetAllocator());
   value->AddMember("start_time", start_time, document->GetAllocator());
 
-  Value end_time(ToStringFromUnixMicros(record.end_time_us).c_str(),
-      document->GetAllocator());
+  Value end_time(ToStringFromUnixMicros(record.end_time_us,
+      TimePrecision::Nanosecond).c_str(), document->GetAllocator());
   value->AddMember("end_time", end_time, document->GetAllocator());
 
-  int64_t duration_us = record.end_time_us - record.start_time_us;
+  // record.end_time_us might still be zero if the query is not yet done
+  // Use the current Unix time in that case. Note that the duration can be
+  // negative if a system clock reset happened after the query was initiated.
+  int64_t end_time_us = record.end_time_us > 0LL ? record.end_time_us : UnixMicros();
+  int64_t duration_us = end_time_us - record.start_time_us;
   const string& printed_duration = PrettyPrinter::Print(duration_us * NANOS_PER_MICRO,
       TUnit::TIME_NS);
   Value val_duration(printed_duration.c_str(), document->GetAllocator());
@@ -702,6 +709,25 @@ void ImpalaHttpHandler::QueryBackendsHandler(
   if (request_state.get() == nullptr || request_state->coord() == nullptr) return;
 
   request_state->coord()->BackendsToJson(document);
+}
+
+void ImpalaHttpHandler::QueryFInstancesHandler(
+    const Webserver::ArgumentMap& args, Document* document) {
+  TUniqueId query_id;
+  Status status = ParseIdFromArguments(args, &query_id, "query_id");
+  Value query_id_val(PrintId(query_id).c_str(), document->GetAllocator());
+  document->AddMember("query_id", query_id_val, document->GetAllocator());
+  if (!status.ok()) {
+    // Redact the error message, it may contain part or all of the query.
+    Value json_error(RedactCopy(status.GetDetail()).c_str(), document->GetAllocator());
+    document->AddMember("error", json_error, document->GetAllocator());
+    return;
+  }
+
+  shared_ptr<ClientRequestState> request_state = server_->GetClientRequestState(query_id);
+  if (request_state.get() == nullptr || request_state->coord() == nullptr) return;
+
+  request_state->coord()->FInstanceStatsToJson(document);
 }
 
 void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include_summary,

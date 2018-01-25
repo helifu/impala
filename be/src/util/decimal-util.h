@@ -69,6 +69,31 @@ class DecimalUtil {
     return result;
   }
 
+  /// Helper function to scale down values by 10^delta_scale, truncating if
+  /// round is false or rounding otherwise.
+  template<typename T>
+  static inline T ScaleDownAndRound(T value, int delta_scale, bool round) {
+    DCHECK_GT(delta_scale, 0);
+    T divisor = DecimalUtil::GetScaleMultiplier<T>(delta_scale);
+    if (divisor > 0) {
+      DCHECK(divisor % 2 == 0);
+      T result = value / divisor;
+      if (round) {
+        T remainder = value % divisor;
+        // In general, shifting down the multiplier is not safe, but we know
+        // here that it is a multiple of two.
+        if (abs(remainder) >= (divisor >> 1)) {
+          // Bias at zero must be corrected by sign of dividend.
+          result += BitUtil::Sign(value);
+        }
+      }
+      return result;
+    } else {
+      DCHECK(divisor == -1);
+      return 0;
+    }
+  }
+
   /// Write decimals as big endian (byte comparable) in fixed_len_size bytes.
   template<typename T>
   static inline void EncodeToFixedLenByteArray(
@@ -127,7 +152,6 @@ class DecimalUtil {
     return 128;
   }
 
-  static inline int128_t GetScaleQuotient(int scale);
 };
 
 template <>
@@ -223,53 +247,6 @@ inline int128_t DecimalUtil::GetScaleMultiplier<int128_t>(int scale) {
   DCHECK_GE(sizeof(values) / sizeof(int128_t), ColumnType::MAX_PRECISION);
   if (LIKELY(scale < 39)) return values[scale];
   return -1;  // Overflow
-}
-
-inline int128_t DecimalUtil::GetScaleQuotient(int scale) {
-  DCHECK_GT(scale, 0);
-  DCHECK_LE(scale, ColumnType::MAX_PRECISION);
-  static const int128_t values[] = {
-      static_cast<int128_t>(0ll),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(1),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(2),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(3),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(4),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(5),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(6),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(7),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(8),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(9),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(10),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(11),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(12),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(13),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(14),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(15),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(16),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(17),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(18),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(19),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(20),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(21),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(22),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(23),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(24),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(25),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(26),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(27),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(28),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(29),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(30),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(31),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(32),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(33),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(34),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(35),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(36),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(37),
-      MAX_UNSCALED_DECIMAL16 / GetScaleMultiplier<int128_t>(38)};
-  DCHECK_GE(sizeof(values) / sizeof(int128_t), ColumnType::MAX_PRECISION);
-  return values[scale];
 }
 }
 

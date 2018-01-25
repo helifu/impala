@@ -53,9 +53,8 @@ namespace impala {
 /// status. All reported errors (ignored or not) will be logged via the RuntimeState.
 class KuduTableSink : public DataSink {
  public:
-  KuduTableSink(const RowDescriptor* row_desc, const TDataSink& tsink);
-
-  virtual std::string GetName() { return "KuduTableSink"; }
+  KuduTableSink(const RowDescriptor* row_desc, const TDataSink& tsink,
+      RuntimeState* state);
 
   /// Prepares the expressions to be applied and creates a KuduSchema based on the
   /// expressions and KuduTableDescriptor.
@@ -101,6 +100,9 @@ class KuduTableSink : public DataSink {
 
   /// Captures parameters passed down from the frontend
   TKuduTableSink kudu_table_sink_;
+
+  /// The amount consumed from 'mem_tracker_' to account for the mem used by 'client_'.
+  int64_t client_tracked_bytes_;
 
   /// Time spent applying Kudu operations. In normal circumstances, Apply() should be
   /// negligible because it is asynchronous with AUTO_FLUSH_BACKGROUND enabled.

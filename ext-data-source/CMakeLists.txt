@@ -15,6 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-add_custom_target(ext-data-source ALL DEPENDS gen-deps
+add_custom_target(ext-data-source ALL DEPENDS gen-deps impala-parent
   COMMAND $ENV{IMPALA_HOME}/bin/mvn-quiet.sh install -DskipTests
 )

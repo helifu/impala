@@ -52,7 +52,7 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
     // This value is built the same way as it assumes that the scan node runs co-located
     // with a Kudu tablet server and that the tablet server is using disks similarly as
     // a datanode would.
-    max_row_batches = 10 * (DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS);
+    max_row_batches = 10 * (DiskInfo::num_disks() + io::DiskIoMgr::REMOTE_NUM_DISKS);
   }
   materialized_row_batches_.reset(new RowBatchQueue(max_row_batches));
 }
@@ -74,6 +74,8 @@ Status KuduScanNode::Open(RuntimeState* state) {
     state->resource_pool()->set_max_quota(
         state->query_options().num_scanner_threads);
   }
+
+  if (filter_ctxs_.size() > 0) WaitForRuntimeFilters();
 
   thread_avail_cb_id_ = state->resource_pool()->AddThreadAvailableCb(
       bind<void>(mem_fn(&KuduScanNode::ThreadAvailableCb), this, _1));
@@ -179,8 +181,9 @@ void KuduScanNode::ThreadAvailableCb(ThreadResourceMgr::ResourcePool* pool) {
 }
 
 Status KuduScanNode::ProcessScanToken(KuduScanner* scanner, const string& scan_token) {
-  RETURN_IF_ERROR(scanner->OpenNextScanToken(scan_token));
-  bool eos = false;
+  bool eos;
+  RETURN_IF_ERROR(scanner->OpenNextScanToken(scan_token, &eos));
+  if (eos) return Status::OK();
   while (!eos && !done_) {
     unique_ptr<RowBatch> row_batch = std::make_unique<RowBatch>(row_desc(),
         runtime_state_->batch_size(), mem_tracker());

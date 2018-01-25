@@ -44,6 +44,15 @@ TEST(ProcessStateInfo, Basic) {
   ASSERT_GE(process_state_info.GetBytes("io/read_bytes"), 0);
   ASSERT_GE(process_state_info.GetInt("sched/prio"), 0);
   ASSERT_GE(process_state_info.GetInt("status/Threads"), 0);
+  ASSERT_GT(process_state_info.GetInt("fd/count"), 0);
+}
+
+TEST(MappedMapInfo, Basic) {
+  MappedMemInfo result = MemInfo::ParseSmaps();
+  ASSERT_GT(result.num_maps, 0);
+  ASSERT_GT(result.size_kb, 0);
+  ASSERT_GT(result.rss_kb, 0);
+  ASSERT_GE(result.anon_huge_pages_kb, 0);
 }
 
 }

@@ -520,13 +520,17 @@ public class Frontend {
     } else {
       throw new IllegalStateException("Unexpected CatalogOp statement type.");
     }
-
     result.setResult_set_metadata(metadata);
+    ddl.setSync_ddl(result.getQuery_options().isSync_ddl());
     result.setCatalog_op_request(ddl);
     if (ddl.getOp_type() == TCatalogOpType.DDL) {
       TCatalogServiceRequestHeader header = new TCatalogServiceRequestHeader();
       header.setRequesting_user(analysis.getAnalyzer().getUser().getName());
       ddl.getDdl_params().setHeader(header);
+      ddl.getDdl_params().setSync_ddl(ddl.isSync_ddl());
+    }
+    if (ddl.getOp_type() == TCatalogOpType.RESET_METADATA) {
+      ddl.getReset_metadata_params().setSync_ddl(ddl.isSync_ddl());
     }
   }
 
@@ -856,6 +860,28 @@ public class Frontend {
   }
 
   /**
+   * Waits indefinitely for the local catalog to be ready. The catalog is "ready" after
+   * the first catalog update is received from the statestore.
+   *
+   * @see ImpaladCatalog.isReady
+   */
+  public void waitForCatalog() {
+    LOG.info("Waiting for first catalog update from the statestore.");
+    int numTries = 0;
+    long startTimeMs = System.currentTimeMillis();
+    while (true) {
+      if (getCatalog().isReady()) {
+        LOG.info("Local catalog initialized after: " +
+            (System.currentTimeMillis() - startTimeMs) + " ms.");
+        return;
+      }
+      LOG.info("Waiting for local catalog to be initialized, attempt: " + numTries);
+      getCatalog().waitForCatalogUpdate(MAX_CATALOG_UPDATE_WAIT_TIME_MS);
+      ++numTries;
+    }
+  }
+
+  /**
    * Overload of requestTblLoadAndWait that uses the default timeout.
    */
   public boolean requestTblLoadAndWait(Set<TableName> requestedTbls)
@@ -879,10 +905,8 @@ public class Frontend {
    */
   private AnalysisContext.AnalysisResult analyzeStmt(TQueryCtx queryCtx)
       throws AnalysisException, InternalException, AuthorizationException {
-    if (!impaladCatalog_.get().isReady()) {
-      throw new AnalysisException("This Impala daemon is not ready to accept user " +
-          "requests. Status: Waiting for catalog update from the StateStore.");
-    }
+    Preconditions.checkState(getCatalog().isReady(),
+        "Local catalog has not been initialized. Aborting query analysis.");
 
     AnalysisContext analysisCtx = new AnalysisContext(impaladCatalog_.get(), queryCtx,
         authzConfig_);
@@ -1085,7 +1109,8 @@ public class Frontend {
       result.stmt_type = TStmtType.SET;
       result.setResult_set_metadata(new TResultSetMetadata(Arrays.asList(
           new TColumn("option", Type.STRING.toThrift()),
-          new TColumn("value", Type.STRING.toThrift()))));
+          new TColumn("value", Type.STRING.toThrift()),
+          new TColumn("level", Type.STRING.toThrift()))));
       result.setSet_query_option_request(analysisResult.getSetStmt().toThrift());
       return result;
     }
@@ -1099,7 +1124,7 @@ public class Frontend {
 
     Planner planner = new Planner(analysisResult, queryCtx);
     TQueryExecRequest queryExecRequest = createExecRequest(planner, explainString);
-    queryExecRequest.setDesc_tbl(
+    queryCtx.setDesc_tbl(
         planner.getAnalysisResult().getAnalyzer().getDescTbl().toThrift());
     queryExecRequest.setQuery_ctx(queryCtx);
     queryExecRequest.setHost_list(analysisResult.getAnalyzer().getHostIndex().getList());

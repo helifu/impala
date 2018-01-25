@@ -24,6 +24,7 @@
 
 #include "common/status.h"
 #include "util/promise.h"
+#include "util/thread.h"
 
 namespace sasl { class TSasl; }
 
@@ -77,6 +78,7 @@ class SaslAuthProvider : public AuthProvider {
   /// Wrap the client transport with a new TSaslClientTransport.  This is only for
   /// internal connections.  Since, as a daemon, we only do Kerberos and not LDAP,
   /// we can go straight to Kerberos.
+  /// This is only applicable to Thrift connections and not KRPC connections.
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
@@ -86,6 +88,7 @@ class SaslAuthProvider : public AuthProvider {
   /// When a connection comes in, thrift will see one of the above on the wire, do
   /// a table lookup, and associate the appropriate callbacks with the connection.
   /// Then presto! You've got authentication for the connection.
+  /// This is only applicable to Thrift connections and not KRPC connections.
   virtual Status GetServerTransportFactory(
       boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
 
@@ -178,7 +181,10 @@ class NoAuthProvider : public AuthProvider {
 
 /// The first entry point to the authentication subsystem.  Performs initialization
 /// of Sasl, the global AuthManager, and the two authentication providers.  Appname
-/// should generally be argv[0].
+/// should generally be argv[0]. Normally, InitAuth() should only be called once.
+/// In certain test cases, we may call it more than once. It's important that InitAuth()
+/// is called with the same 'appname' if it's called more than once. Otherwise, error
+/// status will be returned.
 Status InitAuth(const std::string& appname);
 
 }

@@ -55,6 +55,8 @@ class DisconnectedException(Exception):
   def __str__(self):
       return self.value
 
+class QueryCancelledByShellException(Exception): pass
+
 class ImpalaClient(object):
 
   def __init__(self, impalad, use_kerberos=False, kerberos_service_name="impala",
@@ -71,8 +73,13 @@ class ImpalaClient(object):
     self.user, self.ldap_password = user, ldap_password
     self.use_ldap = use_ldap
     self.default_query_options = {}
+    self.query_option_levels = {}
     self.query_state = QueryState._NAMES_TO_VALUES
     self.fetch_batch_size = 1024
+    # This is set from ImpalaShell's signal handler when a query is cancelled
+    # from command line via CTRL+C. It is used to suppress error messages of
+    # query cancellation.
+    self.is_query_cancelled = False
 
   def _options_to_string_list(self, set_query_options):
     return ["%s=%s" % (k, v) for (k, v) in set_query_options.iteritems()]
@@ -93,6 +100,11 @@ class ImpalaClient(object):
       raise RPCException("Unable to retrieve default query options")
     for option in options:
       self.default_query_options[option.key.upper()] = option.value
+      # If connected to an Impala that predates IMPALA-2181 then the received options
+      # wouldn't contain a level attribute. In this case the query_option_levels
+      # map is left empty.
+      if option.level is not None:
+        self.query_option_levels[option.key.upper()] = option.level
 
   def build_summary_table(self, summary, idx, is_fragment_root, indent_level,
       new_indent_level, output):
@@ -300,6 +312,7 @@ class ImpalaClient(object):
     return query
 
   def execute_query(self, query):
+    self.is_query_cancelled = False
     rpc_result = self._do_rpc(lambda: self.imp_service.query(query))
     last_query_handle, status = rpc_result
     if status != RpcStatus.OK:
@@ -375,7 +388,8 @@ class ImpalaClient(object):
     # co-ordinator, so we don't need to wait.
     if query_handle_closed:
       return True
-    rpc_result = self._do_rpc(lambda: self.imp_service.Cancel(last_query_handle))
+    rpc_result = self._do_rpc(lambda: self.imp_service.Cancel(last_query_handle),
+        False)
     _, status = rpc_result
     return status == RpcStatus.OK
 
@@ -403,7 +417,7 @@ class ImpalaClient(object):
       return summary
     return None
 
-  def _do_rpc(self, rpc):
+  def _do_rpc(self, rpc, suppress_error_on_cancel=True):
     """Executes the provided callable."""
 
     if not self.connected:
@@ -422,16 +436,25 @@ class ImpalaClient(object):
           status = RpcStatus.ERROR
       return ret, status
     except BeeswaxService.QueryNotFoundException:
+      if suppress_error_on_cancel and self.is_query_cancelled:
+        raise QueryCancelledByShellException()
       raise QueryStateException('Error: Stale query handle')
     # beeswaxException prints out the entire object, printing
     # just the message is far more readable/helpful.
     except BeeswaxService.BeeswaxException, b:
-        raise RPCException("ERROR: %s" % b.message)
+      # Suppress the errors from cancelling a query that is in fetch state
+      if suppress_error_on_cancel and self.is_query_cancelled:
+        raise QueryCancelledByShellException()
+      raise RPCException("ERROR: %s" % b.message)
     except TTransportException, e:
       # issue with the connection with the impalad
       raise DisconnectedException("Error communicating with impalad: %s" % e)
     except TApplicationException, t:
-        raise RPCException("Application Exception : %s" % t)
+      # Suppress the errors from cancelling a query that is in waiting_to_finish
+      # state
+      if suppress_error_on_cancel and self.is_query_cancelled:
+        raise QueryCancelledByShellException()
+      raise RPCException("Application Exception : %s" % t)
     return None, RpcStatus.ERROR
 
   def _get_sleep_interval(self, start_time):

@@ -425,8 +425,8 @@ class DataStreamTest : public testing::Test {
         } else if (stream_type == TPartitionType::HASH_PARTITIONED) {
           // hash-partitioned streams send values to the right partition
           int64_t value = *j;
-          uint32_t hash_val =
-              RawValue::GetHashValueFnv(&value, TYPE_BIGINT, HashUtil::FNV_SEED);
+          uint64_t hash_val = RawValue::GetHashValueFastHash(&value, TYPE_BIGINT,
+              DataStreamSender::EXCHANGE_HASH_SEED);
           EXPECT_EQ(hash_val % receiver_info_.size(), info.receiver_num);
         }
       }
@@ -495,7 +495,7 @@ class DataStreamTest : public testing::Test {
     VLOG_QUERY << "create sender " << sender_num;
     const TDataSink& sink = GetSink(partition_type);
     DataStreamSender sender(
-        sender_num, row_desc_, sink.stream_sink, dest_, channel_buffer_size);
+        sender_num, row_desc_, sink.stream_sink, dest_, channel_buffer_size, &state);
 
     TExprNode expr_node;
     expr_node.node_type = TExprNodeType::SLOT_REF;

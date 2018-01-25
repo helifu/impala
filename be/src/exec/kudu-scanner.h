@@ -43,8 +43,10 @@ class KuduScanner {
   /// Does not actually open a kudu::client::KuduScanner.
   Status Open();
 
-  /// Opens a new kudu::client::KuduScanner using 'scan_token'.
-  Status OpenNextScanToken(const std::string& scan_token);
+  /// Opens a new kudu::client::KuduScanner using 'scan_token'. If there are no rows to
+  /// scan (eg. because there is a runtime filter that rejects all rows) 'eos' will
+  /// be set to true, otherwise if the return status is OK it will be false.
+  Status OpenNextScanToken(const std::string& scan_token, bool* eos);
 
   /// Fetches the next batch from the current kudu::client::KuduScanner.
   Status GetNext(RowBatch* row_batch, bool* eos);
@@ -62,6 +64,8 @@ class KuduScanner {
  private:
   /// Handles the case where the projection is empty (e.g. count(*)).
   /// Does this by adding sets of rows to 'row_batch' instead of adding one-by-one.
+  /// If in the rare case where there is any conjunct, evaluate them once for each row
+  /// and add a row to the row batch only when the conjuncts evaluate to true.
   Status HandleEmptyProjection(RowBatch* row_batch);
 
   /// Decodes rows previously fetched from kudu, now in 'cur_rows_' into a RowBatch.

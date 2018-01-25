@@ -29,6 +29,9 @@ public interface CatalogObject {
   // Returns the unqualified object name.
   public String getName();
 
+  // Returns the unique name of this catalog object.
+  public String getUniqueName();
+
   // Returns the version of this catalog object.
   public long getCatalogVersion();
 

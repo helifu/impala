@@ -26,6 +26,8 @@
 #include <gutil/strings/join.h>
 #include <gutil/strings/substitute.h>
 
+#include "runtime/io/disk-io-mgr.h"
+#include "runtime/io/request-context.h"
 #include "runtime/runtime-state.h"
 #include "runtime/tmp-file-mgr-internal.h"
 #include "util/bit-util.h"
@@ -51,6 +53,7 @@ using boost::algorithm::token_compress_on;
 using boost::filesystem::absolute;
 using boost::filesystem::path;
 using boost::uuids::random_generator;
+using namespace impala::io;
 using namespace strings;
 
 namespace impala {
@@ -129,10 +132,10 @@ Status TmpFileMgr::InitCustom(const vector<string>& tmp_dirs, bool one_dir_per_d
 
   DCHECK(metrics != nullptr);
   num_active_scratch_dirs_metric_ =
-      metrics->AddGauge<int64_t>(TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS, 0);
+      metrics->AddGauge(TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS, 0);
   active_scratch_dirs_metric_ = SetMetric<string>::CreateAndRegister(
       metrics, TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS_LIST, set<string>());
-  num_active_scratch_dirs_metric_->set_value(tmp_dirs_.size());
+  num_active_scratch_dirs_metric_->SetValue(tmp_dirs_.size());
   for (int i = 0; i < tmp_dirs_.size(); ++i) {
     active_scratch_dirs_metric_->Add(tmp_dirs_[i]);
   }
@@ -240,7 +243,7 @@ TmpFileMgr::FileGroup::FileGroup(TmpFileMgr* tmp_file_mgr, DiskIoMgr* io_mgr,
     next_allocation_index_(0),
     free_ranges_(64) {
   DCHECK(tmp_file_mgr != nullptr);
-  io_mgr_->RegisterContext(&io_ctx_, nullptr);
+  io_ctx_ = io_mgr_->RegisterContext(nullptr);
 }
 
 TmpFileMgr::FileGroup::~FileGroup() {
@@ -282,8 +285,7 @@ Status TmpFileMgr::FileGroup::CreateFiles() {
 void TmpFileMgr::FileGroup::Close() {
   // Cancel writes before deleting the files, since in-flight writes could re-create
   // deleted files.
-  if (io_ctx_ != nullptr) io_mgr_->UnregisterContext(io_ctx_);
-  io_ctx_ = nullptr;
+  if (io_ctx_ != nullptr) io_mgr_->UnregisterContext(io_ctx_.get());
   for (std::unique_ptr<TmpFileMgr::File>& file : tmp_files_) {
     Status status = file->Remove();
     if (!status.ok()) {
@@ -358,10 +360,10 @@ Status TmpFileMgr::FileGroup::Write(
 
   unique_ptr<WriteHandle> tmp_handle(new WriteHandle(encryption_timer_, cb));
   WriteHandle* tmp_handle_ptr = tmp_handle.get(); // Pass ptr by value into lambda.
-  DiskIoMgr::WriteRange::WriteDoneCallback callback = [this, tmp_handle_ptr](
+  WriteRange::WriteDoneCallback callback = [this, tmp_handle_ptr](
       const Status& write_status) { WriteComplete(tmp_handle_ptr, write_status); };
   RETURN_IF_ERROR(
-      tmp_handle->Write(io_mgr_, io_ctx_, tmp_file, file_offset, buffer, callback));
+      tmp_handle->Write(io_mgr_, io_ctx_.get(), tmp_file, file_offset, buffer, callback));
   write_counter_->Add(1);
   bytes_written_counter_->Add(buffer.len());
   *handle = move(tmp_handle);
@@ -387,14 +389,14 @@ Status TmpFileMgr::FileGroup::ReadAsync(WriteHandle* handle, MemRange buffer) {
   DCHECK(handle->write_range_ != nullptr);
   // Don't grab handle->write_state_lock_, it is safe to touch all of handle's state
   // since the write is not in flight.
-  handle->read_range_ = scan_range_pool_.Add(new DiskIoMgr::ScanRange);
+  handle->read_range_ = scan_range_pool_.Add(new ScanRange);
   handle->read_range_->Reset(nullptr, handle->write_range_->file(),
       handle->write_range_->len(), handle->write_range_->offset(),
       handle->write_range_->disk_id(), false,
-      DiskIoMgr::BufferOpts::ReadInto(buffer.data(), buffer.len()));
+      BufferOpts::ReadInto(buffer.data(), buffer.len()));
   read_counter_->Add(1);
   bytes_read_counter_->Add(buffer.len());
-  RETURN_IF_ERROR(io_mgr_->AddScanRange(io_ctx_, handle->read_range_, true));
+  RETURN_IF_ERROR(io_mgr_->AddScanRange(io_ctx_.get(), handle->read_range_, true));
   return Status::OK();
 }
 
@@ -403,7 +405,7 @@ Status TmpFileMgr::FileGroup::WaitForAsyncRead(WriteHandle* handle, MemRange buf
   // Don't grab handle->write_state_lock_, it is safe to touch all of handle's state
   // since the write is not in flight.
   SCOPED_TIMER(disk_read_timer_);
-  unique_ptr<DiskIoMgr::BufferDescriptor> io_mgr_buffer;
+  unique_ptr<BufferDescriptor> io_mgr_buffer;
   Status status = handle->read_range_->GetNext(&io_mgr_buffer);
   if (!status.ok()) goto exit;
   DCHECK(io_mgr_buffer != NULL);
@@ -489,7 +491,7 @@ Status TmpFileMgr::FileGroup::RecoverWriteError(
   // Choose another file to try. Blacklisting ensures we don't retry the same file.
   // If this fails, the status will include all the errors in 'scratch_errors_'.
   RETURN_IF_ERROR(AllocateSpace(handle->len(), &tmp_file, &file_offset));
-  return handle->RetryWrite(io_mgr_, io_ctx_, tmp_file, file_offset);
+  return handle->RetryWrite(io_mgr_, io_ctx_.get(), tmp_file, file_offset);
 }
 
 string TmpFileMgr::FileGroup::DebugString() {
@@ -525,9 +527,9 @@ string TmpFileMgr::WriteHandle::TmpFilePath() const {
   return file_->path();
 }
 
-Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx,
+Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, RequestContext* io_ctx,
     File* file, int64_t offset, MemRange buffer,
-    DiskIoMgr::WriteRange::WriteDoneCallback callback) {
+    WriteRange::WriteDoneCallback callback) {
   DCHECK(!write_in_flight_);
 
   if (FLAGS_disk_spill_encryption) RETURN_IF_ERROR(EncryptAndHash(buffer));
@@ -536,7 +538,7 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* i
   // WriteComplete() may be called concurrently with the remainder of this function.
   file_ = file;
   write_range_.reset(
-      new DiskIoMgr::WriteRange(file->path(), offset, file->AssignDiskQueue(), callback));
+      new WriteRange(file->path(), offset, file->AssignDiskQueue(), callback));
   write_range_->SetData(buffer.data(), buffer.len());
   write_in_flight_ = true;
   Status status = io_mgr->AddWriteRange(io_ctx, write_range_.get());
@@ -553,7 +555,7 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* i
 }
 
 Status TmpFileMgr::WriteHandle::RetryWrite(
-    DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx, File* file, int64_t offset) {
+    DiskIoMgr* io_mgr, RequestContext* io_ctx, File* file, int64_t offset) {
   DCHECK(write_in_flight_);
   file_ = file;
   write_range_->SetRange(file->path(), offset, file->AssignDiskQueue());
@@ -610,8 +612,8 @@ void TmpFileMgr::WriteHandle::WaitForWrite() {
 Status TmpFileMgr::WriteHandle::EncryptAndHash(MemRange buffer) {
   DCHECK(FLAGS_disk_spill_encryption);
   SCOPED_TIMER(encryption_timer_);
-  // Since we're using AES-CFB mode, we must take care not to reuse a key/IV pair.
-  // Regenerate a new key and IV for every data buffer we write.
+  // Since we're using AES-CTR/AES-CFB mode, we must take care not to reuse a
+  // key/IV pair. Regenerate a new key and IV for every data buffer we write.
   key_.InitializeRandom();
   RETURN_IF_ERROR(key_.Encrypt(buffer.data(), buffer.len(), buffer.data()));
   hash_.Compute(buffer.data(), buffer.len());

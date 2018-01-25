@@ -43,7 +43,6 @@ class BufferPool;
 class CallableThreadPool;
 class DataStreamMgrBase;
 class DataStreamMgr;
-class DiskIoMgr;
 class QueryExecMgr;
 class Frontend;
 class HBaseTableFactory;
@@ -64,6 +63,10 @@ class StatestoreSubscriber;
 class ThreadResourceMgr;
 class TmpFileMgr;
 class Webserver;
+
+namespace io {
+  class DiskIoMgr;
+}
 
 /// Execution environment for Impala daemon. Contains all required global structures, and
 /// handles to singleton services. Clients must call StartServices() exactly once to
@@ -91,8 +94,12 @@ class ExecEnv {
   /// subsystems like the webserver, scheduler etc.
   Status Init();
 
-  /// Starts any dependent services in their correct order
-  Status StartServices() WARN_UNUSED_RESULT;
+  /// Starts the service to subscribe to the statestore.
+  Status StartStatestoreSubscriberService() WARN_UNUSED_RESULT;
+
+  /// Starts krpc, if needed. Start this last so everything is in place before accepting
+  /// the first call.
+  Status StartKrpcService() WARN_UNUSED_RESULT;
 
   /// TODO: Should ExecEnv own the ImpalaServer as well?
   void SetImpalaServer(ImpalaServer* server) { impala_server_ = server; }
@@ -112,7 +119,7 @@ class ExecEnv {
     return catalogd_client_cache_.get();
   }
   HBaseTableFactory* htable_factory() { return htable_factory_.get(); }
-  DiskIoMgr* disk_io_mgr() { return disk_io_mgr_.get(); }
+  io::DiskIoMgr* disk_io_mgr() { return disk_io_mgr_.get(); }
   Webserver* webserver() { return webserver_.get(); }
   MetricGroup* metrics() { return metrics_.get(); }
   MemTracker* process_mem_tracker() { return mem_tracker_.get(); }
@@ -125,6 +132,7 @@ class ExecEnv {
   RequestPoolService* request_pool_service() { return request_pool_service_.get(); }
   CallableThreadPool* rpc_pool() { return async_rpc_pool_.get(); }
   QueryExecMgr* query_exec_mgr() { return query_exec_mgr_.get(); }
+  RpcMgr* rpc_mgr() const { return rpc_mgr_.get(); }
   PoolMemTrackerRegistry* pool_mem_trackers() { return pool_mem_trackers_.get(); }
   ReservationTracker* buffer_reservation() { return buffer_reservation_.get(); }
   BufferPool* buffer_pool() { return buffer_pool_.get(); }
@@ -169,7 +177,7 @@ class ExecEnv {
   boost::scoped_ptr<ImpalaBackendClientCache> impalad_client_cache_;
   boost::scoped_ptr<CatalogServiceClientCache> catalogd_client_cache_;
   boost::scoped_ptr<HBaseTableFactory> htable_factory_;
-  boost::scoped_ptr<DiskIoMgr> disk_io_mgr_;
+  boost::scoped_ptr<io::DiskIoMgr> disk_io_mgr_;
   boost::scoped_ptr<Webserver> webserver_;
   boost::scoped_ptr<MemTracker> mem_tracker_;
   boost::scoped_ptr<PoolMemTrackerRegistry> pool_mem_trackers_;

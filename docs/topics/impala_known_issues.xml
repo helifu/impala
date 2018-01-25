@@ -20,7 +20,7 @@ under the License.
 <!DOCTYPE concept PUBLIC "-//OASIS//DTD DITA Concept//EN" "concept.dtd">
 <concept rev="ver" id="known_issues">
 
-  <title><ph audience="standalone">Known Issues and Workarounds in Impala</ph><ph audience="integrated">Apache Impala (incubating) Known Issues</ph></title>
+  <title><ph audience="standalone">Known Issues and Workarounds in Impala</ph><ph audience="integrated">Apache Impala Known Issues</ph></title>
 
   <prolog>
     <metadata>
@@ -129,6 +129,53 @@ https://issues.apache.org/jira/browse/IMPALA-2144 - Don't have
 
 -->
 
+  <concept id="known_issues_startup">
+
+    <title>Impala Known Issues: Startup</title>
+
+    <conbody>
+
+      <p>
+        These issues can prevent one or more Impala-related daemons
+        from starting properly.
+      </p>
+
+    </conbody>
+
+    <concept id="IMPALA-4978">
+      <title id="IMPALA-5253">Problem retrieving FQDN causes startup problem on kerberized clusters</title>
+      <conbody>
+        <p>
+          The method Impala uses to retrieve the host name while constructing the Kerberos
+          principal is the <codeph>gethostname()</codeph> system call. This function might
+          not always return the fully qualified domain name, depending on the network
+          configuration. If the daemons cannot determine the FQDN, Impala does not start
+          on a kerberized cluster.
+        </p>
+        <p>
+          This problem might occur immediately after an upgrade of a CDH cluster, due to changes
+          in Cloudera Manager that supplies the <codeph>--hostname</codeph> flag automatically to
+          the Impala-related daemons. (See the issue <q>hostname parameter is not passed to Impala catalog role</q>
+          at <xref href="https://www.cloudera.com/documentation/enterprise/release-notes/topics/cm_rn_known_issues.html" scope="external" format="html">the Cloudera Manager Known Issues page</xref>.)
+        </p>
+        <p><b>Bugs:</b> <xref keyref="IMPALA-4978">IMPALA-4978</xref>, <xref keyref="IMPALA-5253">IMPALA-5253</xref></p>
+        <p><b>Severity:</b> High</p>
+        <p><b>Resolution:</b> The issue is expected to occur less frequently on systems
+          with fixes for <xref keyref="IMPALA-4978">IMPALA-4978</xref>, <xref keyref="IMPALA-5253">IMPALA-5253</xref>,
+          or both. Even on systems with fixes for both of these issues, the workaround might still
+          be required in some cases.
+        </p>
+        <p><b>Workaround:</b> Test if a host is affected by checking whether the output of the
+          <cmdname>hostname</cmdname> command includes the FQDN. On hosts where <cmdname>hostname</cmdname>
+          only returns the short name, pass the command-line flag
+          <codeph>--hostname=<varname>fully_qualified_domain_name</varname></codeph>
+          in the startup options of all Impala-related daemons.
+        </p>
+      </conbody>
+    </concept>
+
+  </concept>
+
   <concept id="known_issues_crash">
 
     <title>Impala Known Issues: Crashes and Hangs</title>
@@ -182,6 +229,7 @@ https://issues.apache.org/jira/browse/IMPALA-2144 - Don't have
         </p>
 
       </conbody>
+    </concept>
 
     <concept id="IMPALA-4595">
       <title>Linking IR UDF module to main module crashes Impala</title>
@@ -533,6 +581,27 @@ https://issues.apache.org/jira/browse/IMPALA-2144 - Don't have
       </p>
 
     </conbody>
+
+    <concept id="IMPALA-5638">
+      <title>Malicious user can gain unauthorized access to Kudu table data via Impala</title>
+      <conbody>
+        <p>
+          A malicious user with <codeph>ALTER</codeph> permissions on an Impala table can access any
+          other Kudu table data by altering the table properties to make it <q>external</q>
+          and then changing the underlying table mapping to point to other Kudu tables.
+          This violates and works around the authorization requirement that creating a
+          Kudu external table via Impala requires an <codeph>ALL</codeph> privilege at the server scope.
+          This privilege requirement for <codeph>CREATE</codeph> commands is enforced to precisely avoid
+          this scenario where a malicious user can change the underlying Kudu table
+          mapping. The fix is to enforce the same privilege requirement for <codeph>ALTER</codeph>
+          commands that would make existing non-external Kudu tables external.
+        </p>
+        <p><b>Bug:</b> <xref keyref="IMPALA-5638">IMPALA-5638</xref></p>
+        <p><b>Severity:</b> High</p>
+        <p><b>Workaround:</b> A temporary workaround is to revoke <codeph>ALTER</codeph> permissions on Impala tables.</p>
+        <p><b>Resolution:</b> Upgrade to an Impala version containing the fix for <xref keyref="IMPALA-5638">IMPALA-5638</xref>.</p>
+      </conbody>
+    </concept>
 
     <concept id="renewable_kerberos_tickets">
 
@@ -908,6 +977,51 @@ impala hard nproc 262144
       </p>
 
     </conbody>
+
+    <concept id="IMPALA-4539">
+      <title>Parquet scanner memory bug: I/O buffer is attached to output batch while scratch batch rows still reference it</title>
+<!-- TSB-225 title: Possibly incorrect results when scanning uncompressed Parquet files with Impala. -->
+      <conbody>
+        <p>
+          Impala queries may return incorrect results when scanning plain-encoded string
+          columns in uncompressed Parquet files. I/O buffers holding the string data are
+          prematurely freed, leading to invalid memory reads and possibly
+          non-deterministic results. This does not affect Parquet files that use a
+          compression codec such as Snappy. Snappy is both strongly recommended generally
+          and the default choice for Impala-written Parquet files.
+        </p>
+        <p>
+          How to determine whether a query might be affected:
+        </p>
+        <ul>
+          <li>
+            The query must reference <codeph>STRING</codeph> columns from a Parquet table.
+          </li>
+          <li>
+            A selective filter on the Parquet table makes this issue more likely.
+          </li>
+          <li>
+            Identify any uncompressed Parquet files processed by the query.
+            Examine the <codeph>HDFS_SCAN_NODE</codeph> portion of a query profile that scans the
+            suspected table. Use a query that performs a full table scan, and materializes the column
+            values. (For example, <codeph>SELECT MIN(<varname>colname</varname>) FROM <varname>tablename</varname></codeph>.)
+            Look for <q>File Formats</q>. A value containing <codeph>PARQUET/NONE</codeph> means uncompressed Parquet.
+          </li>
+          <li>
+            Identify any plain-encoded string columns in the associated table. Pay special attention to tables
+            containing Parquet files generated through Hive, Spark, or other mechanisms outside of Impala,
+            because Impala uses Snappy compression by default for Parquet files. Use <codeph>parquet-tools</codeph>
+            to dump the file metadata. Note that a column could have several encodings within the same file (the column
+            data is stored in several column chunks). Look for <codeph>VLE:PLAIN</codeph> in the output of
+            <codeph>parquet-tools</codeph>, which means the values are plain encoded.
+          </li>
+        </ul>
+        <p><b>Bug:</b> <xref keyref="IMPALA-4539">IMPALA-4539</xref></p>
+        <p><b>Severity:</b> High</p>
+        <p><b>Resolution:</b> Upgrade to a version of Impala containing the fix for <xref keyref="IMPALA-4539">IMPALA-4539</xref>.</p>
+        <p><b>Workaround:</b> Use Snappy or another compression codec for Parquet files.</p>
+      </conbody>
+    </concept>
 
     <concept id="IMPALA-4513">
       <title>ABS(n) where n is the lowest bound for the int types returns negative values</title>
@@ -2017,5 +2131,4 @@ ALTER TABLE table_name SET TBLPROPERTIES('EXTERNAL'='TRUE');
 
   </concept>
 
-</concept>
 </concept>

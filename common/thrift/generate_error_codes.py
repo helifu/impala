@@ -114,7 +114,7 @@ error_codes = (
    "Verify that all your impalads are the same version."),
 
   ("RPC_GENERAL_ERROR", 30, "RPC Error: $0"),
-  ("RPC_RECV_TIMEOUT", 31, "RPC recv timed out: $0"),
+  ("RPC_RECV_TIMEOUT", 31, "RPC recv timed out: dest address: $0, rpc: $1"),
 
   ("UDF_VERIFY_FAILED", 32,
    "Failed to verify function $0 from LLVM module $1, see log for more details."),
@@ -224,8 +224,8 @@ error_codes = (
   ("COMPRESSED_FILE_TRUNCATED", 70,
    "Unexpected end of compressed file. File may be truncated. file=$0"),
 
-  ("DATASTREAM_SENDER_TIMEOUT", 71, "Sender timed out waiting for receiver fragment "
-   "instance: $0"),
+  ("DATASTREAM_SENDER_TIMEOUT", 71, "Sender$0 timed out waiting for receiver fragment "
+   "instance: $1, dest node: $2"),
 
   ("KUDU_IMPALA_TYPE_MISSING", 72, "Kudu type $0 is not available in Impala."),
 
@@ -323,9 +323,9 @@ error_codes = (
    "Failed to verify generated IR function $0, see log for more details."),
 
   ("MINIMUM_RESERVATION_UNAVAILABLE", 106, "Failed to get minimum memory reservation of "
-     "$0 on daemon $1:$2 for query $3 because it would exceed an applicable memory "
-     "limit. Memory is likely oversubscribed. Reducing query concurrency or configuring "
-     "admission control may help avoid this error. Memory usage:\\n$4"),
+     "$0 on daemon $1:$2 for query $3 due to following error: $4Memory is likely "
+     "oversubscribed. Reducing query concurrency or configuring admission control may "
+     "help avoid this error."),
 
   ("ADMISSION_REJECTED", 107, "Rejected query from pool $0: $1"),
 
@@ -336,7 +336,18 @@ error_codes = (
 
   ("DISK_IO_ERROR", 110, "Disk I/O error: $0"),
 
+  ("DATASTREAM_RECVR_CLOSED", 111,
+   "DataStreamRecvr for fragment=$0, node=$1 is closed already"),
 
+  ("BAD_PRINCIPAL_FORMAT", 112,
+    "Kerberos principal should be of the form: <service>/<hostname>@<realm> - got: $0"),
+
+  ("LZ4_COMPRESSION_INPUT_TOO_LARGE", 113,
+   "The input size is too large for LZ4 compression: $0"),
+
+  ("SASL_APP_NAME_MISMATCH", 114,
+   "InitAuth() called multiple times with different names. Was called with $0. "
+   "Now using $1.")
 )
 
 import sys

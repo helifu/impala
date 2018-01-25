@@ -19,7 +19,7 @@ under the License.
 <!DOCTYPE concept PUBLIC "-//OASIS//DTD DITA Concept//EN" "concept.dtd">
 <concept rev="ver" id="fixed_issues">
 
-  <title><ph audience="standalone">Fixed Issues in Apache Impala (incubating)</ph><ph audience="integrated">Fixed Issues in Apache Impala (incubating)</ph></title>
+  <title><ph audience="standalone">Fixed Issues in Apache Impala</ph><ph audience="integrated">Fixed Issues in Apache Impala</ph></title>
   <prolog>
     <metadata>
       <data name="Category" value="Impala"/>
@@ -45,6 +45,22 @@ under the License.
 
     <p outputclass="toc inpage"/>
   </conbody>
+
+<!-- All 2.11.x subsections go under here -->
+
+  <concept rev="2.11.0" id="fixed_issues_2_11_0">
+
+    <title>Issues Fixed in <keyword keyref="impala2110"/></title>
+
+    <conbody>
+
+      <p>
+        For the full list of issues closed in this release, including bug fixes,
+        see the <xref keyref="changelog_211">changelog for <keyword keyref="impala211"/></xref>.
+      </p>
+
+    </conbody>
+  </concept>
 
 <!-- All 2.10.x subsections go under here -->
 

@@ -37,14 +37,15 @@ DEFINE_string(hostname, "", "Hostname to use for this daemon, also used as part 
 
 DEFINE_int32(be_port, 22000,
     "port on which thrift based ImpalaInternalService is exported");
-DEFINE_int32_hidden(krpc_port, 29000,
+DEFINE_int32_hidden(krpc_port, 27000,
     "port on which KRPC based ImpalaInternalService is exported");
 
 // Kerberos is enabled if and only if principal is set.
-DEFINE_string(principal, "", "Kerberos principal. If set, both client and backend network"
-    "connections will use Kerberos encryption and authentication.");
+DEFINE_string(principal, "", "Kerberos principal. If set, both client and backend "
+    "network connections will use Kerberos encryption and authentication. Kerberos will "
+    "not be used for internal or external connections if this is not set.");
 DEFINE_string(be_principal, "", "Kerberos principal for backend network connections only,"
-    "overriding --principal if set.");
+    "overriding --principal if set. Must not be set if --principal is not set.");
 DEFINE_string(keytab_file, "", "Absolute path to Kerberos keytab file");
 DEFINE_string(krb5_conf, "", "Absolute path to Kerberos krb5.conf if in a non-standard "
     "location. Does not normally need to be set.");
@@ -75,7 +76,11 @@ DEFINE_bool(enable_process_lifetime_heap_profiling, false, "(Advanced) Enables h
     "on-demand/remote server profile handlers.");
 
 DEFINE_string(heap_profile_dir, "", "Output directory to store heap profiles. If not set "
-    " profiles are stored in the current working directory.");
+    "profiles are stored in the current working directory.");
+
+DEFINE_int64(tcmalloc_max_total_thread_cache_bytes, 0, "(Advanced) Bound on the total "
+    "amount of bytes allocated to TCMalloc thread caches. If left at 0 (default), use "
+    "the default value in TCMalloc library.");
 
 DEFINE_bool(abort_on_config_error, true, "Abort Impala startup if there are improper "
     "configs or running on unsupported hardware.");
@@ -140,6 +145,9 @@ DEFINE_int32(stress_scratch_write_delay_ms, 0, "A stress option which causes wri
 DEFINE_bool(thread_creation_fault_injection, false, "A fault injection option that "
     " causes calls to Thread::Create() to fail randomly 1% of the time on eligible "
     " codepaths. Effective in debug builds only.");
+DEFINE_int32(stress_catalog_init_delay_ms, 0, "A stress option that injects extra delay"
+    " in milliseconds when initializing an impalad's local catalog replica. Delay <= 0"
+    " inject no delay.");
 #endif
 
 // Used for testing the path where the Kudu client is stubbed.

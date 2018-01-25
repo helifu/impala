@@ -40,14 +40,14 @@ class TestSetAndUnset(CustomClusterTestSuite, HS2TestSuite):
     so the same test is run in both contexts.
     """
     # Beeswax API:
-    result = self.execute_query_expect_success(self.client, "set")
-    assert "DEBUG_ACTION\tcustom" in result.data, "baseline"
+    result = self.execute_query_expect_success(self.client, "set all")
+    assert "DEBUG_ACTION\tcustom\tDEVELOPMENT" in result.data, "baseline"
     self.execute_query_expect_success(self.client, "set debug_action=hey")
-    assert "DEBUG_ACTION\they" in \
-        self.execute_query_expect_success(self.client, "set").data, "session override"
+    assert "DEBUG_ACTION\they\tDEVELOPMENT" in \
+        self.execute_query_expect_success(self.client, "set all").data, "session override"
     self.execute_query_expect_success(self.client, 'set debug_action=""')
-    assert "DEBUG_ACTION\tcustom" in \
-        self.execute_query_expect_success(self.client, "set").data, "reset"
+    assert "DEBUG_ACTION\tcustom\tDEVELOPMENT" in \
+        self.execute_query_expect_success(self.client, "set all").data, "reset"
     self.execute_query_expect_success(self.client, 'set batch_size=123')
     # Use a "request overlay" to change the option for a specific
     # request within a session. We run a real query and check its
@@ -84,12 +84,59 @@ class TestSetAndUnset(CustomClusterTestSuite, HS2TestSuite):
     get_profile_req.sessionHandle = self.session_handle
     assert "BATCH_SIZE=999" in self.hs2_client.GetRuntimeProfile(get_profile_req).profile
 
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--idle_session_timeout=321")
+  @needs_session(TCLIService.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6)
+  def test_set_and_unset_session_timeout(self):
+    """
+    Starts Impala cluster with idle_session_timeout configured, and checks if
+    the SET query displays the correct value.
+
+    The Beeswax API and the HiveServer2 implementations are slightly different,
+    so the same test is run in both contexts.
+    """
+    # Beeswax API:
+    # Default value
+    result = self.execute_query_expect_success(self.client, "set")
+    assert "IDLE_SESSION_TIMEOUT\t321\tREGULAR" in result.data, "baseline"
+    # Session override
+    self.execute_query_expect_success(self.client, "set idle_session_timeout=123")
+    assert "IDLE_SESSION_TIMEOUT\t123\tREGULAR" in \
+        self.execute_query_expect_success(self.client, "set").data, "session override"
+    self.execute_query_expect_success(self.client, 'set idle_session_timeout=1000')
+    assert "IDLE_SESSION_TIMEOUT\t1000\tREGULAR" in \
+        self.execute_query_expect_success(self.client, "set").data, "session override"
+    self.execute_query_expect_success(self.client, 'set idle_session_timeout=0')
+    assert "IDLE_SESSION_TIMEOUT\t0\tREGULAR" in \
+        self.execute_query_expect_success(self.client, "set").data, "session override"
+    # Unset
+    self.execute_query_expect_success(self.client, 'set idle_session_timeout=""')
+    assert "IDLE_SESSION_TIMEOUT\t321\tREGULAR" in \
+        self.execute_query_expect_success(self.client, "set").data, "reset"
+    assert "IDLE_SESSION_TIMEOUT\t321\tREGULAR" in \
+        self.execute_query_expect_success(self.client, "set").data, "after errors"
+
+    # Same dance, but with HS2:
+    # Default value
+    assert ("IDLE_SESSION_TIMEOUT", "321") in self.get_set_results(), "baseline"
+    # Session override
+    self.execute_statement("set idle_session_timeout=123")
+    assert ("IDLE_SESSION_TIMEOUT", "123") in self.get_set_results(), "session override"
+    self.execute_statement("set idle_session_timeout=1000")
+    assert ("IDLE_SESSION_TIMEOUT", "1000") in self.get_set_results(), "session override"
+    self.execute_statement("set idle_session_timeout=0")
+    assert ("IDLE_SESSION_TIMEOUT", "0") in self.get_set_results(), "session override"
+    # Unset
+    self.execute_statement("set idle_session_timeout=''")
+    assert ("IDLE_SESSION_TIMEOUT", "321") in self.get_set_results(), "reset"
+
   def get_set_results(self):
     """
     Executes a "SET" HiveServer2 query and returns a list
     of key-value tuples.
     """
-    execute_statement_resp = self.execute_statement("set")
+    execute_statement_resp = self.execute_statement("set all")
     fetch_results_req = TCLIService.TFetchResultsReq()
     fetch_results_req.operationHandle = execute_statement_resp.operationHandle
     fetch_results_req.maxRows = 100

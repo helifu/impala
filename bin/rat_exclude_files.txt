@@ -19,8 +19,9 @@ testdata/__init__.py
 tests/__init__.py
 www/index.html
 
-# See LICENSE.txt
+# See $IMPALA_HOME/LICENSE.txt
 be/src/gutil/*
+be/src/thirdparty/mpfit/*
 be/src/kudu/gutil
 www/highlight/*
 www/DataTables*/*
@@ -78,6 +79,7 @@ tests/comparison/ORACLE.txt
 bin/distcc/README.md
 tests/comparison/POSTGRES.txt
 docs/README.md
+be/src/thirdparty/pcg-cpp-0.98/README.md
 
 # http://www.apache.org/legal/src-headers.html: "Test data for which the addition of a
 # source header would cause the tests to fail."
@@ -110,8 +112,13 @@ testdata/hive_benchmark/grepTiny/part-00000
 tests/pytest.ini
 tests/shell/bad_impalarc
 tests/shell/good_impalarc
+tests/shell/impalarc_with_error
+tests/shell/impalarc_with_query_options
+tests/shell/impalarc_with_warnings
 tests/shell/shell.cmds
 tests/shell/shell2.cmds
+tests/shell/shell_case_sensitive.cmds
+tests/shell/shell_case_sensitive2.cmds
 tests/shell/shell_error.cmds
 tests/shell/test_close_queries.sql
 tests/shell/test_file_comments.sql
@@ -135,6 +142,7 @@ NOTICE.txt
 
 # Notices in thirdparty sources included in the Impala repo and called out in /LICENSE.txt
 be/src/thirdparty/squeasel/LICENSE
+be/src/thirdparty/pcg-cpp-0.98/LICENSE.txt
 
 # http://www.apache.org/legal/src-headers.html: 'Snippet' files that are combined as form
 # a larger file where the larger file would have duplicate licensing headers.

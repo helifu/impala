@@ -17,6 +17,7 @@
 
 #include "service/client-request-state.h"
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <limits>
 #include <gutil/strings/substitute.h>
 
@@ -42,6 +43,7 @@
 
 #include "common/names.h"
 
+using boost::algorithm::iequals;
 using boost::algorithm::join;
 using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
@@ -88,7 +90,8 @@ ClientRequestState::ClientRequestState(
     fetched_rows_(false),
     frontend_(frontend),
     parent_server_(server),
-    start_time_us_(UnixMicros()) {
+    start_time_us_(UnixMicros()),
+    end_time_us_(0LL) {
 #ifndef NDEBUG
   profile_->AddInfoString("DEBUG MODE WARNING", "Query profile created while running a "
       "DEBUG build of Impala. Use RELEASE builds to measure query performance.");
@@ -106,7 +109,10 @@ ClientRequestState::ClientRequestState(
     summary_profile_->AddInfoString("HiveServer2 Protocol Version",
         Substitute("V$0", 1 + session->hs2_version));
   }
-  summary_profile_->AddInfoString("Start Time", ToStringFromUnixMicros(start_time_us()));
+  // Certain API clients expect Start Time and End Time to be date-time strings
+  // of nanosecond precision, so we explicitly specify the precision here.
+  summary_profile_->AddInfoString("Start Time", ToStringFromUnixMicros(start_time_us(),
+      TimePrecision::Nanosecond));
   summary_profile_->AddInfoString("End Time", "");
   summary_profile_->AddInfoString("Query Type", "N/A");
   summary_profile_->AddInfoString("Query State", PrintQueryState(query_state_));
@@ -118,7 +124,8 @@ ClientRequestState::ClientRequestState(
   summary_profile_->AddInfoString("Network Address",
       lexical_cast<string>(session_->network_address));
   summary_profile_->AddInfoString("Default Db", default_db());
-  summary_profile_->AddInfoString("Sql Statement", query_ctx_.client_request.stmt);
+  summary_profile_->AddInfoStringRedacted(
+      "Sql Statement", query_ctx_.client_request.stmt);
   summary_profile_->AddInfoString("Coordinator",
       TNetworkAddressToString(exec_env->backend_address()));
 }
@@ -176,12 +183,15 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
 
       // Now refresh the table metadata.
       TCatalogOpRequest reset_req;
+      reset_req.__set_sync_ddl(exec_request_.query_options.sync_ddl);
       reset_req.__set_op_type(TCatalogOpType::RESET_METADATA);
       reset_req.__set_reset_metadata_params(TResetMetadataRequest());
       reset_req.reset_metadata_params.__set_header(TCatalogServiceRequestHeader());
       reset_req.reset_metadata_params.__set_is_refresh(true);
       reset_req.reset_metadata_params.__set_table_name(
           exec_request_.load_data_request.table_name);
+      reset_req.reset_metadata_params.__set_sync_ddl(
+          exec_request_.query_options.sync_ddl);
       catalog_op_executor_.reset(
           new CatalogOpExecutor(exec_env_, frontend_, server_profile_));
       RETURN_IF_ERROR(catalog_op_executor_->Exec(reset_req));
@@ -196,24 +206,23 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
       if (exec_request_.set_query_option_request.__isset.key) {
         // "SET key=value" updates the session query options.
         DCHECK(exec_request_.set_query_option_request.__isset.value);
-        RETURN_IF_ERROR(SetQueryOption(
-            exec_request_.set_query_option_request.key,
-            exec_request_.set_query_option_request.value,
-            &session_->set_query_options,
-            &session_->set_query_options_mask));
-        SetResultSet({}, {});
-      } else {
-        // "SET" returns a table of all query options.
-        map<string, string> config;
-        TQueryOptionsToMap(
-            session_->QueryOptions(), &config);
-        vector<string> keys, values;
-        map<string, string>::const_iterator itr = config.begin();
-        for (; itr != config.end(); ++itr) {
-          keys.push_back(itr->first);
-          values.push_back(itr->second);
+        const auto& key = exec_request_.set_query_option_request.key;
+        const auto& value = exec_request_.set_query_option_request.value;
+        RETURN_IF_ERROR(SetQueryOption(key, value, &session_->set_query_options,
+              &session_->set_query_options_mask));
+        SetResultSet({}, {}, {});
+        if (iequals(key, "idle_session_timeout")) {
+          // IMPALA-2248: Session timeout is set as a query option
+          session_->last_accessed_ms = UnixMillis(); // do not expire session immediately
+          session_->UpdateTimeout();
+          VLOG_QUERY << "ClientRequestState::Exec() SET: idle_session_timeout="
+                     << PrettyPrinter::Print(session_->session_timeout, TUnit::TIME_S);
         }
-        SetResultSet(keys, values);
+      } else {
+        // "SET" or "SET ALL"
+        bool is_set_all = exec_request_.set_query_option_request.__isset.is_set_all &&
+            exec_request_.set_query_option_request.is_set_all;
+        PopulateResultForSet(is_set_all);
       }
       return Status::OK();
     }
@@ -222,6 +231,27 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
       errmsg << "Unknown  exec request stmt type: " << exec_request_.stmt_type;
       return Status(errmsg.str());
   }
+}
+
+void ClientRequestState::PopulateResultForSet(bool is_set_all) {
+  map<string, string> config;
+  TQueryOptionsToMap(session_->QueryOptions(), &config);
+  vector<string> keys, values, levels;
+  map<string, string>::const_iterator itr = config.begin();
+  for (; itr != config.end(); ++itr) {
+    const auto opt_level_id =
+        parent_server_->query_option_levels_[itr->first];
+    if (!is_set_all && (opt_level_id == TQueryOptionLevel::DEVELOPMENT ||
+                        opt_level_id == TQueryOptionLevel::DEPRECATED)) {
+      continue;
+    }
+    keys.push_back(itr->first);
+    values.push_back(itr->second);
+    const auto opt_level = _TQueryOptionLevel_VALUES_TO_NAMES.find(opt_level_id);
+    DCHECK(opt_level !=_TQueryOptionLevel_VALUES_TO_NAMES.end());
+    levels.push_back(opt_level->second);
+  }
+  SetResultSet(keys, values, levels);
 }
 
 Status ClientRequestState::ExecLocalCatalogOp(
@@ -393,7 +423,7 @@ Status ClientRequestState::ExecQueryOrDmlRequest(
     plan_ss << "\n----------------\n"
             << query_exec_request.query_plan
             << "----------------";
-    summary_profile_->AddInfoString("Plan", plan_ss.str());
+    summary_profile_->AddInfoStringRedacted("Plan", plan_ss.str());
   }
   // Add info strings consumed by CM: Estimated mem and tables missing stats.
   if (query_exec_request.__isset.per_host_mem_estimate) {
@@ -565,23 +595,15 @@ void ClientRequestState::Done() {
 
   unique_lock<mutex> l(lock_);
   end_time_us_ = UnixMicros();
-  summary_profile_->AddInfoString("End Time", ToStringFromUnixMicros(end_time_us()));
+  // Certain API clients expect Start Time and End Time to be date-time strings
+  // of nanosecond precision, so we explicitly specify the precision here.
+  summary_profile_->AddInfoString("End Time", ToStringFromUnixMicros(end_time_us(),
+      TimePrecision::Nanosecond));
   query_events_->MarkEvent("Unregister query");
 
   // Update result set cache metrics, and update mem limit accounting before tearing
   // down the coordinator.
   ClearResultCache();
-
-  if (coord_.get() != NULL) {
-    // Release any reserved resources.
-    if (exec_env_->admission_controller() != nullptr) {
-      Status status = exec_env_->admission_controller()->ReleaseQuery(schedule_.get());
-      if (!status.ok()) {
-        LOG(WARNING) << "Failed to release resources of query " << schedule_->query_id()
-                     << " because of error: " << status.GetDetail();
-      }
-    }
-  }
 }
 
 Status ClientRequestState::Exec(const TMetadataOpRequest& exec_request) {
@@ -612,12 +634,12 @@ void ClientRequestState::BlockOnWait() {
     l.lock();
     is_block_on_wait_joining_ = false;
     wait_thread_.reset();
-    block_on_wait_cv_.notify_all();
+    block_on_wait_cv_.NotifyAll();
   } else {
     // Another thread is already joining with wait_thread_.  Block on the cond-var
     // until the Join() executed in the other thread has completed.
     do {
-      block_on_wait_cv_.wait(l);
+      block_on_wait_cv_.Wait(l);
     } while (is_block_on_wait_joining_);
   }
 }
@@ -723,7 +745,7 @@ Status ClientRequestState::UpdateQueryStatus(const Status& status) {
   if (!status.ok() && query_status_.ok()) {
     UpdateQueryState(beeswax::QueryState::EXCEPTION);
     query_status_ = status;
-    summary_profile_->AddInfoString("Query Status", query_status_.GetDetail());
+    summary_profile_->AddInfoStringRedacted("Query Status", query_status_.GetDetail());
   }
 
   return status;
@@ -904,6 +926,7 @@ Status ClientRequestState::UpdateCatalog() {
   if (query_exec_request.__isset.finalize_params) {
     const TFinalizeParams& finalize_params = query_exec_request.finalize_params;
     TUpdateCatalogRequest catalog_update;
+    catalog_update.__set_sync_ddl(exec_request().query_options.sync_ddl);
     catalog_update.__set_header(TCatalogServiceRequestHeader());
     catalog_update.header.__set_requesting_user(effective_user());
     if (!coord()->PrepareCatalogUpdate(&catalog_update)) {
@@ -971,6 +994,22 @@ void ClientRequestState::SetResultSet(const vector<string>& col1,
     (*request_result_set_.get())[i].colVals.resize(2);
     (*request_result_set_.get())[i].colVals[0].__set_string_val(col1[i]);
     (*request_result_set_.get())[i].colVals[1].__set_string_val(col2[i]);
+  }
+}
+
+void ClientRequestState::SetResultSet(const vector<string>& col1,
+    const vector<string>& col2, const vector<string>& col3) {
+  DCHECK_EQ(col1.size(), col2.size());
+  DCHECK_EQ(col1.size(), col3.size());
+
+  request_result_set_.reset(new vector<TResultRow>);
+  request_result_set_->resize(col1.size());
+  for (int i = 0; i < col1.size(); ++i) {
+    (*request_result_set_.get())[i].__isset.colVals = true;
+    (*request_result_set_.get())[i].colVals.resize(3);
+    (*request_result_set_.get())[i].colVals[0].__set_string_val(col1[i]);
+    (*request_result_set_.get())[i].colVals[1].__set_string_val(col2[i]);
+    (*request_result_set_.get())[i].colVals[2].__set_string_val(col3[i]);
   }
 }
 
@@ -1043,7 +1082,7 @@ Status ClientRequestState::UpdateTableAndColumnStats(
   }
 
   Status status = catalog_op_executor_->ExecComputeStats(
-      exec_request_.catalog_op_request.ddl_params.compute_stats_params,
+      exec_request_.catalog_op_request,
       child_queries[0]->result_schema(),
       child_queries[0]->result_data(),
       col_stats_schema,

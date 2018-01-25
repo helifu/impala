@@ -72,68 +72,113 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=474-6c406b4a88
+export IMPALA_TOOLCHAIN_BUILD_ID=482-c2361403fc
 # Versions of toolchain dependencies.
 # -----------------------------------
 export IMPALA_AVRO_VERSION=1.7.4-p4
+unset IMPALA_AVRO_URL
 export IMPALA_BINUTILS_VERSION=2.26.1
+unset IMPALA_BINUTILS_URL
 export IMPALA_BOOST_VERSION=1.57.0-p3
+unset IMPALA_BOOST_URL
 export IMPALA_BREAKPAD_VERSION=1b704857f1e78a864e6942e613457e55f1aecb60-p3
+unset IMPALA_BREAKPAD_URL
 export IMPALA_BZIP2_VERSION=1.0.6-p2
+unset IMPALA_BZIP2_URL
 export IMPALA_CMAKE_VERSION=3.8.2-p1
+unset IMPALA_CMAKE_URL
 export IMPALA_CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e-p1
+unset IMPALA_CRCUTIL_URL
 export IMPALA_CYRUS_SASL_VERSION=2.1.23
+unset IMPALA_CYRUS_SASL_URL
 export IMPALA_FLATBUFFERS_VERSION=1.6.0
+unset IMPALA_FLATBUFFERS_URL
 export IMPALA_GCC_VERSION=4.9.2
+unset IMPALA_GCC_URL
 export IMPALA_GFLAGS_VERSION=2.2.0-p1
+unset IMPALA_GFLAGS_URL
 export IMPALA_GLOG_VERSION=0.3.4-p2
+unset IMPALA_GLOG_URL
 export IMPALA_GPERFTOOLS_VERSION=2.5
+unset IMPALA_GPERFTOOLS_URL
 export IMPALA_GTEST_VERSION=1.6.0
+unset IMPALA_GTEST_URL
 export IMPALA_LIBEV_VERSION=4.20
+unset IMPALA_LIBEV_URL
 export IMPALA_LLVM_VERSION=3.9.1
+unset IMPALA_LLVM_URL
 export IMPALA_LLVM_ASAN_VERSION=3.9.1
+unset IMPALA_LLVM_ASAN_URL
+
 # Debug builds should use the release+asserts build to get additional coverage.
 # Don't use the LLVM debug build because the binaries are too large to distribute.
 export IMPALA_LLVM_DEBUG_VERSION=3.9.1-asserts
+unset IMPALA_LLVM_DEBUG_URL
 export IMPALA_LZ4_VERSION=1.7.5
+unset IMPALA_LZ4_URL
 export IMPALA_OPENLDAP_VERSION=2.4.25
+unset IMPALA_OPENLDAP_URL
 export IMPALA_OPENSSL_VERSION=1.0.2l
+unset IMPALA_OPENSSL_URL
 export IMPALA_PROTOBUF_VERSION=2.6.1
+unset IMPALA_PROTOBUF_URL
 export IMPALA_POSTGRES_JDBC_DRIVER_VERSION=9.0-801
+unset IMPALA_POSTGRES_JDBC_DRIVER_URL
 export IMPALA_RAPIDJSON_VERSION=0.11
+unset IMPALA_RAPIDJSON_URL
 export IMPALA_RE2_VERSION=20130115-p1
+unset IMPALA_RE2_URL
 export IMPALA_SNAPPY_VERSION=1.1.4
+unset IMPALA_SNAPPY_URL
 export IMPALA_SQUEASEL_VERSION=3.3
+unset IMPALA_SQUEASEL_URL
 # TPC utilities used for test/benchmark data generation.
 export IMPALA_TPC_DS_VERSION=2.1.0
+unset IMPALA_TPC_DS_URL
 export IMPALA_TPC_H_VERSION=2.17.0
+unset IMPALA_TPC_H_URL
 export IMPALA_THRIFT_VERSION=0.9.0-p11
+unset IMPALA_THRIFT_URL
 export IMPALA_THRIFT_JAVA_VERSION=0.9.0
+unset IMPALA_THRIFT_JAVA_URL
 export IMPALA_ZLIB_VERSION=1.2.8
+unset IMPALA_ZLIB_URL
 
 if [[ $OSTYPE == "darwin"* ]]; then
   IMPALA_CYRUS_SASL_VERSION=2.1.26
+  unset IMPALA_CYRUS_SASL_URL
   IMPALA_GPERFTOOLS_VERSION=2.3
+  unset IMPALA_GPERFTOOLS_URL
   IMPALA_OPENSSL_VERSION=1.0.1p
+  unset IMPALA_OPENSSL_URL
   IMPALA_THRIFT_VERSION=0.9.2
+  unset IMPALA_THRIFT_URL
   IMPALA_THRIFT_JAVA_VERSION=0.9.2
+  unset IMPALA_THRIFT_JAVA_URL
 fi
 
 # Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
-export IMPALA_KUDU_VERSION=bec2a24
+export IMPALA_KUDU_VERSION=1520b39
+unset IMPALA_KUDU_URL
 
 # Kudu version used to identify Java client jar from maven
-export KUDU_JAVA_VERSION=1.6.0-cdh5.14.0-SNAPSHOT
+export KUDU_JAVA_VERSION=1.6.0-cdh5.15.0-SNAPSHOT
 
 # Versions of Hadoop ecosystem dependencies.
 # ------------------------------------------
 export CDH_MAJOR_VERSION=5
-export IMPALA_HADOOP_VERSION=2.6.0-cdh5.14.0-SNAPSHOT
-export IMPALA_HBASE_VERSION=1.2.0-cdh5.14.0-SNAPSHOT
-export IMPALA_HIVE_VERSION=1.1.0-cdh5.14.0-SNAPSHOT
-export IMPALA_SENTRY_VERSION=1.5.1-cdh5.14.0-SNAPSHOT
-export IMPALA_PARQUET_VERSION=1.5.0-cdh5.14.0-SNAPSHOT
+export IMPALA_HADOOP_VERSION=2.6.0-cdh5.15.0-SNAPSHOT
+unset IMPALA_HADOOP_URL
+export IMPALA_HBASE_VERSION=1.2.0-cdh5.15.0-SNAPSHOT
+unset IMPALA_HBASE_URL
+export IMPALA_HIVE_VERSION=1.1.0-cdh5.15.0-SNAPSHOT
+unset IMPALA_HIVE_URL
+export IMPALA_SENTRY_VERSION=1.5.1-cdh5.15.0-SNAPSHOT
+unset IMPALA_SENTRY_URL
+export IMPALA_PARQUET_VERSION=1.5.0-cdh5.15.0-SNAPSHOT
 export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
+unset IMPALA_LLAMA_MINIKDC_URL
+export IMPALA_KITE_VERSION=1.0.0-cdh5.15.0-SNAPSHOT
 
 # Source the branch and local config override files here to override any
 # variables above or any variables below that allow overriding via environment
@@ -164,6 +209,9 @@ export USE_GOLD_LINKER=${USE_GOLD_LINKER-true}
 # is to set the compiler to distcc, in that case the user would also set
 # IMPALA_BUILD_THREADS to increase parallelism.
 export IMPALA_CXX_COMPILER=${IMPALA_CXX_COMPILER-default}
+
+# Add options to 'mvn'; useful for configuring a settings file (-s).
+export IMPALA_MAVEN_OPTIONS=${IMPALA_MAVEN_OPTIONS-}
 
 # If enabled, debug symbols are added to cross-compiled IR.
 export ENABLE_IMPALA_IR_DEBUG_INFO=${ENABLE_IMPALA_IR_DEBUG_INFO-false}
@@ -237,8 +285,6 @@ export IMPALA_LZO="${IMPALA_LZO-$IMPALA_HOME/../Impala-lzo}"
 export IMPALA_AUX_TEST_HOME="${IMPALA_AUX_TEST_HOME-$IMPALA_HOME/../Impala-auxiliary-tests}"
 export TARGET_FILESYSTEM="${TARGET_FILESYSTEM-hdfs}"
 export FILESYSTEM_PREFIX="${FILESYSTEM_PREFIX-}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY-DummySecretAccessKey}"
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID-DummyAccessKeyId}"
 export S3_BUCKET="${S3_BUCKET-}"
 export azure_tenant_id="${azure_tenant_id-DummyAdlsTenantId}"
 export azure_client_id="${azure_client_id-DummyAdlsClientId}"
@@ -251,27 +297,64 @@ export WAREHOUSE_LOCATION_PREFIX="${WAREHOUSE_LOCATION_PREFIX-}"
 export LOCAL_FS="file:${WAREHOUSE_LOCATION_PREFIX}"
 export METASTORE_DB="hive_impala"
 
+# Environment variables carrying AWS security credentials are prepared
+# according to the following rules:
+#
+#     Instance:     Running outside EC2 ||  Running in EC2 |
+# --------------------+--------+--------++--------+--------+
+#   TARGET_FILESYSTEM |   S3   | not S3 ||   S3   | not S3 |
+# --------------------+--------+--------++--------+--------+
+#                     |        |        ||        |        |
+#               empty | unset  | dummy  ||  unset |  unset |
+# AWS_*               |        |        ||        |        |
+# env   --------------+--------+--------++--------+--------+
+# var                 |        |        ||        |        |
+#           not empty | export | export || export | export |
+#                     |        |        ||        |        |
+# --------------------+--------+--------++--------+--------+
+#
+# Legend: unset:  the variable is unset
+#         export: the variable is exported with its current value
+#         dummy:  the variable is set to a constant dummy value and exported
+#
+# Running on an EC2 VM is indicated by setting RUNNING_IN_EC2 to "true" and
+# exporting it from an script running before this one.
+
+# Checks are performed in a subshell to avoid leaking secrets to log files.
+if (set +x; [[ -n ${AWS_ACCESS_KEY_ID-} ]]); then
+  export AWS_ACCESS_KEY_ID
+else
+  if [[ "${TARGET_FILESYSTEM}" == "s3" || "${RUNNING_IN_EC2:-false}" == "true" ]]; then
+    unset AWS_ACCESS_KEY_ID
+  else
+    export AWS_ACCESS_KEY_ID=DummyAccessKeyId
+  fi
+fi
+
+if (set +x; [[ -n ${AWS_SECRET_ACCESS_KEY-} ]]); then
+  export AWS_SECRET_ACCESS_KEY
+else
+  if [[ "${TARGET_FILESYSTEM}" == "s3" || "${RUNNING_IN_EC2:-false}" == "true" ]]; then
+    unset AWS_SECRET_ACCESS_KEY
+  else
+    export AWS_SECRET_ACCESS_KEY=DummySecretAccessKey
+  fi
+fi
+
+# AWS_SESSION_TOKEN is not set to a dummy value, it is not needed by the FE tests
+if (set +x; [[ -n ${AWS_SESSION_TOKEN-} ]]); then
+  export AWS_SESSION_TOKEN
+else
+  unset AWS_SESSION_TOKEN
+fi
+
 if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
-  # Basic error checking
-  if [[ "${AWS_ACCESS_KEY_ID}" = "DummyAccessKeyId" ||\
-        "${AWS_SECRET_ACCESS_KEY}" = "DummySecretAccessKey" ]]; then
-    echo "Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-      need to be assigned valid values and belong to the owner of the s3
-      bucket in order to access the file system"
+  if ${IMPALA_HOME}/bin/check-s3-access.sh; then
+    export DEFAULT_FS="s3a://${S3_BUCKET}"
+    export FILESYSTEM_PREFIX="${DEFAULT_FS}"
+  else
     return 1
   fi
-  # Check if the s3 bucket is NULL.
-  if [[ "${S3_BUCKET}" = "" ]]; then
-    echo "S3_BUCKET cannot be an empty string for s3"
-    return 1
-  fi
-  aws s3 ls "s3://${S3_BUCKET}/" 1>/dev/null
-  if [ $? != 0 ]; then
-    echo "Access to ${S3_BUCKET} failed."
-    return 1
-  fi
-  DEFAULT_FS="s3a://${S3_BUCKET}"
-  export DEFAULT_FS
 elif [ "${TARGET_FILESYSTEM}" = "adls" ]; then
   # Basic error checking
   if [[ "${azure_client_id}" = "DummyAdlsClientId" ||\
@@ -502,6 +585,7 @@ echo "LD_PRELOAD              = $LD_PRELOAD"
 echo "POSTGRES_JDBC_DRIVER    = $POSTGRES_JDBC_DRIVER"
 echo "IMPALA_TOOLCHAIN        = $IMPALA_TOOLCHAIN"
 echo "DOWNLOAD_CDH_COMPONENTS = $DOWNLOAD_CDH_COMPONENTS"
+echo "IMPALA_MAVEN_OPTIONS    = $IMPALA_MAVEN_OPTIONS"
 
 # Kerberos things.  If the cluster exists and is kerberized, source
 # the required environment.  This is required for any hadoop tool to

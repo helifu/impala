@@ -22,7 +22,6 @@
 #include <list>
 #include <set>
 #include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
 
@@ -96,7 +95,7 @@ class DataStreamMgr : public DataStreamMgrBase {
   /// sender has closed.
   /// Returns OK if successful, error status otherwise.
   Status CloseSender(const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id,
-      int sender_id) override;
+      int sender_id);
 
   /// Closes all receivers registered for fragment_instance_id immediately.
   void Cancel(const TUniqueId& fragment_instance_id) override;

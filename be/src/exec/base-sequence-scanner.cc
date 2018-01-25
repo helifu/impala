@@ -32,6 +32,7 @@
 #include "common/names.h"
 
 using namespace impala;
+using namespace impala::io;
 
 const int BaseSequenceScanner::HEADER_SIZE = 1024;
 const int BaseSequenceScanner::SYNC_MARKER = -1;
@@ -48,18 +49,21 @@ Status BaseSequenceScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
   // Issue just the header range for each file.  When the header is complete,
   // we'll issue the splits for that file.  Splits cannot be processed until the
   // header is parsed (the header object is then shared across splits for that file).
-  vector<DiskIoMgr::ScanRange*> header_ranges;
+  vector<ScanRange*> header_ranges;
   for (int i = 0; i < files.size(); ++i) {
     ScanRangeMetadata* metadata =
         static_cast<ScanRangeMetadata*>(files[i]->splits[0]->meta_data());
+    ScanRangeMetadata* header_metadata =
+        scan_node->runtime_state()->obj_pool()->Add(new ScanRangeMetadata(*metadata));
+    header_metadata->is_sequence_header = true;
     int64_t header_size = min<int64_t>(HEADER_SIZE, files[i]->file_length);
     // The header is almost always a remote read. Set the disk id to -1 and indicate
     // it is not cached.
     // TODO: add remote disk id and plumb that through to the io mgr.  It should have
     // 1 queue for each NIC as well?
-    DiskIoMgr::ScanRange* header_range = scan_node->AllocateScanRange(files[i]->fs,
-        files[i]->filename.c_str(), header_size, 0, metadata->partition_id, -1, false,
-        DiskIoMgr::BufferOpts::Uncached());
+    ScanRange* header_range = scan_node->AllocateScanRange(files[i]->fs,
+        files[i]->filename.c_str(), header_size, 0, header_metadata, -1, false,
+        BufferOpts::Uncached());
     header_ranges.push_back(header_range);
   }
   // Issue the header ranges only. GetNextInternal() will issue the files' scan ranges
@@ -98,9 +102,6 @@ Status BaseSequenceScanner::Open(ScannerContext* context) {
     only_parsing_header_ = true;
     return Status::OK();
   }
-
-  // If the file is compressed, the buffers in the stream_ are not used directly.
-  if (header_->is_compressed) stream_->set_contains_tuple_data(false);
   RETURN_IF_ERROR(InitNewRange());
 
   // Skip to the first record
@@ -128,7 +129,6 @@ void BaseSequenceScanner::Close(RowBatch* row_batch) {
   if (row_batch != nullptr) {
     row_batch->tuple_data_pool()->AcquireData(data_buffer_pool_.get(), false);
     row_batch->tuple_data_pool()->AcquireData(template_tuple_pool_.get(), false);
-    context_->ReleaseCompletedResources(row_batch, true);
     if (scan_node_->HasRowBatchQueue()) {
       static_cast<HdfsScanNode*>(scan_node_)->AddMaterializedRowBatch(
         unique_ptr<RowBatch>(row_batch));
@@ -136,13 +136,12 @@ void BaseSequenceScanner::Close(RowBatch* row_batch) {
   } else {
     data_buffer_pool_->FreeAll();
     template_tuple_pool_->FreeAll();
-    context_->ReleaseCompletedResources(nullptr, true);
   }
+  context_->ReleaseCompletedResources(true);
 
   // Verify all resources (if any) have been transferred.
   DCHECK_EQ(template_tuple_pool_.get()->total_allocated_bytes(), 0);
   DCHECK_EQ(data_buffer_pool_.get()->total_allocated_bytes(), 0);
-  DCHECK_EQ(context_->num_completed_io_buffers(), 0);
   // 'header_' can be nullptr if HdfsScanNodeBase::CreateAndOpenScanner() failed.
   if (!only_parsing_header_ && header_ != nullptr) {
     scan_node_->RangeComplete(file_format(), header_->compression_type);
@@ -314,7 +313,7 @@ void BaseSequenceScanner::CloseFileRanges(const char* filename) {
   DCHECK(only_parsing_header_);
   HdfsFileDesc* desc = scan_node_->GetFileDesc(
       context_->partition_descriptor()->id(), filename);
-  const vector<DiskIoMgr::ScanRange*>& splits = desc->splits;
+  const vector<ScanRange*>& splits = desc->splits;
   for (int i = 0; i < splits.size(); ++i) {
     COUNTER_ADD(bytes_skipped_counter_, splits[i]->len());
     scan_node_->RangeComplete(file_format(), THdfsCompression::NONE);

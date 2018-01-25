@@ -19,7 +19,6 @@ package org.apache.impala.planner;
 
 import static org.junit.Assert.fail;
 
-import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.file.Paths;
@@ -153,8 +152,8 @@ public class PlannerTestBase extends FrontendTestBase {
         }
       }
     }
-    if (execRequest.isSetDesc_tbl()) {
-      TDescriptorTable descTbl = execRequest.desc_tbl;
+    if (execRequest.query_ctx.isSetDesc_tbl()) {
+      TDescriptorTable descTbl = execRequest.query_ctx.desc_tbl;
       for (TTupleDescriptor tupleDesc: descTbl.tupleDescriptors) {
         tupleMap_.put(tupleDesc.id, tupleDesc);
       }
@@ -234,8 +233,9 @@ public class PlannerTestBase extends FrontendTestBase {
     boolean first = true;
     // Iterate through all partitions of the descriptor table and verify all partitions
     // are referenced.
-    if (execRequest.isSetDesc_tbl() && execRequest.desc_tbl.isSetTableDescriptors()) {
-      for (TTableDescriptor tableDesc: execRequest.desc_tbl.tableDescriptors) {
+    if (execRequest.query_ctx.isSetDesc_tbl()
+        && execRequest.query_ctx.desc_tbl.isSetTableDescriptors()) {
+      for (TTableDescriptor tableDesc: execRequest.query_ctx.desc_tbl.tableDescriptors) {
         // All partitions of insertTableId are okay.
         if (tableDesc.getId() == insertTableId) continue;
         if (!tableDesc.isSetHdfsTable()) continue;
@@ -410,22 +410,24 @@ public class PlannerTestBase extends FrontendTestBase {
       throw new IllegalStateException("Cannot plan empty query in line: " +
           testCase.getStartingLineNum());
     }
+    // Set up the query context. Note that we need to deep copy it before planning each
+    // time since planning modifies it.
     TQueryCtx queryCtx = TestUtils.createQueryContext(
         dbName, System.getProperty("user.name"));
     queryCtx.client_request.query_options = testCase.getOptions();
     // Test single node plan, scan range locations, and column lineage.
-    TExecRequest singleNodeExecRequest = testPlan(testCase, Section.PLAN, queryCtx,
+    TExecRequest singleNodeExecRequest = testPlan(testCase, Section.PLAN, queryCtx.deepCopy(),
         ignoreExplainHeader, errorLog, actualOutput);
     validateTableIds(singleNodeExecRequest);
     checkScanRangeLocations(testCase, singleNodeExecRequest, errorLog, actualOutput);
     checkColumnLineage(testCase, singleNodeExecRequest, errorLog, actualOutput);
     checkLimitCardinality(query, singleNodeExecRequest, errorLog);
     // Test distributed plan.
-    testPlan(testCase, Section.DISTRIBUTEDPLAN, queryCtx, ignoreExplainHeader, errorLog,
-        actualOutput);
+    testPlan(testCase, Section.DISTRIBUTEDPLAN, queryCtx.deepCopy(), ignoreExplainHeader,
+        errorLog, actualOutput);
     // test parallel plans
-    testPlan(testCase, Section.PARALLELPLANS, queryCtx, ignoreExplainHeader, errorLog,
-        actualOutput);
+    testPlan(testCase, Section.PARALLELPLANS, queryCtx.deepCopy(), ignoreExplainHeader,
+        errorLog, actualOutput);
   }
 
   /**
@@ -436,8 +438,8 @@ public class PlannerTestBase extends FrontendTestBase {
     if (request == null || !request.isSetQuery_exec_request()) return;
     TQueryExecRequest execRequest = request.query_exec_request;
     HashSet<Integer> seenTableIds = Sets.newHashSet();
-    if (execRequest.isSetDesc_tbl()) {
-      TDescriptorTable descTbl = execRequest.desc_tbl;
+    if (execRequest.query_ctx.isSetDesc_tbl()) {
+      TDescriptorTable descTbl = execRequest.query_ctx.desc_tbl;
       if (descTbl.isSetTableDescriptors()) {
         for (TTableDescriptor tableDesc: descTbl.tableDescriptors) {
           if (seenTableIds.contains(tableDesc.id)) {
@@ -742,6 +744,13 @@ public class PlannerTestBase extends FrontendTestBase {
     for (TestCase testCase : queryFileParser.getTestCases()) {
       actualOutput.append(testCase.getSectionAsString(Section.QUERY, true, "\n"));
       actualOutput.append("\n");
+      String queryOptionsSection = testCase.getSectionAsString(
+          Section.QUERYOPTIONS, true, "\n");
+      if (queryOptionsSection != null && !queryOptionsSection.isEmpty()) {
+        actualOutput.append("---- QUERYOPTIONS\n");
+        actualOutput.append(queryOptionsSection);
+        actualOutput.append("\n");
+      }
       try {
         runTestCase(testCase, errorLog, actualOutput, dbName, ignoreExplainHeader);
       } catch (CatalogException e) {

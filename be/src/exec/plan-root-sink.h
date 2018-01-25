@@ -19,8 +19,7 @@
 #define IMPALA_EXEC_PLAN_ROOT_SINK_H
 
 #include "exec/data-sink.h"
-
-#include <boost/thread/condition_variable.hpp>
+#include "util/condition-variable.h"
 
 namespace impala {
 
@@ -57,9 +56,7 @@ class ScalarExprEvaluator;
 /// and consumer. See IMPALA-4268.
 class PlanRootSink : public DataSink {
  public:
-  PlanRootSink(const RowDescriptor* row_desc);
-
-  virtual std::string GetName() { return NAME; }
+  PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state);
 
   /// Sends a new batch. Ownership of 'batch' remains with the sender. Blocks until the
   /// consumer has consumed 'batch' by calling GetNext().
@@ -95,12 +92,12 @@ class PlanRootSink : public DataSink {
   /// num_rows_requested_, and so the sender may begin satisfying that request for rows
   /// from its current batch. Also signalled when CloseConsumer() is called, to unblock
   /// the sender.
-  boost::condition_variable sender_cv_;
+  ConditionVariable sender_cv_;
 
   /// Waited on by the consumer only. Signalled when the sender has finished serving a
   /// request for rows. Also signalled by Close() and FlushFinal() to signal to the
   /// consumer that no more rows are coming.
-  boost::condition_variable consumer_cv_;
+  ConditionVariable consumer_cv_;
 
   /// Signals to producer that the consumer is done, and the sink may be torn down.
   bool consumer_done_ = false;

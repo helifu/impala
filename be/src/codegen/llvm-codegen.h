@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <boost/scoped_ptr.hpp>
 
 #include <boost/unordered_set.hpp>
@@ -102,6 +103,13 @@ class LlvmBuilder : public llvm::IRBuilder<> {
 /// be called directly.  The test interface can be used to load any precompiled
 /// module or none at all (but this class will not validate the module).
 //
+/// There are two classes of functions defined based on how they are generated:
+/// 1. Handcrafted functions - These functions are built from scratch using the IRbuilder
+/// interface.
+/// 2. Cross-compiled functions - These functions are loaded directly from a
+/// cross-compiled IR module and are either directly used or are cloned and modified
+/// before use.
+//
 /// This class is not threadsafe.  During the Prepare() phase of the fragment execution,
 /// nodes should codegen functions, and register those functions with AddFunctionToJit().
 /// Afterward, FinalizeModule() should be called at which point all codegened functions
@@ -119,7 +127,7 @@ class LlvmBuilder : public llvm::IRBuilder<> {
 /// TODO: look into diagnostic output and debuggability
 /// TODO: confirm that the multi-threaded usage is correct
 //
-/// llvm::Function objects in the module are materialized lazily to save the cost of
+/// Function objects in the module are materialized lazily to save the cost of
 /// parsing IR of functions which are dead code. An unmaterialized function is similar
 /// to a function declaration which only contains the function signature and needs to
 /// be materialized before optimization and compilation happen if it's not dead code.
@@ -168,7 +176,7 @@ class LlvmCodeGen {
 
   /// For debugging. Returns the IR that was generated.  If full_module, the
   /// entire module is dumped, including what was loaded from precompiled IR.
-  /// If false, only output IR for functions which were generated.
+  /// If false, only output IR for functions which were handcrafted.
   std::string GetIR(bool full_module) const;
 
   /// Utility struct that wraps a variable name and llvm type.
@@ -206,18 +214,18 @@ class LlvmCodeGen {
     }
 
     /// Generate LLVM function prototype.
-    /// If a non-null 'builder' is passed, this function will also create the entry block
-    /// and set the builder's insert point to there.
+    /// This is the canonical way to start generating a handcrafted codegen'd function.
+    /// If a non-null 'builder' is passed, this function will also create the entry
+    /// block, add it to the llvm module via the builder by setting the builder's insert
+    /// point to the entry block, and add it to the list of functions handcrafted by
+    /// impala. FinalizeFunction() must be called for any function generated this way
+    /// otherwise it will be deleted during FinalizeModule().
     ///
     /// If 'params' is non-null, this function will also return the arguments values
     /// (params[0] is the first arg, etc). In that case, 'params' should be preallocated
     /// to be number of arguments
-    ///
-    /// If 'print_ir' is true, the generated llvm::Function's IR will be printed when
-    /// GetIR() is called. Avoid doing so for IR function prototypes generated for
-    /// externally defined native function.
     llvm::Function* GeneratePrototype(
-        LlvmBuilder* builder = NULL, llvm::Value** params = NULL, bool print_ir = true);
+        LlvmBuilder* builder = nullptr, llvm::Value** params = nullptr);
 
    private:
     friend class LlvmCodeGen;
@@ -265,6 +273,12 @@ class LlvmCodeGen {
   /// which cannot be represented with primitive types (e.g. struct).
   llvm::Constant* ConstantToGVPtr(llvm::Type* type, llvm::Constant* ir_constant,
       const std::string& name);
+
+  /// Creates a global value 'name' that is an array with element type 'element_type'
+  /// containing 'ir_constants'. Returns a pointer to the global value, i.e. a pointer
+  /// to a constant array of 'element_type'.
+  llvm::Constant* ConstantsToGVArrayPtr(llvm::Type* element_type,
+      llvm::ArrayRef<llvm::Constant*> ir_constants, const std::string& name);
 
   /// Returns reference to llvm context object.  Each LlvmCodeGen has its own
   /// context to allow multiple threads to be calling into llvm at the same time.
@@ -357,13 +371,19 @@ class LlvmCodeGen {
   /// Returns the i-th argument of fn.
   llvm::Argument* GetArgument(llvm::Function* fn, int i);
 
-  /// Verify function.  This should be called at the end for each codegen'd function.  If
-  /// the function does not verify, it will delete the function and return NULL,
+  /// Verify function. All handcrafted functions need to be finalized before being
+  /// passed to AddFunctionToJit() otherwise the functions will be deleted from the
+  /// module when the module is finalized. Also, all loaded functions that need to be JIT
+  /// compiled after modification also need to be finalized.
+  /// If the function does not verify, it will delete the function and return NULL,
   /// otherwise, it returns the function object.
   llvm::Function* FinalizeFunction(llvm::Function* function);
 
   /// Adds the function to be automatically jit compiled when the codegen object is
   /// finalized. FinalizeModule() will set fn_ptr to point to the jitted function.
+  ///
+  /// Pre-condition: FinalizeFunction() must have been called on the function passed to
+  /// this method.
   ///
   /// Only functions registered with AddFunctionToJit() and their dependencies are
   /// compiled by FinalizeModule(): other functions are considered dead code and will
@@ -414,7 +434,7 @@ class LlvmCodeGen {
   ///   int32_t Hash(int8_t* data, int len, int32_t seed);
   /// If num_bytes is non-zero, the returned function will be codegen'd to only
   /// work for that number of bytes.  It is invalid to call that function with a
-  /// different 'len'.
+  /// different 'len'. Functions returned by these methods have already been finalized.
   llvm::Function* GetHashFunction(int num_bytes = -1);
   llvm::Function* GetFnvHashFunction(int num_bytes = -1);
   llvm::Function* GetMurmurHashFunction(int num_bytes = -1);
@@ -488,8 +508,10 @@ class LlvmCodeGen {
   static Status GetSymbols(const string& file, const string& module_id,
       boost::unordered_set<std::string>* symbols);
 
-  /// Generates function to return min/max(v1, v2)
-  llvm::Function* CodegenMinMax(const ColumnType& type, bool min);
+  /// Codegen at the current builder location in function 'fn' to store the
+  /// max/min('src', value in 'dst_slot_ptr') in 'dst_slot_ptr'
+  void CodegenMinMax(LlvmBuilder* builder, const ColumnType& type,
+      llvm::Value* dst_slot_ptr, llvm::Value* src, bool min, llvm::Function* fn);
 
   /// Codegen to call llvm memcpy intrinsic at the current builder location
   /// dst & src must be pointer types. size is the number of bytes to copy.
@@ -534,6 +556,7 @@ class LlvmCodeGen {
  private:
   friend class ExprCodegenTest;
   friend class LlvmCodeGenTest;
+  friend class LlvmCodeGenTest_CpuAttrWhitelist_Test;
   friend class SubExprElimination;
 
   /// Top level codegen object. 'module_id' is used for debugging when outputting the IR.
@@ -573,9 +596,13 @@ class LlvmCodeGen {
   Status LoadModuleFromMemory(std::unique_ptr<llvm::MemoryBuffer> module_ir_buf,
       std::string module_name, std::unique_ptr<llvm::Module>* module);
 
-  /// Loads a module at 'file' and links it to the module associated with
-  /// this LlvmCodeGen object. The module must be on the local filesystem.
-  Status LinkModule(const std::string& file);
+  /// Loads a module at 'file' and links it to the module associated with this
+  /// LlvmCodeGen object. The 'file' must be on the local filesystem.
+  Status LinkModuleFromLocalFs(const std::string& file);
+
+  /// Same as 'LinkModuleFromLocalFs', but takes an hdfs file location instead and makes
+  /// sure that the same hdfs file is not linked twice.
+  Status LinkModuleFromHdfs(const std::string& hdfs_file);
 
   /// Strip global constructors and destructors from an LLVM module. We never run them
   /// anyway (they must be explicitly invoked) so it is dead code.
@@ -648,6 +675,14 @@ class LlvmCodeGen {
   /// Destroy the IR module, freeing memory used by the IR. Any machine code that was
   /// generated is retained by the execution engine.
   void DestroyModule();
+
+  /// Disable CPU attributes in 'cpu_attrs' that are not present in
+  /// the '--llvm_cpu_attr_whitelist' flag. The same attributes in the input are
+  /// always present in the output, except "+" is flipped to "-" for the disabled
+  /// attributes. E.g. if 'cpu_attrs' is {"+x", "+y", "-z"} and the whitelist is
+  /// {"x", "z"}, returns {"+x", "-y", "-z"}.
+  static std::vector<std::string> ApplyCpuAttrWhitelist(
+      const std::vector<std::string>& cpu_attrs);
 
   /// Whether InitializeLlvm() has been called.
   static bool llvm_initialized_;
@@ -733,13 +768,16 @@ class LlvmCodeGen {
   /// The memory manager used by 'execution_engine_'. Owned by 'execution_engine_'.
   ImpalaMCJITMemoryManager* memory_manager_;
 
-  /// Functions parsed from pre-compiled module.  Indexed by ImpalaIR::Function enum
-  std::vector<llvm::Function*> loaded_functions_;
+  /// Functions parsed from pre-compiled module. Indexed by ImpalaIR::Function enum.
+  std::vector<llvm::Function*> cross_compiled_functions_;
 
-  /// Stores functions codegen'd by impala.  This does not contain cross compiled
-  /// functions, only function that were generated at runtime.  Does not overlap
-  /// with loaded_functions_.
-  std::vector<llvm::Function*> codegend_functions_;
+  /// Stores functions handcrafted by impala.  This does not contain cross compiled
+  /// functions, only function that were generated from scratch at runtime. Does not
+  /// overlap with loaded_functions_.
+  std::vector<llvm::Function*> handcrafted_functions_;
+
+  /// Stores the functions that have been finalized.
+  std::unordered_set<llvm::Function*> finalized_functions_;
 
   /// A mapping of unique id to registered expr functions
   std::map<int64_t, llvm::Function*> registered_exprs_map_;
@@ -755,8 +793,8 @@ class LlvmCodeGen {
   /// we can codegen a loop unrolled hash function.
   std::map<int, llvm::Function*> hash_fns_;
 
-  /// The locations of modules that have been linked. Used to avoid linking the same module
-  /// twice, which causes symbol collision errors.
+  /// The locations of modules that have been linked. Uses hdfs file location as the key.
+  /// Used to avoid linking the same module twice, which causes symbol collision errors.
   std::set<std::string> linked_modules_;
 
   /// The vector of functions to automatically JIT compile after FinalizeModule().

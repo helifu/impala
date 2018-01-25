@@ -94,11 +94,10 @@ struct FieldLocation {
 ///    the codegen'd function to use.
 /// This way, we only codegen once per scanner type, rather than once per scanner object.
 //
-/// This class also encapsulates row batch management.  Subclasses should call CommitRows()
-/// after writing to the current row batch, which handles creating row batches, attaching
-/// resources (IO buffers and mem pools) to the current row batch, and passing row batches
-/// up to the scan node. Subclasses can also use GetMemory() to help with per-row memory
-/// management.
+/// This class also encapsulates row batch management. Subclasses should call
+/// CommitRows() after writing to the current row batch, which handles creating row
+/// batches, releasing per-batch resources, and passing row batches up to the scan node.
+/// Subclasses can also use GetMemory() to help with per-row memory management.
 /// TODO: Have a pass over all members and move them out of the base class if sensible
 /// to clarify which state each concrete scanner type actually has.
 class HdfsScanner {
@@ -137,7 +136,7 @@ class HdfsScanner {
   /// queue. Only valid to call if HasRowBatchQueue().
   void Close();
 
-  /// Transfers the ownership of memory backing returned tuples such as IO buffers
+  /// Transfers the ownership of memory backing returned tuples such as buffers
   /// and memory in mem pools to the given row batch. If the row batch is NULL,
   /// those resources are released instead. In any case, releases all other resources
   /// that are not backing returned rows (e.g. temporary decompression buffers).
@@ -218,8 +217,9 @@ class HdfsScanner {
   // scanners that do not support nested types.
   const std::vector<ScalarExprEvaluator*>* conjunct_evals_ = nullptr;
 
-  // Clones of the conjuncts' evaluators in scan_node_->dict_filter_conjuncts_map().
-  typedef std::map<SlotId, std::vector<ScalarExprEvaluator*>> DictFilterConjunctsMap;
+  // Clones of the conjuncts' evaluators in scan_node_->thrift_dict_filter_conjuncts().
+  typedef std::map<SlotId, std::vector<ScalarExprEvaluator*>>
+      DictFilterConjunctsMap;
   DictFilterConjunctsMap dict_filter_map_;
 
   /// Holds memory for template tuples. The memory in this pool must remain valid as long
@@ -271,13 +271,19 @@ class HdfsScanner {
   /// decompressor and any other per data block allocations.
   boost::scoped_ptr<MemPool> data_buffer_pool_;
 
+  /// Offsets of string slots in the result tuple that may need to be copied as part of
+  /// tuple materialization. Populated in constructor. This is redundant with offset
+  /// information stored in the TupleDescriptor but storing only the required metadata
+  /// in a simple array of struct simplifies codegen and speeds up interpretation.
+  std::vector<SlotOffsets> string_slot_offsets_;
+
   /// Time spent decompressing bytes.
   RuntimeProfile::Counter* decompress_timer_ = nullptr;
 
   /// Matching typedef for WriteAlignedTuples for codegen.  Refer to comments for
   /// that function.
-  typedef int (*WriteTuplesFn)(HdfsScanner*, MemPool*, TupleRow*, int, FieldLocation*,
-      int, int, int, int);
+  typedef int (*WriteTuplesFn)(HdfsScanner*, MemPool*, TupleRow*, FieldLocation*,
+      int, int, int, int, bool);
   /// Jitted write tuples function pointer.  Null if codegen is disabled.
   WriteTuplesFn write_tuples_fn_ = nullptr;
 
@@ -310,7 +316,6 @@ class HdfsScanner {
       Tuple** tuple_mem, TupleRow** tuple_row_mem, int64_t* num_rows) WARN_UNUSED_RESULT;
 
   /// Commits 'num_rows' to 'row_batch'. Advances 'tuple_mem_' and 'tuple_' accordingly.
-  /// Attaches completed resources from 'context_' to 'row_batch' if necessary.
   /// Frees expr result allocations. Returns non-OK if 'context_' is cancelled or the
   /// query status in 'state_' is non-OK.
   Status CommitRows(int num_rows, RowBatch* row_batch) WARN_UNUSED_RESULT;
@@ -322,8 +327,12 @@ class HdfsScanner {
     return ExecNode::EvalConjuncts(conjunct_evals_->data(), conjunct_evals_->size(), row);
   }
 
-  /// Sets 'num_tuples' template tuples in the batch that 'row' points to. Assumes the
-  /// 'tuple_row' only has a single tuple. Returns the number of tuples set.
+  /// Handles the case when there are no slots materialized (e.g. count(*)) by adding
+  /// up to 'num_tuples' rows to the row batch which 'row' points to. Assumes each tuple
+  /// row only has one tuple. Set the added tuples in the row batch with the template
+  /// tuple if it's not NULL. In the rare case when there are conjuncts, evaluate them
+  /// once for each row and only add a row when they evaluate to true. Returns the number
+  /// of tuple rows added.
   int WriteTemplateTuples(TupleRow* row, int num_tuples);
 
   /// Processes batches of fields and writes them out to tuple_row_mem.
@@ -332,15 +341,18 @@ class HdfsScanner {
   /// - 'fields' must start at the beginning of a tuple.
   /// - 'num_tuples' number of tuples to process
   /// - 'max_added_tuples' the maximum number of tuples that should be added to the batch.
-  /// - 'row_start_index' is the number of rows that have already been processed
+  /// - 'row_idx_start' is the number of rows that have already been processed
   ///   as part of WritePartialTuple.
+  /// - 'copy_strings': if true, strings in returned tuples that pass conjuncts are
+  ///   copied into 'pool'
   /// Returns the number of tuples added to the row batch.  This can be less than
   /// num_tuples/tuples_till_limit because of failed conjuncts.
-  /// Returns -1 if parsing should be aborted due to parse errors.
+  /// Returns -1 if an error is encountered, e.g. a parse error or a memory allocation
+  /// error.
   /// Only valid to call if the parent scan node is multi-threaded.
-  int WriteAlignedTuples(MemPool* pool, TupleRow* tuple_row_mem, int row_size,
-      FieldLocation* fields, int num_tuples,
-      int max_added_tuples, int slots_per_tuple, int row_start_indx);
+  int WriteAlignedTuples(MemPool* pool, TupleRow* tuple_row_mem, FieldLocation* fields,
+      int num_tuples, int max_added_tuples, int slots_per_tuple, int row_idx_start,
+      bool copy_strings);
 
   /// Update the decompressor_ object given a compression type or codec name. Depending on
   /// the old compression type and the new one, it may close the old decompressor and/or
@@ -390,31 +402,42 @@ class HdfsScanner {
   /// Codegen function to replace WriteCompleteTuple. Should behave identically
   /// to WriteCompleteTuple. Stores the resulting function in 'write_complete_tuple_fn'
   /// if codegen was successful or NULL otherwise.
-  static Status CodegenWriteCompleteTuple(HdfsScanNodeBase* node, LlvmCodeGen* codegen,
-      const std::vector<ScalarExpr*>& conjuncts,
-      llvm::Function** write_complete_tuple_fn)
-      WARN_UNUSED_RESULT;
+  static Status CodegenWriteCompleteTuple(const HdfsScanNodeBase* node,
+      LlvmCodeGen* codegen, const std::vector<ScalarExpr*>& conjuncts,
+      llvm::Function** write_complete_tuple_fn) WARN_UNUSED_RESULT;
 
   /// Codegen function to replace WriteAlignedTuples.  WriteAlignedTuples is cross
   /// compiled to IR.  This function loads the precompiled IR function, modifies it,
   /// and stores the resulting function in 'write_aligned_tuples_fn' if codegen was
   /// successful or NULL otherwise.
-  static Status CodegenWriteAlignedTuples(HdfsScanNodeBase*, LlvmCodeGen*,
-      llvm::Function* write_tuple_fn, llvm::Function** write_aligned_tuples_fn)
-      WARN_UNUSED_RESULT;
+  static Status CodegenWriteAlignedTuples(const HdfsScanNodeBase*, LlvmCodeGen*,
+      llvm::Function* write_tuple_fn,
+      llvm::Function** write_aligned_tuples_fn) WARN_UNUSED_RESULT;
+
+  /// Codegen function to replace InitTuple() removing runtime constants like the tuple
+  /// size and branches like the template tuple existence check. The codegen'd version
+  /// of InitTuple() is stored in 'init_tuple_fn' if codegen was successful.
+  static Status CodegenInitTuple(
+      const HdfsScanNodeBase* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn);
 
   /// Report parse error for column @ desc.   If abort_on_error is true, sets
   /// parse_status_ to the error message.
   void ReportColumnParseError(const SlotDescriptor* desc, const char* data, int len);
 
-  /// Initialize a tuple.
-  /// TODO: only copy over non-null slots.
-  void InitTuple(const TupleDescriptor* desc, Tuple* template_tuple, Tuple* tuple) {
-    if (template_tuple != NULL) {
-      InitTupleFromTemplate(template_tuple, tuple, desc->byte_size());
+  /// Initialize a tuple. Inlined into the convenience version below for codegen.
+  void IR_ALWAYS_INLINE InitTuple(
+      const TupleDescriptor* desc, Tuple* template_tuple, Tuple* tuple) {
+    if (has_template_tuple(template_tuple)) {
+      InitTupleFromTemplate(template_tuple, tuple, tuple_byte_size());
     } else {
-      tuple->ClearNullBits(*desc);
+      tuple->ClearNullBits(desc->null_bytes_offset(), desc->num_null_bytes());
     }
+  }
+
+  /// Convenience version of above that passes in the scan's TupleDescriptor.
+  /// Replaced with a codegen'd version in IR.
+  void IR_NO_INLINE InitTuple(Tuple* template_tuple, Tuple* tuple) {
+    return InitTuple(scan_node_->tuple_desc(), template_tuple, tuple);
   }
 
   /// Initialize 'tuple' with size 'tuple_byte_size' from 'template_tuple'
@@ -454,8 +477,13 @@ class HdfsScanner {
     }
   }
 
-  void InitTuple(Tuple* template_tuple, Tuple* tuple) {
-    InitTuple(scan_node_->tuple_desc(), template_tuple, tuple);
+  /// Not inlined in IR so it can be replaced with a constant.
+  int IR_NO_INLINE tuple_byte_size() const { return tuple_byte_size_; }
+
+  /// Returns true iff 'template_tuple' is non-NULL.
+  /// Not inlined in IR so it can be replaced with a constant.
+  static bool IR_NO_INLINE has_template_tuple(Tuple* template_tuple) {
+    return template_tuple != nullptr;
   }
 
   inline Tuple* next_tuple(int tuple_byte_size, Tuple* t) const {

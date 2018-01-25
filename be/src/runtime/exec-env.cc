@@ -28,6 +28,7 @@
 #include "common/object-pool.h"
 #include "exec/kudu-util.h"
 #include "gen-cpp/ImpalaInternalService.h"
+#include "kudu/rpc/service_if.h"
 #include "rpc/rpc-mgr.h"
 #include "runtime/backend-client.h"
 #include "runtime/bufferpool/buffer-pool.h"
@@ -35,7 +36,7 @@
 #include "runtime/client-cache.h"
 #include "runtime/coordinator.h"
 #include "runtime/data-stream-mgr.h"
-#include "runtime/disk-io-mgr.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/hbase-table-factory.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/krpc-data-stream-mgr.h"
@@ -47,6 +48,7 @@
 #include "scheduling/admission-controller.h"
 #include "scheduling/request-pool-service.h"
 #include "scheduling/scheduler.h"
+#include "service/data-stream-service.h"
 #include "service/frontend.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/debug-util.h"
@@ -64,6 +66,7 @@
 #include "common/names.h"
 
 using boost::algorithm::join;
+using kudu::rpc::ServiceIf;
 using namespace strings;
 
 DEFINE_bool_hidden(use_statestore, true, "Deprecated, do not use");
@@ -81,6 +84,11 @@ DEFINE_bool_hidden(use_krpc, false, "Used to indicate whether to use KRPC for th
     "DataStream subsystem, or the Thrift RPC layer instead. Defaults to false. "
     "KRPC not yet supported");
 
+DEFINE_int32(datastream_service_queue_depth, 1024, "Size of datastream service queue");
+DEFINE_int32(datastream_service_num_svc_threads, 0, "Number of datastream service "
+    "processing threads. If left at default value 0, it will be set to number of CPU "
+    "cores.");
+
 DECLARE_int32(state_store_port);
 DECLARE_int32(num_threads_per_core);
 DECLARE_int32(num_cores);
@@ -92,6 +100,7 @@ DECLARE_string(buffer_pool_clean_pages_limit);
 DECLARE_int64(min_buffer_size);
 DECLARE_bool(is_coordinator);
 DECLARE_int32(webserver_port);
+DECLARE_int64(tcmalloc_max_total_thread_cache_bytes);
 
 // TODO: Remove the following RM-related flags in Impala 3.0.
 DEFINE_bool_hidden(enable_rm, false, "Deprecated");
@@ -156,7 +165,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
             FLAGS_catalog_client_rpc_timeout_ms, FLAGS_catalog_client_rpc_timeout_ms, "",
             !FLAGS_ssl_client_ca_certificate.empty())),
     htable_factory_(new HBaseTableFactory()),
-    disk_io_mgr_(new DiskIoMgr()),
+    disk_io_mgr_(new io::DiskIoMgr()),
     webserver_(new Webserver(webserver_port)),
     pool_mem_trackers_(new PoolMemTrackerRegistry),
     thread_mgr_(new ThreadResourceMgr),
@@ -168,6 +177,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
     backend_address_(MakeNetworkAddress(hostname, backend_port)) {
 
   if (FLAGS_use_krpc) {
+    VLOG_QUERY << "Using KRPC.";
     // KRPC relies on resolved IP address. It's set in StartServices().
     krpc_address_.__set_port(krpc_port);
     rpc_mgr_.reset(new RpcMgr());
@@ -261,6 +271,16 @@ Status ExecEnv::Init() {
           "bytes value or percentage: $0", FLAGS_mem_limit));
   }
 
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
+  // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
+  // not backed by physical pages and do not contribute towards memory consumption.
+  // Enable it in TCMalloc before InitBufferPool().
+  if (!MallocExtension::instance()->SetNumericProperty(
+          "tcmalloc.aggressive_memory_decommit", 1)) {
+    return Status("Failed to enable TCMalloc aggressive decommit.");
+  }
+#endif
+
   if (!BitUtil::IsPowerOf2(FLAGS_min_buffer_size)) {
     return Status(Substitute(
         "--min_buffer_size must be a power-of-two: $0", FLAGS_min_buffer_size));
@@ -293,7 +313,13 @@ Status ExecEnv::Init() {
   // Initialize the RPCMgr before allowing services registration.
   if (FLAGS_use_krpc) {
     krpc_address_.__set_hostname(ip_address_);
+    RETURN_IF_ERROR(KrpcStreamMgr()->Init());
     RETURN_IF_ERROR(rpc_mgr_->Init());
+    unique_ptr<ServiceIf> data_svc(new DataStreamService(rpc_mgr_.get()));
+    int num_svc_threads = FLAGS_datastream_service_num_svc_threads > 0 ?
+        FLAGS_datastream_service_num_svc_threads : CpuInfo::num_cores();
+    RETURN_IF_ERROR(rpc_mgr_->RegisterService(num_svc_threads,
+        FLAGS_datastream_service_queue_depth, move(data_svc)));
   }
 
   mem_tracker_.reset(
@@ -307,20 +333,34 @@ Status ExecEnv::Init() {
   // Also need a MemTracker for unused reservations as a negative value. Unused
   // reservations are counted against queries but not against the process memory
   // consumption. This accounts for that difference.
-  IntGauge* negated_unused_reservation = obj_pool_->Add(new NegatedGauge<int64_t>(
-        MakeTMetricDef("negated_unused_reservation", TMetricKind::GAUGE, TUnit::BYTES),
-        BufferPoolMetric::UNUSED_RESERVATION_BYTES));
+  IntGauge* negated_unused_reservation = obj_pool_->Add(new NegatedGauge(
+      MakeTMetricDef("negated_unused_reservation", TMetricKind::GAUGE, TUnit::BYTES),
+      BufferPoolMetric::UNUSED_RESERVATION_BYTES));
   obj_pool_->Add(new MemTracker(negated_unused_reservation, -1,
       "Buffer Pool: Unused Reservation", mem_tracker_.get()));
 #if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
-  // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
-  // not backed by physical pages and do not contribute towards memory consumption.
-  size_t aggressive_decommit_enabled = 0;
-  MallocExtension::instance()->GetNumericProperty(
-      "tcmalloc.aggressive_memory_decommit", &aggressive_decommit_enabled);
-  if (!aggressive_decommit_enabled) {
-    return Status("TCMalloc aggressive decommit is required but is disabled.");
+  // Change the total TCMalloc thread cache size if necessary.
+  if (FLAGS_tcmalloc_max_total_thread_cache_bytes > 0 &&
+      !MallocExtension::instance()->SetNumericProperty(
+          "tcmalloc.max_total_thread_cache_bytes",
+          FLAGS_tcmalloc_max_total_thread_cache_bytes)) {
+    return Status("Failed to change TCMalloc total thread cache size.");
   }
+  // A MemTracker for TCMalloc overhead which is the difference between the physical bytes
+  // reserved (TcmallocMetric::PHYSICAL_BYTES_RESERVED) and the bytes in use
+  // (TcmallocMetrics::BYTES_IN_USE). This overhead accounts for all the cached freelists
+  // used by TCMalloc.
+  IntGauge* negated_bytes_in_use = obj_pool_->Add(new NegatedGauge(
+      MakeTMetricDef("negated_tcmalloc_bytes_in_use", TMetricKind::GAUGE, TUnit::BYTES),
+      TcmallocMetric::BYTES_IN_USE));
+  vector<IntGauge*> overhead_metrics;
+  overhead_metrics.push_back(negated_bytes_in_use);
+  overhead_metrics.push_back(TcmallocMetric::PHYSICAL_BYTES_RESERVED);
+  SumGauge* tcmalloc_overhead = obj_pool_->Add(new SumGauge(
+      MakeTMetricDef("tcmalloc_overhead", TMetricKind::GAUGE, TUnit::BYTES),
+      overhead_metrics));
+  obj_pool_->Add(
+      new MemTracker(tcmalloc_overhead, -1, "TCMalloc Overhead", mem_tracker_.get()));
 #endif
   mem_tracker_->RegisterMetrics(metrics_.get(), "mem-tracker.process");
 
@@ -367,8 +407,8 @@ Status ExecEnv::Init() {
   return Status::OK();
 }
 
-Status ExecEnv::StartServices() {
-  LOG(INFO) << "Starting global services";
+Status ExecEnv::StartStatestoreSubscriberService() {
+  LOG(INFO) << "Starting statestore subscriber service";
 
   // Must happen after all topic registrations / callbacks are done
   if (statestore_subscriber_.get() != nullptr) {
@@ -379,8 +419,14 @@ Status ExecEnv::StartServices() {
     }
   }
 
-  // Start this last so everything is in place before accepting the first call.
-  if (FLAGS_use_krpc) RETURN_IF_ERROR(rpc_mgr_->StartServices(krpc_address_));
+  return Status::OK();
+}
+
+Status ExecEnv::StartKrpcService() {
+  if (FLAGS_use_krpc) {
+    LOG(INFO) << "Starting KRPC service";
+    RETURN_IF_ERROR(rpc_mgr_->StartServices(krpc_address_));
+  }
   return Status::OK();
 }
 

@@ -30,7 +30,14 @@
 #include <gutil/strings/substitute.h>
 
 #include "codegen/llvm-codegen.h"
+#include "common/logging.h"
+#include "common/object-pool.h"
+#include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
+#include "runtime/descriptors.h"
 #include "runtime/hdfs-fs-cache.h"
+#include "runtime/io/disk-io-mgr.h"
+#include "runtime/io/request-context.h"
 #include "runtime/runtime-filter.inline.h"
 #include "runtime/runtime-state.h"
 #include "util/disk-info.h"
@@ -48,7 +55,7 @@ DECLARE_bool(skip_file_runtime_filtering);
 
 namespace filesystem = boost::filesystem;
 using namespace impala;
-using namespace llvm;
+using namespace impala::io;
 using namespace strings;
 
 const string HdfsScanNodeBase::HDFS_SPLIT_STATS_DESC =
@@ -231,7 +238,7 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
     file_desc->splits.push_back(
         AllocateScanRange(file_desc->fs, file_desc->filename.c_str(), split.length,
             split.offset, split.partition_id, params.volume_id, expected_local,
-            DiskIoMgr::BufferOpts(try_cache, file_desc->mtime)));
+            BufferOpts(try_cache, file_desc->mtime)));
   }
 
   // Update server wide metrics for number of scan ranges and ranges that have
@@ -270,7 +277,7 @@ void HdfsScanNodeBase::Codegen(RuntimeState* state) {
 
     // Create reusable codegen'd functions for each file type type needed
     // TODO: do this for conjuncts_map_
-    Function* fn;
+    llvm::Function* fn;
     Status status;
     switch (format) {
       case THdfsFileFormat::TEXT:
@@ -325,7 +332,7 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
         partition_desc->partition_key_value_evals(), scan_node_pool_.get(), state);
   }
 
-  runtime_state_->io_mgr()->RegisterContext(&reader_context_, mem_tracker());
+  reader_context_ = runtime_state_->io_mgr()->RegisterContext(mem_tracker());
 
   // Initialize HdfsScanNode specific counters
   // TODO: Revisit counters and move the counters specific to multi-threaded scans
@@ -345,12 +352,13 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
   num_scanner_threads_started_counter_ =
       ADD_COUNTER(runtime_profile(), NUM_SCANNER_THREADS_STARTED, TUnit::UNIT);
 
-  runtime_state_->io_mgr()->set_bytes_read_counter(reader_context_, bytes_read_counter());
-  runtime_state_->io_mgr()->set_read_timer(reader_context_, read_timer());
-  runtime_state_->io_mgr()->set_active_read_thread_counter(reader_context_,
-      &active_hdfs_read_thread_counter_);
-  runtime_state_->io_mgr()->set_disks_access_bitmap(reader_context_,
-      &disks_accessed_bitmap_);
+  runtime_state_->io_mgr()->set_bytes_read_counter(
+      reader_context_.get(), bytes_read_counter());
+  runtime_state_->io_mgr()->set_read_timer(reader_context_.get(), read_timer());
+  runtime_state_->io_mgr()->set_active_read_thread_counter(
+      reader_context_.get(), &active_hdfs_read_thread_counter_);
+  runtime_state_->io_mgr()->set_disks_access_bitmap(
+      reader_context_.get(), &disks_accessed_bitmap_);
 
   average_scanner_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
       AVERAGE_SCANNER_THREAD_CONCURRENCY, &active_scanner_thread_counter_);
@@ -394,14 +402,10 @@ Status HdfsScanNodeBase::Reset(RuntimeState* state) {
 void HdfsScanNodeBase::Close(RuntimeState* state) {
   if (is_closed()) return;
 
-  if (reader_context_ != NULL) {
-    // There may still be io buffers used by parent nodes so we can't unregister the
-    // reader context yet. The runtime state keeps a list of all the reader contexts and
-    // they are unregistered when the fragment is closed.
-    state->AcquireReaderContext(reader_context_);
+  if (reader_context_ != nullptr) {
     // Need to wait for all the active scanner threads to finish to ensure there is no
     // more memory tracked by this scan node's mem tracker.
-    state->io_mgr()->CancelContext(reader_context_, true);
+    state->io_mgr()->UnregisterContext(reader_context_.get());
   }
 
   StopAndFinalizeCounters();
@@ -474,19 +478,25 @@ bool HdfsScanNodeBase::FilePassesFilterPredicates(
       static_cast<ScanRangeMetadata*>(file->splits[0]->meta_data());
   if (!PartitionPassesFilters(metadata->partition_id, FilterStats::FILES_KEY,
           filter_ctxs)) {
-    for (int j = 0; j < file->splits.size(); ++j) {
-      // Mark range as complete to ensure progress.
-      RangeComplete(format, file->file_compression, true);
-    }
+    SkipFile(format, file);
     return false;
   }
   return true;
 }
 
-DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
     int64_t len, int64_t offset, int64_t partition_id, int disk_id, bool expected_local,
-    const DiskIoMgr::BufferOpts& buffer_opts,
-    const DiskIoMgr::ScanRange* original_split) {
+    const BufferOpts& buffer_opts,
+    const ScanRange* original_split) {
+  ScanRangeMetadata* metadata = runtime_state_->obj_pool()->Add(
+        new ScanRangeMetadata(partition_id, original_split));
+  return AllocateScanRange(fs, file, len, offset, metadata, disk_id, expected_local,
+      buffer_opts);
+}
+
+ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+    int64_t len, int64_t offset, ScanRangeMetadata* metadata, int disk_id, bool expected_local,
+    const BufferOpts& buffer_opts) {
   DCHECK_GE(disk_id, -1);
   // Require that the scan range is within [0, file_length). While this cannot be used
   // to guarantee safety (file_length metadata may be stale), it avoids different
@@ -494,28 +504,25 @@ DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char*
   // beyond the end of the file).
   DCHECK_GE(offset, 0);
   DCHECK_GE(len, 0);
-  DCHECK_LE(offset + len, GetFileDesc(partition_id, file)->file_length)
+  DCHECK_LE(offset + len, GetFileDesc(metadata->partition_id, file)->file_length)
       << "Scan range beyond end of file (offset=" << offset << ", len=" << len << ")";
   disk_id = runtime_state_->io_mgr()->AssignQueue(file, disk_id, expected_local);
 
-  ScanRangeMetadata* metadata = runtime_state_->obj_pool()->Add(
-        new ScanRangeMetadata(partition_id, original_split));
-  DiskIoMgr::ScanRange* range =
-      runtime_state_->obj_pool()->Add(new DiskIoMgr::ScanRange());
+  ScanRange* range = runtime_state_->obj_pool()->Add(new ScanRange);
   range->Reset(fs, file, len, offset, disk_id, expected_local, buffer_opts, metadata);
   return range;
 }
 
-DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
     int64_t len, int64_t offset, int64_t partition_id, int disk_id, bool try_cache,
-    bool expected_local, int mtime, const DiskIoMgr::ScanRange* original_split) {
+    bool expected_local, int mtime, const ScanRange* original_split) {
   return AllocateScanRange(fs, file, len, offset, partition_id, disk_id, expected_local,
-      DiskIoMgr::BufferOpts(try_cache, mtime), original_split);
+      BufferOpts(try_cache, mtime), original_split);
 }
 
-Status HdfsScanNodeBase::AddDiskIoRanges(const vector<DiskIoMgr::ScanRange*>& ranges,
-    int num_files_queued) {
-  RETURN_IF_ERROR(runtime_state_->io_mgr()->AddScanRanges(reader_context_, ranges));
+Status HdfsScanNodeBase::AddDiskIoRanges(
+    const vector<ScanRange*>& ranges, int num_files_queued) {
+  RETURN_IF_ERROR(runtime_state_->io_mgr()->AddScanRanges(reader_context_.get(), ranges));
   num_unqueued_files_.Add(-num_files_queued);
   DCHECK_GE(num_unqueued_files_.Load(), 0);
   return Status::OK();
@@ -659,7 +666,7 @@ bool HdfsScanNodeBase::PartitionPassesFilters(int32_t partition_id,
       continue;
     }
 
-    bool has_filter = ctx.filter->HasBloomFilter();
+    bool has_filter = ctx.filter->HasFilter();
     bool passed_filter = !has_filter || ctx.Eval(tuple_row_mem);
     ctx.stats->IncrCounters(stats_name, 1, has_filter, !passed_filter);
     if (!passed_filter) return false;
@@ -684,6 +691,13 @@ void HdfsScanNodeBase::RangeComplete(const THdfsFileFormat::type& file_type,
     compression_set.AddType(compression_types[i]);
   }
   ++file_type_counts_[std::make_tuple(file_type, skipped, compression_set)];
+}
+
+void HdfsScanNodeBase::SkipFile(const THdfsFileFormat::type& file_type,
+    HdfsFileDesc* file) {
+  for (int i = 0; i < file->splits.size(); ++i) {
+    RangeComplete(file_type, file->file_compression, true);
+  }
 }
 
 void HdfsScanNodeBase::ComputeSlotMaterializationOrder(vector<int>* order) const {
@@ -809,20 +823,21 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
   runtime_profile()->AppendExecOption(
       Substitute("Codegen enabled: $0 out of $1", num_enabled, total));
 
-  if (reader_context_ != NULL) {
-    bytes_read_local_->Set(runtime_state_->io_mgr()->bytes_read_local(reader_context_));
+  if (reader_context_ != nullptr) {
+    bytes_read_local_->Set(
+        runtime_state_->io_mgr()->bytes_read_local(reader_context_.get()));
     bytes_read_short_circuit_->Set(
-        runtime_state_->io_mgr()->bytes_read_short_circuit(reader_context_));
+        runtime_state_->io_mgr()->bytes_read_short_circuit(reader_context_.get()));
     bytes_read_dn_cache_->Set(
-        runtime_state_->io_mgr()->bytes_read_dn_cache(reader_context_));
+        runtime_state_->io_mgr()->bytes_read_dn_cache(reader_context_.get()));
     num_remote_ranges_->Set(static_cast<int64_t>(
-        runtime_state_->io_mgr()->num_remote_ranges(reader_context_)));
+        runtime_state_->io_mgr()->num_remote_ranges(reader_context_.get())));
     unexpected_remote_bytes_->Set(
-        runtime_state_->io_mgr()->unexpected_remote_bytes(reader_context_));
+        runtime_state_->io_mgr()->unexpected_remote_bytes(reader_context_.get()));
     cached_file_handles_hit_count_->Set(
-        runtime_state_->io_mgr()->cached_file_handles_hit_count(reader_context_));
+        runtime_state_->io_mgr()->cached_file_handles_hit_count(reader_context_.get()));
     cached_file_handles_miss_count_->Set(
-        runtime_state_->io_mgr()->cached_file_handles_miss_count(reader_context_));
+        runtime_state_->io_mgr()->cached_file_handles_miss_count(reader_context_.get()));
 
     if (unexpected_remote_bytes_->value() >= UNEXPECTED_REMOTE_BYTES_WARN_THRESHOLD) {
       runtime_state_->LogError(ErrorMsg(TErrorCode::GENERAL, Substitute(

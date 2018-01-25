@@ -246,7 +246,10 @@ public class AggregateInfo extends AggregateInfoBase {
         throw new AnalysisException(
             "all DISTINCT aggregate functions need to have the same set of "
             + "parameters as " + distinctAggExprs.get(0).toSql()
-            + "; deviating function: " + distinctAggExprs.get(i).toSql());
+            + "; deviating function: " + distinctAggExprs.get(i).toSql() + "\n"
+            + "Consider using NDV() instead of COUNT(DISTINCT) if estimated "
+            + "counts are acceptable. Enable the APPX_COUNT_DISTINCT query "
+            + "option to perform this rewrite automatically.");
       }
     }
 
@@ -574,7 +577,7 @@ public class AggregateInfo extends AggregateInfoBase {
           new SlotRef(outputTupleDesc_.getSlots().get(i)),
           new SlotRef(intermediateTupleDesc_.getSlots().get(i)));
       if (i < groupingExprs_.size()) {
-        analyzer.createAuxEquivPredicate(
+        analyzer.createAuxEqPredicate(
             new SlotRef(outputTupleDesc_.getSlots().get(i)),
             new SlotRef(intermediateTupleDesc_.getSlots().get(i)));
       }

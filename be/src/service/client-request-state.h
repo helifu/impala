@@ -25,6 +25,7 @@
 #include "service/child-query.h"
 #include "service/impala-server.h"
 #include "util/auth-util.h"
+#include "util/condition-variable.h"
 #include "util/runtime-profile.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/Frontend_types.h"
@@ -254,7 +255,7 @@ class ClientRequestState {
 
   /// Condition variable to make BlockOnWait() thread-safe. One thread joins
   /// wait_thread_, and all other threads block on this cv. Used with lock_.
-  boost::condition_variable block_on_wait_cv_;
+  ConditionVariable block_on_wait_cv_;
 
   /// Used in conjunction with block_on_wait_cv_ to make BlockOnWait() thread-safe.
   bool is_block_on_wait_joining_;
@@ -295,10 +296,18 @@ class ClientRequestState {
   /// * server_profile_ tracks time spent inside the ImpalaServer,
   ///   but not inside fragment execution, i.e. the time taken to
   ///   register and set-up the query and for rows to be fetched.
-  //
+  ///
   /// There's a fourth profile which is not built here (but is a
   /// child of profile_); the execution profile which tracks the
   /// actual fragment execution.
+  ///
+  /// Redaction: Only the following info strings in the profile are redacted as they
+  /// are expected to contain sensitive information like schema/column references etc.
+  /// Other fields are left unredacted.
+  /// - Query Statement
+  /// - Query Plan
+  /// - Query Status
+  /// - Error logs
   RuntimeProfile* const profile_;
   RuntimeProfile* const server_profile_;
   RuntimeProfile* const summary_profile_;
@@ -339,6 +348,9 @@ class ClientRequestState {
   ImpalaServer* parent_server_;
 
   /// Start/end time of the query, in Unix microseconds.
+  /// end_time_us_ is initialized to 0 in the constructor, which is used to indicate
+  /// that the query is not yet done. It is assinged the final value in
+  /// ClientRequestState::Done().
   int64_t start_time_us_, end_time_us_;
 
   /// Executes a local catalog operation (an operation that does not need to execute
@@ -387,6 +399,8 @@ class ClientRequestState {
   void SetResultSet(const std::vector<std::string>& results);
   void SetResultSet(const std::vector<std::string>& col1,
       const std::vector<std::string>& col2);
+  void SetResultSet(const vector<string>& col1,
+      const vector<string>& col2, const vector<string>& col3);
   void SetResultSet(const std::vector<std::string>& col1,
       const std::vector<std::string>& col2, const std::vector<std::string>& col3,
       const std::vector<std::string>& col4);
@@ -413,6 +427,11 @@ class ClientRequestState {
   /// Does not take lock_, but requires it: caller must ensure lock_
   /// is taken before calling UpdateQueryState.
   void UpdateQueryState(beeswax::QueryState::type query_state);
+
+  /// Gets the query options, their values and levels and populates the result set
+  /// with them. It covers the subset of options for 'SET' and all of them for
+  /// 'SET ALL'
+  void PopulateResultForSet(bool is_set_all);
 };
 
 }

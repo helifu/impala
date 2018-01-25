@@ -29,13 +29,17 @@ class TestWebPage(ImpalaTestSuite):
   RESET_GLOG_LOGLEVEL_URL = "http://localhost:{0}/reset_glog_level"
   CATALOG_URL = "http://localhost:{0}/catalog"
   CATALOG_OBJECT_URL = "http://localhost:{0}/catalog_object"
+  TABLE_METRICS_URL = "http://localhost:{0}/table_metrics"
   QUERY_BACKENDS_URL = "http://localhost:{0}/query_backends"
+  QUERY_FINSTANCES_URL = "http://localhost:{0}/query_finstances"
+  THREAD_GROUP_URL = "http://localhost:{0}/thread-group"
   # log4j changes do not apply to the statestore since it doesn't
   # have an embedded JVM. So we make two sets of ports to test the
   # log level endpoints, one without the statestore port and the
   # one with it.
   TEST_PORTS_WITHOUT_SS = ["25000", "25020"]
   TEST_PORTS_WITH_SS = ["25000", "25010", "25020"]
+  CATALOG_TEST_PORT = ["25020"]
 
   def test_memz(self):
     """test /memz at impalad / statestored / catalogd"""
@@ -150,6 +154,8 @@ class TestWebPage(ImpalaTestSuite):
     self.__test_catalog_object("functional_parquet", "alltypes")
     self.__test_catalog_object("functional", "alltypesnopart")
     self.__test_catalog_object("functional_kudu", "alltypes")
+    self.__test_table_metrics("functional", "alltypes", "total-file-size-bytes")
+    self.__test_table_metrics("functional_kudu", "alltypes", "alter-duration")
 
   def __test_catalog_object(self, db_name, tbl_name):
     """Tests the /catalog_object endpoint for the given db/table. Runs
@@ -163,7 +169,26 @@ class TestWebPage(ImpalaTestSuite):
       "?object_type=TABLE&object_name=%s.%s" % (db_name, tbl_name), tbl_name,
       ports_to_test=self.TEST_PORTS_WITHOUT_SS)
 
-  def test_query_details(self, unique_database):
+  def __test_table_metrics(self, db_name, tbl_name, metric):
+    self.client.execute("refresh %s.%s" % (db_name, tbl_name))
+    self.get_and_check_status(self.TABLE_METRICS_URL +
+      "?name=%s.%s" % (db_name, tbl_name), metric, ports_to_test=self.CATALOG_TEST_PORT)
+
+  def __run_query_and_get_debug_page(self, query, page_url):
+    """Runs a query to obtain the content of the debug page pointed to by page_url, then
+    cancels the query."""
+    query_handle =  self.client.execute_async(query)
+    response_json = ""
+    try:
+      response = self.get_and_check_status(
+        page_url + "?query_id=%s&json" % query_handle.get_handle().id,
+        ports_to_test=[25000])
+      response_json = json.loads(response)
+    finally:
+      self.client.cancel(query_handle)
+    return response_json
+
+  def test_backend_states(self, unique_database):
     """Test that /query_backends returns the list of backend states for DML or queries;
     nothing for DDL statements"""
     CROSS_JOIN = ("select count(*) from functional.alltypes a "
@@ -171,17 +196,36 @@ class TestWebPage(ImpalaTestSuite):
     for q in [CROSS_JOIN,
               "CREATE TABLE {0}.foo AS {1}".format(unique_database, CROSS_JOIN),
               "DESCRIBE functional.alltypes"]:
-      query_handle =  self.client.execute_async(q)
-      try:
-        response = self.get_and_check_status(
-          self.QUERY_BACKENDS_URL + "?query_id=%s&json" % query_handle.get_handle().id,
-          ports_to_test=[25000])
+      response_json = self.__run_query_and_get_debug_page(q, self.QUERY_BACKENDS_URL)
 
-        response_json = json.loads(response)
+      if "DESCRIBE" not in q:
+        assert len(response_json['backend_states']) > 0
+      else:
+        assert 'backend_states' not in response_json
 
-        if "DESCRIBE" not in q:
-          assert len(response_json['backend_states']) > 0
-        else:
-          assert 'backend_states' not in response_json
-      finally:
-        self.client.cancel(query_handle)
+  def test_backend_instances(self, unique_database):
+    """Test that /query_finstances returns the list of fragment instances for DML or
+    queries; nothing for DDL statements"""
+    CROSS_JOIN = ("select count(*) from functional.alltypes a "
+                  "CROSS JOIN functional.alltypes b CROSS JOIN functional.alltypes c")
+    for q in [CROSS_JOIN,
+              "CREATE TABLE {0}.foo AS {1}".format(unique_database, CROSS_JOIN),
+              "DESCRIBE functional.alltypes"]:
+      response_json = self.__run_query_and_get_debug_page(q, self.QUERY_FINSTANCES_URL)
+
+      if "DESCRIBE" not in q:
+        assert len(response_json['backend_instances']) > 0
+      else:
+        assert 'backend_instances' not in response_json
+
+  def test_io_mgr_threads(self):
+    """Test that IoMgr threads have readable names. This test assumed that all systems we
+    support have a disk called 'sda'."""
+    response = self.get_and_check_status(
+        self.THREAD_GROUP_URL + "?group=disk-io-mgr&json", ports_to_test=[25000])
+    response_json = json.loads(response)
+    thread_names = [t["name"] for t in response_json['threads']]
+    expected_name_patterns = ["ADLS remote", "S3 remote", "HDFS remote", "sda"]
+    for pattern in expected_name_patterns:
+      assert any(pattern in t for t in thread_names), \
+           "Could not find thread matching '%s'" % pattern

@@ -18,6 +18,7 @@
 #ifndef IMPALA_SERVICE_IMPALA_SERVER_H
 #define IMPALA_SERVICE_IMPALA_SERVER_H
 
+#include <atomic>
 #include <boost/thread/mutex.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/scoped_ptr.hpp>
@@ -35,6 +36,7 @@
 #include "common/status.h"
 #include "service/frontend.h"
 #include "service/query-options.h"
+#include "util/condition-variable.h"
 #include "util/metrics.h"
 #include "util/runtime-profile.h"
 #include "util/simple-logger.h"
@@ -74,6 +76,30 @@ class ClientRequestState;
 /// An ImpalaServer contains both frontend and backend functionality;
 /// it implements ImpalaService (Beeswax), ImpalaHiveServer2Service (HiveServer2)
 /// and ImpalaInternalService APIs.
+/// ImpalaServer can be started in 1 of 3 roles: executor, coordinator, or both executor
+/// and coordinator. All roles start ImpalaInternalService API's. The
+/// coordinator role additionally starts client API's (Beeswax and HiveServer2).
+///
+/// Startup Sequence
+/// ----------------
+/// The startup sequence opens and starts all services so that they are ready to be used
+/// by clients at the same time. The Impala server is considered 'ready' only when it can
+/// process requests with all of its specified roles. Avoiding states where some roles are
+/// ready and some are not makes it easier to reason about the state of the server.
+///
+/// Main thread (caller code), after instantiating the server, must call Start().
+/// Start() does the following:
+///    - Start internal services
+///    - Wait (indefinitely) for local catalog to be initialized from statestore
+///      (if coordinator)
+///    - Open ImpalaInternalService ports
+///    - Open client ports (if coordinator)
+///    - Start ImpalaInternalService API
+///    - Start client service API's (if coordinator)
+///    - Set services_started_ flag
+///
+/// Internally, the Membership callback thread also participates in startup:
+///    - If services_started_, then register to the statestore as an executor.
 ///
 /// Locking
 /// -------
@@ -117,14 +143,10 @@ class ImpalaServer : public ImpalaServiceIf,
   ImpalaServer(ExecEnv* exec_env);
   ~ImpalaServer();
 
-  /// Initializes RPC services and other subsystems (like audit logging). Returns an error
-  /// if initialization failed. If any ports are <= 0, their respective service will not
-  /// be started.
-  Status Init(int32_t thrift_be_port, int32_t beeswax_port, int32_t hs2_port);
-
-  /// Starts client and internal services. Does not block. Returns an error if any service
-  /// failed to start.
-  Status Start();
+  /// Initializes and starts RPC services and other subsystems (like audit logging).
+  /// Returns an error if starting any services failed. If the port is <= 0, their
+  ///respective service will not be started.
+  Status Start(int32_t thrift_be_port, int32_t beeswax_port, int32_t hs2_port);
 
   /// Blocks until the server shuts down (by calling Shutdown()).
   void Join();
@@ -286,21 +308,43 @@ class ImpalaServer : public ImpalaServiceIf,
   void CatalogUpdateCallback(const StatestoreSubscriber::TopicDeltaMap& topic_deltas,
       std::vector<TTopicDelta>* topic_updates);
 
-  /// Processes a CatalogUpdateResult returned from the CatalogServer and ensures
-  /// the update has been applied to the local impalad's catalog cache. If
-  /// wait_for_all_subscribers is true, this function will also wait until all
-  /// catalog topic subscribers have processed the update. Called from ClientRequestState
-  /// after executing any statement that modifies the catalog.
-  /// If wait_for_all_subscribers is false AND if the TCatalogUpdateResult contains
-  /// TCatalogObject(s) to add and/or remove, this function will update the local cache
-  /// by directly calling UpdateCatalog() with the TCatalogObject results.
-  /// Otherwise this function will wait until the local impalad's catalog cache has been
-  /// updated from a statestore heartbeat that includes this catalog update's catalog
-  /// version. If wait_for_all_subscribers is true, this function also wait all other
-  /// catalog topic subscribers to process this update by checking the current
-  /// min_subscriber_topic_version included in each state store heartbeat.
+  /// Processes a TCatalogUpdateResult returned from the CatalogServer and ensures
+  /// the update has been applied to the local impalad's catalog cache. Called from
+  /// ClientRequestState after executing any statement that modifies the catalog.
+  ///
+  /// If TCatalogUpdateResult contains TCatalogObject(s) to add and/or remove, this
+  /// function will update the local cache by directly calling UpdateCatalog() with the
+  /// TCatalogObject results.
+  ///
+  /// If TCatalogUpdateResult does not contain any TCatalogObjects and this is
+  /// the result of an INVALIDATE METADATA operation, it waits until the minimum
+  /// catalog version in the local cache is greater than or equal to the catalog
+  /// version specified in TCatalogUpdateResult. If it is not an INVALIDATE
+  /// METADATA operation, it waits until the local impalad's catalog cache has
+  /// been updated from a statestore heartbeat that includes this catalog
+  /// update's version.
+  ///
+  /// If wait_for_all_subscribers is true, this function also
+  /// waits for all other catalog topic subscribers to process this update by checking the
+  /// current min_subscriber_topic_version included in each state store heartbeat.
   Status ProcessCatalogUpdateResult(const TCatalogUpdateResult& catalog_update_result,
       bool wait_for_all_subscribers) WARN_UNUSED_RESULT;
+
+  /// Wait until the catalog update with version 'catalog_update_version' is
+  /// received and applied in the local catalog cache or until the catalog
+  /// service id has changed.
+  void WaitForCatalogUpdate(const int64_t catalog_update_version,
+      const TUniqueId& catalog_service_id);
+
+  /// Wait until the minimum catalog object version in the local cache is
+  /// greater than or equal to 'min_catalog_update_version' or until the catalog
+  /// service id has changed.
+  void WaitForMinCatalogUpdate(const int64_t min_catalog_update_version,
+      const TUniqueId& catalog_service_id);
+
+  /// Wait until the last applied catalog update has been broadcast to
+  /// all coordinators or until the catalog service id has changed.
+  void WaitForCatalogUpdateTopicPropagation(const TUniqueId& catalog_service_id);
 
   /// Returns true if lineage logging is enabled, false otherwise.
   bool IsLineageLoggingEnabled();
@@ -314,6 +358,9 @@ class ImpalaServer : public ImpalaServiceIf,
   typedef boost::unordered_map<std::string, TBackendDescriptor> BackendDescriptorMap;
   const BackendDescriptorMap& GetKnownBackends();
 
+  // Mapping between query option names and levels
+  QueryOptionLevels query_option_levels_;
+
   /// The prefix of audit event log filename.
   static const string AUDIT_EVENT_LOG_FILE_PREFIX;
 
@@ -325,10 +372,14 @@ class ImpalaServer : public ImpalaServiceIf,
     /// run as children of Beeswax sessions) get results back in the expected format -
     /// child queries inherit the HS2 version from their parents, and a Beeswax session
     /// will never update the HS2 version from the default.
-    SessionState() : closed(false), expired(false),
-        hs2_version(apache::hive::service::cli::thrift::
+    SessionState(ImpalaServer* impala_server) : impala_server(impala_server),
+        closed(false), expired(false), hs2_version(apache::hive::service::cli::thrift::
         TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V1), total_queries(0), ref_count(0) {
+      DCHECK(this->impala_server != nullptr);
     }
+
+    /// Pointer to the Impala server of this session
+    ImpalaServer* impala_server;
 
     TSessionType::type session_type;
 
@@ -396,9 +447,14 @@ class ImpalaServer : public ImpalaServiceIf,
     uint32_t ref_count;
 
     /// Per-session idle timeout in seconds. Default value is FLAGS_idle_session_timeout.
-    /// It can be overridden with a smaller value via the option "idle_session_timeout"
-    /// when opening a HS2 session.
-    int32_t session_timeout;
+    /// It can be overridden with the query option "idle_session_timeout" when opening a
+    /// HS2 session, or using the SET command.
+    int32_t session_timeout = 0;
+
+    /// Updates the session timeout based on the query option idle_session_timeout.
+    /// It registers/unregisters the session timeout to the Impala server.
+    /// The lock must be owned by the caller of this function.
+    void UpdateTimeout();
 
     /// Builds a Thrift representation of this SessionState for serialisation to
     /// the frontend.
@@ -412,6 +468,7 @@ class ImpalaServer : public ImpalaServiceIf,
  private:
   friend class ChildQuery;
   friend class ImpalaHttpHandler;
+  friend class SessionState;
 
   boost::scoped_ptr<ImpalaHttpHandler> http_handler_;
 
@@ -512,6 +569,13 @@ class ImpalaServer : public ImpalaServiceIf,
   /// "support_start_over/false" to indicate that Impala does not support start over
   /// in the fetch call.
   void InitializeConfigVariables();
+
+  /// Sets the option level for parameter 'option' based on the mapping stored in
+  /// 'query_option_levels_'. The option level is used by the Impala shell when it
+  /// displays the options. 'option_key' is the key for the 'query_option_levels_'
+  /// to get the level of the query option.
+  void AddOptionLevelToConfig(beeswax::ConfigVariable* option,
+      const string& option_key) const;
 
   /// Checks settings for profile logging, including whether the output
   /// directory exists and is writeable, and initialises the first log file.
@@ -620,6 +684,9 @@ class ImpalaServer : public ImpalaServiceIf,
     beeswax::QueryState::type query_state;
 
     /// Start and end time of the query, in Unix microseconds.
+    /// A query whose end_time_us is 0 indicates that it is an in-flight query.
+    /// These two variables are initialized with the corresponding values from
+    /// ClientRequestState.
     int64_t start_time_us, end_time_us;
 
     /// Summary of execution for this query.
@@ -731,11 +798,13 @@ class ImpalaServer : public ImpalaServiceIf,
       const QueryOptionsMask& override_options_mask);
 
   /// Register timeout value upon opening a new session. This will wake up
-  /// session_timeout_thread_ to update its poll period.
+  /// session_timeout_thread_.
   void RegisterSessionTimeout(int32_t timeout);
 
-  /// To be run in a thread which wakes up every x / 2 seconds in which x is the minimum
-  /// non-zero idle session timeout value of all sessions. This function checks all
+  /// Unregister timeout value.
+  void UnregisterSessionTimeout(int32_t timeout);
+
+  /// To be run in a thread which wakes up every second. This function checks all
   /// sessions for their last-idle times. Those that have been idle for longer than
   /// their configured timeout values are 'expired': they will no longer accept queries
   /// and any running queries associated with those sessions are unregistered.
@@ -796,8 +865,8 @@ class ImpalaServer : public ImpalaServiceIf,
   boost::mutex session_timeout_lock_;
 
   /// session_timeout_thread_ relies on the following conditional variable to wake up
-  /// on every poll period expiration or when the poll period changes.
-  boost::condition_variable session_timeout_cv_;
+  /// when there are sessions that have a timeout.
+  ConditionVariable session_timeout_cv_;
 
   /// map from query id to exec state; ClientRequestState is owned by us and referenced
   /// as a shared_ptr to allow asynchronous deletion
@@ -914,18 +983,19 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Lock to protect uuid_generator
   boost::mutex uuid_lock_;
 
-  /// Lock for catalog_update_version_info_, min_subscriber_catalog_topic_version_,
+  /// Lock for catalog_update_version_, min_subscriber_catalog_topic_version_,
   /// and catalog_version_update_cv_
   boost::mutex catalog_version_lock_;
 
   /// Variable to signal when the catalog version has been modified
-  boost::condition_variable catalog_version_update_cv_;
+  ConditionVariable catalog_version_update_cv_;
 
   /// Contains details on the version information of a catalog update.
   struct CatalogUpdateVersionInfo {
     CatalogUpdateVersionInfo() :
       catalog_version(0L),
-      catalog_topic_version(0L) {
+      catalog_topic_version(0L),
+      min_catalog_object_version(0L) {
     }
 
     /// The last catalog version returned from UpdateCatalog()
@@ -934,6 +1004,8 @@ class ImpalaServer : public ImpalaServiceIf,
     TUniqueId catalog_service_id;
     /// The statestore catalog topic version this update was received in.
     int64_t catalog_topic_version;
+    /// Minimum catalog object version after a call to UpdateCatalog()
+    int64_t min_catalog_object_version;
   };
 
   /// The version information from the last successfull call to UpdateCatalog().
@@ -1010,6 +1082,10 @@ class ImpalaServer : public ImpalaServiceIf,
   boost::scoped_ptr<ThriftServer> beeswax_server_;
   boost::scoped_ptr<ThriftServer> hs2_server_;
   boost::scoped_ptr<ThriftServer> thrift_be_server_;
+
+  /// Flag that records if backend and/or client services have been started. The flag is
+  /// set after all services required for the server have been started.
+  std::atomic_bool services_started_;
 
   /// Set to true when this ImpalaServer should shut down.
   Promise<bool> shutdown_promise_;

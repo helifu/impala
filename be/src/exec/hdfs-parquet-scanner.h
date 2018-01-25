@@ -43,7 +43,8 @@ class ParquetLevelDecoder;
 class ParquetColumnReader;
 class CollectionColumnReader;
 class BaseScalarColumnReader;
-template<typename T, bool MATERIALIZED> class ScalarColumnReader;
+template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
+class ScalarColumnReader;
 class BoolColumnReader;
 
 /// This scanner parses Parquet files located in HDFS, and writes the content as tuples in
@@ -187,7 +188,7 @@ class BoolColumnReader;
 ///   0), but we don't distinguish between these two cases yet.
 ///   TODO: fix this (IMPALA-2272)
 ///
-///   The column readers that materialize this structure form a tree analagous to the
+///   The column readers that materialize this structure form a tree analogous to the
 ///   materialized output:
 ///     CollectionColumnReader slot_id=0 node="repeated group list (d=2 r=1)"
 ///       CollectionColumnReader slot_id=1 node="repeated group list (d=4 r=2)"
@@ -354,7 +355,8 @@ class HdfsParquetScanner : public HdfsScanner {
   friend class ParquetColumnReader;
   friend class CollectionColumnReader;
   friend class BaseScalarColumnReader;
-  template<typename T, bool MATERIALIZED> friend class ScalarColumnReader;
+  template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
+  friend class ScalarColumnReader;
   friend class BoolColumnReader;
 
   /// Size of the file footer.  This is a guess.  If this value is too little, we will
@@ -382,8 +384,8 @@ class HdfsParquetScanner : public HdfsScanner {
 
   boost::scoped_ptr<ParquetSchemaResolver> schema_resolver_;
 
-  /// Buffer to back tuples when reading parquet::Statistics.
-  ScopedBuffer min_max_tuple_buffer_;
+  /// Tuple to hold values when reading parquet::Statistics. Owned by perm_pool_.
+  Tuple* min_max_tuple_;
 
   /// Clone of Min/max statistics conjunct evaluators. Has the same life time as
   /// the scanner. Stored in 'obj_pool_'.
@@ -414,9 +416,10 @@ class HdfsParquetScanner : public HdfsScanner {
     LocalFilterStats() : considered(0), rejected(0), total_possible(0), enabled(1) { }
   };
 
-  /// Pool used for allocating caches of definition/repetition levels that are
-  /// populated by the level readers. The pool is freed in Close().
-  boost::scoped_ptr<MemPool> level_cache_pool_;
+  /// Pool used for allocating caches of definition/repetition levels and tuples for
+  /// dictionary filtering. The definition/repetition levels are populated by the
+  /// level readers. The pool is freed in Close().
+  boost::scoped_ptr<MemPool> perm_pool_;
 
   /// Track statistics of each filter (one for each filter in filter_ctxs_) per scanner so
   /// that expensive aggregation up to the scan node can be performed once, during
@@ -440,22 +443,30 @@ class HdfsParquetScanner : public HdfsScanner {
   ParquetFileVersion file_version_;
 
   /// Scan range for the metadata.
-  const DiskIoMgr::ScanRange* metadata_range_;
+  const io::ScanRange* metadata_range_;
 
   /// Pool to copy dictionary page buffer into. This pool is shared across all the
   /// pages in a column chunk.
   boost::scoped_ptr<MemPool> dictionary_pool_;
 
-  /// Column readers that are eligible for dictionary filtering
-  /// These are pointers to elements of column_readers_
-  std::vector<ParquetColumnReader*> dict_filterable_readers_;
+  /// Column readers that are eligible for dictionary filtering.
+  /// These are pointers to elements of column_readers_. Materialized columns that are
+  /// dictionary encoded correspond to scalar columns that are either top-level columns
+  /// or nested within a collection. CollectionColumnReaders are not eligible for
+  /// dictionary filtering so are not included.
+  std::vector<BaseScalarColumnReader*> dict_filterable_readers_;
 
-  /// Column readers that are not eligible for dictionary filtering
-  /// These are pointers to elements of column_readers_
-  std::vector<ParquetColumnReader*> non_dict_filterable_readers_;
+  /// Column readers that are not eligible for dictionary filtering.
+  /// These are pointers to elements of column_readers_. The readers are either top-level
+  /// or nested within a collection.
+  std::vector<BaseScalarColumnReader*> non_dict_filterable_readers_;
 
-  /// Memory used to store the tuple used for dictionary filtering
-  ScopedBuffer dict_filter_tuple_backing_;
+  /// Flattened collection column readers that point to readers in column_readers_.
+  std::vector<CollectionColumnReader*> collection_readers_;
+
+  /// Memory used to store the tuples used for dictionary filtering. Tuples owned by
+  /// perm_pool_.
+  std::unordered_map<const TupleDescriptor*, Tuple*> dict_filter_tuple_map_;
 
   /// Timer for materializing rows.  This ignores time getting the next buffer.
   ScopedTimer<MonotonicStopWatch> assemble_rows_timer_;
@@ -583,7 +594,7 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Find and return the last split in the file if it is assigned to this scan node.
   /// Returns NULL otherwise.
-  static DiskIoMgr::ScanRange* FindFooterSplit(HdfsFileDesc* file);
+  static io::ScanRange* FindFooterSplit(HdfsFileDesc* file);
 
   /// Process the file footer and parse file_metadata_.  This should be called with the
   /// last FOOTER_SIZE bytes in context_.
@@ -617,14 +628,17 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Walks file_metadata_ and initiates reading the materialized columns.  This
   /// initializes 'column_readers' and issues the reads for the columns. 'column_readers'
-  /// should be the readers used to materialize a single tuple (i.e., column_readers_ or
-  /// the children of a collection node).
-  Status InitColumns(
-      int row_group_idx, const std::vector<ParquetColumnReader*>& column_readers)
+  /// includes a mix of scalar readers from multiple schema nodes (i.e., readers of
+  /// top-level scalar columns and readers of scalar columns within a collection node).
+  Status InitScalarColumns(
+      int row_group_idx, const std::vector<BaseScalarColumnReader*>& column_readers)
       WARN_UNUSED_RESULT;
 
+  /// Initializes the column readers in collection_readers_.
+  void InitCollectionColumns();
+
   /// Initialize dictionaries for all column readers
-  Status InitDictionaries(const std::vector<ParquetColumnReader*>& column_readers)
+  Status InitDictionaries(const std::vector<BaseScalarColumnReader*>& column_readers)
       WARN_UNUSED_RESULT;
 
   /// Performs some validation once we've reached the end of a row group to help detect
@@ -643,8 +657,19 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Evaluates whether the column reader is eligible for dictionary predicates
   bool IsDictFilterable(ParquetColumnReader* col_reader);
 
-  /// Divides the column readers into dict_filterable_readers_ and
-  /// non_dict_filterable_readers_. Allocates memory for dict_filter_tuple_backing_.
+  /// Evaluates whether the column reader is eligible for dictionary predicates.
+  bool IsDictFilterable(BaseScalarColumnReader* col_reader);
+
+  /// Partitions the readers into scalar and collection readers. The collection readers
+  /// are flattened into collection_readers_. The scalar readers are partitioned into
+  /// dict_filterable_readers_ and non_dict_filterable_readers_ depending on whether
+  /// dictionary filtering is enabled and the reader can be dictionary filtered.
+  void PartitionReaders(const vector<ParquetColumnReader*>& readers,
+                        bool can_eval_dict_filters);
+
+  /// Divides the column readers into dict_filterable_readers_,
+  /// non_dict_filterable_readers_ and collection_readers_. Allocates memory for
+  /// dict_filter_tuple_map_.
   Status InitDictFilterStructures() WARN_UNUSED_RESULT;
 
   /// Returns true if all of the data pages in the column chunk are dictionary encoded

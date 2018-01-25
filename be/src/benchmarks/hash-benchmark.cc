@@ -16,8 +16,6 @@
 // under the License.
 
 #include <iostream>
-#include <stdlib.h>
-#include <stdio.h>
 #include <vector>
 
 #include <boost/functional/hash.hpp>
@@ -26,19 +24,15 @@
 #include "common/init.h"
 #include "experiments/data-provider.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/string-value.h"
 #include "runtime/test-env.h"
 #include "service/fe-support.h"
 #include "util/benchmark.h"
-#include "util/cpu-info.h"
-#include "util/hash-util.h"
 
 #include "common/names.h"
 
 using boost::hash_combine;
 using boost::hash_range;
 using namespace impala;
-using namespace llvm;
 
 
 // Benchmark tests for hashing tuples.  There are two sets of inputs
@@ -50,6 +44,7 @@ using namespace llvm;
 // The different hash functions benchmarked:
 //   1. FNV Hash: Fowler-Noll-Vo hash function
 //   2. FNV Hash with empty string handling: FNV with special-case for empty string
+//   3. FastHash64: 64-bit FastHash function
 //   3. Murmur2_64 Hash: Murmur2 hash function
 //   4. Boost Hash: boost hash function
 //   5. Crc: hash using sse4 crc hash instruction
@@ -62,24 +57,30 @@ using namespace llvm;
 //                      = lim n->inf n(1 - 1/n) ^n
 //                      = n / e
 //                      = 367
-
-// Machine Info: Intel(R) Core(TM) i7-4790 CPU @ 3.60GHz
-// Int Hash:             Function     Rate (iters/ms)          Comparison
-// ----------------------------------------------------------------------
-//                            Fnv               114.6                  1X
-//                     Murmur2_64               129.9              1.134X
-//                          Boost               294.1              2.567X
-//                            Crc               536.2               4.68X
-//                        Codegen                1413              12.33X
-//
-// Mixed Hash:           Function     Rate (iters/ms)          Comparison
-// ----------------------------------------------------------------------
-//                            Fnv               90.88                  1X
-//                       FnvEmpty               91.58              1.008X
-//                     Murmur2_64               124.9              1.374X
-//                          Boost               133.5              1.469X
-//                            Crc               435.8              4.795X
-//                        Codegen               379.3              4.174X
+/*
+Machine Info:  Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz
+Int Hash:
+Function     10%ile   50%ile   90%ile     10%ile     50%ile     90%ile
+                                      (relative) (relative) (relative)
+----------- ----------------------------------------------------------
+        Fnv    88.5      109      111         1X         1X         1X
+ FastHash64    96.9      110      112       1.1X      1.01X      1.01X
+ Murmur2_64    90.7      124      126      1.03X      1.14X      1.14X
+      Boost     203      277      282       2.3X      2.55X      2.55X
+        Crc     415      536      540      4.68X      4.93X      4.89X
+    Codegen 1.5e+03 1.85e+03 1.88e+03      16.9X        17X        17X
+Mixed Hash:
+Function  10%ile   50%ile   90%ile        10%ile     50%ile     90%ile
+                                      (relative) (relative) (relative)
+----------------------------------------------------------------------
+        Fnv    75.3       78     78.9         1X         1X         1X
+ FastHash64    91.2     95.4     96.3      1.21X      1.22X      1.22X
+   FnvEmpty    82.7     86.3     86.9       1.1X      1.11X       1.1X
+ Murmur2_64     109      113      114      1.45X      1.45X      1.45X
+      Boost     109      112      113      1.45X      1.43X      1.44X
+        Crc     467      481      489      6.21X      6.17X      6.21X
+    Codegen     292      312      318      3.88X         4X      4.03X
+*/
 
 typedef uint32_t (*CodegenHashFn)(int rows, char* data, int32_t* results);
 
@@ -118,6 +119,23 @@ void TestCrcIntHash(int batch, void* d) {
       size_t hash = HashUtil::FNV_SEED;
       for (int k = 0; k < cols; ++k) {
         hash = HashUtil::CrcHash(&values[k], sizeof(uint32_t), hash);
+      }
+      data->results[j] = hash;
+      values += cols;
+    }
+  }
+}
+
+void TestFastHashIntHash(int batch, void* d) {
+  TestData* data = reinterpret_cast<TestData*>(d);
+  int rows = data->num_rows;
+  int cols = data->num_cols;
+  for (int i = 0; i < batch; ++i) {
+    int32_t* values = reinterpret_cast<int32_t*>(data->data);
+    for (int j = 0; j < rows; ++j) {
+      uint64_t hash = HashUtil::FNV_SEED;
+      for (int k = 0; k < cols; ++k) {
+        hash = HashUtil::FastHash64(&values[k], sizeof(uint32_t), hash);
       }
       data->results[j] = hash;
       values += cols;
@@ -235,6 +253,32 @@ void TestCrcMixedHash(int batch, void* d) {
   }
 }
 
+void TestFastHashMixedHash(int batch, void* d) {
+  TestData* data = reinterpret_cast<TestData*>(d);
+  int rows = data->num_rows;
+  for (int i = 0; i < batch; ++i) {
+    char* values = reinterpret_cast<char*>(data->data);
+    for (int j = 0; j < rows; ++j) {
+      uint64_t hash = HashUtil::FNV_SEED;
+
+      hash = HashUtil::FastHash64(values, sizeof(int8_t), hash);
+      values += sizeof(int8_t);
+
+      hash = HashUtil::FastHash64(values, sizeof(int32_t), hash);
+      values += sizeof(int32_t);
+
+      hash = HashUtil::FastHash64(values, sizeof(int64_t), hash);
+      values += sizeof(int64_t);
+
+      StringValue* str = reinterpret_cast<StringValue*>(values);
+      hash = HashUtil::FastHash64(str->ptr, str->len, hash);
+      values += sizeof(StringValue);
+
+      data->results[j] = hash;
+    }
+  }
+}
+
 void TestCodegenMixedHash(int batch, void* d) {
   TestData* data = reinterpret_cast<TestData*>(d);
   CodegenHashFn fn = reinterpret_cast<CodegenHashFn>(data->jitted_fn);
@@ -336,7 +380,7 @@ int NumCollisions(TestData* data, int num_buckets) {
 // exit:                                             ; preds = %loop, %entry
 //   ret void
 // }
-Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
+llvm::Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
   string name = mixed ? "HashMixed" : "HashInt";
   LlvmCodeGen::FnPrototype prototype(codegen, name, codegen->void_type());
   prototype.AddArgument(
@@ -347,62 +391,65 @@ Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
       LlvmCodeGen::NamedVariable("results", codegen->GetPtrType(TYPE_INT)));
 
   LlvmBuilder builder(codegen->context());
-  Value* args[3];
-  Function* fn = prototype.GeneratePrototype(&builder, &args[0]);
+  llvm::Value* args[3];
+  llvm::Function* fn = prototype.GeneratePrototype(&builder, &args[0]);
 
-  BasicBlock* loop_start = builder.GetInsertBlock();
-  BasicBlock* loop_body = BasicBlock::Create(codegen->context(), "loop", fn);
-  BasicBlock* loop_exit = BasicBlock::Create(codegen->context(), "exit", fn);
+  llvm::BasicBlock* loop_start = builder.GetInsertBlock();
+  llvm::BasicBlock* loop_body = llvm::BasicBlock::Create(codegen->context(), "loop", fn);
+  llvm::BasicBlock* loop_exit = llvm::BasicBlock::Create(codegen->context(), "exit", fn);
 
   int fixed_byte_size = mixed ?
     sizeof(int8_t) + sizeof(int32_t) + sizeof(int64_t) : sizeof(int32_t) * 4;
 
-  Function* fixed_fn = codegen->GetHashFunction(fixed_byte_size);
-  Function* string_hash_fn = codegen->GetHashFunction();
+  llvm::Function* fixed_fn = codegen->GetHashFunction(fixed_byte_size);
+  llvm::Function* string_hash_fn = codegen->GetHashFunction();
 
-  Value* row_size = NULL;
+  llvm::Value* row_size = NULL;
   if (mixed) {
     row_size = codegen->GetIntConstant(TYPE_INT,
       sizeof(int8_t) + sizeof(int32_t) + sizeof(int64_t) + sizeof(StringValue));
   } else {
     row_size = codegen->GetIntConstant(TYPE_INT, fixed_byte_size);
   }
-  Value* dummy_len = codegen->GetIntConstant(TYPE_INT, 0);
+  llvm::Value* dummy_len = codegen->GetIntConstant(TYPE_INT, 0);
 
   // Check loop counter
-  Value* counter_check =
+  llvm::Value* counter_check =
       builder.CreateICmpSGT(args[0], codegen->GetIntConstant(TYPE_INT, 0));
   builder.CreateCondBr(counter_check, loop_body, loop_exit);
 
   // Loop body
   builder.SetInsertPoint(loop_body);
-  PHINode* counter = builder.CreatePHI(codegen->GetType(TYPE_INT), 2, "counter");
+  llvm::PHINode* counter = builder.CreatePHI(codegen->GetType(TYPE_INT), 2, "counter");
   counter->addIncoming(codegen->GetIntConstant(TYPE_INT, 0), loop_start);
 
-  Value* next_counter = builder.CreateAdd(counter, codegen->GetIntConstant(TYPE_INT, 1));
+  llvm::Value* next_counter =
+      builder.CreateAdd(counter, codegen->GetIntConstant(TYPE_INT, 1));
   counter->addIncoming(next_counter, loop_body);
 
   // Hash the current data
-  Value* offset = builder.CreateMul(counter, row_size);
-  Value* data = builder.CreateGEP(args[1], offset);
+  llvm::Value* offset = builder.CreateMul(counter, row_size);
+  llvm::Value* data = builder.CreateGEP(args[1], offset);
 
-  Value* seed = codegen->GetIntConstant(TYPE_INT, HashUtil::FNV_SEED);
-  seed = builder.CreateCall(fixed_fn, ArrayRef<Value*>({data, dummy_len, seed}));
+  llvm::Value* seed = codegen->GetIntConstant(TYPE_INT, HashUtil::FNV_SEED);
+  seed =
+      builder.CreateCall(fixed_fn, llvm::ArrayRef<llvm::Value*>({data, dummy_len, seed}));
 
   // Get the string data
   if (mixed) {
-    Value* string_data = builder.CreateGEP(
-        data, codegen->GetIntConstant(TYPE_INT, fixed_byte_size));
-    Value* string_val =
+    llvm::Value* string_data =
+        builder.CreateGEP(data, codegen->GetIntConstant(TYPE_INT, fixed_byte_size));
+    llvm::Value* string_val =
         builder.CreateBitCast(string_data, codegen->GetPtrType(TYPE_STRING));
-    Value* str_ptr = builder.CreateStructGEP(NULL, string_val, 0);
-    Value* str_len = builder.CreateStructGEP(NULL, string_val, 1);
+    llvm::Value* str_ptr = builder.CreateStructGEP(NULL, string_val, 0);
+    llvm::Value* str_len = builder.CreateStructGEP(NULL, string_val, 1);
     str_ptr = builder.CreateLoad(str_ptr);
     str_len = builder.CreateLoad(str_len);
-    seed = builder.CreateCall(string_hash_fn, ArrayRef<Value*>({str_ptr, str_len, seed}));
+    seed = builder.CreateCall(
+        string_hash_fn, llvm::ArrayRef<llvm::Value*>({str_ptr, str_len, seed}));
   }
 
-  Value* result = builder.CreateGEP(args[2], counter);
+  llvm::Value* result = builder.CreateGEP(args[2], counter);
   builder.CreateStore(seed, result);
 
   counter_check = builder.CreateICmpSLT(next_counter, args[0]);
@@ -416,9 +463,8 @@ Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
 }
 
 int main(int argc, char **argv) {
-  CpuInfo::Init();
-  cout << Benchmark::GetMachineInfo() << endl;
   impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
+  cout << Benchmark::GetMachineInfo() << endl;
   impala::InitFeSupport();
   ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm());
 
@@ -453,11 +499,11 @@ int main(int argc, char **argv) {
   }
   codegen->EnableOptimizations(true);
 
-  Function* hash_ints = CodegenCrcHash(codegen.get(), false);
+  llvm::Function* hash_ints = CodegenCrcHash(codegen.get(), false);
   void* jitted_hash_ints;
   codegen->AddFunctionToJit(hash_ints, &jitted_hash_ints);
 
-  Function* hash_mixed = CodegenCrcHash(codegen.get(), true);
+  llvm::Function* hash_mixed = CodegenCrcHash(codegen.get(), true);
   void* jitted_hash_mixed;
   codegen->AddFunctionToJit(hash_mixed, &jitted_hash_mixed);
 
@@ -506,6 +552,7 @@ int main(int argc, char **argv) {
 
   Benchmark int_suite("Int Hash");
   int_suite.AddBenchmark("Fnv", TestFnvIntHash, &int_data);
+  int_suite.AddBenchmark("FastHash64", TestFastHashIntHash, &int_data);
   int_suite.AddBenchmark("Murmur2_64", TestMurmur2_64IntHash, &int_data);
   int_suite.AddBenchmark("Boost", TestBoostIntHash, &int_data);
   int_suite.AddBenchmark("Crc", TestCrcIntHash, &int_data);
@@ -514,6 +561,7 @@ int main(int argc, char **argv) {
 
   Benchmark mixed_suite("Mixed Hash");
   mixed_suite.AddBenchmark("Fnv", TestFnvMixedHash, &mixed_data);
+  mixed_suite.AddBenchmark("FastHash64", TestFastHashMixedHash, &mixed_data);
   mixed_suite.AddBenchmark("FnvEmpty", TestFnvEmptyMixedHash, &mixed_data);
   mixed_suite.AddBenchmark("Murmur2_64", TestMurmur2_64MixedHash, &mixed_data);
   mixed_suite.AddBenchmark("Boost", TestBoostMixedHash, &mixed_data);
@@ -521,5 +569,7 @@ int main(int argc, char **argv) {
   mixed_suite.AddBenchmark("Codegen", TestCodegenMixedHash, &mixed_data);
   cout << mixed_suite.Measure();
 
+  codegen->Close();
+  mem_pool.FreeAll();
   return 0;
 }

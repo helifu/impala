@@ -28,32 +28,10 @@
   <groupId>org.apache.impala</groupId>
   <artifactId>impala-data-source-api</artifactId>
   <version>1.0-SNAPSHOT</version>
-  <name>Apache Impala (Incubating) External Data Source API</name>
+  <name>Apache Impala External Data Source API</name>
   <description>External Data Source API interface definition</description>
   <packaging>jar</packaging>
   <url>.</url>
-
-  <repositories>
-    <repository>
-      <id>cdh.repo</id>
-      <url>https://repository.cloudera.com/content/groups/cloudera-repos</url>
-      <name>Cloudera Repositories</name>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </repository>
-    <repository>
-      <id>cdh.snapshots.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/snapshots</url>
-      <name>Cloudera Snapshots Repository</name>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-    </repository>
-  </repositories>
 
   <dependencies>
     <dependency>

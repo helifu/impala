@@ -773,6 +773,14 @@ select concat('abc','mno','xyz');</codeblock>
         HBase tables.
       </p>
 
+      <p id="boolean_functions_vs_expressions" rev="2.11.0 IMPALA-1767">
+        In <keyword keyref="impala211_full"/> and higher, you can use
+        the operators <codeph>IS [NOT] TRUE</codeph> and
+        <codeph>IS [NOT] FALSE</codeph> as equivalents for the built-in
+        functions <codeph>istrue()</codeph>, <codeph>isnottrue()</codeph>,
+        <codeph>isfalse()</codeph>, and <codeph>isnotfalse()</codeph>.
+      </p>
+
       <p id="base64_charset">
         The set of characters that can be generated as output
         from <codeph>base64encode()</codeph>, or specified in
@@ -1192,6 +1200,12 @@ drop database temp;
         For the <codeph>PURGE</codeph> clause to work effectively, you must originally create the
         data files on S3 using one of the tools from the Hadoop ecosystem, such as
         <codeph>hadoop fs -cp</codeph>, or <codeph>INSERT</codeph> in Impala or Hive.
+      </p>
+
+      <p rev="2.11.0 IMPALA-4252" id="filter_option_bloom_only">
+        This query option affects only Bloom filters, not the min/max filters
+        that are applied to Kudu tables. Therefore, it does not affect the
+        performance of queries against Kudu tables.
       </p>
 
       <p rev="2.9.0 IMPALA-5333" id="adls_dml_performance">
@@ -1690,6 +1704,33 @@ DROP VIEW db2.v1;
         For <codeph>INSERT</codeph> operations into <codeph>CHAR</codeph> or <codeph>VARCHAR</codeph> columns, you
         must cast all <codeph>STRING</codeph> literals or expressions returning <codeph>STRING</codeph> to to a
         <codeph>CHAR</codeph> or <codeph>VARCHAR</codeph> type with the appropriate length.
+      </p>
+
+      <p id="length_demo" rev="IMPALA-6391 IMPALA-2172">
+        The following example demonstrates how <codeph>length()</codeph>
+        and <codeph>char_length()</codeph> sometimes produce the same result,
+        and sometimes produce different results depending on the type of the
+        argument and the presence of trailing spaces for <codeph>CHAR</codeph>
+        values. The <codeph>S</codeph> and <codeph>C</codeph> values are
+        displayed with enclosing quotation marks to show any trailing spaces.
+<codeblock id="length_demo_example">create table length_demo (s string, c char(5));
+insert into length_demo values
+  ('a',cast('a' as char(5))),
+  ('abc',cast('abc' as char(5))),
+  ('hello',cast('hello' as char(5)));
+
+select concat('"',s,'"') as s, concat('"',c,'"') as c,
+  length(s), length(c),
+  char_length(s), char_length(c)
+from length_demo;
++---------+---------+-----------+-----------+----------------+----------------+
+| s       | c       | length(s) | length(c) | char_length(s) | char_length(c) |
++---------+---------+-----------+-----------+----------------+----------------+
+| "a"     | "a    " | 1         | 1         | 1              | 5              |
+| "abc"   | "abc  " | 3         | 3         | 3              | 5              |
+| "hello" | "hello" | 5         | 5         | 5              | 5              |
++---------+---------+-----------+-----------+----------------+----------------+
+</codeblock>
       </p>
 
       <p rev="2.0.0" id="subquery_no_limit">
@@ -2787,7 +2828,10 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
         each value.
       </p>
 
-      <p rev="2.9.0" id="added_in_2100">
+      <p rev="2.11.0" id="added_in_2110">
+        <b>Added in:</b> <keyword keyref="impala2_11_0"/>
+      </p>
+      <p rev="2.10.0" id="added_in_2100">
         <b>Added in:</b> <keyword keyref="impala2100"/>
       </p>
       <p rev="2.9.0" id="added_in_290">
@@ -3227,7 +3271,7 @@ Query finished, fetching results ...
       </p>
 
       <p id="impala_mission_statement">
-        The Apache Impala (incubating) project provides high-performance, low-latency SQL queries on data stored in popular Apache Hadoop
+        The Apache Impala project provides high-performance, low-latency SQL queries on data stored in popular Apache Hadoop
         file formats. The fast response for queries enables interactive exploration and fine-tuning of analytic
         queries, rather than long batch jobs traditionally associated with SQL-on-Hadoop technologies. (You will
         often see the term <q>interactive</q> applied to these kinds of fast queries with human-scale response

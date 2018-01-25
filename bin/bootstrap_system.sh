@@ -96,7 +96,7 @@ apt-get --yes install git
 # If there is no Impala git repo, get one now
 if ! [[ -d ~/Impala ]]
 then
-  time -p git clone https://git-wip-us.apache.org/repos/asf/incubator-impala.git ~/Impala
+  time -p git clone https://git-wip-us.apache.org/repos/asf/impala.git ~/Impala
 fi
 cd ~/Impala
 SET_IMPALA_HOME="export IMPALA_HOME=$(pwd)"
@@ -106,7 +106,8 @@ eval "$SET_IMPALA_HOME"
 apt-get --yes install ccache g++ gcc libffi-dev liblzo2-dev libkrb5-dev \
         krb5-admin-server krb5-kdc krb5-user libsasl2-dev libsasl2-modules \
         libsasl2-modules-gssapi-mit libssl-dev make maven ninja-build ntp \
-        ntpdate python-dev python-setuptools postgresql ssh wget vim-common psmisc
+        ntpdate python-dev python-setuptools postgresql ssh wget vim-common psmisc \
+        lsof
 
 if ! { service --status-all | grep -E '^ \[ \+ \]  ssh$'; }
 then
@@ -122,7 +123,8 @@ if [[ $DISTRIB_RELEASE = 14.04 ]]
 then
   JDK_VERSION=7
 fi
-apt-get --yes install openjdk-${JDK_VERSION}-jdk openjdk-${JDK_VERSION}-source
+apt-get --yes install openjdk-${JDK_VERSION}-jdk openjdk-${JDK_VERSION}-source \
+  openjdk-${JDK_VERSION}-dbg
 SET_JAVA_HOME="export JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk-amd64"
 echo "$SET_JAVA_HOME" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
 eval "$SET_JAVA_HOME"

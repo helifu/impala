@@ -47,6 +47,8 @@ DECLARE_int32(stress_scratch_write_delay_ms);
 
 namespace impala {
 
+using namespace io;
+
 class TmpFileMgrTest : public ::testing::Test {
  public:
   virtual void SetUp() {
@@ -76,7 +78,7 @@ class TmpFileMgrTest : public ::testing::Test {
     vector<TmpFileMgr::DeviceId> active = tmp_file_mgr->ActiveTmpDevices();
     IntGauge* active_metric =
         metrics_->FindMetricForTesting<IntGauge>("tmp-file-mgr.active-scratch-dirs");
-    EXPECT_EQ(active.size(), active_metric->value());
+    EXPECT_EQ(active.size(), active_metric->GetValue());
     SetMetric<string>* active_set_metric =
         metrics_->FindMetricForTesting<SetMetric<string>>(
         "tmp-file-mgr.active-scratch-dirs.list");
@@ -130,9 +132,9 @@ class TmpFileMgrTest : public ::testing::Test {
     group->next_allocation_index_ = value;
   }
 
-  /// Helper to cancel the FileGroup DiskIoRequestContext.
+  /// Helper to cancel the FileGroup RequestContext.
   static void CancelIoContext(TmpFileMgr::FileGroup* group) {
-    group->io_mgr_->CancelContext(group->io_ctx_);
+    group->io_mgr_->CancelContext(group->io_ctx_.get());
   }
 
   /// Helper to get the # of bytes allocated by the group. Validates that the sum across
@@ -404,7 +406,7 @@ TEST_F(TmpFileMgrTest, TestScratchRangeRecycling) {
       std::iota(data[i].begin(), data[i].end(), i);
     }
 
-    DiskIoMgr::WriteRange::WriteDoneCallback callback =
+    WriteRange::WriteDoneCallback callback =
         bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
     vector<unique_ptr<TmpFileMgr::WriteHandle>> handles(BLOCKS);
     // 'file_group' should allocate extra scratch bytes for this 'alloc_size'.
@@ -449,7 +451,7 @@ TEST_F(TmpFileMgrTest, TestProcessMemLimitExceeded) {
   CancelIoContext(&file_group);
 
   // After this error, writing via the file group should fail.
-  DiskIoMgr::WriteRange::WriteDoneCallback callback =
+  WriteRange::WriteDoneCallback callback =
       bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
   unique_ptr<TmpFileMgr::WriteHandle> handle;
   Status status = file_group.Write(MemRange(data.data(), DATA_SIZE), callback, &handle);
@@ -483,7 +485,7 @@ TEST_F(TmpFileMgrTest, TestEncryptionDuringCancellation) {
 
   // Start a write in flight, which should encrypt the data and write it to disk.
   unique_ptr<TmpFileMgr::WriteHandle> handle;
-  DiskIoMgr::WriteRange::WriteDoneCallback callback =
+  WriteRange::WriteDoneCallback callback =
       bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
   ASSERT_OK(file_group.Write(data_mem_range, callback, &handle));
   string file_path = handle->TmpFilePath();

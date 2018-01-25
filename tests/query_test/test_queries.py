@@ -110,6 +110,9 @@ class TestQueries(ImpalaTestSuite):
   def test_subquery(self, vector):
     self.run_test_case('QueryTest/subquery', vector)
 
+  def test_subquery_in_constant_lhs(self, vector):
+    self.run_test_case('QueryTest/subquery-in-constant-lhs', vector)
+
   def test_empty(self, vector):
     self.run_test_case('QueryTest/empty', vector)
 
@@ -169,6 +172,12 @@ class TestQueriesTextTables(ImpalaTestSuite):
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/distinct-estimate', vector)
 
+  def test_random(self, vector):
+    # These results will vary slightly depending on how the values get split up
+    # so only run with 1 node and on text.
+    vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/random', vector)
+
   def test_mixed_format(self, vector):
     self.run_test_case('QueryTest/mixed-format', vector)
 
@@ -226,7 +235,7 @@ class TestTopNReclaimQuery(ImpalaTestSuite):
 
   # Mem limit empirically selected so that the query fails if tuple pool reclamation
   # is not implemented for TopN
-  MEM_LIMIT = "50m"
+  MEM_LIMIT = "60m"
 
   @classmethod
   def get_workload(self):
@@ -243,6 +252,7 @@ class TestTopNReclaimQuery(ImpalaTestSuite):
   def test_top_n_reclaim(self, vector):
     exec_options = vector.get_value('exec_option')
     exec_options['mem_limit'] = self.MEM_LIMIT
+    exec_options['num_scanner_threads'] = 1
     result = self.execute_query(self.QUERY, exec_options)
     runtime_profile = str(result.runtime_profile)
     num_of_times_tuple_pool_reclaimed = re.findall(

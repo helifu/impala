@@ -17,6 +17,10 @@
 
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.impala_cluster import ImpalaCluster
+import logging
+import pytest
+import time
 
 class TestObservability(ImpalaTestSuite):
   @classmethod
@@ -108,3 +112,85 @@ class TestObservability(ImpalaTestSuite):
     assert "Query Options (set by configuration and planner): MEM_LIMIT=8589934592," \
         "NUM_NODES=1,NUM_SCANNER_THREADS=1,RUNTIME_FILTER_MODE=0,MT_DOP=0\n" \
         in runtime_profile
+
+  @SkipIfLocal.multiple_impalad
+  def test_profile_fragment_instances(self):
+    """IMPALA-6081: Test that the expected number of fragment instances and their exec
+    nodes appear in the runtime profile, even when fragments may be quickly cancelled when
+    all results are already returned."""
+    results = self.execute_query("""
+        with l as (select * from tpch.lineitem UNION ALL select * from tpch.lineitem)
+        select STRAIGHT_JOIN count(*) from (select * from tpch.lineitem a LIMIT 1) a
+        join (select * from l LIMIT 2000000) b on a.l_orderkey = -b.l_orderkey;""")
+    # There are 3 scan nodes and each appears in the profile 4 times (for 3 fragment
+    # instances + the averaged fragment).
+    assert results.runtime_profile.count("HDFS_SCAN_NODE") == 12
+    # There are 3 exchange nodes and each appears in the profile 2 times (for 1 fragment
+    # instance + the averaged fragment).
+    assert results.runtime_profile.count("EXCHANGE_NODE") == 6
+    # The following appear only in the root fragment which has 1 instance.
+    assert results.runtime_profile.count("HASH_JOIN_NODE") == 2
+    assert results.runtime_profile.count("AGGREGATION_NODE") == 2
+    assert results.runtime_profile.count("PLAN_ROOT_SINK") == 2
+
+  # IMPALA-6399: Run this test serially to avoid a delay over the wait time in fetching
+  # the profile.
+  @pytest.mark.execute_serially
+  def test_query_profile_thrift_timestamps(self):
+    """Test that the query profile start and end time date-time strings have
+    nanosecond precision. Nanosecond precision is expected by management API clients
+    that consume Impala debug webpages."""
+    query = "select sleep(1000)"
+    handle = self.client.execute_async(query)
+    query_id = handle.get_handle().id
+    results = self.client.fetch(query, handle)
+    self.client.close()
+
+    MAX_WAIT = 300
+    start = time.time()
+    end = start + MAX_WAIT
+    while time.time() <= end:
+      # Sleep before trying to fetch the profile. This helps to prevent a warning when the
+      # profile is not yet available immediately. It also makes it less likely to
+      # introduce an error below in future changes by forgetting to sleep.
+      time.sleep(1)
+      tree = self.impalad_test_service.get_thrift_profile(query_id)
+      if not tree:
+        continue
+
+      # tree.nodes[1] corresponds to ClientRequestState::summary_profile_
+      # See be/src/service/client-request-state.[h|cc].
+      start_time = tree.nodes[1].info_strings["Start Time"]
+      end_time = tree.nodes[1].info_strings["End Time"]
+      # Start and End Times are of the form "2017-12-07 22:26:52.167711000"
+      start_time_sub_sec_str = start_time.split('.')[-1]
+      end_time_sub_sec_str = end_time.split('.')[-1]
+      if len(end_time_sub_sec_str) == 0:
+        elapsed = time.time() - start
+        logging.info("end_time_sub_sec_str hasn't shown up yet, elapsed=%d", elapsed)
+        continue
+
+      assert len(end_time_sub_sec_str) == 9, end_time
+      assert len(start_time_sub_sec_str) == 9, start_time
+      return True
+
+    # If we're here, we didn't get the final thrift profile from the debug web page.
+    # This could happen due to heavy system load. The test is then inconclusive.
+    # Log a message and fail this run.
+
+    dbg_str = "Debug thrift profile for query {0} not available in {1} seconds".format(
+      query_id, MAX_WAIT)
+    assert False, dbg_str
+
+  def test_query_profile_contains_instance_events(self, unique_database):
+    """Test that /query_profile_encoded contains an event timeline for fragment
+    instances, even when there are errors."""
+    events = ["Fragment Instance Lifecycle Event Timeline",
+              "Prepare Finished",
+              "First Batch Produced",
+              "First Batch Sent",
+              "ExecInternal Finished"]
+    query = "select count(*) from functional.alltypes"
+    runtime_profile = self.execute_query(query).runtime_profile
+    for event in events:
+      assert event in runtime_profile

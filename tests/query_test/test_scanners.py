@@ -388,6 +388,35 @@ class TestParquet(ImpalaTestSuite):
     self.run_test_case('QueryTest/parquet-corrupt-rle-counts-abort',
                        vector, unique_database)
 
+  def test_bad_compressed_page_size(self, vector, unique_database):
+    """IMPALA-6353: Tests that a parquet dict page with 0 compressed_page_size is
+    gracefully handled. """
+    self.client.execute(
+        "create table %s.bad_compressed_dict_page_size (col string) stored as parquet"
+        % unique_database)
+    tbl_loc = get_fs_path("/test-warehouse/%s.db/%s" % (unique_database,
+        "bad_compressed_dict_page_size"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/bad_compressed_dict_page_size.parquet", tbl_loc])
+    self.run_test_case('QueryTest/parquet-bad-compressed-dict-page-size', vector,
+        unique_database)
+
+  def test_bitpacked_def_levels(self, vector, unique_database):
+    """Test that Impala can read a Parquet file with the deprecated bit-packed def
+       level encoding."""
+    self.client.execute(("""CREATE TABLE {0}.alltypesagg (
+          id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT,
+          int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE,
+          date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP,
+          year INT, month INT, day INT) STORED AS PARQUET""").format(unique_database))
+    alltypesagg_loc = get_fs_path(
+        "/test-warehouse/{0}.db/{1}".format(unique_database, "alltypesagg"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/alltypes_agg_bitpacked_def_levels.parquet", alltypesagg_loc])
+    self.client.execute("refresh {0}.alltypesagg".format(unique_database));
+
+    self.run_test_case('QueryTest/parquet-def-levels', vector, unique_database)
+
   @SkipIfS3.hdfs_block_size
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
@@ -588,6 +617,24 @@ class TestParquet(ImpalaTestSuite):
   def test_resolution_by_name(self, vector, unique_database):
     self.run_test_case('QueryTest/parquet-resolution-by-name', vector,
                        use_db=unique_database)
+
+  def test_decimal_encodings(self, vector, unique_database):
+    # Create a table using an existing data file with dictionary-encoded, variable-length
+    # physical encodings for decimals.
+    TABLE_NAME = "decimal_encodings"
+    self.client.execute('''create table if not exists %s.%s
+    (small_dec decimal(9,2), med_dec decimal(18,2), large_dec decimal(38,2))
+    STORED AS PARQUET''' % (unique_database, TABLE_NAME))
+
+    table_loc = get_fs_path(
+      "/test-warehouse/%s.db/%s" % (unique_database, TABLE_NAME))
+    for file_name in ["binary_decimal_dictionary.parquet",
+                      "binary_decimal_no_dictionary.parquet"]:
+      data_file_path = os.path.join(os.environ['IMPALA_HOME'],
+                                    "testdata/data/", file_name)
+      check_call(['hdfs', 'dfs', '-copyFromLocal', data_file_path, table_loc])
+
+    self.run_test_case('QueryTest/parquet-decimal-formats', vector, unique_database)
 
 # We use various scan range lengths to exercise corner cases in the HDFS scanner more
 # thoroughly. In particular, it will exercise:

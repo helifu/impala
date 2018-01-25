@@ -29,7 +29,11 @@ from tests.common.impala_connection import create_connection, create_ldap_connec
 from TCLIService import TCLIService
 from thrift.transport.TSocket import TSocket
 from thrift.transport.TTransport import TBufferedTransport
-from thrift.protocol import TBinaryProtocol
+from thrift.protocol import TBinaryProtocol, TCompactProtocol, TProtocol
+from thrift.TSerialization import deserialize
+from RuntimeProfile.ttypes import TRuntimeProfileTree
+import base64
+import zlib
 
 logging.basicConfig(level=logging.ERROR, format='%(threadName)s: %(message)s')
 LOG = logging.getLogger('impala_service')
@@ -57,6 +61,32 @@ class BaseImpalaService(object):
   def read_debug_webpage(self, page_name, timeout=10, interval=1):
     return self.open_debug_webpage(page_name, timeout=timeout, interval=interval).read()
 
+  def get_thrift_profile(self, query_id, timeout=10, interval=1):
+    """Returns thrift profile of the specified query ID, if available"""
+    page_name = "query_profile_encoded?query_id=%s" % (query_id)
+    try:
+      response = self.open_debug_webpage(page_name, timeout=timeout, interval=interval)
+      tbuf = response.read()
+    except Exception as e:
+      LOG.info("Thrift profile for query %s not yet available: %s", query_id, str(e))
+      return None
+    else:
+      tree = TRuntimeProfileTree()
+      try:
+        deserialize(tree, zlib.decompress(base64.b64decode(tbuf)),
+                  protocol_factory=TCompactProtocol.TCompactProtocolFactory())
+        tree.validate()
+        return tree
+      except Exception as e:
+        LOG.info("Exception while deserializing query profile of %s: %s", query_id,
+                str(e));
+        # We should assert that the response code is not 200 once
+        # IMPALA-6332: Impala webserver should return HTTP error code for missing query
+        # profiles, is fixed.
+        if str(e) == 'Incorrect padding':
+          assert "Could not obtain runtime profile" in tbuf, tbuf
+        return None
+
   def get_debug_webpage_json(self, page_name):
     """Returns the json for the given Impala debug webpage, eg. '/queries'"""
     return json.loads(self.read_debug_webpage(page_name + "?json"))
@@ -78,7 +108,7 @@ class BaseImpalaService(object):
         LOG.error(e)
 
       if value == expected_value:
-        LOG.info("Metric '%s' has reach desired value: %s" % (metric_name, value))
+        LOG.info("Metric '%s' has reached desired value: %s" % (metric_name, value))
         return value
       else:
         LOG.info("Waiting for metric value '%s'=%s. Current value: %s" %

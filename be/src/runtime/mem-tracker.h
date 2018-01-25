@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <map>
 #include <memory>
+#include <queue>
 #include <vector>
 #include <boost/thread/mutex.hpp>
 #include <boost/unordered_map.hpp>
@@ -249,7 +250,7 @@ class MemTracker {
   bool LimitExceeded() {
     if (UNLIKELY(CheckLimitExceeded())) {
       if (bytes_over_limit_metric_ != NULL) {
-        bytes_over_limit_metric_->set_value(consumption() - limit_);
+        bytes_over_limit_metric_->SetValue(consumption() - limit_);
       }
       return GcMemory(limit_);
     }
@@ -273,7 +274,7 @@ class MemTracker {
   /// call if this tracker has a consumption metric.
   void RefreshConsumptionFromMetric() {
     DCHECK(consumption_metric_ != nullptr);
-    consumption_->Set(consumption_metric_->value());
+    consumption_->Set(consumption_metric_->GetValue());
   }
 
   int64_t limit() const { return limit_; }
@@ -294,8 +295,9 @@ class MemTracker {
 
   /// Returns the memory 'reserved' by this resource pool mem tracker, which is the sum
   /// of the memory reserved by the queries in it (i.e. its child trackers). The mem
-  /// reserved for a query is its limit_, if set (which should be the common case with
-  /// admission control). Otherwise the current consumption is used.
+  /// reserved for a query that is currently executing is its limit_, if set (which
+  /// should be the common case with admission control). Otherwise, if the query has
+  /// no limit or the query is finished executing, the current consumption is used.
   int64_t GetPoolMemReserved();
 
   /// Returns the memory consumed in bytes.
@@ -343,6 +345,10 @@ class MemTracker {
   /// are not performance sensitive
   static const int UNLIMITED_DEPTH = INT_MAX;
 
+  /// Logs the usage of 'limit' number of queries based on maximum total memory
+  /// consumption.
+  std::string LogTopNQueries(int limit);
+
   /// Log the memory usage when memory limit is exceeded and return a status object with
   /// details of the allocation which caused the limit to be exceeded.
   /// If 'failed_allocation_size' is greater than zero, logs the allocation size. If
@@ -350,6 +356,11 @@ class MemTracker {
   /// If 'state' is non-NULL, logs the error to 'state'.
   Status MemLimitExceeded(RuntimeState* state, const std::string& details,
       int64_t failed_allocation = 0) WARN_UNUSED_RESULT;
+
+  void set_query_exec_finished() {
+    DCHECK(is_query_mem_tracker_);
+    query_exec_finished_.Store(1);
+  }
 
   static const std::string COUNTER_NAME;
 
@@ -376,6 +387,14 @@ class MemTracker {
   static std::string LogUsage(int max_recursive_depth, const std::string& prefix,
       const std::list<MemTracker*>& trackers, int64_t* logged_consumption);
 
+  /// Helper function for LogTopNQueries that iterates through the MemTracker hierarchy
+  /// and populates 'min_pq' with 'limit' number of elements (that contain state related
+  /// to query MemTrackers) based on maximum total memory consumption.
+  void GetTopNQueries(
+      std::priority_queue<pair<int64_t, string>,
+          vector<pair<int64_t, string>>, std::greater<pair<int64_t, string>>>& min_pq,
+      int limit);
+
   /// If an ancestor of this tracker is a query MemTracker, return that tracker.
   /// Otherwise return NULL.
   MemTracker* GetQueryMemTracker();
@@ -385,6 +404,12 @@ class MemTracker {
 
   /// True if this is a Query MemTracker returned from CreateQueryMemTracker().
   bool is_query_mem_tracker_ = false;
+
+  /// Only used if 'is_query_mem_tracker_' is true.
+  /// 0 if the query is still executing or 1 if it has finished executing. Before
+  /// it has finished executing, the tracker limit is treated as "reserved memory"
+  /// for the purpose of admission control - see GetPoolMemReserved().
+  AtomicInt32 query_exec_finished_{0};
 
   /// Only valid for MemTrackers returned from CreateQueryMemTracker()
   TUniqueId query_id_;

@@ -73,8 +73,6 @@ DecimalVal TestGetFnAttrs(
 
 #include "common/names.h"
 
-using namespace llvm;
-
 namespace impala {
 
 const char* TEST_GET_FN_ATTR_SYMBOL =
@@ -317,7 +315,7 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
   test_udf_file << getenv("IMPALA_HOME") << "/be/build/latest/exprs/expr-codegen-test.ll";
   scoped_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(CreateFromFile(test_udf_file.str(), &codegen));
-  Function* fn = codegen->GetFunction(TEST_GET_FN_ATTR_SYMBOL, false);
+  llvm::Function* fn = codegen->GetFunction(TEST_GET_FN_ATTR_SYMBOL, false);
   ASSERT_TRUE(fn != NULL);
 
   // Function verification should fail because we haven't inlined GetTypeAttr() calls
@@ -326,7 +324,7 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
 
   // Call InlineConstFnAttrs() and rerun verification
   int replaced = InlineConstFnAttrs(expr, codegen.get(), fn);
-  EXPECT_EQ(replaced, 9);
+  EXPECT_EQ(replaced, 19);
   ResetVerification(codegen.get());
   verification_succeeded = VerifyFunction(codegen.get(), fn);
   EXPECT_TRUE(verification_succeeded) << CodeGenUtil::Print(fn);

@@ -20,6 +20,7 @@ package org.apache.impala.catalog;
 import com.google.common.base.Preconditions;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.MetaException;
@@ -29,6 +30,7 @@ import org.apache.thrift.TException;
 
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDataSource;
@@ -173,23 +175,31 @@ public class ImpaladCatalog extends Catalog {
       }
     }
 
-    // Now remove all objects from the catalog. Removing a database before removing
-    // its child tables/functions is fine. If that happens, the removal of the child
-    // object will be a no-op.
+    // Now remove all objects from the catalog. First remove low-level objects (tables,
+    // functions and privileges) and then the top-level objects (databases and roles).
     for (TCatalogObject catalogObject: req.getRemoved_objects()) {
-      removeCatalogObject(catalogObject);
+      if (!isTopLevelCatalogObject(catalogObject)) {
+        removeCatalogObject(catalogObject);
+      }
     }
+    for (TCatalogObject catalogObject: req.getRemoved_objects()) {
+      if (isTopLevelCatalogObject(catalogObject)) {
+        removeCatalogObject(catalogObject);
+      }
+    }
+
+
     lastSyncedCatalogVersion_ = newCatalogVersion;
     // Cleanup old entries in the log.
     catalogDeltaLog_.garbageCollect(lastSyncedCatalogVersion_);
     isReady_.set(true);
-
     // Notify all the threads waiting on a catalog update.
     synchronized (catalogUpdateEventNotifier_) {
       catalogUpdateEventNotifier_.notifyAll();
     }
 
-    return new TUpdateCatalogCacheResponse(catalogServiceId_);
+    return new TUpdateCatalogCacheResponse(catalogServiceId_,
+        CatalogObjectVersionQueue.INSTANCE.getMinimumVersion());
   }
 
   /**
@@ -346,7 +356,7 @@ public class ImpaladCatalog extends Catalog {
       case HDFS_CACHE_POOL:
         HdfsCachePool existingItem =
             hdfsCachePools_.get(catalogObject.getCache_pool().getPool_name());
-        if (existingItem.getCatalogVersion() > catalogObject.getCatalog_version()) {
+        if (existingItem.getCatalogVersion() <= catalogObject.getCatalog_version()) {
           hdfsCachePools_.remove(catalogObject.getCache_pool().getPool_name());
         }
         break;
@@ -367,6 +377,15 @@ public class ImpaladCatalog extends Catalog {
       Db newDb = Db.fromTDatabase(thriftDb, this);
       newDb.setCatalogVersion(catalogVersion);
       addDb(newDb);
+      if (existingDb != null) {
+        CatalogObjectVersionQueue.INSTANCE.updateVersions(
+            existingDb.getCatalogVersion(), catalogVersion);
+        CatalogObjectVersionQueue.INSTANCE.removeAll(existingDb.getTables());
+        CatalogObjectVersionQueue.INSTANCE.removeAll(
+            existingDb.getFunctions(null, new PatternMatcher()));
+      } else {
+        CatalogObjectVersionQueue.INSTANCE.addVersion(catalogVersion);
+      }
     }
   }
 
@@ -400,6 +419,12 @@ public class ImpaladCatalog extends Catalog {
     if (existingFn == null ||
         existingFn.getCatalogVersion() < catalogVersion) {
       db.addFunction(function);
+      if (existingFn != null) {
+        CatalogObjectVersionQueue.INSTANCE.updateVersions(
+            existingFn.getCatalogVersion(), catalogVersion);
+      } else {
+        CatalogObjectVersionQueue.INSTANCE.addVersion(catalogVersion);
+      }
     }
   }
 
@@ -417,6 +442,11 @@ public class ImpaladCatalog extends Catalog {
     Db db = getDb(thriftDb.getDb_name());
     if (db != null && db.getCatalogVersion() < dropCatalogVersion) {
       removeDb(db.getName());
+      CatalogObjectVersionQueue.INSTANCE.removeVersion(
+          db.getCatalogVersion());
+      CatalogObjectVersionQueue.INSTANCE.removeAll(db.getTables());
+      CatalogObjectVersionQueue.INSTANCE.removeAll(
+          db.getFunctions(null, new PatternMatcher()));
     }
   }
 
@@ -441,6 +471,8 @@ public class ImpaladCatalog extends Catalog {
     Function fn = db.getFunction(thriftFn.getSignature());
     if (fn != null && fn.getCatalogVersion() < dropCatalogVersion) {
       db.removeFunction(thriftFn.getSignature());
+      CatalogObjectVersionQueue.INSTANCE.removeVersion(
+          fn.getCatalogVersion());
     }
   }
 
@@ -449,6 +481,7 @@ public class ImpaladCatalog extends Catalog {
     // version of the drop, remove the function.
     if (existingRole != null && existingRole.getCatalogVersion() < dropCatalogVersion) {
       authPolicy_.removeRole(thriftRole.getRole_name());
+      CatalogObjectVersionQueue.INSTANCE.removeAll(existingRole.getPrivileges());
     }
   }
 

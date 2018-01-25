@@ -53,12 +53,13 @@
 
 #include "common/names.h"
 
-using namespace llvm;
 using strings::Substitute;
 
 DECLARE_int32(max_errors);
 
 namespace impala {
+
+const char* RuntimeState::LLVM_CLASS_NAME = "class.impala::RuntimeState";
 
 RuntimeState::RuntimeState(QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
     const TPlanFragmentInstanceCtx& instance_ctx, ExecEnv* exec_env)
@@ -139,7 +140,7 @@ Status RuntimeState::CreateCodegen() {
 
 Status RuntimeState::CodegenScalarFns() {
   for (ScalarFnCall* scalar_fn : scalar_fns_to_codegen_) {
-    Function* fn;
+    llvm::Function* fn;
     RETURN_IF_ERROR(scalar_fn->GetCodegendComputeFn(codegen_.get(), &fn));
   }
   return Status::OK();
@@ -222,22 +223,8 @@ Status RuntimeState::CheckQueryState() {
   return GetQueryStatus();
 }
 
-void RuntimeState::AcquireReaderContext(DiskIoRequestContext* reader_context) {
-  boost::lock_guard<SpinLock> l(reader_contexts_lock_);
-  reader_contexts_.push_back(reader_context);
-}
-
-void RuntimeState::UnregisterReaderContexts() {
-  boost::lock_guard<SpinLock> l(reader_contexts_lock_);
-  for (DiskIoRequestContext* context : reader_contexts_) {
-    io_mgr()->UnregisterContext(context);
-  }
-  reader_contexts_.clear();
-}
-
 void RuntimeState::ReleaseResources() {
   DCHECK(!released_resources_);
-  UnregisterReaderContexts();
   if (filter_bank_ != nullptr) filter_bank_->Close();
   if (resource_pool_ != nullptr) {
     exec_env_->thread_mgr()->UnregisterPool(resource_pool_);
@@ -273,7 +260,7 @@ CatalogServiceClientCache* RuntimeState::catalogd_client_cache() {
   return exec_env_->catalogd_client_cache();
 }
 
-DiskIoMgr* RuntimeState::io_mgr() {
+io::DiskIoMgr* RuntimeState::io_mgr() {
   return exec_env_->disk_io_mgr();
 }
 

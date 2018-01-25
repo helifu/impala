@@ -348,6 +348,34 @@ function load-custom-data {
 
   hadoop fs -mv /bad_text_lzo_text_lzo/ /test-warehouse/
 
+  # IMPALA-694: data file produced by parquet-mr version 1.2.5-cdh4.5.0
+  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/bad_parquet_data.parquet \
+                    /test-warehouse/bad_parquet_parquet
+
+  # Data file produced by parquet-mr with repeated values (produces 0 bit width dictionary)
+  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/repeated_values.parquet \
+                    /test-warehouse/bad_parquet_parquet
+
+  # IMPALA-720: data file produced by parquet-mr with multiple row groups
+  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/multiple_rowgroups.parquet \
+                    /test-warehouse/bad_parquet_parquet
+
+  # IMPALA-1401: data file produced by Hive 13 containing page statistics with long min/max
+  # string values
+  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/long_page_header.parquet \
+                    /test-warehouse/bad_parquet_parquet
+
+  # IMPALA-3732: parquet files with corrupt strings
+  local parq_file
+  for parq_file in dict-encoded-negative-len.parq plain-encoded-negative-len.parq; do
+    hadoop fs -put -f ${IMPALA_HOME}/testdata/bad_parquet_data/$parq_file \
+                    /test-warehouse/bad_parquet_strings_negative_len_parquet
+  done
+  for parq_file in dict-encoded-out-of-bounds.parq plain-encoded-out-of-bounds.parq; do
+    hadoop fs -put -f ${IMPALA_HOME}/testdata/bad_parquet_data/$parq_file \
+                    /test-warehouse/bad_parquet_strings_out_of_bounds_parquet
+  done
+
   # Remove all index files in this partition.
   hadoop fs -rm -f /test-warehouse/alltypes_text_lzo/year=2009/month=1/*.lzo.index
 
@@ -421,6 +449,23 @@ function copy-and-load-ext-data-source {
     ${IMPALA_HOME}/testdata/bin/create-data-source-table.sql
 }
 
+function wait-hdfs-replication {
+  FAIL_COUNT=0
+  while [[ "$FAIL_COUNT" -ne "6" ]] ; do
+    FSCK_OUTPUT="$(hdfs fsck /test-warehouse)"
+    echo "$FSCK_OUTPUT"
+    if grep "Under-replicated blocks:[[:space:]]*0" <<< "$FSCK_OUTPUT"; then
+      return
+    fi
+    let FAIL_COUNT="$FAIL_COUNT"+1
+    sleep 5
+  done
+  echo "Some HDFS blocks are still under replicated after 30s."
+  echo "Some tests cannot pass without fully replicated blocks (IMPALA-3887)."
+  echo "Failing the data loading."
+  exit 1
+}
+
 # For kerberized clusters, use kerberos
 if ${CLUSTER_DIR}/admin is_kerberized; then
   LOAD_DATA_ARGS="${LOAD_DATA_ARGS} --use_kerberos --principal=${MINIKDC_PRINC_HIVE}"
@@ -449,9 +494,15 @@ fi
 
 if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   run-step "Loading custom schemas" load-custom-schemas.log load-custom-schemas
-  run-step "Loading functional-query data" load-functional-query.log \
+  # Run some steps in parallel, with run-step-backgroundable / run-step-wait-all.
+  # This is effective on steps that take a long time and don't depend on each
+  # other. Functional-query takes about ~35 minutes, and TPC-H and TPC-DS can
+  # finish while functional-query is running.
+  run-step-backgroundable "Loading functional-query data" load-functional-query.log \
       load-data "functional-query" "exhaustive"
-  run-step "Loading TPC-H data" load-tpch.log load-data "tpch" "core"
+  run-step-backgroundable "Loading TPC-H data" load-tpch.log load-data "tpch" "core"
+  run-step-backgroundable "Loading TPC-DS data" load-tpcds.log load-data "tpcds" "core"
+  run-step-wait-all
   # Load tpch nested data.
   # TODO: Hacky and introduces more complexity into the system, but it is expedient.
   if [[ -n "$CM_HOST" ]]; then
@@ -459,7 +510,6 @@ if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   fi
   run-step "Loading nested data" load-nested.log \
     ${IMPALA_HOME}/testdata/bin/load_nested.py ${LOAD_NESTED_ARGS:-}
-  run-step "Loading TPC-DS data" load-tpcds.log load-data "tpcds" "core"
   run-step "Loading auxiliary workloads" load-aux-workloads.log load-aux-workloads
   run-step "Loading dependent tables" copy-and-load-dependent-tables.log \
       copy-and-load-dependent-tables
@@ -474,13 +524,14 @@ fi
 
 if $KUDU_IS_SUPPORTED; then
   # Tests depend on the kudu data being clean, so load the data from scratch.
-  run-step "Loading Kudu functional" load-kudu.log \
+  run-step-backgroundable "Loading Kudu functional" load-kudu.log \
         load-data "functional-query" "core" "kudu/none/none" force
-  run-step "Loading Kudu TPCH" load-kudu-tpch.log \
+  run-step-backgroundable "Loading Kudu TPCH" load-kudu-tpch.log \
         load-data "tpch" "core" "kudu/none/none" force
 fi
-run-step "Loading Hive UDFs" build-and-copy-hive-udfs.log \
+run-step-backgroundable "Loading Hive UDFs" build-and-copy-hive-udfs.log \
     build-and-copy-hive-udfs
+run-step-wait-all
 run-step "Running custom post-load steps" custom-post-load-steps.log \
     custom-post-load-steps
 
@@ -500,6 +551,8 @@ if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
 
   run-step "Creating internal HBase table" create-internal-hbase-table.log \
       create-internal-hbase-table
+
+  run-step "Waiting for HDFS replication" wait-hdfs-replication.log wait-hdfs-replication
 fi
 
 # TODO: Investigate why all stats are not preserved. Theoretically, we only need to

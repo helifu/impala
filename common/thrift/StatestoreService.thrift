@@ -80,13 +80,13 @@ struct TTopicItem {
 
   // Byte-string value for this topic entry. May not be null-terminated (in that it may
   // contain null bytes). It can be non-empty when deleted is true. This is needed when
-  // subscribers need additional information in order to process the deleted topics that
-  // is not included in the topic key (e.g. catalog version of deleted catalog objects).
+  // subscribers require additional information not captured in the item key to process
+  // the deleted item (e.g., catalog version of deleted catalog object).
   2: required string value;
 
   // If true, this item was deleted. When false, this TTopicItem need not be included in
-  // non-delta TTopicDelta's (since the latest version of every still-present topic will
-  // be included).
+  // non-delta TTopicDelta's since the latest version of every still-present topic item
+  // will be included.
   3: required bool deleted = false;
 }
 

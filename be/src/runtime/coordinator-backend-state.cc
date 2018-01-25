@@ -183,7 +183,7 @@ void Coordinator::BackendState::Exec(
     const string& err_msg =
         Substitute(ERR_TEMPLATE, PrintId(query_id_), rpc_status.msg().msg());
     VLOG_QUERY << err_msg;
-    status_ = Status(err_msg);
+    status_ = Status::Expected(err_msg);
     return;
   }
 
@@ -256,22 +256,21 @@ bool Coordinator::BackendState::ApplyExecStatusReport(
         instance_exec_status.fragment_instance_id);
     // Ignore duplicate or out-of-order messages.
     if (instance_stats->done_) continue;
-    if (instance_status.ok()) {
-      instance_stats->Update(instance_exec_status, exec_summary, scan_range_progress);
-      if (instance_stats->peak_mem_counter_ != nullptr) {
-        // protect against out-of-order status updates
-        peak_consumption_ =
-            max(peak_consumption_, instance_stats->peak_mem_counter_->value());
-      }
-    } else {
-      // if a query is aborted due to an error encountered by a single fragment instance,
-      // all other fragment instances will report a cancelled status; make sure not
-      // to mask the original error status
-      if (status_.ok() || status_.IsCancelled()) {
-        status_ = instance_status;
-        failed_instance_id_ = instance_exec_status.fragment_instance_id;
-        is_fragment_failure_ = true;
-      }
+
+    instance_stats->Update(instance_exec_status, exec_summary, scan_range_progress);
+    if (instance_stats->peak_mem_counter_ != nullptr) {
+      // protect against out-of-order status updates
+      peak_consumption_ =
+        max(peak_consumption_, instance_stats->peak_mem_counter_->value());
+    }
+
+    // If a query is aborted due to an error encountered by a single fragment instance,
+    // all other fragment instances will report a cancelled status; make sure not to mask
+    // the original error status.
+    if (!instance_status.ok() && (status_.ok() || status_.IsCancelled())) {
+      status_ = instance_status;
+      failed_instance_id_ = instance_exec_status.fragment_instance_id;
+      is_fragment_failure_ = true;
     }
     DCHECK_GT(num_remaining_instances_, 0);
     if (instance_exec_status.done) {
@@ -391,6 +390,13 @@ bool Coordinator::BackendState::Cancel() {
 
 void Coordinator::BackendState::PublishFilter(const TPublishFilterParams& rpc_params) {
   DCHECK_EQ(rpc_params.dst_query_id, query_id_);
+  {
+    // If the backend is already done, it's not waiting for this filter, so we skip
+    // sending it in this case.
+    lock_guard<mutex> l(lock_);
+    if (IsDone()) return;
+  }
+
   if (fragments_.count(rpc_params.dst_fragment_idx) == 0) return;
   Status status;
   ImpalaBackendConnection backend_client(
@@ -447,7 +453,7 @@ void Coordinator::BackendState::InstanceStats::InitCounters() {
 void Coordinator::BackendState::InstanceStats::Update(
     const TFragmentInstanceExecStatus& exec_status,
     ExecSummary* exec_summary, ProgressUpdater* scan_range_progress) {
-  DCHECK(Status(exec_status.status).ok());
+  last_report_time_ms_ = MonotonicMillis();
   if (exec_status.done) stopwatch_.Stop();
   profile_->Update(exec_status.profile);
   if (!profile_created_) {
@@ -491,6 +497,32 @@ void Coordinator::BackendState::InstanceStats::Update(
   int64_t delta = total - total_ranges_complete_;
   total_ranges_complete_ = total;
   scan_range_progress->Update(delta);
+
+  // extract the current execution state of this instance
+  current_state_ = exec_status.current_state;
+}
+
+void Coordinator::BackendState::InstanceStats::ToJson(Value* value, Document* document) {
+  Value instance_id_val(PrintId(exec_params_.instance_id).c_str(),
+      document->GetAllocator());
+  value->AddMember("instance_id", instance_id_val, document->GetAllocator());
+
+  // We send 'done' explicitly so we don't have to infer it by comparison with a string
+  // constant in the debug page JS code.
+  value->AddMember("done", done_, document->GetAllocator());
+
+  Value state_val(FragmentInstanceState::ExecStateToString(current_state_).c_str(),
+      document->GetAllocator());
+  value->AddMember("current_state", state_val, document->GetAllocator());
+
+  Value fragment_name_val(exec_params_.fragment().display_name.c_str(),
+      document->GetAllocator());
+  value->AddMember("fragment_name", fragment_name_val, document->GetAllocator());
+
+  value->AddMember("first_status_update_received", last_report_time_ms_ > 0,
+      document->GetAllocator());
+  value->AddMember("time_since_last_heard_from", MonotonicMillis() - last_report_time_ms_,
+      document->GetAllocator());
 }
 
 Coordinator::FragmentStats::FragmentStats(const string& avg_profile_name,
@@ -577,4 +609,23 @@ void Coordinator::BackendState::ToJson(Value* value, Document* document) {
 
   value->AddMember(
       "num_remaining_instances", num_remaining_instances_, document->GetAllocator());
+}
+
+void Coordinator::BackendState::InstanceStatsToJson(Value* value, Document* document) {
+  Value instance_stats(kArrayType);
+  {
+    lock_guard<mutex> l(lock_);
+    for (const auto& elem : instance_stats_map_) {
+      Value val(kObjectType);
+      elem.second->ToJson(&val, document);
+      instance_stats.PushBack(val, document->GetAllocator());
+    }
+    DCHECK_EQ(instance_stats.Size(), fragments_.size());
+  }
+  value->AddMember("instance_stats", instance_stats, document->GetAllocator());
+
+  // impalad_address is not protected by lock_. The lifetime of the backend state is
+  // protected by Coordinator::lock_.
+  Value val(TNetworkAddressToString(impalad_address()).c_str(), document->GetAllocator());
+  value->AddMember("host", val, document->GetAllocator());
 }

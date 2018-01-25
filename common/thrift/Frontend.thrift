@@ -87,6 +87,17 @@ struct TGetTablesResult {
   1: list<string> tables
 }
 
+// Arguments to getTableMetrics, which returns the metrics of a specific table.
+struct TGetTableMetricsParams {
+  1: required CatalogObjects.TTableName table_name
+}
+
+// Response to a getTableMetrics request. The response contains all the collected metrics
+// pretty-printed into a string.
+struct TGetTableMetricsResponse {
+  1: required string metrics
+}
+
 // Arguments to getDbs, which returns a list of dbs that match an optional pattern
 struct TGetDbsParams {
   // If not set, match every database
@@ -363,42 +374,39 @@ struct TPlanExecInfo {
 
 // Result of call to ImpalaPlanService/JniFrontend.CreateQueryRequest()
 struct TQueryExecRequest {
-  // global descriptor tbl for all fragments
-  1: optional Descriptors.TDescriptorTable desc_tbl
-
   // exec info for all plans; the first one materializes the query result
-  2: optional list<TPlanExecInfo> plan_exec_info
+  1: optional list<TPlanExecInfo> plan_exec_info
 
   // Metadata of the query result set (only for select)
-  3: optional Results.TResultSetMetadata result_set_metadata
+  2: optional Results.TResultSetMetadata result_set_metadata
 
   // Set if the query needs finalization after it executes
-  4: optional TFinalizeParams finalize_params
+  3: optional TFinalizeParams finalize_params
 
-  5: required ImpalaInternalService.TQueryCtx query_ctx
+  4: required ImpalaInternalService.TQueryCtx query_ctx
 
   // The same as the output of 'explain <query>'
-  6: optional string query_plan
+  5: optional string query_plan
 
   // The statement type governs when the coordinator can judge a query to be finished.
   // DML queries are complete after Wait(), SELECTs may not be. Generally matches
   // the stmt_type of the parent TExecRequest, but in some cases (such as CREATE TABLE
   // AS SELECT), these may differ.
-  7: required Types.TStmtType stmt_type
+  6: required Types.TStmtType stmt_type
 
   // List of replica hosts.  Used by the host_idx field of TScanRangeLocation.
-  9: required list<Types.TNetworkAddress> host_list
+  7: required list<Types.TNetworkAddress> host_list
 
   // Column lineage graph
-  10: optional LineageGraph.TLineageGraph lineage_graph
+  8: optional LineageGraph.TLineageGraph lineage_graph
 
   // Estimated per-host peak memory consumption in bytes. Used by admission control.
   // TODO: Remove when AC doesn't rely on this any more.
-  8: optional i64 per_host_mem_estimate
+  9: optional i64 per_host_mem_estimate
 
   // Maximum possible (in the case all fragments are scheduled on all hosts with
   // max DOP) minimum reservation required per host, in bytes.
-  11: optional i64 max_per_host_min_reservation;
+  10: optional i64 max_per_host_min_reservation;
 }
 
 enum TCatalogOpType {
@@ -424,63 +432,68 @@ enum TCatalogOpType {
 struct TCatalogOpRequest {
   1: required TCatalogOpType op_type
 
+  // True if SYNC_DDL is used in the query options
+  2: required bool sync_ddl
+
   // Parameters for USE commands
-  2: optional TUseDbParams use_db_params
+  3: optional TUseDbParams use_db_params
 
   // Parameters for DESCRIBE DATABASE db commands
-  17: optional TDescribeDbParams describe_db_params
+  4: optional TDescribeDbParams describe_db_params
 
   // Parameters for DESCRIBE table commands
-  3: optional TDescribeTableParams describe_table_params
+  5: optional TDescribeTableParams describe_table_params
 
   // Parameters for SHOW DATABASES
-  4: optional TShowDbsParams show_dbs_params
+  6: optional TShowDbsParams show_dbs_params
 
   // Parameters for SHOW TABLES
-  5: optional TShowTablesParams show_tables_params
+  7: optional TShowTablesParams show_tables_params
 
   // Parameters for SHOW FUNCTIONS
-  6: optional TShowFunctionsParams show_fns_params
+  8: optional TShowFunctionsParams show_fns_params
 
   // Parameters for SHOW DATA SOURCES
-  11: optional TShowDataSrcsParams show_data_srcs_params
+  9: optional TShowDataSrcsParams show_data_srcs_params
 
   // Parameters for SHOW ROLES
-  12: optional TShowRolesParams show_roles_params
+  10: optional TShowRolesParams show_roles_params
 
   // Parameters for SHOW GRANT ROLE
-  13: optional TShowGrantRoleParams show_grant_role_params
+  11: optional TShowGrantRoleParams show_grant_role_params
 
   // Parameters for DDL requests executed using the CatalogServer
   // such as CREATE, ALTER, and DROP. See CatalogService.TDdlExecRequest
   // for details.
-  7: optional CatalogService.TDdlExecRequest ddl_params
+  12: optional CatalogService.TDdlExecRequest ddl_params
 
   // Parameters for RESET/INVALIDATE METADATA, executed using the CatalogServer.
   // See CatalogService.TResetMetadataRequest for more details.
-  8: optional CatalogService.TResetMetadataRequest reset_metadata_params
+  13: optional CatalogService.TResetMetadataRequest reset_metadata_params
 
   // Parameters for SHOW TABLE/COLUMN STATS
-  9: optional TShowStatsParams show_stats_params
+  14: optional TShowStatsParams show_stats_params
 
   // Parameters for SHOW CREATE TABLE
-  10: optional CatalogObjects.TTableName show_create_table_params
+  15: optional CatalogObjects.TTableName show_create_table_params
 
   // Parameters for SHOW FILES
-  14: optional TShowFilesParams show_files_params
+  16: optional TShowFilesParams show_files_params
 
   // Column lineage graph
-  15: optional LineageGraph.TLineageGraph lineage_graph
+  17: optional LineageGraph.TLineageGraph lineage_graph
 
   // Parameters for SHOW_CREATE_FUNCTION
-  16: optional TGetFunctionsParams show_create_function_params
+  18: optional TGetFunctionsParams show_create_function_params
 }
 
 // Parameters for the SET query option command
 struct TSetQueryOptionRequest {
-  // Set for "SET key=value", unset for "SET" statement.
+  // Set for "SET key=value", unset for "SET" and "SET ALL" statements.
   1: optional string key
   2: optional string value
+  // Set true for "SET ALL"
+  3: optional bool is_set_all
 }
 
 // HiveServer2 Metadata operations (JniFrontend.hiveServer2MetadataOperation)
@@ -542,7 +555,7 @@ struct TExecRequest {
   // Set iff stmt_type is QUERY or DML
   3: optional TQueryExecRequest query_exec_request
 
-  // Set iff stmt_type is DDL
+  // Set if stmt_type is DDL
   4: optional TCatalogOpRequest catalog_op_request
 
   // Metadata of the query result set (not set for DML)
@@ -561,7 +574,7 @@ struct TExecRequest {
   // List of warnings that were generated during analysis. May be empty.
   9: required list<string> analysis_warnings
 
-  // Set iff stmt_type is SET
+  // Set if stmt_type is SET
   10: optional TSetQueryOptionRequest set_query_option_request
 
   // Timeline of planner's operation, for profiling
@@ -662,6 +675,9 @@ struct TUpdateCatalogCacheRequest {
 struct TUpdateCatalogCacheResponse {
   // The catalog service id this version is from.
   1: required Types.TUniqueId catalog_service_id
+
+  // The minimum catalog object version after CatalogUpdate() was processed.
+  2: required i64 min_catalog_object_version
 }
 
 // Sent from the impalad BE to FE with the latest cluster membership snapshot resulting

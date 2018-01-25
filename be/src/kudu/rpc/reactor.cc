@@ -70,11 +70,6 @@ using std::shared_ptr;
 using std::unique_ptr;
 using strings::Substitute;
 
-DEFINE_int64_hidden(rpc_negotiation_timeout_ms, 3000,
-             "Timeout for negotiating an RPC connection.");
-TAG_FLAG(rpc_negotiation_timeout_ms, advanced);
-TAG_FLAG(rpc_negotiation_timeout_ms, runtime);
-
 DEFINE_bool_hidden(rpc_reopen_outbound_connections, false,
             "Open a new connection to the server for every RPC call. "
             "If not enabled, an already existing connection to a "
@@ -308,28 +303,30 @@ void ReactorThread::ScanIdleConnections() {
   // Enforce TCP connection timeouts: server-side connections.
   const auto server_conns_end = server_conns_.end();
   uint64_t timed_out = 0;
-  for (auto it = server_conns_.begin(); it != server_conns_end; ) {
-    Connection* conn = it->get();
-    if (!conn->Idle()) {
-      VLOG(10) << "Connection " << conn->ToString() << " not idle";
-      ++it;
-      continue;
-    }
+  // Scan for idle server connections if it's enabled.
+  if (connection_keepalive_time_ >= MonoDelta::FromMilliseconds(0)) {
+    for (auto it = server_conns_.begin(); it != server_conns_end; ) {
+      Connection* conn = it->get();
+      if (!conn->Idle()) {
+        VLOG(10) << "Connection " << conn->ToString() << " not idle";
+        ++it;
+        continue;
+      }
 
-    const MonoDelta connection_delta(cur_time_ - conn->last_activity_time());
-    if (connection_delta <= connection_keepalive_time_) {
-      ++it;
-      continue;
-    }
+      const MonoDelta connection_delta(cur_time_ - conn->last_activity_time());
+      if (connection_delta <= connection_keepalive_time_) {
+        ++it;
+        continue;
+      }
 
-    conn->Shutdown(Status::NetworkError(
-        Substitute("connection timed out after $0", connection_keepalive_time_.ToString())));
-    VLOG(1) << "Timing out connection " << conn->ToString() << " - it has been idle for "
-            << connection_delta.ToString();
-    ++timed_out;
-    it = server_conns_.erase(it);
+      conn->Shutdown(Status::NetworkError(
+          Substitute("connection timed out after $0", connection_keepalive_time_.ToString())));
+      VLOG(1) << "Timing out connection " << conn->ToString() << " - it has been idle for "
+              << connection_delta.ToString();
+      ++timed_out;
+      it = server_conns_.erase(it);
+    }
   }
-
   // Take care of idle client-side connections marked for shutdown.
   uint64_t shutdown = 0;
   for (auto it = client_conns_.begin(); it != client_conns_.end();) {
@@ -472,7 +469,7 @@ Status ReactorThread::StartConnectionNegotiation(const scoped_refptr<Connection>
 
   // Set a limit on how long the server will negotiate with a new client.
   MonoTime deadline = MonoTime::Now() +
-      MonoDelta::FromMilliseconds(FLAGS_rpc_negotiation_timeout_ms);
+      MonoDelta::FromMilliseconds(reactor()->messenger()->rpc_negotiation_timeout_ms());
 
   scoped_refptr<Trace> trace(new Trace());
   ADOPT_TRACE(trace.get());

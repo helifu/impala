@@ -1,4 +1,4 @@
-# Generating HTML or a PDF of Apache Impala (Incubating) Documentation
+# Generating HTML or a PDF of Apache Impala Documentation
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ instructions.
 * Open a terminal window and run the following commands to get the Impala
   documentation source files from Git:
     ```
-    git clone https://git-wip-us.apache.org/repos/asf/incubator-impala.git/docs
+    git clone https://git-wip-us.apache.org/repos/asf/impala.git/docs
     cd <local_directory>
     git checkout master
     ```

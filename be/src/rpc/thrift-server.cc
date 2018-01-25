@@ -18,7 +18,6 @@
 #include <boost/filesystem.hpp>
 #include <boost/thread.hpp>
 #include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
 #include <thrift/concurrency/Thread.h>
@@ -37,9 +36,11 @@
 #include "rpc/authentication.h"
 #include "rpc/thrift-server.h"
 #include "rpc/thrift-thread.h"
+#include "util/condition-variable.h"
 #include "util/debug-util.h"
 #include "util/metrics.h"
 #include "util/network-util.h"
+#include "util/openssl-util.h"
 #include "util/os-util.h"
 #include "util/uid-util.h"
 
@@ -86,14 +87,20 @@ Status SSLProtoVersions::StringToProtocol(const string& in, SSLProtocol* protoco
   return Status(Substitute("Unknown TLS version: '$0'", in));
 }
 
-#define OPENSSL_MIN_VERSION_WITH_TLS_1_1 0x10001000L
-
 bool SSLProtoVersions::IsSupported(const SSLProtocol& protocol) {
-  bool is_openssl_1_0_0_or_lower = (SSLeay() < OPENSSL_MIN_VERSION_WITH_TLS_1_1);
-  if (is_openssl_1_0_0_or_lower) return (protocol == TLSv1_0_plus);
+  DCHECK_LE(protocol, TLSv1_2_plus);
+  int max_supported_tls_version = MaxSupportedTlsVersion();
+  DCHECK_GE(max_supported_tls_version, TLS1_VERSION);
 
-  // All other versions supported by OpenSSL 1.0.1 and later.
-  return true;
+  switch (max_supported_tls_version) {
+    case TLS1_VERSION:
+      return protocol == TLSv1_0_plus || protocol == TLSv1_0;
+    case TLS1_1_VERSION:
+      return protocol != TLSv1_2_plus && protocol != TLSv1_2;
+    default:
+      DCHECK_GE(max_supported_tls_version, TLS1_2_VERSION);
+      return true;
+  }
 }
 
 bool EnableInternalSslConnections() {
@@ -139,13 +146,13 @@ class ThriftServer::ThriftServerEventProcessor : public TServerEventHandler {
 
  private:
   // Lock used to ensure that there are no missed notifications between starting the
-  // supervision thread and calling signal_cond_.timed_wait. Also used to ensure
+  // supervision thread and calling signal_cond_.WaitUntil. Also used to ensure
   // thread-safe access to members of thrift_server_
   boost::mutex signal_lock_;
 
   // Condition variable that is notified by the supervision thread once either
   // a) all is well or b) an error occurred.
-  boost::condition_variable signal_cond_;
+  ConditionVariable signal_cond_;
 
   // The ThriftServer under management. This class is a friend of ThriftServer, and
   // reaches in to change member variables at will.
@@ -179,7 +186,7 @@ Status ThriftServer::ThriftServerEventProcessor::StartAndWaitForServer() {
   // visibility.
   while (!signal_fired_) {
     // Yields lock and allows supervision thread to continue and signal
-    if (!signal_cond_.timed_wait(lock, deadline)) {
+    if (!signal_cond_.WaitUntil(lock, deadline)) {
       stringstream ss;
       ss << "ThriftServer '" << thrift_server_->name_ << "' (on port: "
          << thrift_server_->port_ << ") did not start within "
@@ -220,7 +227,7 @@ void ThriftServer::ThriftServerEventProcessor::Supervise() {
     // failure, for example.
     signal_fired_ = true;
   }
-  signal_cond_.notify_all();
+  signal_cond_.NotifyAll();
 }
 
 void ThriftServer::ThriftServerEventProcessor::preServe() {
@@ -234,7 +241,7 @@ void ThriftServer::ThriftServerEventProcessor::preServe() {
   thrift_server_->started_ = true;
 
   // Should only be one thread waiting on signal_cond_, but wake all just in case.
-  signal_cond_.notify_all();
+  signal_cond_.NotifyAll();
 }
 
 // This thread-local variable contains the current connection context for whichever
@@ -342,10 +349,10 @@ ThriftServer::ThriftServer(const string& name,
     metrics_enabled_ = true;
     stringstream count_ss;
     count_ss << "impala.thrift-server." << name << ".connections-in-use";
-    num_current_connections_metric_ = metrics->AddGauge<int64_t>(count_ss.str(), 0);
+    num_current_connections_metric_ = metrics->AddGauge(count_ss.str(), 0);
     stringstream max_ss;
     max_ss << "impala.thrift-server." << name << ".total-connections";
-    total_connections_metric_ = metrics->AddCounter<int64_t>(max_ss.str(), 0);
+    total_connections_metric_ = metrics->AddCounter(max_ss.str(), 0);
     metrics_ = metrics;
   } else {
     metrics_enabled_ = false;
@@ -376,8 +383,8 @@ Status ThriftServer::CreateSocket(boost::shared_ptr<TServerTransport>* socket) {
   if (ssl_enabled()) {
     if (!SSLProtoVersions::IsSupported(version_)) {
       return Status(TErrorCode::SSL_SOCKET_CREATION_FAILED,
-          Substitute("TLS ($0) version not supported (linked OpenSSL version is $1)",
-                        version_, SSLeay()));
+          Substitute("TLS ($0) version not supported (maximum supported version is $1)",
+                        version_, MaxSupportedTlsVersion()));
     }
     try {
       // This 'factory' is only called once, since CreateSocket() is only called from

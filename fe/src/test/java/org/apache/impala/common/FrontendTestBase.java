@@ -31,6 +31,7 @@ import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.CreateTableStmt;
 import org.apache.impala.analysis.CreateViewStmt;
 import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.ParseNode;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.SqlParser;
@@ -58,8 +59,8 @@ import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
 import org.junit.After;
-import org.junit.Assert;
 import org.junit.AfterClass;
+import org.junit.Assert;
 import org.junit.BeforeClass;
 
 import com.google.common.base.Joiner;
@@ -233,10 +234,35 @@ public class FrontendTestBase {
     return dummyView;
   }
 
+  protected Table addAllScalarTypesTestTable() {
+    addTestDb("allscalartypesdb", "");
+    return addTestTable("create table allscalartypes (" +
+      "bool_col boolean, tinyint_col tinyint, smallint_col smallint, int_col int, " +
+      "bigint_col bigint, float_col float, double_col double, dec1 decimal(9,0), " +
+      "d2 decimal(10, 0), d3 decimal(20, 10), d4 decimal(38, 38), d5 decimal(10, 5), " +
+      "timestamp_col timestamp, string_col string, varchar_col varchar(50), " +
+      "char_col char (30))");
+  }
+
   protected void clearTestTables() {
     for (Table testTable: testTables_) {
       testTable.getDb().removeTable(testTable.getName());
     }
+  }
+
+  /**
+   * Inject the hint into the pattern using hint location.
+   *
+   * Example:
+   *   pattern: insert %s into t %s select * from t
+   *   hint: <token_hint_begin> hint_with_args(a) <token_hint_end>
+   *   loc: Start(=oracle style) | End(=traditional style)
+   */
+  protected String InjectInsertHint(String pattern, String hint,
+      InsertStmt.HintLocation loc) {
+    final String oracleHint = (loc == InsertStmt.HintLocation.Start) ? hint : "";
+    final String defaultHint  = (loc == InsertStmt.HintLocation.End) ? hint : "";
+    return String.format(pattern, oracleHint, defaultHint);
   }
 
   @After

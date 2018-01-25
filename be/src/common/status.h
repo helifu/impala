@@ -34,6 +34,8 @@
 
 namespace impala {
 
+class StatusPB;
+
 /// Status is used as a function return type to indicate success, failure or cancellation
 /// of the function. In case of successful completion, it only occupies sizeof(void*)
 /// statically allocated memory and therefore no more members should be added to this
@@ -151,6 +153,10 @@ class NODISCARD Status {
   /// Retains the TErrorCode value and the message
   explicit Status(const TStatus& status);
 
+  /// "Copy" c'tor from StatusPB (a protobuf serialized version of Status object).
+  /// Retains the TErrorCode value and the message
+  explicit Status(const StatusPB& status);
+
   /// "Copy c'tor from HS2 TStatus.
   /// Retains the TErrorCode value and the message
   explicit Status(const apache::hive::service::cli::thrift::TStatus& hs2_status);
@@ -240,6 +246,9 @@ class NODISCARD Status {
   /// Convert into TStatus.
   void ToThrift(TStatus* status) const;
 
+  /// Serialize into StatusPB
+  void ToProto(StatusPB* status) const;
+
   /// Returns the formatted message of the error message and the individual details of the
   /// additional messages as a single string. This should only be called internally and
   /// not to report an error back to the client.
@@ -249,6 +258,7 @@ class NODISCARD Status {
     return msg_ == NULL ? TErrorCode::OK : msg_->error();
   }
 
+  static const char* LLVM_CLASS_NAME;
  private:
 
   // Status constructors that can suppress logging via 'silent' parameter
@@ -263,6 +273,9 @@ class NODISCARD Status {
 
   /// A non-inline function for unwrapping a TStatus object.
   void FromThrift(const TStatus& status);
+
+  /// A non-inline function for unwrapping a StatusPB object.
+  void FromProto(const StatusPB& status);
 
   /// Status uses a naked pointer to ensure the size of an instance on the stack is only
   /// the sizeof(ErrorMsg*). Every Status owns its ErrorMsg instance.

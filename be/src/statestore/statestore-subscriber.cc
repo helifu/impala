@@ -113,7 +113,7 @@ StatestoreSubscriber::StatestoreSubscriber(const std::string& subscriber_id,
       metrics_(metrics->GetOrCreateChildGroup("statestore-subscriber")) {
   connected_to_statestore_metric_ =
       metrics_->AddProperty("statestore-subscriber.connected", false);
-  last_recovery_duration_metric_ = metrics_->AddGauge(
+  last_recovery_duration_metric_ = metrics_->AddDoubleGauge(
       "statestore-subscriber.last-recovery-duration", 0.0);
   last_recovery_time_metric_ = metrics_->AddProperty<string>(
       "statestore-subscriber.last-recovery-time", "N/A");
@@ -164,12 +164,12 @@ Status StatestoreSubscriber::Register() {
   RETURN_IF_ERROR(client.DoRpc(&StatestoreServiceClientWrapper::RegisterSubscriber,
       request, &response));
   Status status = Status(response.status);
-  if (status.ok()) connected_to_statestore_metric_->set_value(true);
+  if (status.ok()) connected_to_statestore_metric_->SetValue(true);
   if (response.__isset.registration_id) {
     lock_guard<mutex> l(registration_id_lock_);
     registration_id_ = response.registration_id;
     const string& registration_string = PrintId(registration_id_);
-    registration_id_metric_->set_value(registration_string);
+    registration_id_metric_->SetValue(registration_string);
     VLOG(1) << "Subscriber registration ID: " << registration_string;
   } else {
     VLOG(1) << "No subscriber registration ID received from statestore";
@@ -243,7 +243,7 @@ void StatestoreSubscriber::RecoveryModeChecker() {
       lock_guard<mutex> l(lock_);
       MonotonicStopWatch recovery_timer;
       recovery_timer.Start();
-      connected_to_statestore_metric_->set_value(false);
+      connected_to_statestore_metric_->SetValue(false);
       LOG(INFO) << subscriber_id_
                 << ": Connection with statestore lost, entering recovery mode";
       uint32_t attempt_count = 1;
@@ -265,7 +265,7 @@ void StatestoreSubscriber::RecoveryModeChecker() {
                        << status.GetDetail();
           SleepForMs(SLEEP_INTERVAL_MS);
         }
-        last_recovery_duration_metric_->set_value(
+        last_recovery_duration_metric_->SetValue(
             recovery_timer.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
       }
       // When we're successful in re-registering, we don't do anything
@@ -273,22 +273,22 @@ void StatestoreSubscriber::RecoveryModeChecker() {
       // responsibility of individual clients to post missing updates
       // back to the statestore. This saves a lot of complexity where
       // we would otherwise have to cache updates here.
-      last_recovery_duration_metric_->set_value(
+      last_recovery_duration_metric_->SetValue(
           recovery_timer.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
-      last_recovery_time_metric_->set_value(CurrentTimeString());
+      last_recovery_time_metric_->SetValue(CurrentTimeString());
     }
 
     SleepForMs(SLEEP_INTERVAL_MS);
   }
 }
 
-Status StatestoreSubscriber::CheckRegistrationId(const TUniqueId& registration_id) {
+Status StatestoreSubscriber::CheckRegistrationId(const RegistrationId& registration_id) {
   {
     lock_guard<mutex> r(registration_id_lock_);
     // If this subscriber has just started, the registration_id_ may not have been set
-    // despite the statestore starting to send updates. The 'unset' TUniqueId is 0:0, so
-    // we can differentiate between a) an early message from an eager statestore, and b)
-    // a message that's targeted to a previous registration.
+    // despite the statestore starting to send updates. The 'unset' RegistrationId is 0:0,
+    // so we can differentiate between a) an early message from an eager statestore, and
+    // b) a message that's targeted to a previous registration.
     if (registration_id_ != TUniqueId() && registration_id != registration_id_) {
       return Status(Substitute("Unexpected registration ID: $0, was expecting $1",
           PrintId(registration_id), PrintId(registration_id_)));
@@ -298,7 +298,7 @@ Status StatestoreSubscriber::CheckRegistrationId(const TUniqueId& registration_i
   return Status::OK();
 }
 
-void StatestoreSubscriber::Heartbeat(const TUniqueId& registration_id) {
+void StatestoreSubscriber::Heartbeat(const RegistrationId& registration_id) {
   const Status& status = CheckRegistrationId(registration_id);
   if (status.ok()) {
     heartbeat_interval_metric_->Update(
@@ -310,7 +310,7 @@ void StatestoreSubscriber::Heartbeat(const TUniqueId& registration_id) {
 }
 
 Status StatestoreSubscriber::UpdateState(const TopicDeltaMap& incoming_topic_deltas,
-    const TUniqueId& registration_id, vector<TTopicDelta>* subscriber_topic_updates,
+    const RegistrationId& registration_id, vector<TTopicDelta>* subscriber_topic_updates,
     bool* skipped) {
   // We don't want to block here because this is an RPC, and delaying the return causes
   // the statestore to delay sending further messages. The only time that lock_ might be

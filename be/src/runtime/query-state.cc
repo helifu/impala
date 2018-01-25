@@ -20,6 +20,7 @@
 #include <boost/thread/lock_guard.hpp>
 #include <boost/thread/locks.hpp>
 
+#include "common/thread-debug-info.h"
 #include "exprs/expr.h"
 #include "runtime/backend-client.h"
 #include "runtime/bufferpool/buffer-pool.h"
@@ -82,6 +83,9 @@ void QueryState::ReleaseExecResources() {
   if (initial_reservations_ != nullptr) initial_reservations_->ReleaseResources();
   if (buffer_reservation_ != nullptr) buffer_reservation_->Close();
   if (desc_tbl_ != nullptr) desc_tbl_->ReleaseResources();
+  // Mark the query as finished on the query MemTracker so that admission control will
+  // not consider the whole query memory limit to be "reserved".
+  query_mem_tracker_->set_query_exec_finished();
   // At this point query execution should not be consuming any resources but some tracked
   // memory may still be used by the ClientRequestState for result caching. The query
   // MemTracker will be closed later when this QueryState is torn down.
@@ -223,11 +227,11 @@ void QueryState::ReportExecStatusAux(bool done, const Status& status,
     instance_status.__set_fragment_instance_id(fis->instance_id());
     status.SetTStatus(&instance_status);
     instance_status.__set_done(done);
+    instance_status.__set_current_state(fis->current_state());
 
-    if (fis->profile() != nullptr) {
-      fis->profile()->ToThrift(&instance_status.profile);
-      instance_status.__isset.profile = true;
-    }
+    DCHECK(fis->profile() != nullptr);
+    fis->profile()->ToThrift(&instance_status.profile);
+    instance_status.__isset.profile = true;
 
     // Only send updates to insert status if fragment is finished, the coordinator waits
     // until query execution is done to use them anyhow.
@@ -301,6 +305,7 @@ void QueryState::StartFInstances() {
   DCHECK_GT(rpc_params_.fragment_ctxs.size(), 0);
   TPlanFragmentCtx* fragment_ctx = &rpc_params_.fragment_ctxs[0];
   int fragment_ctx_idx = 0;
+  fragment_events_start_time_ = MonotonicStopWatch::Now();
   for (const TPlanFragmentInstanceCtx& instance_ctx: rpc_params_.fragment_instance_ctxs) {
     // determine corresponding TPlanFragmentCtx
     if (fragment_ctx->fragment.idx != instance_ctx.fragment_idx) {
@@ -370,17 +375,21 @@ void QueryState::ReleaseExecResourceRefcount() {
 }
 
 void QueryState::ExecFInstance(FragmentInstanceState* fis) {
+  GetThreadDebugInfo()->SetInstanceId(fis->instance_id());
+
   ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->Increment(1L);
   ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS->Increment(1L);
   VLOG_QUERY << "Executing instance. instance_id=" << PrintId(fis->instance_id())
       << " fragment_idx=" << fis->instance_ctx().fragment_idx
       << " per_fragment_instance_idx=" << fis->instance_ctx().per_fragment_instance_idx
       << " coord_state_idx=" << rpc_params().coord_state_idx
-      << " #in-flight=" << ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->value();
+      << " #in-flight="
+      << ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->GetValue();
   Status status = fis->Exec();
   ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->Increment(-1L);
   VLOG_QUERY << "Instance completed. instance_id=" << PrintId(fis->instance_id())
-      << " #in-flight=" << ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->value()
+      << " #in-flight="
+      << ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT->GetValue()
       << " status=" << status;
   // initiate cancellation if nobody has done so yet
   if (!status.ok()) Cancel();
@@ -397,12 +406,11 @@ void QueryState::Cancel() {
   for (auto entry: fis_map_) entry.second->Cancel();
 }
 
-void QueryState::PublishFilter(int32_t filter_id, int fragment_idx,
-    const TBloomFilter& thrift_bloom_filter) {
+void QueryState::PublishFilter(const TPublishFilterParams& params) {
   if (!instances_prepared_promise_.Get().ok()) return;
-  DCHECK_EQ(fragment_map_.count(fragment_idx), 1);
-  for (FragmentInstanceState* fis: fragment_map_[fragment_idx]) {
-    fis->PublishFilter(filter_id, thrift_bloom_filter);
+  DCHECK_EQ(fragment_map_.count(params.dst_fragment_idx), 1);
+  for (FragmentInstanceState* fis : fragment_map_[params.dst_fragment_idx]) {
+    fis->PublishFilter(params);
   }
 }
 

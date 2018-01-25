@@ -28,7 +28,7 @@
   <groupId>org.apache.impala</groupId>
   <artifactId>impala-data-source-test</artifactId>
   <version>0.1-SNAPSHOT</version>
-  <name>Apache Impala (Incubating) External Data Source Test Library</name>
+  <name>Apache Impala External Data Source Test Library</name>
   <description>Test External Data Source</description>
   <packaging>jar</packaging>
   <url>.</url>
@@ -36,28 +36,6 @@
   <properties>
     <impala.extdatasrc.api.version>1.0-SNAPSHOT</impala.extdatasrc.api.version>
   </properties>
-
-  <repositories>
-    <repository>
-      <id>cdh.repo</id>
-      <url>https://repository.cloudera.com/content/groups/cloudera-repos</url>
-      <name>Cloudera Repositories</name>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-    </repository>
-    <repository>
-      <id>cdh.snapshots.repo</id>
-      <url>https://repository.cloudera.com/content/repositories/snapshots</url>
-      <name>Cloudera Snapshots Repository</name>
-      <snapshots>
-        <enabled>true</enabled>
-      </snapshots>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-    </repository>
-  </repositories>
 
   <dependencies>
     <dependency>

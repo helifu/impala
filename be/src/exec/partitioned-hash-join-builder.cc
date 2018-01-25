@@ -34,6 +34,7 @@
 #include "runtime/runtime-filter.h"
 #include "runtime/runtime-state.h"
 #include "util/bloom-filter.h"
+#include "util/min-max-filter.h"
 #include "util/runtime-profile-counters.h"
 
 #include "gen-cpp/PlanNodes_types.h"
@@ -46,12 +47,6 @@ static const string PREPARE_FOR_READ_FAILED_ERROR_MSG =
     "the memory limit may help this query to complete successfully.";
 
 using namespace impala;
-using llvm::ConstantInt;
-using llvm::Function;
-using llvm::LLVMContext;
-using llvm::PointerType;
-using llvm::Type;
-using llvm::Value;
 using strings::Substitute;
 
 const char* PhjBuilder::LLVM_CLASS_NAME = "class.impala::PhjBuilder";
@@ -60,7 +55,8 @@ PhjBuilder::PhjBuilder(int join_node_id, TJoinOp::type join_op,
     const RowDescriptor* probe_row_desc, const RowDescriptor* build_row_desc,
     RuntimeState* state, BufferPool::ClientHandle* buffer_pool_client,
     int64_t spillable_buffer_size, int64_t max_row_buffer_size)
-  : DataSink(build_row_desc),
+  : DataSink(build_row_desc,
+        Substitute("Hash Join Builder (join_node_id=$0)", join_node_id), state),
     runtime_state_(state),
     join_node_id_(join_node_id),
     join_op_(join_op),
@@ -85,11 +81,6 @@ PhjBuilder::PhjBuilder(int join_node_id, TJoinOp::type join_op,
     process_build_batch_fn_level0_(NULL),
     insert_batch_fn_(NULL),
     insert_batch_fn_level0_(NULL) {}
-
-Status PhjBuilder::Init(const vector<TExpr>& thrift_output_exprs,
-    const TDataSink& tsink, RuntimeState* state) {
-  return Status::OK();
-}
 
 Status PhjBuilder::InitExprsAndFilters(RuntimeState* state,
     const vector<TEqJoinCondition>& eq_join_conjuncts,
@@ -117,10 +108,6 @@ Status PhjBuilder::InitExprsAndFilters(RuntimeState* state,
     filter_ctxs_.back().filter = state->filter_bank()->RegisterFilter(filter_desc, true);
   }
   return Status::OK();
-}
-
-string PhjBuilder::GetName() {
-  return Substitute("Hash Join Builder (join_node_id=$0)", join_node_id_);
 }
 
 Status PhjBuilder::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
@@ -475,9 +462,16 @@ void PhjBuilder::AllocateRuntimeFilters() {
       << "Runtime filters not supported with NULL_AWARE_LEFT_ANTI_JOIN";
   DCHECK(ht_ctx_ != NULL);
   for (int i = 0; i < filter_ctxs_.size(); ++i) {
-    filter_ctxs_[i].local_bloom_filter =
-        runtime_state_->filter_bank()->AllocateScratchBloomFilter(
-            filter_ctxs_[i].filter->id());
+    if (filter_ctxs_[i].filter->is_bloom_filter()) {
+      filter_ctxs_[i].local_bloom_filter =
+          runtime_state_->filter_bank()->AllocateScratchBloomFilter(
+              filter_ctxs_[i].filter->id());
+    } else {
+      DCHECK(filter_ctxs_[i].filter->is_min_max_filter());
+      filter_ctxs_[i].local_min_max_filter =
+          runtime_state_->filter_bank()->AllocateScratchMinMaxFilter(
+              filter_ctxs_[i].filter->id(), filter_ctxs_[i].expr_eval->root().type());
+    }
   }
 }
 
@@ -497,12 +491,22 @@ void PhjBuilder::PublishRuntimeFilters(int64_t num_build_rows) {
   for (const FilterContext& ctx : filter_ctxs_) {
     // TODO: Consider checking actual number of bits set in filter to compute FP rate.
     // TODO: Consider checking this every few batches or so.
-    bool fp_rate_too_high = runtime_state_->filter_bank()->FpRateTooHigh(
-        ctx.filter->filter_size(), num_build_rows);
-    runtime_state_->filter_bank()->UpdateFilterFromLocal(ctx.filter->id(),
-        fp_rate_too_high ? BloomFilter::ALWAYS_TRUE_FILTER : ctx.local_bloom_filter);
+    BloomFilter* bloom_filter = nullptr;
+    if (ctx.local_bloom_filter != nullptr) {
+      if (runtime_state_->filter_bank()->FpRateTooHigh(
+              ctx.filter->filter_size(), num_build_rows)) {
+        bloom_filter = BloomFilter::ALWAYS_TRUE_FILTER;
+      } else {
+        bloom_filter = ctx.local_bloom_filter;
+        ++num_enabled_filters;
+      }
+    } else if (ctx.local_min_max_filter != nullptr
+        && !ctx.local_min_max_filter->AlwaysTrue()) {
+      ++num_enabled_filters;
+    }
 
-    num_enabled_filters += !fp_rate_too_high;
+    runtime_state_->filter_bank()->UpdateFilterFromLocal(
+        ctx.filter->id(), bloom_filter, ctx.local_min_max_filter);
   }
 
   if (filter_ctxs_.size() > 0) {
@@ -746,16 +750,16 @@ void PhjBuilder::Codegen(LlvmCodeGen* codegen) {
   Status codegen_status;
 
   // Codegen for hashing rows with the builder's hash table context.
-  Function* hash_fn;
+  llvm::Function* hash_fn;
   codegen_status = ht_ctx_->CodegenHashRow(codegen, false, &hash_fn);
-  Function* murmur_hash_fn;
+  llvm::Function* murmur_hash_fn;
   codegen_status.MergeStatus(ht_ctx_->CodegenHashRow(codegen, true, &murmur_hash_fn));
 
   // Codegen for evaluating build rows
-  Function* eval_build_row_fn;
+  llvm::Function* eval_build_row_fn;
   codegen_status.MergeStatus(ht_ctx_->CodegenEvalRow(codegen, true, &eval_build_row_fn));
 
-  Function* insert_filters_fn;
+  llvm::Function* insert_filters_fn;
   codegen_status.MergeStatus(
       CodegenInsertRuntimeFilters(codegen, filter_exprs_, &insert_filters_fn));
 
@@ -786,9 +790,10 @@ string PhjBuilder::DebugString() const {
   return ss.str();
 }
 
-Status PhjBuilder::CodegenProcessBuildBatch(LlvmCodeGen* codegen, Function* hash_fn,
-    Function* murmur_hash_fn, Function* eval_row_fn, Function* insert_filters_fn) {
-  Function* process_build_batch_fn =
+Status PhjBuilder::CodegenProcessBuildBatch(LlvmCodeGen* codegen, llvm::Function* hash_fn,
+    llvm::Function* murmur_hash_fn, llvm::Function* eval_row_fn,
+    llvm::Function* insert_filters_fn) {
+  llvm::Function* process_build_batch_fn =
       codegen->GetFunction(IRFunction::PHJ_PROCESS_BUILD_BATCH, true);
   DCHECK(process_build_batch_fn != NULL);
 
@@ -813,19 +818,20 @@ Status PhjBuilder::CodegenProcessBuildBatch(LlvmCodeGen* codegen, Function* hash
   DCHECK_EQ(replaced_constants.stores_tuples, 0);
   DCHECK_EQ(replaced_constants.quadratic_probing, 0);
 
-  Value* is_null_aware_arg = codegen->GetArgument(process_build_batch_fn, 5);
+  llvm::Value* is_null_aware_arg = codegen->GetArgument(process_build_batch_fn, 5);
   is_null_aware_arg->replaceAllUsesWith(
-      ConstantInt::get(Type::getInt1Ty(codegen->context()),
-      join_op_ == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN));
+      llvm::ConstantInt::get(llvm::Type::getInt1Ty(codegen->context()),
+          join_op_ == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN));
 
-  Function* process_build_batch_fn_level0 =
+  llvm::Function* process_build_batch_fn_level0 =
       codegen->CloneFunction(process_build_batch_fn);
 
   // Always build runtime filters at level0 (if there are any).
   // Note that the first argument of this function is the return value.
-  Value* build_filter_l0_arg = codegen->GetArgument(process_build_batch_fn_level0, 4);
-  build_filter_l0_arg->replaceAllUsesWith(
-      ConstantInt::get(Type::getInt1Ty(codegen->context()), filter_ctxs_.size() > 0));
+  llvm::Value* build_filter_l0_arg =
+      codegen->GetArgument(process_build_batch_fn_level0, 4);
+  build_filter_l0_arg->replaceAllUsesWith(llvm::ConstantInt::get(
+      llvm::Type::getInt1Ty(codegen->context()), filter_ctxs_.size() > 0));
 
   // process_build_batch_fn_level0 uses CRC hash if available,
   replaced =
@@ -840,9 +846,9 @@ Status PhjBuilder::CodegenProcessBuildBatch(LlvmCodeGen* codegen, Function* hash
   // Never build filters after repartitioning, as all rows have already been added to the
   // filters during the level0 build. Note that the first argument of this function is the
   // return value.
-  Value* build_filter_arg = codegen->GetArgument(process_build_batch_fn, 4);
+  llvm::Value* build_filter_arg = codegen->GetArgument(process_build_batch_fn, 4);
   build_filter_arg->replaceAllUsesWith(
-      ConstantInt::get(Type::getInt1Ty(codegen->context()), false));
+      llvm::ConstantInt::get(llvm::Type::getInt1Ty(codegen->context()), false));
 
   // Finalize ProcessBuildBatch functions
   process_build_batch_fn = codegen->FinalizeFunction(process_build_batch_fn);
@@ -867,18 +873,20 @@ Status PhjBuilder::CodegenProcessBuildBatch(LlvmCodeGen* codegen, Function* hash
   return Status::OK();
 }
 
-Status PhjBuilder::CodegenInsertBatch(LlvmCodeGen* codegen, Function* hash_fn,
-    Function* murmur_hash_fn, Function* eval_row_fn, TPrefetchMode::type prefetch_mode) {
-  Function* insert_batch_fn = codegen->GetFunction(IRFunction::PHJ_INSERT_BATCH, true);
-  Function* build_equals_fn;
+Status PhjBuilder::CodegenInsertBatch(LlvmCodeGen* codegen, llvm::Function* hash_fn,
+    llvm::Function* murmur_hash_fn, llvm::Function* eval_row_fn,
+    TPrefetchMode::type prefetch_mode) {
+  llvm::Function* insert_batch_fn =
+      codegen->GetFunction(IRFunction::PHJ_INSERT_BATCH, true);
+  llvm::Function* build_equals_fn;
   RETURN_IF_ERROR(ht_ctx_->CodegenEquals(codegen, true, &build_equals_fn));
 
   // Replace the parameter 'prefetch_mode' with constant.
-  Value* prefetch_mode_arg = codegen->GetArgument(insert_batch_fn, 1);
+  llvm::Value* prefetch_mode_arg = codegen->GetArgument(insert_batch_fn, 1);
   DCHECK_GE(prefetch_mode, TPrefetchMode::NONE);
   DCHECK_LE(prefetch_mode, TPrefetchMode::HT_BUCKET);
   prefetch_mode_arg->replaceAllUsesWith(
-      ConstantInt::get(Type::getInt32Ty(codegen->context()), prefetch_mode));
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(codegen->context()), prefetch_mode));
 
   // Use codegen'd EvalBuildRow() function
   int replaced = codegen->ReplaceCallSites(insert_batch_fn, eval_row_fn, "EvalBuildRow");
@@ -900,7 +908,7 @@ Status PhjBuilder::CodegenInsertBatch(LlvmCodeGen* codegen, Function* hash_fn,
   DCHECK_GE(replaced_constants.stores_tuples, 1);
   DCHECK_GE(replaced_constants.quadratic_probing, 1);
 
-  Function* insert_batch_fn_level0 = codegen->CloneFunction(insert_batch_fn);
+  llvm::Function* insert_batch_fn_level0 = codegen->CloneFunction(insert_batch_fn);
 
   // Use codegen'd hash functions
   replaced = codegen->ReplaceCallSites(insert_batch_fn_level0, hash_fn, "HashRow");
@@ -942,32 +950,33 @@ Status PhjBuilder::CodegenInsertBatch(LlvmCodeGen* codegen, Function* hash_fn,
 //   ret void
 // }
 Status PhjBuilder::CodegenInsertRuntimeFilters(
-    LlvmCodeGen* codegen, const vector<ScalarExpr*>& filter_exprs, Function** fn) {
-  LLVMContext& context = codegen->context();
+    LlvmCodeGen* codegen, const vector<ScalarExpr*>& filter_exprs, llvm::Function** fn) {
+  llvm::LLVMContext& context = codegen->context();
   LlvmBuilder builder(context);
 
   *fn = nullptr;
-  Type* this_type = codegen->GetPtrType(PhjBuilder::LLVM_CLASS_NAME);
-  PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
+  llvm::Type* this_type = codegen->GetPtrType(PhjBuilder::LLVM_CLASS_NAME);
+  llvm::PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
   LlvmCodeGen::FnPrototype prototype(
       codegen, "InsertRuntimeFilters", codegen->void_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_type));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
 
-  Value* args[2];
-  Function* insert_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
-  Value* row_arg = args[1];
+  llvm::Value* args[2];
+  llvm::Function* insert_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
+  llvm::Value* row_arg = args[1];
 
   int num_filters = filter_exprs.size();
   for (int i = 0; i < num_filters; ++i) {
-    Function* insert_fn;
-    RETURN_IF_ERROR(FilterContext::CodegenInsert(codegen, filter_exprs_[i], &insert_fn));
-    PointerType* filter_context_type =
+    llvm::Function* insert_fn;
+    RETURN_IF_ERROR(FilterContext::CodegenInsert(
+        codegen, filter_exprs_[i], &filter_ctxs_[i], &insert_fn));
+    llvm::PointerType* filter_context_type =
         codegen->GetPtrType(FilterContext::LLVM_CLASS_NAME);
-    Value* filter_context_ptr =
+    llvm::Value* filter_context_ptr =
         codegen->CastPtrToLlvmPtr(filter_context_type, &filter_ctxs_[i]);
 
-    Value* insert_args[] = {filter_context_ptr, row_arg};
+    llvm::Value* insert_args[] = {filter_context_ptr, row_arg};
     builder.CreateCall(insert_fn, insert_args);
   }
 

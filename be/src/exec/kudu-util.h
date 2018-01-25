@@ -23,6 +23,7 @@ struct tm;
 
 #include <kudu/client/callbacks.h>
 #include <kudu/client/client.h>
+#include <kudu/client/value.h>
 
 #include "common/status.h"
 #include "runtime/string-value.h"
@@ -39,11 +40,10 @@ namespace impala {
     } \
   } while (0)
 
-
 #define KUDU_ASSERT_OK(status)                                     \
   do {                                                             \
-    const Status& status_ = FromKuduStatus(status);                \
-    ASSERT_TRUE(status_.ok()) << "Error: " << status_.GetDetail(); \
+    const Status& _s = FromKuduStatus(status);                     \
+    ASSERT_TRUE(_s.ok()) << "Error: " << _s.GetDetail();           \
   } while (0)
 
 class TimestampValue;
@@ -85,6 +85,11 @@ void LogKuduMessage(kudu::client::KuduLogSeverity severity, const char* filename
 Status WriteKuduValue(int col, PrimitiveType type, const void* value,
     bool copy_strings, kudu::KuduPartialRow* row) WARN_UNUSED_RESULT;
 
+/// Casts 'value' according to 'type' and create a new KuduValue containing 'value' which
+/// is returned in 'out'.
+Status CreateKuduValue(
+    PrimitiveType type, void* value, kudu::client::KuduValue** out) WARN_UNUSED_RESULT;
+
 /// Takes a Kudu client DataType and returns the corresponding Impala ColumnType.
 ColumnType KuduDataTypeToColumnType(kudu::client::KuduColumnSchema::DataType type);
 
@@ -97,8 +102,10 @@ ColumnType KuduDataTypeToColumnType(kudu::client::KuduColumnSchema::DataType typ
 inline Status FromKuduStatus(
     const kudu::Status& k_status, const std::string prepend = "") {
   if (LIKELY(k_status.ok())) return Status::OK();
-  if (prepend.empty()) return Status(k_status.ToString());
-  return Status(strings::Substitute("$0: $1", prepend, k_status.ToString()));
+  const string& err_msg = prepend.empty() ? k_status.ToString() :
+      strings::Substitute("$0: $1", prepend, k_status.ToString());
+  VLOG(1) << err_msg;
+  return Status::Expected(err_msg);
 }
 
 } /// namespace impala

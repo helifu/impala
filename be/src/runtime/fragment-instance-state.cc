@@ -26,6 +26,7 @@
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 
 #include "common/names.h"
+#include "common/thread-debug-info.h"
 #include "codegen/llvm-codegen.h"
 #include "exec/plan-root-sink.h"
 #include "exec/exec-node.h"
@@ -60,7 +61,6 @@ static const string OPEN_TIMER_NAME = "OpenTime";
 static const string PREPARE_TIMER_NAME = "PrepareTime";
 static const string EXEC_TIMER_NAME = "ExecTime";
 
-
 FragmentInstanceState::FragmentInstanceState(
     QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
     const TPlanFragmentInstanceCtx& instance_ctx)
@@ -90,6 +90,7 @@ Status FragmentInstanceState::Exec() {
   }
 
 done:
+  UpdateState(StateEvent::EXEC_END);
   // call this before Close() to make sure the thread token got released
   Finalize(status);
   Close();
@@ -113,7 +114,6 @@ void FragmentInstanceState::Cancel() {
 
 Status FragmentInstanceState::Prepare() {
   DCHECK(!prepared_promise_.IsSet());
-
   VLOG(2) << "fragment_instance_ctx:\n" << ThriftDebugString(instance_ctx_);
 
   // Do not call RETURN_IF_ERROR or explicitly return before this line,
@@ -128,11 +128,17 @@ Status FragmentInstanceState::Prepare() {
   profile()->AddChild(timings_profile_);
   SCOPED_TIMER(ADD_TIMER(timings_profile_, PREPARE_TIMER_NAME));
 
+  // Events that are tracked in a separate timeline for each fragment instance, relative
+  // to the startup of the query state.
+  event_sequence_ =
+      profile()->AddEventSequence("Fragment Instance Lifecycle Event Timeline");
+  event_sequence_->Start(query_state_->fragment_events_start_time());
+  UpdateState(StateEvent::PREPARE_START);
+
   runtime_state_->InitFilterBank();
 
   // Reserve one main thread from the pool
   runtime_state_->resource_pool()->AcquireThreadToken();
-
   avg_thread_tokens_ = profile()->AddSamplingCounter("AverageThreadTokens",
       bind<int64_t>(mem_fn(&ThreadResourceMgr::ResourcePool::num_threads),
           runtime_state_->resource_pool()));
@@ -200,15 +206,6 @@ Status FragmentInstanceState::Prepare() {
     ReleaseThreadToken();
   }
 
-  if (runtime_state_->ShouldCodegen()) {
-    RETURN_IF_ERROR(runtime_state_->CreateCodegen());
-    exec_tree_->Codegen(runtime_state_);
-    // It shouldn't be fatal to fail codegen. However, until IMPALA-4233 is fixed,
-    // ScalarFnCall has no fall back to interpretation when codegen fails so propagates
-    // the error status for now.
-    RETURN_IF_ERROR(runtime_state_->CodegenScalarFns());
-  }
-
   // set up profile counters
   profile()->AddChild(exec_tree_->runtime_profile());
   rows_produced_counter_ =
@@ -227,10 +224,13 @@ Status FragmentInstanceState::Prepare() {
     string thread_name = Substitute("profile-report (finst:$0)", PrintId(instance_id()));
     unique_lock<mutex> l(report_thread_lock_);
     RETURN_IF_ERROR(Thread::Create(FragmentInstanceState::FINST_THREAD_GROUP_NAME,
-        thread_name, [this]() { this->ReportProfileThread(); }, &report_thread_, true));
+        thread_name, [this]() {
+          GetThreadDebugInfo()->SetInstanceId(this->instance_id());
+          this->ReportProfileThread();
+        }, &report_thread_, true));
     // Make sure the thread started up, otherwise ReportProfileThread() might get into
     // a race with StopReportThread().
-    while (!report_thread_active_) report_thread_started_cv_.wait(l);
+    while (!report_thread_active_) report_thread_started_cv_.Wait(l);
   }
 
   return Status::OK();
@@ -243,14 +243,22 @@ Status FragmentInstanceState::Open() {
   SCOPED_TIMER(ADD_TIMER(timings_profile_, OPEN_TIMER_NAME));
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
 
-  // codegen prior to exec_tree_->Open()
   if (runtime_state_->ShouldCodegen()) {
+    UpdateState(StateEvent::CODEGEN_START);
+    RETURN_IF_ERROR(runtime_state_->CreateCodegen());
+    exec_tree_->Codegen(runtime_state_);
+    // It shouldn't be fatal to fail codegen. However, until IMPALA-4233 is fixed,
+    // ScalarFnCall has no fall back to interpretation when codegen fails so propagates
+    // the error status for now.
+    RETURN_IF_ERROR(runtime_state_->CodegenScalarFns());
+
     LlvmCodeGen* codegen = runtime_state_->codegen();
     DCHECK(codegen != nullptr);
     RETURN_IF_ERROR(codegen->FinalizeModule());
   }
 
   {
+    UpdateState(StateEvent::OPEN_START);
     SCOPED_TIMER(ADD_CHILD_TIMER(timings_profile_, "ExecTreeOpenTime", OPEN_TIMER_NAME));
     RETURN_IF_ERROR(exec_tree_->Open(runtime_state_));
   }
@@ -262,6 +270,7 @@ Status FragmentInstanceState::ExecInternal() {
       ADD_CHILD_TIMER(timings_profile_, "ExecTreeExecTime", EXEC_TIMER_NAME);
   SCOPED_THREAD_COUNTER_MEASUREMENT(runtime_state_->total_thread_statistics());
   bool exec_tree_complete = false;
+  UpdateState(StateEvent::WAITING_FOR_FIRST_BATCH);
   do {
     Status status;
     row_batch_->Reset();
@@ -270,11 +279,14 @@ Status FragmentInstanceState::ExecInternal() {
       RETURN_IF_ERROR(
           exec_tree_->GetNext(runtime_state_, row_batch_.get(), &exec_tree_complete));
     }
+    UpdateState(StateEvent::BATCH_PRODUCED);
     if (VLOG_ROW_IS_ON) row_batch_->VLogRows("FragmentInstanceState::ExecInternal()");
     COUNTER_ADD(rows_produced_counter_, row_batch_->num_rows());
     RETURN_IF_ERROR(sink_->Send(runtime_state_, row_batch_.get()));
+    UpdateState(StateEvent::BATCH_SENT);
   } while (!exec_tree_complete);
 
+  UpdateState(StateEvent::LAST_BATCH_SENT);
   // Flush the sink *before* stopping the report thread. Flush may need to add some
   // important information to the last report that gets sent. (e.g. table sinks record the
   // files they have written to in this method)
@@ -322,28 +334,26 @@ void FragmentInstanceState::ReportProfileThread() {
   unique_lock<mutex> l(report_thread_lock_);
   // tell Prepare() that we started
   report_thread_active_ = true;
-  report_thread_started_cv_.notify_one();
+  report_thread_started_cv_.NotifyOne();
 
   // Jitter the reporting time of remote fragments by a random amount between
   // 0 and the report_interval.  This way, the coordinator doesn't get all the
   // updates at once so its better for contention as well as smoother progress
   // reporting.
   int report_fragment_offset = rand() % FLAGS_status_report_interval;
-  boost::system_time timeout = boost::get_system_time()
-      + boost::posix_time::seconds(report_fragment_offset);
+  boost::posix_time::seconds wait_duration(report_fragment_offset);
   // We don't want to wait longer than it takes to run the entire fragment.
-  stop_report_thread_cv_.timed_wait(l, timeout);
+  stop_report_thread_cv_.WaitFor(l, wait_duration);
 
   while (report_thread_active_) {
-    boost::system_time timeout = boost::get_system_time()
-        + boost::posix_time::seconds(FLAGS_status_report_interval);
+    boost::posix_time::seconds loop_wait_duration(FLAGS_status_report_interval);
 
     // timed_wait can return because the timeout occurred or the condition variable
     // was signaled.  We can't rely on its return value to distinguish between the
     // two cases (e.g. there is a race here where the wait timed out but before grabbing
     // the lock, the condition variable was signaled).  Instead, we will use an external
     // flag, report_thread_active_, to coordinate this.
-    stop_report_thread_cv_.timed_wait(l, timeout);
+    stop_report_thread_cv_.WaitFor(l, loop_wait_duration);
 
     if (!report_thread_active_) break;
     SendReport(false, Status::OK());
@@ -372,13 +382,86 @@ void FragmentInstanceState::SendReport(bool done, const Status& status) {
   query_state_->ReportExecStatus(done, status, this);
 }
 
+void FragmentInstanceState::UpdateState(const StateEvent event)
+{
+  TFInstanceExecState::type current_state = current_state_.Load();
+  TFInstanceExecState::type next_state = current_state;
+  switch (event) {
+    case StateEvent::PREPARE_START:
+      DCHECK_EQ(current_state, TFInstanceExecState::WAITING_FOR_EXEC);
+      next_state = TFInstanceExecState::WAITING_FOR_PREPARE;
+      break;
+
+    case StateEvent::CODEGEN_START:
+      DCHECK_EQ(current_state, TFInstanceExecState::WAITING_FOR_PREPARE);
+      event_sequence_->MarkEvent("Prepare Finished");
+      next_state = TFInstanceExecState::WAITING_FOR_CODEGEN;
+      break;
+
+    case StateEvent::OPEN_START:
+      if (current_state == TFInstanceExecState::WAITING_FOR_PREPARE) {
+        event_sequence_->MarkEvent("Prepare Finished");
+      } else {
+        DCHECK_EQ(current_state, TFInstanceExecState::WAITING_FOR_CODEGEN);
+      }
+      next_state = TFInstanceExecState::WAITING_FOR_OPEN;
+      break;
+
+    case StateEvent::WAITING_FOR_FIRST_BATCH:
+      DCHECK_EQ(current_state, TFInstanceExecState::WAITING_FOR_OPEN);
+      next_state = TFInstanceExecState::WAITING_FOR_FIRST_BATCH;
+      break;
+
+    case StateEvent::BATCH_PRODUCED:
+      if (UNLIKELY(current_state == TFInstanceExecState::WAITING_FOR_FIRST_BATCH)) {
+        event_sequence_->MarkEvent("First Batch Produced");
+        next_state = TFInstanceExecState::FIRST_BATCH_PRODUCED;
+      } else {
+        DCHECK_EQ(current_state, TFInstanceExecState::PRODUCING_DATA);
+      }
+      break;
+
+    case StateEvent::BATCH_SENT:
+      if (UNLIKELY(current_state == TFInstanceExecState::FIRST_BATCH_PRODUCED)) {
+        event_sequence_->MarkEvent("First Batch Sent");
+        next_state = TFInstanceExecState::PRODUCING_DATA;
+      } else {
+        DCHECK_EQ(current_state, TFInstanceExecState::PRODUCING_DATA);
+      }
+      break;
+
+    case StateEvent::LAST_BATCH_SENT:
+      if (UNLIKELY(current_state == TFInstanceExecState::WAITING_FOR_OPEN)) {
+        event_sequence_->MarkEvent("Open Finished");
+      } else {
+        DCHECK_EQ(current_state, TFInstanceExecState::PRODUCING_DATA);
+      }
+      next_state = TFInstanceExecState::LAST_BATCH_SENT;
+      break;
+
+    case StateEvent::EXEC_END:
+      // Allow abort in all states to make error handling easier.
+      event_sequence_->MarkEvent("ExecInternal Finished");
+      next_state = TFInstanceExecState::FINISHED;
+      break;
+
+    default:
+      DCHECK(false) << "Unexpected Event: " << static_cast<int>(event);
+      break;
+  }
+  // current_state_ is an AtomicEnum to add memory barriers for concurrent reads by the
+  // profile reporting thread. This method is the only one updating it and is not
+  // meant to be thread safe.
+  if (next_state != current_state) current_state_.Store(next_state);
+}
+
 void FragmentInstanceState::StopReportThread() {
   if (!report_thread_active_) return;
   {
     lock_guard<mutex> l(report_thread_lock_);
     report_thread_active_ = false;
   }
-  stop_report_thread_cv_.notify_one();
+  stop_report_thread_cv_.NotifyOne();
   report_thread_->Join();
 }
 
@@ -416,13 +499,35 @@ Status FragmentInstanceState::WaitForOpen() {
   return opened_promise_.Get();
 }
 
-void FragmentInstanceState::PublishFilter(
-    int32_t filter_id, const TBloomFilter& thrift_bloom_filter) {
+void FragmentInstanceState::PublishFilter(const TPublishFilterParams& params) {
   VLOG_FILE << "PublishFilter(): instance_id=" << PrintId(instance_id())
-            << " filter_id=" << filter_id;
+            << " filter_id=" << params.filter_id;
   // Wait until Prepare() is done, so we know that the filter bank is set up.
   if (!WaitForPrepare().ok()) return;
-  runtime_state_->filter_bank()->PublishGlobalFilter(filter_id, thrift_bloom_filter);
+  runtime_state_->filter_bank()->PublishGlobalFilter(params);
+}
+
+string FragmentInstanceState::ExecStateToString(const TFInstanceExecState::type state) {
+  // Labels to send to the debug webpages to display the current state to the user.
+  static const string finstance_state_labels[] = {
+      "Waiting for Exec",         // WAITING_FOR_EXEC
+      "Waiting for Codegen",      // WAITING_FOR_CODEGEN
+      "Waiting for Prepare",      // WAITING_FOR_PREPARE
+      "Waiting for First Batch",  // WAITING_FOR_OPEN
+      "Waiting for First Batch",  // WAITING_FOR_FIRST_BATCH
+      "First batch produced",     // FIRST_BATCH_PRODUCED
+      "Producing Data",           // PRODUCING_DATA
+      "Last batch sent",          // LAST_BATCH_SENT
+      "Finished"                  // FINISHED
+  };
+  /// Make sure we have a label for every possible state.
+  static_assert(
+      sizeof(finstance_state_labels) / sizeof(char*) == TFInstanceExecState::FINISHED + 1,
+      "");
+
+  DCHECK_LT(state, sizeof(finstance_state_labels) / sizeof(char*))
+      << "Unknown instance state";
+  return finstance_state_labels[state];
 }
 
 const TQueryCtx& FragmentInstanceState::query_ctx() const {

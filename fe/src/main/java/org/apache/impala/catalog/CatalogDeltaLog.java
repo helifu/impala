@@ -34,7 +34,7 @@ import com.google.common.collect.ImmutableList;
  *
  * a) Processing catalog updates in the impalads
  *   The impalad catalog cache can be modified by either a state store update or by a
- *   direct ("fast") update that applies the result of a catalog operation to the cache
+ *   direct update that applies the result of a catalog operation to the cache
  *   out-of-band of a state store update. This thread safe log tracks the divergence
  *   (due to direct updates to the cache) of this impalad's cache from the last state
  *   store update. This log is needed to ensure work is never undone. For example,
@@ -50,12 +50,10 @@ import com.google.common.collect.ImmutableList;
  *   "invalidate metadata" is run concurrently with async catalog operations.
  *
  * b) Building catalog topic updates in the catalogd
- *   The catalogd uses this log to identify deleted catalog objects. Deleted
- *   catalog objects are added to this log by the corresponding operations that delete
- *   them (e.g. dropTable()). While constructing a catalog update topic, we use the log to
- *   determine which catalog objects were deleted since the last catalog topic update.
- *   Once the catalog topic update is constructed, the old deleted catalog objects are
- *   garbage collected to prevent the log from growing indefinitely.
+ *   The catalogd uses this log to identify deleted catalog objects that have been deleted
+ *   since the last catalog topic update. Once the catalog topic update is constructed,
+ *   the old entries in the log are garbage collected to prevent the log from growing
+ *   indefinitely.
  */
 public class CatalogDeltaLog {
   // Map of the catalog version an object was removed from the catalog
@@ -72,11 +70,13 @@ public class CatalogDeltaLog {
   }
 
   /**
-   * Retrieve all the removed catalog objects with version > 'fromVersion'.
+   * Retrieve all the removed catalog objects with versions in range
+   * (fromVersion, toVersion].
    */
-  public synchronized List<TCatalogObject> retrieveObjects(long fromVersion) {
+  public synchronized List<TCatalogObject> retrieveObjects(long fromVersion,
+      long toVersion) {
     SortedMap<Long, TCatalogObject> objects =
-        removedCatalogObjects_.tailMap(fromVersion + 1);
+        removedCatalogObjects_.subMap(fromVersion + 1, toVersion + 1);
     return ImmutableList.<TCatalogObject>copyOf(objects.values());
   }
 
@@ -108,51 +108,8 @@ public class CatalogDeltaLog {
     SortedMap<Long, TCatalogObject> candidateObjects =
         removedCatalogObjects_.tailMap(catalogObject.getCatalog_version());
     for (Map.Entry<Long, TCatalogObject> entry: candidateObjects.entrySet()) {
-      if (objectNamesMatch(catalogObject, entry.getValue())) return true;
+      if (Catalog.keyEquals(catalogObject, entry.getValue())) return true;
     }
     return false;
-  }
-
-  /**
-   * Returns true if the two objects have the same object type and key (generated using
-   * toCatalogObjectKey()).
-   * TODO: Use global object IDs everywhere instead of tracking catalog objects by
-   * generated keys.
-   */
-  private static boolean objectNamesMatch(TCatalogObject first, TCatalogObject second) {
-    return toCatalogObjectKey(first).equals(toCatalogObjectKey(second));
-  }
-
-  /**
-   * Returns a unique string key of a catalog object.
-   */
-  public static String toCatalogObjectKey(TCatalogObject catalogObject)
-      throws IllegalStateException {
-    switch (catalogObject.getType()) {
-      case DATABASE:
-        return "DATABASE:" + catalogObject.getDb().getDb_name().toLowerCase();
-      case TABLE:
-      case VIEW:
-        TTable tbl = catalogObject.getTable();
-        return "TABLE:" + tbl.getDb_name().toLowerCase() + "." +
-            tbl.getTbl_name().toLowerCase();
-      case FUNCTION:
-        return "FUNCTION:" + catalogObject.getFn().getName() + "(" +
-            catalogObject.getFn().getSignature() + ")";
-      case ROLE:
-        return "ROLE:" + catalogObject.getRole().getRole_name().toLowerCase();
-      case PRIVILEGE:
-        return "PRIVILEGE:" +
-            catalogObject.getPrivilege().getPrivilege_name().toLowerCase() + "." +
-            Integer.toString(catalogObject.getPrivilege().getRole_id());
-      case HDFS_CACHE_POOL:
-        return "HDFS_CACHE_POOL:" +
-            catalogObject.getCache_pool().getPool_name().toLowerCase();
-      case DATA_SOURCE:
-        return "DATA_SOURCE:" + catalogObject.getData_source().getName().toLowerCase();
-      default:
-        throw new IllegalStateException(
-            "Unsupported catalog object type: " + catalogObject.getType());
-    }
   }
 }

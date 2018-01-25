@@ -175,7 +175,7 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   // be added.
   void Close() {
     if (compressor_.get() != nullptr) compressor_->Close();
-    if (dict_encoder_base_ != nullptr) dict_encoder_base_->ClearIndices();
+    if (dict_encoder_base_ != nullptr) dict_encoder_base_->Close();
   }
 
   const ColumnType& type() const { return expr_eval_->root().type(); }
@@ -315,7 +315,8 @@ class HdfsParquetTableWriter::ColumnWriter :
     current_encoding_ = Encoding::PLAIN_DICTIONARY;
     next_page_encoding_ = Encoding::PLAIN_DICTIONARY;
     dict_encoder_.reset(
-        new DictEncoder<T>(parent_->per_file_mem_pool_.get(), plain_encoded_value_size_));
+        new DictEncoder<T>(parent_->per_file_mem_pool_.get(), plain_encoded_value_size_,
+            parent_->parent_->mem_tracker()));
     dict_encoder_base_ = dict_encoder_.get();
     page_stats_.reset(
         new ColumnStats<T>(parent_->per_file_mem_pool_.get(), plain_encoded_value_size_));
@@ -859,7 +860,7 @@ Status HdfsParquetTableWriter::CreateSchema() {
     parquet::SchemaElement& node = file_metadata_.schema[i + 1];
     const ColumnType& type = output_expr_evals_[i]->root().type();
     node.name = table_desc_->col_descs()[i + num_clustering_cols].name();
-    node.__set_type(IMPALA_TO_PARQUET_TYPES[type.type]);
+    node.__set_type(INTERNAL_TO_PARQUET_TYPES[type.type]);
     node.__set_repetition_type(FieldRepetitionType::OPTIONAL);
     if (type.type == TYPE_DECIMAL) {
       // This column is type decimal. Update the file metadata to include the
@@ -876,6 +877,14 @@ Status HdfsParquetTableWriter::CreateSchema() {
         (type.type == TYPE_STRING &&
          state_->query_options().parquet_annotate_strings_utf8)) {
       node.__set_converted_type(ConvertedType::UTF8);
+    } else if (type.type == TYPE_TINYINT) {
+      node.__set_converted_type(ConvertedType::INT_8);
+    } else if (type.type == TYPE_SMALLINT) {
+      node.__set_converted_type(ConvertedType::INT_16);
+    } else if (type.type == TYPE_INT) {
+      node.__set_converted_type(ConvertedType::INT_32);
+    } else if (type.type == TYPE_BIGINT) {
+      node.__set_converted_type(ConvertedType::INT_64);
     }
   }
 
@@ -892,7 +901,7 @@ Status HdfsParquetTableWriter::AddRowGroup() {
   current_row_group_->columns.resize(columns_.size());
   for (int i = 0; i < columns_.size(); ++i) {
     ColumnMetaData metadata;
-    metadata.type = IMPALA_TO_PARQUET_TYPES[columns_[i]->type().type];
+    metadata.type = INTERNAL_TO_PARQUET_TYPES[columns_[i]->type().type];
     metadata.path_in_schema.push_back(
         table_desc_->col_descs()[i + num_clustering_cols].name());
     metadata.codec = columns_[i]->codec();

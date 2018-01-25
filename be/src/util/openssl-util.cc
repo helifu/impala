@@ -26,6 +26,7 @@
 #include <openssl/sha.h>
 
 #include "common/atomic.h"
+#include "gutil/port.h" // ATTRIBUTE_WEAK
 #include "gutil/strings/substitute.h"
 
 #include "common/names.h"
@@ -41,6 +42,10 @@ static const int RNG_RESEED_INTERVAL = 128;
 
 // Number of bytes of entropy to add at RNG_RESEED_INTERVAL.
 static const int RNG_RESEED_BYTES = 512;
+
+int MaxSupportedTlsVersion() {
+  return SSLv23_method()->version;
+}
 
 // Callback used by OpenSSLErr() - write the error given to us through buf to the
 // stringstream that's passed in through ctx.
@@ -99,13 +104,15 @@ Status EncryptionKey::EncryptInternal(
   EVP_CIPHER_CTX_init(&ctx);
   EVP_CIPHER_CTX_set_padding(&ctx, 0);
 
-  int success;
-
   // Start encryption/decryption.  We use a 256-bit AES key, and the cipher block mode
-  // is CFB because this gives us a stream cipher, which supports arbitrary
-  // length ciphertexts - it doesn't have to be a multiple of 16 bytes.
-  success = encrypt ? EVP_EncryptInit_ex(&ctx, EVP_aes_256_cfb(), NULL, key_, iv_) :
-                      EVP_DecryptInit_ex(&ctx, EVP_aes_256_cfb(), NULL, key_, iv_);
+  // is either CTR or CFB(stream cipher), both of which support arbitrary length
+  // ciphertexts - it doesn't have to be a multiple of 16 bytes. Additionally, CTR
+  // mode is well-optimized(instruction level parallelism) with hardware acceleration
+  // on x86 and PowerPC
+  const EVP_CIPHER* evpCipher = GetCipher();
+  int success = encrypt ? EVP_EncryptInit_ex(&ctx, evpCipher, NULL, key_, iv_) :
+                          EVP_DecryptInit_ex(&ctx, evpCipher, NULL, key_, iv_);
+
   if (success != 1) {
     return OpenSSLErr(encrypt ? "EVP_EncryptInit_ex" : "EVP_DecryptInit_ex");
   }
@@ -122,7 +129,7 @@ Status EncryptionKey::EncryptInternal(
     if (success != 1) {
       return OpenSSLErr(encrypt ? "EVP_EncryptUpdate" : "EVP_DecryptUpdate");
     }
-    // This is safe because we're using CFB mode without padding.
+    // This is safe because we're using CTR/CFB mode without padding.
     DCHECK_EQ(in_len, out_len);
     offset += in_len;
   }
@@ -134,8 +141,21 @@ Status EncryptionKey::EncryptInternal(
   if (success != 1) {
     return OpenSSLErr(encrypt ? "EVP_EncryptFinal" : "EVP_DecryptFinal");
   }
-  // Again safe due to CFB with no padding
+  // Again safe due to CTR/CFB with no padding
   DCHECK_EQ(final_out_len, 0);
   return Status::OK();
+}
+
+extern "C" {
+ATTRIBUTE_WEAK
+const EVP_CIPHER* EVP_aes_256_ctr();
+}
+
+const EVP_CIPHER* EncryptionKey::GetCipher() const {
+  // use weak symbol to avoid compiling error on OpenSSL 1.0.0 environment
+  if (mode_ == AES_256_CTR && EVP_aes_256_ctr) return EVP_aes_256_ctr();
+
+  // otherwise, fallback to CFB mode
+  return EVP_aes_256_cfb();
 }
 }

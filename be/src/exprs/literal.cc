@@ -30,7 +30,6 @@
 
 #include "common/names.h"
 
-using namespace llvm;
 using namespace impala_udf;
 
 namespace impala {
@@ -357,10 +356,15 @@ Status Literal::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) 
     return Status::OK();
   }
 
+  if (type_.type == TYPE_CHAR) {
+    return Status::Expected("Codegen not supported for CHAR");
+  }
+
   DCHECK_EQ(GetNumChildren(), 0);
-  Value* args[2];
+  llvm::Value* args[2];
   *fn = CreateIrFunctionPrototype("Literal", codegen, &args);
-  BasicBlock* entry_block = BasicBlock::Create(codegen->context(), "entry", *fn);
+  llvm::BasicBlock* entry_block =
+      llvm::BasicBlock::Create(codegen->context(), "entry", *fn);
   LlvmBuilder builder(entry_block);
 
   CodegenAnyVal v = CodegenAnyVal::GetNonNullVal(codegen, &builder, type_);
@@ -388,7 +392,6 @@ Status Literal::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) 
       break;
     case TYPE_STRING:
     case TYPE_VARCHAR:
-    case TYPE_CHAR:
       v.SetLen(builder.getInt32(value_.string_val.len));
       v.SetPtr(codegen->GetStringConstant(
           &builder, value_.string_val.ptr, value_.string_val.len));
