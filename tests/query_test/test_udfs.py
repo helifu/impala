@@ -18,7 +18,8 @@
 from copy import copy
 import os
 import pytest
-from subprocess import check_call
+import tempfile
+from subprocess import call, check_call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_cluster import ImpalaCluster
@@ -36,23 +37,19 @@ class TestUdfBase(ImpalaTestSuite):
   """
   Base class with utility functions for testing UDFs.
   """
-  def _check_exception(self, e):
-    # The interesting exception message may be in 'e' or in its inner_exception
-    # depending on the point of query failure.
-    if 'Memory limit exceeded' in str(e) or 'Cancelled' in str(e):
-      return
-    if e.inner_exception is not None\
-       and ('Memory limit exceeded' in e.inner_exception.message
-            or 'Cancelled' not in e.inner_exception.message):
+  def _check_mem_limit_exception(self, e):
+    """Return without error if the exception is MEM_LIMIT_EXCEEDED, re-raise 'e'
+    in all other cases."""
+    if 'Memory limit exceeded' in str(e):
       return
     raise e
 
   def _run_query_all_impalads(self, exec_options, query, expected):
-    impala_cluster = ImpalaCluster()
+    impala_cluster = ImpalaCluster.get_e2e_test_cluster()
     for impalad in impala_cluster.impalads:
       client = impalad.service.create_beeswax_client()
       result = self.execute_query_expect_success(client, query, exec_options)
-      assert result.data == expected
+      assert result.data == expected, impalad
 
   def _load_functions(self, template, vector, database, location):
     queries = template.format(database=database, location=location)
@@ -105,6 +102,11 @@ returns decimal(6,5) intermediate decimal(4,3) location '{location}'
 init_fn='AggDecimalIntermediateInit' update_fn='AggDecimalIntermediateUpdate'
 merge_fn='AggDecimalIntermediateMerge' finalize_fn='AggDecimalIntermediateFinalize';
 
+create aggregate function {database}.agg_date_intermediate(date, int)
+returns date intermediate date location '{location}'
+init_fn='AggDateIntermediateInit' update_fn='AggDateIntermediateUpdate'
+merge_fn='AggDateIntermediateMerge' finalize_fn='AggDateIntermediateFinalize';
+
 create aggregate function {database}.agg_string_intermediate(decimal(20,10), bigint, string)
 returns decimal(20,0) intermediate string location '{location}'
 init_fn='AggStringIntermediateInit' update_fn='AggStringIntermediateUpdate'
@@ -147,6 +149,10 @@ create function {database}.identity(timestamp) returns timestamp
 location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_12TimestampValE';
 
+create function {database}.identity(date) returns date
+location '{location}'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_7DateValE';
+
 create function {database}.identity(decimal(9,0)) returns decimal(9,0)
 location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
@@ -160,7 +166,7 @@ location '{location}'
 symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
 
 create function {database}.all_types_fn(
-    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0))
+    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0), date)
 returns int
 location '{location}' symbol='AllTypes';
 
@@ -205,6 +211,9 @@ symbol='_Z7ToUpperPN10impala_udf15FunctionContextERKNS_9StringValE';
 
 create function {database}.constant_timestamp() returns timestamp
 location '{location}' symbol='ConstantTimestamp';
+
+create function {database}.constant_date() returns date
+location '{location}' symbol='ConstantDate';
 
 create function {database}.validate_arg_type(string) returns boolean
 location '{location}' symbol='ValidateArgType';
@@ -290,12 +299,12 @@ class TestUdfExecution(TestUdfBase):
       self.run_test_case('QueryTest/udf-codegen-required', vector, use_db=unique_database)
     self.run_test_case('QueryTest/uda', vector, use_db=unique_database)
     self.run_test_case('QueryTest/udf-init-close', vector, use_db=unique_database)
-    # Some tests assume determinism or non-determinism, which depends on expr rewrites.
+    # Some tests assume no expr rewrites.
     if enable_expr_rewrites:
       self.run_test_case('QueryTest/udf-init-close-deterministic', vector,
           use_db=unique_database)
     else:
-      self.run_test_case('QueryTest/udf-non-deterministic', vector,
+      self.run_test_case('QueryTest/udf-no-expr-rewrite', vector,
           use_db=unique_database)
 
   def test_ir_functions(self, vector, unique_database):
@@ -313,11 +322,8 @@ class TestUdfExecution(TestUdfBase):
       self.run_test_case('QueryTest/udf-init-close-deterministic', vector,
           use_db=unique_database)
     else:
-      self.run_test_case('QueryTest/udf-non-deterministic', vector,
-          use_db=unique_database)
+      self.run_test_case('QueryTest/udf-no-expr-rewrite', vector, use_db=unique_database)
 
-  # Runs serially as a temporary workaround for IMPALA_6092.
-  @pytest.mark.execute_serially
   def test_java_udfs(self, vector, unique_database):
     self.run_test_case('QueryTest/load-java-udfs', vector, use_db=unique_database)
     self.run_test_case('QueryTest/java-udf', vector, use_db=unique_database)
@@ -327,33 +333,45 @@ class TestUdfExecution(TestUdfBase):
     # Aim to exercise two failure cases:
     # 1. too many arguments
     # 2. IR UDF
-    if vector.get_value('exec_option')['disable_codegen']:
-      self.run_test_case('QueryTest/udf-errors', vector, use_db=unique_database)
+    fd, dir_name = tempfile.mkstemp()
+    hdfs_path = get_fs_path("/test-warehouse/{0}_bad_udf.ll".format(unique_database))
+    try:
+      with open(dir_name, "w") as f:
+        f.write("Hello World")
+      self.filesystem_client.copy_from_local(f.name, hdfs_path)
+      if vector.get_value('exec_option')['disable_codegen']:
+        self.run_test_case('QueryTest/udf-errors', vector, use_db=unique_database)
+    finally:
+      if os.path.exists(f.name):
+        os.remove(f.name)
+      call(["hadoop", "fs", "-rm", "-f", hdfs_path])
+      os.close(fd)
 
   # Run serially because this will blow the process limit, potentially causing other
   # queries to fail
   @pytest.mark.execute_serially
   def test_mem_limits(self, vector, unique_database):
-    # Set the mem limit high enough that a simple scan can run
-    mem_limit = 1024 * 1024
+    # Set the mem_limit and buffer_pool_limit high enough that the query makes it through
+    # admission control and a simple scan can run.
     vector = copy(vector)
-    vector.get_value('exec_option')['mem_limit'] = mem_limit
+    vector.get_value('exec_option')['mem_limit'] = '1mb'
+    vector.get_value('exec_option')['buffer_pool_limit'] = '32kb'
     try:
       self.run_test_case('QueryTest/udf-mem-limit', vector, use_db=unique_database)
       assert False, "Query was expected to fail"
     except ImpalaBeeswaxException, e:
-      self._check_exception(e)
+      self._check_mem_limit_exception(e)
 
     try:
       self.run_test_case('QueryTest/uda-mem-limit', vector, use_db=unique_database)
       assert False, "Query was expected to fail"
     except ImpalaBeeswaxException, e:
-      self._check_exception(e)
+      self._check_mem_limit_exception(e)
 
     # It takes a long time for Impala to free up memory after this test, especially if
     # ASAN is enabled. Verify that all fragments finish executing before moving on to the
     # next test to make sure that the next test is not affected.
-    for impalad in ImpalaCluster().impalads:
+    for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
       verifier = MetricVerifier(impalad.service)
       verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0)
       verifier.verify_num_unused_buffers()
@@ -418,16 +436,32 @@ class TestUdfTargeted(TestUdfBase):
             unique_database, tgt_udf_path))
     query = "select `{0}`.fn_invalid_symbol('test')".format(unique_database)
 
-    # Dropping the function can interact with other tests whose Java classes are in
-    # the same jar. Use a copy of the jar to avoid unintended interactions.
-    # See IMPALA-6215 and IMPALA-6092 for examples.
-    check_call(["hadoop", "fs", "-put", "-f", src_udf_path, tgt_udf_path])
+    self.filesystem_client.copy_from_local(src_udf_path, tgt_udf_path)
     self.client.execute(drop_fn_stmt)
     self.client.execute(create_fn_stmt)
     for _ in xrange(5):
       ex = self.execute_query_expect_failure(self.client, query)
       assert "Unable to find class" in str(ex)
     self.client.execute(drop_fn_stmt)
+
+  def test_hidden_symbol(self, vector, unique_database):
+    """Test that symbols in the test UDFs are hidden by default and that therefore
+    they cannot be used as a UDF entry point."""
+    symbol = "_Z16UnexportedSymbolPN10impala_udf15FunctionContextE"
+    ex = self.execute_query_expect_failure(self.client, """
+        create function `{0}`.unexported() returns BIGINT LOCATION '{1}'
+        SYMBOL='{2}'""".format(
+        unique_database, get_fs_path('/test-warehouse/libTestUdfs.so'), symbol))
+    assert "Could not find symbol '{0}'".format(symbol) in str(ex), str(ex)
+    # IMPALA-8196: IR UDFs ignore whether symbol is hidden or not. Exercise the current
+    # behaviour, where the UDF can be created and executed.
+    result = self.execute_query_expect_success(self.client, """
+        create function `{0}`.unexported() returns BIGINT LOCATION '{1}'
+        SYMBOL='{2}'""".format(
+        unique_database, get_fs_path('/test-warehouse/test-udfs.ll'), symbol))
+    result = self.execute_query_expect_success(self.client,
+        "select `{0}`.unexported()".format(unique_database))
+    assert result.data[0][0] == '5'
 
   @SkipIfLocal.multiple_impalad
   def test_hive_udfs_missing_jar(self, vector, unique_database):
@@ -437,7 +471,7 @@ class TestUdfTargeted(TestUdfBase):
     jar_path = get_fs_path("/test-warehouse/{0}.db/".format(unique_database)
                            + get_random_id(5) + ".jar")
     hive_jar = get_fs_path("/test-warehouse/hive-exec.jar")
-    check_call(["hadoop", "fs", "-cp", hive_jar, jar_path])
+    self.filesystem_client.copy(hive_jar, jar_path)
     drop_fn_stmt = (
         "drop function if exists "
         "`{0}`.`pi_missing_jar`()".format(unique_database))
@@ -445,7 +479,7 @@ class TestUdfTargeted(TestUdfBase):
         "create function `{0}`.`pi_missing_jar`() returns double location '{1}' "
         "symbol='org.apache.hadoop.hive.ql.udf.UDFPI'".format(unique_database, jar_path))
 
-    cluster = ImpalaCluster()
+    cluster = ImpalaCluster.get_e2e_test_cluster()
     impalad = cluster.get_any_impalad()
     client = impalad.service.create_beeswax_client()
     # Create and drop functions with sync_ddl to make sure they are reflected
@@ -494,14 +528,14 @@ class TestUdfTargeted(TestUdfBase):
     query_stmt = "select `{0}`.`udf_update_test_drop`()".format(unique_database)
 
     # Put the old UDF binary on HDFS, make the UDF in Impala and run it.
-    check_call(["hadoop", "fs", "-put", "-f", old_udf, udf_dst])
+    self.filesystem_client.copy_from_local(old_udf, udf_dst)
     self.execute_query_expect_success(self.client, drop_fn_stmt, exec_options)
     self.execute_query_expect_success(self.client, create_fn_stmt, exec_options)
     self._run_query_all_impalads(exec_options, query_stmt, ["Old UDF"])
 
     # Update the binary, drop and create the function again. The new binary should
     # be running.
-    check_call(["hadoop", "fs", "-put", "-f", new_udf, udf_dst])
+    self.filesystem_client.copy_from_local(new_udf, udf_dst)
     self.execute_query_expect_success(self.client, drop_fn_stmt, exec_options)
     self.execute_query_expect_success(self.client, create_fn_stmt, exec_options)
     self._run_query_all_impalads(exec_options, query_stmt, ["New UDF"])
@@ -534,7 +568,7 @@ class TestUdfTargeted(TestUdfBase):
     query_template = "select `{0}`.`{{0}}`()".format(unique_database)
 
     # Put the old UDF binary on HDFS, make the UDF in Impala and run it.
-    check_call(["hadoop", "fs", "-put", "-f", old_udf, udf_dst])
+    self.filesystem_client.copy_from_local(old_udf, udf_dst)
     self.execute_query_expect_success(
         self.client, create_fn_template.format(old_function_name), exec_options)
     self._run_query_all_impalads(
@@ -542,7 +576,7 @@ class TestUdfTargeted(TestUdfBase):
 
     # Update the binary, and create a new function using the binary. The new binary
     # should be running.
-    check_call(["hadoop", "fs", "-put", "-f", new_udf, udf_dst])
+    self.filesystem_client.copy_from_local(new_udf, udf_dst)
     self.execute_query_expect_success(
         self.client, create_fn_template.format(new_function_name), exec_options)
     self._run_query_all_impalads(

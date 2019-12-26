@@ -17,14 +17,24 @@
 
 #include "kudu/security/tls_socket.h"
 
+#include <sys/uio.h>
+
+#include <cerrno>
+#include <string>
+#include <utility>
+
+#include <glog/logging.h>
 #include <openssl/err.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
 
 #include "kudu/gutil/basictypes.h"
-#include "kudu/security/cert.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/util/errno.h"
+#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
+
+using std::string;
+using strings::Substitute;
 
 namespace kudu {
 namespace security {
@@ -42,21 +52,25 @@ Status TlsSocket::Write(const uint8_t *buf, int32_t amt, int32_t *nwritten) {
   CHECK(ssl_);
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
 
+  *nwritten = 0;
   if (PREDICT_FALSE(amt == 0)) {
     // Writing an empty buffer is a no-op. This happens occasionally, eg in the
     // case where the response has an empty sidecar. We have to special case
     // it, because SSL_write can return '0' to indicate certain types of errors.
-    *nwritten = 0;
     return Status::OK();
   }
 
   errno = 0;
   int32_t bytes_written = SSL_write(ssl_.get(), buf, amt);
+  int save_errno = errno;
   if (bytes_written <= 0) {
     auto error_code = SSL_get_error(ssl_.get(), bytes_written);
     if (error_code == SSL_ERROR_WANT_WRITE) {
+      if (save_errno != 0) {
+        return Status::NetworkError("SSL_write error",
+                                    ErrnoToString(save_errno), save_errno);
+      }
       // Socket not ready to write yet.
-      *nwritten = 0;
       return Status::OK();
     }
     return Status::NetworkError("failed to write to TLS socket",
@@ -66,39 +80,57 @@ Status TlsSocket::Write(const uint8_t *buf, int32_t amt, int32_t *nwritten) {
   return Status::OK();
 }
 
-Status TlsSocket::Writev(const struct ::iovec *iov, int iov_len, int32_t *nwritten) {
+Status TlsSocket::Writev(const struct ::iovec *iov, int iov_len, int64_t *nwritten) {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(ssl_);
-  int32_t total_written = 0;
+  *nwritten = 0;
   // Allows packets to be aggresively be accumulated before sending.
   RETURN_NOT_OK(SetTcpCork(1));
   Status write_status = Status::OK();
   for (int i = 0; i < iov_len; ++i) {
     int32_t frame_size = iov[i].iov_len;
+    int32_t bytes_written;
     // Don't return before unsetting TCP_CORK.
-    write_status = Write(static_cast<uint8_t*>(iov[i].iov_base), frame_size, nwritten);
-    total_written += *nwritten;
-    if (*nwritten < frame_size) break;
+    write_status = Write(static_cast<uint8_t*>(iov[i].iov_base), frame_size, &bytes_written);
+    if (!write_status.ok()) break;
+
+    // nwritten should have the correct amount written.
+    *nwritten += bytes_written;
+    if (bytes_written < frame_size) break;
   }
   RETURN_NOT_OK(SetTcpCork(0));
-  *nwritten = total_written;
+  // If we did manage to write something, but not everything, due to a temporary socket
+  // error, then we should still return an OK status indicating a successful _partial_
+  // write.
+  if (*nwritten > 0 && Socket::IsTemporarySocketError(write_status.posix_code())) {
+    return Status::OK();
+  }
   return write_status;
 }
 
 Status TlsSocket::Recv(uint8_t *buf, int32_t amt, int32_t *nread) {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
-  const char* kErrString = "failed to read from TLS socket";
 
   CHECK(ssl_);
   errno = 0;
   int32_t bytes_read = SSL_read(ssl_.get(), buf, amt);
   int save_errno = errno;
   if (bytes_read <= 0) {
+    Sockaddr remote;
+    Status s = GetPeerAddress(&remote);
+    const string remote_str = s.ok() ? remote.ToString() : "unknown";
+    string kErrString = Substitute("failed to read from TLS socket (remote: $0)",
+                                   remote_str);
+
     if (bytes_read == 0 && SSL_get_shutdown(ssl_.get()) == SSL_RECEIVED_SHUTDOWN) {
       return Status::NetworkError(kErrString, ErrnoToString(ESHUTDOWN), ESHUTDOWN);
     }
     auto error_code = SSL_get_error(ssl_.get(), bytes_read);
     if (error_code == SSL_ERROR_WANT_READ) {
+      if (save_errno != 0) {
+        return Status::NetworkError("SSL_read error from " + remote_str,
+                                    ErrnoToString(save_errno), save_errno);
+      }
       // Nothing available to read yet.
       *nread = 0;
       return Status::OK();

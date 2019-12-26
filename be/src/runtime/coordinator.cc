@@ -17,6 +17,9 @@
 
 #include "runtime/coordinator.h"
 
+#include <cerrno>
+#include <unordered_set>
+
 #include <thrift/protocol/TDebugProtocol.h>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/filesystem.hpp>
@@ -25,6 +28,7 @@
 #include <boost/algorithm/string.hpp>
 #include <gutil/strings/substitute.h>
 
+#include "common/hdfs.h"
 #include "exec/data-sink.h"
 #include "exec/plan-root-sink.h"
 #include "gen-cpp/ImpalaInternalService.h"
@@ -39,51 +43,86 @@
 #include "runtime/query-state.h"
 #include "scheduling/admission-controller.h"
 #include "scheduling/scheduler.h"
+#include "scheduling/query-schedule.h"
+#include "service/client-request-state.h"
 #include "util/bloom-filter.h"
-#include "util/counting-barrier.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
 #include "util/min-max-filter.h"
+#include "util/pretty-printer.h"
 #include "util/table-printer.h"
 
 #include "common/names.h"
 
 using namespace apache::thrift;
 using namespace rapidjson;
-using namespace strings;
 using boost::algorithm::iequals;
 using boost::algorithm::is_any_of;
 using boost::algorithm::join;
 using boost::algorithm::token_compress_on;
 using boost::algorithm::split;
 using boost::filesystem::path;
-using std::unique_ptr;
 
-DECLARE_int32(be_port);
 DECLARE_string(hostname);
 
-DEFINE_bool(insert_inherit_permissions, false, "If true, new directories created by "
-    "INSERTs will inherit the permissions of their parent directories");
+using namespace impala;
 
-namespace impala {
+PROFILE_DEFINE_COUNTER(NumBackends, STABLE_HIGH, TUnit::UNIT,
+    "Number of backends running this query.");
+PROFILE_DEFINE_COUNTER(TotalBytesRead, STABLE_HIGH, TUnit::BYTES,
+    "Total number of bytes read by a query.");
+PROFILE_DEFINE_COUNTER(TotalCpuTime, STABLE_HIGH, TUnit::TIME_NS,
+    "Total CPU time (user + system) consumed by a query.");
+PROFILE_DEFINE_COUNTER(FiltersReceived,STABLE_LOW, TUnit::UNIT,
+    "Total number of filter updates received (always 0 if filter mode is not "
+    "GLOBAL). Excludes repeated broadcast filter updates.");
+PROFILE_DEFINE_COUNTER(NumFragments, STABLE_HIGH, TUnit::UNIT,
+    "Number of fragments in the plan of a query.");
+PROFILE_DEFINE_COUNTER(NumFragmentInstances, STABLE_HIGH, TUnit::UNIT,
+     "Number of fragment instances executed by a query.");
+PROFILE_DEFINE_COUNTER(TotalBytesSent, STABLE_LOW, TUnit::BYTES,"The total number"
+    " of bytes sent (across the network) by this query in exchange nodes. Does not "
+    "include remote reads, data written to disk, or data sent to the client.");
+PROFILE_DEFINE_COUNTER(TotalScanBytesSent, STABLE_LOW, TUnit::BYTES,
+    "The total number of bytes sent (across the network) by fragment instances that "
+    "had a scan node in their plan.");
+PROFILE_DEFINE_COUNTER(TotalInnerBytesSent, STABLE_LOW, TUnit::BYTES, "The total "
+    "number of bytes sent (across the network) by fragment instances that did not have a"
+    " scan node in their plan i.e. that received their input data from other instances"
+    " through exchange node.");
+PROFILE_DEFINE_COUNTER(ExchangeScanRatio, STABLE_LOW, TUnit::DOUBLE_VALUE,
+    "The ratio between TotalScanByteSent and TotalBytesRead, i.e. the selectivity over "
+    "all fragment instances that had a scan node in their plan.");
+PROFILE_DEFINE_COUNTER(InnerNodeSelectivityRatio, STABLE_LOW, TUnit::DOUBLE_VALUE,
+    "The ratio between bytes sent by instances with a scan node in their plan and "
+    "instances without a scan node in their plan. This indicates how well the inner "
+    "nodes of the execution plan reduced the data volume.");
+PROFILE_DEFINE_COUNTER(NumCompletedBackends, STABLE_HIGH, TUnit::UNIT,"The number of "
+    "completed backends. Only valid after all backends have started executing. "
+    "Does not count the number of CANCELLED Backends.");
+PROFILE_DEFINE_TIMER(FinalizationTimer, STABLE_LOW,
+    "Total time spent in finalization (typically 0 except for INSERT into hdfs tables).");
 
 // Maximum number of fragment instances that can publish each broadcast filter.
 static const int MAX_BROADCAST_FILTER_PRODUCERS = 3;
 
-Coordinator::Coordinator(
-    const QuerySchedule& schedule, RuntimeProfile::EventSequence* events)
-  : schedule_(schedule),
+Coordinator::Coordinator(ClientRequestState* parent, const QuerySchedule& schedule,
+    RuntimeProfile::EventSequence* events)
+  : parent_request_state_(parent),
+    schedule_(schedule),
     filter_mode_(schedule.query_options().runtime_filter_mode),
     obj_pool_(new ObjectPool()),
-    query_events_(events) {}
+    query_events_(events),
+    exec_rpcs_complete_barrier_(schedule_.per_backend_exec_params().size()),
+    backend_released_barrier_(schedule_.per_backend_exec_params().size()),
+    filter_routing_table_(new FilterRoutingTable) {}
 
 Coordinator::~Coordinator() {
-  DCHECK(released_exec_resources_)
-      << "ReleaseExecResources() must be called before Coordinator is destroyed";
-  DCHECK(released_admission_control_resources_)
-      << "ReleaseAdmissionControlResources() must be called before Coordinator is "
-      << "destroyed";
+  // Must have entered a terminal exec state guaranteeing resources were released.
+  DCHECK(!IsExecuting());
+  DCHECK_LE(backend_exec_complete_barrier_->pending(), 0);
+  // Release the coordinator's reference to the query control structures.
   if (query_state_ != nullptr) {
     ExecEnv::GetInstance()->query_exec_mgr()->ReleaseQueryState(query_state_);
   }
@@ -93,19 +132,17 @@ Status Coordinator::Exec() {
   const TQueryExecRequest& request = schedule_.request();
   DCHECK(request.plan_exec_info.size() > 0);
 
-  needs_finalization_ = request.__isset.finalize_params;
-  if (needs_finalization_) finalize_params_ = request.finalize_params;
-
-  VLOG_QUERY << "Exec() query_id=" << schedule_.query_id()
+  VLOG_QUERY << "Exec() query_id=" << PrintId(query_id())
              << " stmt=" << request.query_ctx.client_request.stmt;
   stmt_type_ = request.stmt_type;
-  query_ctx_ = request.query_ctx;
-  query_ctx_.__set_request_pool(schedule_.request_pool());
 
   query_profile_ =
       RuntimeProfile::Create(obj_pool(), "Execution Profile " + PrintId(query_id()));
-  finalization_timer_ = ADD_TIMER(query_profile_, "FinalizationTimer");
-  filter_updates_received_ = ADD_COUNTER(query_profile_, "FiltersReceived", TUnit::UNIT);
+  finalization_timer_ = PROFILE_FinalizationTimer.Instantiate(query_profile_);
+  filter_updates_received_ = PROFILE_FiltersReceived.Instantiate(query_profile_);
+
+  host_profiles_ = RuntimeProfile::Create(obj_pool(), "Per Node Profiles");
+  query_profile_->AddChild(host_profiles_);
 
   SCOPED_TIMER(query_profile_->total_time_counter());
 
@@ -113,18 +150,8 @@ Status Coordinator::Exec() {
   const string& str = Substitute("Query $0", PrintId(query_id()));
   progress_.Init(str, schedule_.num_scan_ranges());
 
-  // runtime filters not yet supported for mt execution
-  bool is_mt_execution = request.query_ctx.client_request.query_options.mt_dop > 0;
-  if (is_mt_execution) filter_mode_ = TRuntimeFilterMode::OFF;
-
-  // to keep things simple, make async Cancel() calls wait until plan fragment
-  // execution has been initiated, otherwise we might try to cancel fragment
-  // execution at Impala daemons where it hasn't even started
-  // TODO: revisit this, it may not be true anymore
-  lock_guard<mutex> l(lock_);
-
-  query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(query_ctx_);
-  query_state_->AcquireExecResourceRefcount(); // Decremented in ReleaseExecResources().
+  query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(
+      query_ctx(), schedule_.coord_backend_mem_limit());
   filter_mem_tracker_ = query_state_->obj_pool()->Add(new MemTracker(
       -1, "Runtime Filter (Coordinator)", query_state_->query_mem_tracker(), false));
 
@@ -134,10 +161,6 @@ Status Coordinator::Exec() {
   InitBackendStates();
   exec_summary_.Init(schedule_);
 
-  // TODO-MT: populate the runtime filter routing table
-  // This requires local aggregation of filters prior to sending
-  // for broadcast joins in order to avoid more complicated merge logic here.
-
   if (filter_mode_ != TRuntimeFilterMode::OFF) {
     DCHECK_EQ(request.plan_exec_info.size(), 1);
     // Populate the runtime filter routing table. This should happen before starting the
@@ -146,38 +169,25 @@ Status Coordinator::Exec() {
     InitFilterRoutingTable();
   }
 
-  // At this point, all static setup is done and all structures are initialized.
-  // Only runtime-related state changes past this point (examples:
-  // num_remaining_backends_, fragment instance profiles, etc.)
+  // At this point, all static setup is done and all structures are initialized. Only
+  // runtime-related state changes past this point (examples: fragment instance
+  // profiles, etc.)
 
-  StartBackendExec();
+  RETURN_IF_ERROR(StartBackendExec());
   RETURN_IF_ERROR(FinishBackendStartup());
 
   // set coord_instance_ and coord_sink_
   if (schedule_.GetCoordFragment() != nullptr) {
     // this blocks until all fragment instances have finished their Prepare phase
-    coord_instance_ = query_state_->GetFInstanceState(query_id());
-    if (coord_instance_ == nullptr) {
-      // at this point, the query is done with the Prepare phase, and we expect
-      // to have a coordinator instance, but coord_instance_ == nullptr,
-      // which means we failed Prepare
-      Status prepare_status = query_state_->WaitForPrepare();
-      DCHECK(!prepare_status.ok());
-      return prepare_status;
-    }
-
-    // When GetFInstanceState() returns the coordinator instance, the Prepare phase
-    // is done and the FragmentInstanceState's root sink will be set up. At that point,
-    // the coordinator must be sure to call root_sink()->CloseConsumer(); the
-    // fragment instance's executor will not complete until that point.
-    // TODO: what does this mean?
-    // TODO: Consider moving this to Wait().
-    // TODO: clarify need for synchronization on this event
-    DCHECK(coord_instance_->IsPrepared() && coord_instance_->WaitForPrepare().ok());
-    coord_sink_ = coord_instance_->root_sink();
+    Status query_status = query_state_->GetFInstanceState(query_id(), &coord_instance_);
+    if (!query_status.ok()) return UpdateExecState(query_status, nullptr, FLAGS_hostname);
+    // We expected this query to have a coordinator instance.
+    DCHECK(coord_instance_ != nullptr);
+    // When GetFInstanceState() returns the coordinator instance, the Prepare phase is
+    // done and the FragmentInstanceState's root sink will be set up.
+    coord_sink_ = coord_instance_->GetRootSink();
     DCHECK(coord_sink_ != nullptr);
   }
-
   return Status::OK();
 }
 
@@ -205,37 +215,41 @@ void Coordinator::InitFragmentStats() {
     query_profile_->AddChild(fragment_stats->avg_profile(), true);
     query_profile_->AddChild(fragment_stats->root_profile());
   }
-  RuntimeProfile::Counter* num_fragments =
-      ADD_COUNTER(query_profile_, "NumFragments", TUnit::UNIT);
-  num_fragments->Set(static_cast<int64_t>(fragments.size()));
-  RuntimeProfile::Counter* num_finstances =
-      ADD_COUNTER(query_profile_, "NumFragmentInstances", TUnit::UNIT);
-  num_finstances->Set(total_num_finstances);
+  COUNTER_SET(PROFILE_NumFragments.Instantiate(query_profile_),
+      static_cast<int64_t>(fragments.size()));
+  COUNTER_SET(PROFILE_NumFragmentInstances.Instantiate(query_profile_),
+      total_num_finstances);
 }
 
 void Coordinator::InitBackendStates() {
   int num_backends = schedule_.per_backend_exec_params().size();
   DCHECK_GT(num_backends, 0);
+
+  lock_guard<SpinLock> l(backend_states_init_lock_);
   backend_states_.resize(num_backends);
 
-  RuntimeProfile::Counter* num_backends_counter =
-      ADD_COUNTER(query_profile_, "NumBackends", TUnit::UNIT);
-  num_backends_counter->Set(num_backends);
+  COUNTER_SET(PROFILE_NumBackends.Instantiate(query_profile_), num_backends);
 
   // create BackendStates
-  bool has_coord_fragment = schedule_.GetCoordFragment() != nullptr;
-  const TNetworkAddress& coord_address = ExecEnv::GetInstance()->backend_address();
   int backend_idx = 0;
-  for (const auto& entry: schedule_.per_backend_exec_params()) {
-    if (has_coord_fragment && coord_address == entry.first) {
-      coord_backend_idx_ = backend_idx;
-    }
-    BackendState* backend_state = obj_pool()->Add(
-        new BackendState(query_id(), backend_idx, filter_mode_));
-    backend_state->Init(entry.second, fragment_stats_, obj_pool());
+  for (const auto& entry : schedule_.per_backend_exec_params()) {
+    BackendState* backend_state = obj_pool()->Add(new BackendState(
+        schedule_, query_ctx(), backend_idx, filter_mode_, entry.second));
+    backend_state->Init(fragment_stats_, host_profiles_, obj_pool());
     backend_states_[backend_idx++] = backend_state;
+    // was_inserted is true if the pair was successfully inserted into the map, false
+    // otherwise.
+    bool was_inserted = addr_to_backend_state_
+                            .emplace(backend_state->krpc_impalad_address(), backend_state)
+                            .second;
+    if (UNLIKELY(!was_inserted)) {
+      DCHECK(false) << "Network address " << backend_state->krpc_impalad_address()
+                    << " associated with multiple BackendStates";
+    }
   }
-  DCHECK(!has_coord_fragment || coord_backend_idx_ != -1);
+  backend_resource_state_ =
+      obj_pool()->Add(new BackendResourceState(backend_states_, schedule_));
+  num_completed_backends_ = PROFILE_NumCompletedBackends.Instantiate(query_profile_);
 }
 
 void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
@@ -251,9 +265,42 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
       int root_node_idx = thrift_exec_summary.nodes.size();
 
       const TPlan& plan = fragment.plan;
-      int num_instances =
-          schedule.GetFragmentExecParams(fragment.idx).instance_exec_params.size();
-      for (const TPlanNode& node: plan.nodes) {
+      const TDataSink& output_sink = fragment.output_sink;
+      // Count the number of hosts and instances.
+      const vector<FInstanceExecParams>& instance_params =
+          schedule.GetFragmentExecParams(fragment.idx).instance_exec_params;
+      unordered_set<TNetworkAddress> host_set;
+      for (const FInstanceExecParams& instance: instance_params) {
+        host_set.insert(instance.host);
+      }
+      int num_hosts = host_set.size();
+      int num_instances = instance_params.size();
+
+      // Add the data sink at the root of the fragment.
+      data_sink_id_to_idx_map[fragment.idx] = thrift_exec_summary.nodes.size();
+      thrift_exec_summary.nodes.emplace_back();
+      // Note that some clients like impala-shell depend on many of these fields being
+      // set, even if they are optional in the thrift.
+      TPlanNodeExecSummary& node_summary = thrift_exec_summary.nodes.back();
+      node_summary.__set_node_id(-1);
+      node_summary.__set_fragment_idx(fragment.idx);
+      node_summary.__set_label(output_sink.label);
+      node_summary.__set_label_detail("");
+      node_summary.__set_num_children(1);
+      DCHECK(output_sink.__isset.estimated_stats);
+      node_summary.__set_estimated_stats(output_sink.estimated_stats);
+      node_summary.__set_num_hosts(num_hosts);
+      node_summary.exec_stats.resize(num_instances);
+
+      // We don't track rows returned from sinks, but some clients like impala-shell
+      // expect it to be set in the thrift struct. Set it to -1 for compatibility
+      // with those tools.
+      node_summary.estimated_stats.__set_cardinality(-1);
+      for (TExecStats& instance_stats : node_summary.exec_stats) {
+        instance_stats.__set_cardinality(-1);
+      }
+
+      for (const TPlanNode& node : plan.nodes) {
         node_id_to_idx_map[node.node_id] = thrift_exec_summary.nodes.size();
         thrift_exec_summary.nodes.emplace_back();
         TPlanNodeExecSummary& node_summary = thrift_exec_summary.nodes.back();
@@ -262,9 +309,9 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
         node_summary.__set_label(node.label);
         node_summary.__set_label_detail(node.label_detail);
         node_summary.__set_num_children(node.num_children);
-        if (node.__isset.estimated_stats) {
-          node_summary.__set_estimated_stats(node.estimated_stats);
-        }
+        DCHECK(node.__isset.estimated_stats);
+        node_summary.__set_estimated_stats(node.estimated_stats);
+        node_summary.__set_num_hosts(num_hosts);
         node_summary.exec_stats.resize(num_instances);
       }
 
@@ -283,12 +330,12 @@ void Coordinator::ExecSummary::Init(const QuerySchedule& schedule) {
 }
 
 void Coordinator::InitFilterRoutingTable() {
-  DCHECK(schedule_.request().query_ctx.client_request.query_options.mt_dop == 0);
   DCHECK_NE(filter_mode_, TRuntimeFilterMode::OFF)
       << "InitFilterRoutingTable() called although runtime filters are disabled";
-  DCHECK(!filter_routing_table_complete_)
-      << "InitFilterRoutingTable() called after setting filter_routing_table_complete_";
+  DCHECK(!filter_routing_table_->is_complete)
+      << "InitFilterRoutingTable() called after table marked as complete";
 
+  lock_guard<shared_mutex> lock(filter_routing_table_->lock); // Exclusive lock.
   for (const FragmentExecParams& fragment_params: schedule_.fragment_exec_params()) {
     int num_instances = fragment_params.instance_exec_params.size();
     DCHECK_GT(num_instances, 0);
@@ -297,7 +344,7 @@ void Coordinator::InitFilterRoutingTable() {
       if (!plan_node.__isset.runtime_filters) continue;
       for (const TRuntimeFilterDesc& filter: plan_node.runtime_filters) {
         DCHECK(filter_mode_ == TRuntimeFilterMode::GLOBAL || filter.has_local_targets);
-        FilterRoutingTable::iterator i = filter_routing_table_.emplace(
+        auto i = filter_routing_table_->id_to_filter.emplace(
             filter.filter_id, FilterState(filter, plan_node.node_id)).first;
         FilterState* f = &(i->second);
 
@@ -323,9 +370,14 @@ void Coordinator::InitFilterRoutingTable() {
             random_shuffle(src_idxs.begin(), src_idxs.end());
             src_idxs.resize(MAX_BROADCAST_FILTER_PRODUCERS);
           }
-          f->src_fragment_instance_idxs()->insert(src_idxs.begin(), src_idxs.end());
-
-        // target plan node of filter
+          for (int src_idx : src_idxs) {
+            TRuntimeFilterSource filter_src;
+            filter_src.src_node_id = plan_node.node_id;
+            filter_src.filter_id = filter.filter_id;
+            filter_routing_table_->finstance_filters_produced[src_idx].emplace_back(
+                filter_src);
+          }
+          f->set_num_producers(src_idxs.size());
         } else if (plan_node.__isset.hdfs_scan_node || plan_node.__isset.kudu_scan_node) {
           auto it = filter.planid_to_target_ndx.find(plan_node.node_id);
           DCHECK(it != filter.planid_to_target_ndx.end());
@@ -341,60 +393,99 @@ void Coordinator::InitFilterRoutingTable() {
   }
 
   query_profile_->AddInfoString(
-      "Number of filters", Substitute("$0", filter_routing_table_.size()));
+      "Number of filters", Substitute("$0", filter_routing_table_->num_filters()));
   query_profile_->AddInfoString("Filter routing table", FilterDebugString());
   if (VLOG_IS_ON(2)) VLOG_QUERY << FilterDebugString();
-  filter_routing_table_complete_ = true;
+  filter_routing_table_->is_complete = true;
 }
 
-void Coordinator::StartBackendExec() {
+Status Coordinator::StartBackendExec() {
   int num_backends = backend_states_.size();
-  exec_complete_barrier_.reset(new CountingBarrier(num_backends));
-  num_remaining_backends_ = num_backends;
+  backend_exec_complete_barrier_.reset(new CountingBarrier(num_backends));
 
   DebugOptions debug_options(schedule_.query_options());
 
-  VLOG_QUERY << "starting execution on " << num_backends << " backends for query "
-             << query_id();
+  VLOG_QUERY << "starting execution on " << num_backends << " backends for query_id="
+             << PrintId(query_id());
   query_events_->MarkEvent(Substitute("Ready to start on $0 backends", num_backends));
+
+  // Serialize the TQueryCtx once and pass it to each backend. The serialized buffer must
+  // stay valid until exec_rpcs_complete_barrier_ has been signalled.
+  ThriftSerializer serializer(true);
+  uint8_t* serialized_buf = nullptr;
+  uint32_t serialized_len = 0;
+  Status serialize_status =
+      serializer.SerializeToBuffer(&query_ctx(), &serialized_len, &serialized_buf);
+  if (UNLIKELY(!serialize_status.ok())) {
+    return UpdateExecState(serialize_status, nullptr, FLAGS_hostname);
+  }
+  kudu::Slice query_ctx_slice(serialized_buf, serialized_len);
 
   for (BackendState* backend_state: backend_states_) {
     ExecEnv::GetInstance()->exec_rpc_thread_pool()->Offer(
-        [backend_state, this, &debug_options]() {
-          backend_state->Exec(query_ctx_, debug_options, filter_routing_table_,
-            exec_complete_barrier_.get());
+        [backend_state, this, &debug_options, &query_ctx_slice]() {
+          DebugActionNoFail(schedule_.query_options(), "COORD_BEFORE_EXEC_RPC");
+          // Safe for Exec() to read 'filter_routing_table_' because it is complete
+          // at this point and won't be destroyed while this function is executing,
+          // because it won't be torn down until 'exec_rpcs_complete_barrier_' is
+          // signalled.
+          DCHECK(filter_mode_ == TRuntimeFilterMode::OFF
+              || filter_routing_table_->is_complete);
+          backend_state->Exec(debug_options, *filter_routing_table_, query_ctx_slice,
+              &exec_rpcs_complete_barrier_);
         });
   }
+  exec_rpcs_complete_barrier_.Wait();
 
-  exec_complete_barrier_->Wait();
-  VLOG_QUERY << "started execution on " << num_backends << " backends for query "
-             << query_id();
+  VLOG_QUERY << "started execution on " << num_backends << " backends for query_id="
+             << PrintId(query_id());
   query_events_->MarkEvent(
       Substitute("All $0 execution backends ($1 fragment instances) started",
         num_backends, schedule_.GetNumFragmentInstances()));
+  return Status::OK();
 }
 
 Status Coordinator::FinishBackendStartup() {
-  Status status = Status::OK();
   const TMetricDef& def =
       MakeTMetricDef("backend-startup-latencies", TMetricKind::HISTOGRAM, TUnit::TIME_MS);
   // Capture up to 30 minutes of start-up times, in ms, with 4 s.f. accuracy.
   HistogramMetric latencies(def, 30 * 60 * 1000, 4);
+  Status status = Status::OK();
+  string error_hostname;
+  string max_latency_host;
+  int max_latency = 0;
   for (BackendState* backend_state: backend_states_) {
     // preserve the first non-OK, if there is one
     Status backend_status = backend_state->GetStatus();
-    if (!backend_status.ok() && status.ok()) status = backend_status;
+    if (!backend_status.ok() && status.ok()) {
+      status = backend_status;
+      error_hostname = backend_state->impalad_address().hostname;
+    }
+    if (!backend_state->exec_rpc_status().ok()) {
+      // The Exec() rpc failed, so blacklist the executor.
+      LOG(INFO) << "Blacklisting "
+                << TNetworkAddressToString(backend_state->impalad_address())
+                << " because an Exec() rpc to it failed.";
+      const TBackendDescriptor& be_desc = backend_state->exec_params()->be_desc;
+      ExecEnv::GetInstance()->cluster_membership_mgr()->BlacklistExecutor(be_desc);
+    }
+    if (backend_state->rpc_latency() > max_latency) {
+      // Find the backend that takes the most time to acknowledge to
+      // the ExecQueryFInstances() RPC.
+      max_latency = backend_state->rpc_latency();
+      max_latency_host = TNetworkAddressToString(backend_state->impalad_address());
+    }
     latencies.Update(backend_state->rpc_latency());
+    // Mark backend complete if no fragment instances were assigned to it.
+    if (backend_state->IsEmptyBackend()) {
+      backend_exec_complete_barrier_->Notify();
+      num_completed_backends_->Add(1);
+    }
   }
-
   query_profile_->AddInfoString(
       "Backend startup latencies", latencies.ToHumanReadable());
-
-  if (!status.ok()) {
-    query_status_ = status;
-    CancelInternal();
-  }
-  return status;
+  query_profile_->AddInfoString("Slowest backend to start up", max_latency_host);
+  return UpdateExecState(status, nullptr, error_hostname);
 }
 
 string Coordinator::FilterDebugString() {
@@ -404,7 +495,6 @@ string Coordinator::FilterDebugString() {
   table_printer.AddColumn("Tgt. Node(s)", false);
   table_printer.AddColumn("Target type", false);
   table_printer.AddColumn("Partition filter", false);
-
   // Distribution metrics are only meaningful if the coordinator is routing the filter.
   if (filter_mode_ == TRuntimeFilterMode::GLOBAL) {
     table_printer.AddColumn("Pending (Expected)", false);
@@ -412,8 +502,7 @@ string Coordinator::FilterDebugString() {
     table_printer.AddColumn("Completed", false);
   }
   table_printer.AddColumn("Enabled", false);
-  lock_guard<SpinLock> l(filter_lock_);
-  for (FilterRoutingTable::value_type& v: filter_routing_table_) {
+  for (auto& v: filter_routing_table_->id_to_filter) {
     vector<string> row;
     const FilterState& state = v.second;
     row.push_back(lexical_cast<string>(v.first));
@@ -432,8 +521,7 @@ string Coordinator::FilterDebugString() {
 
     if (filter_mode_ == TRuntimeFilterMode::GLOBAL) {
       int pending_count = state.completion_time() != 0L ? 0 : state.pending_count();
-      row.push_back(Substitute("$0 ($1)", pending_count,
-          state.src_fragment_instance_idxs().size()));
+      row.push_back(Substitute("$0 ($1)", pending_count, state.num_producers()));
       if (state.first_arrival_time() == 0L) {
         row.push_back("N/A");
       } else {
@@ -454,326 +542,151 @@ string Coordinator::FilterDebugString() {
   return Substitute("\n$0", table_printer.ToString());
 }
 
-Status Coordinator::GetStatus() {
-  lock_guard<mutex> l(lock_);
-  return query_status_;
+const char* Coordinator::ExecStateToString(const ExecState state) {
+  static const unordered_map<ExecState, const char *> exec_state_to_str{
+    {ExecState::EXECUTING,        "EXECUTING"},
+    {ExecState::RETURNED_RESULTS, "RETURNED_RESULTS"},
+    {ExecState::CANCELLED,        "CANCELLED"},
+    {ExecState::ERROR,            "ERROR"}};
+  return exec_state_to_str.at(state);
 }
 
-Status Coordinator::UpdateStatus(const Status& status, const string& backend_hostname,
-    bool is_fragment_failure, const TUniqueId& instance_id) {
+Status Coordinator::SetNonErrorTerminalState(const ExecState state) {
+  DCHECK(state == ExecState::RETURNED_RESULTS || state == ExecState::CANCELLED);
+  Status ret_status;
   {
-    lock_guard<mutex> l(lock_);
-
-    // The query is done and we are just waiting for backends to clean up.
-    // Ignore their cancelled updates.
-    if (returned_all_results_ && status.IsCancelled()) return query_status_;
-
-    // nothing to update
-    if (status.ok()) return query_status_;
-
-    // don't override an error status; also, cancellation has already started
-    if (!query_status_.ok()) return query_status_;
-
-    query_status_ = status;
-    CancelInternal();
+    lock_guard<SpinLock> l(exec_state_lock_);
+    // May have already entered a terminal state, in which case nothing to do.
+    if (!IsExecuting()) return exec_status_;
+    DCHECK(exec_status_.ok()) << exec_status_;
+    exec_state_.Store(state);
+    if (state == ExecState::CANCELLED) exec_status_ = Status::CANCELLED;
+    ret_status = exec_status_;
   }
+  VLOG_QUERY << Substitute("ExecState: query id=$0 execution $1", PrintId(query_id()),
+      state == ExecState::CANCELLED ? "cancelled" : "completed");
+  HandleExecStateTransition(ExecState::EXECUTING, state);
+  return ret_status;
+}
 
-  if (is_fragment_failure) {
-    // Log the id of the fragment that first failed so we can track it down more easily.
-    VLOG_QUERY << "Query id=" << query_id() << " failed because instance id="
-               << instance_id << " on host=" << backend_hostname << " failed.";
+Status Coordinator::UpdateExecState(const Status& status,
+    const TUniqueId* failed_finst, const string& instance_hostname) {
+  Status ret_status;
+  ExecState old_state, new_state;
+  {
+    lock_guard<SpinLock> l(exec_state_lock_);
+    old_state = exec_state_.Load();
+    if (old_state == ExecState::EXECUTING) {
+      DCHECK(exec_status_.ok()) << exec_status_;
+      if (!status.ok()) {
+        // Error while executing - go to ERROR state.
+        exec_status_ = status;
+        exec_state_.Store(ExecState::ERROR);
+      }
+    } else if (old_state == ExecState::RETURNED_RESULTS) {
+      // Already returned all results. Leave exec status as ok, stay in this state.
+      DCHECK(exec_status_.ok()) << exec_status_;
+    } else if (old_state == ExecState::CANCELLED) {
+      // Client requested cancellation already, stay in this state.  Ignores errors
+      // after requested cancellations.
+      DCHECK(exec_status_.IsCancelled()) << exec_status_;
+    } else {
+      // Already in the ERROR state, stay in this state but update status to be the
+      // first non-cancelled status.
+      DCHECK_EQ(old_state, ExecState::ERROR);
+      DCHECK(!exec_status_.ok());
+      if (!status.ok() && !status.IsCancelled() && exec_status_.IsCancelled()) {
+        exec_status_ = status;
+      }
+    }
+    new_state = exec_state_.Load();
+    ret_status = exec_status_;
+  }
+  // Log interesting status: a non-cancelled error or a cancellation if was executing.
+  if (!status.ok() && (!status.IsCancelled() || old_state == ExecState::EXECUTING)) {
+    VLOG_QUERY << Substitute(
+        "ExecState: query id=$0 finstance=$1 on host=$2 ($3 -> $4) status=$5",
+        PrintId(query_id()), failed_finst != nullptr ? PrintId(*failed_finst) : "N/A",
+        instance_hostname, ExecStateToString(old_state), ExecStateToString(new_state),
+        status.GetDetail());
+  }
+  // After dropping the lock, apply the state transition (if any) side-effects.
+  HandleExecStateTransition(old_state, new_state);
+  return ret_status;
+}
+
+void Coordinator::HandleExecStateTransition(
+    const ExecState old_state, const ExecState new_state) {
+  static const unordered_map<ExecState, const char *> exec_state_to_event{
+    {ExecState::EXECUTING,        "Executing"},
+    {ExecState::RETURNED_RESULTS, "Last row fetched"},
+    {ExecState::CANCELLED,        "Execution cancelled"},
+    {ExecState::ERROR,            "Execution error"}};
+  if (old_state == new_state) return;
+  // Once we enter a terminal state, we stay there, guaranteeing this code runs only once.
+  DCHECK_EQ(old_state, ExecState::EXECUTING);
+  // Should never transition to the initial state.
+  DCHECK_NE(new_state, ExecState::EXECUTING);
+  // Can't transition until the exec RPCs are no longer in progress. Otherwise, a
+  // cancel RPC could be missed, and resources freed before a backend has had a chance
+  // to take a resource reference.
+  DCHECK_LE(exec_rpcs_complete_barrier_.pending(), 0) << "exec rpcs not completed";
+
+  query_events_->MarkEvent(exec_state_to_event.at(new_state));
+  // This thread won the race to transitioning into a terminal state - terminate
+  // execution and release resources.
+  ReleaseExecResources();
+  if (new_state == ExecState::RETURNED_RESULTS) {
+    // TODO: IMPALA-6984: cancel all backends in this case too.
+    WaitForBackends();
   } else {
-    VLOG_QUERY << "Query id=" << query_id() << " failed due to error on host="
-               << backend_hostname;
+    CancelBackends();
   }
-  return query_status_;
+  ReleaseQueryAdmissionControlResources();
+  // Once the query has released its admission control resources, update its end time.
+  parent_request_state_->UpdateEndTime();
+  // Can compute summary only after we stop accepting reports from the backends. Both
+  // WaitForBackends() and CancelBackends() ensures that.
+  // TODO: should move this off of the query execution path?
+  ComputeQuerySummary();
 }
 
-void Coordinator::PopulatePathPermissionCache(hdfsFS fs, const string& path_str,
-    PermissionCache* permissions_cache) {
-  // Find out if the path begins with a hdfs:// -style prefix, and remove it and the
-  // location (e.g. host:port) if so.
-  int scheme_end = path_str.find("://");
-  string stripped_str;
-  if (scheme_end != string::npos) {
-    // Skip past the subsequent location:port/ prefix.
-    stripped_str = path_str.substr(path_str.find("/", scheme_end + 3));
-  } else {
-    stripped_str = path_str;
-  }
-
-  // Get the list of path components, used to build all path prefixes.
-  vector<string> components;
-  split(components, stripped_str, is_any_of("/"));
-
-  // Build a set of all prefixes (including the complete string) of stripped_path. So
-  // /a/b/c/d leads to a vector of: /a, /a/b, /a/b/c, /a/b/c/d
-  vector<string> prefixes;
-  // Stores the current prefix
-  stringstream accumulator;
-  for (const string& component: components) {
-    if (component.empty()) continue;
-    accumulator << "/" << component;
-    prefixes.push_back(accumulator.str());
-  }
-
-  // Now for each prefix, stat() it to see if a) it exists and b) if so what its
-  // permissions are. When we meet a directory that doesn't exist, we record the fact that
-  // we need to create it, and the permissions of its parent dir to inherit.
-  //
-  // Every prefix is recorded in the PermissionCache so we don't do more than one stat()
-  // for each path. If we need to create the directory, we record it as the pair (true,
-  // perms) so that the caller can identify which directories need their permissions
-  // explicitly set.
-
-  // Set to the permission of the immediate parent (i.e. the permissions to inherit if the
-  // current dir doesn't exist).
-  short permissions = 0;
-  for (const string& path: prefixes) {
-    PermissionCache::const_iterator it = permissions_cache->find(path);
-    if (it == permissions_cache->end()) {
-      hdfsFileInfo* info = hdfsGetPathInfo(fs, path.c_str());
-      if (info != nullptr) {
-        // File exists, so fill the cache with its current permissions.
-        permissions_cache->insert(
-            make_pair(path, make_pair(false, info->mPermissions)));
-        permissions = info->mPermissions;
-        hdfsFreeFileInfo(info, 1);
-      } else {
-        // File doesn't exist, so we need to set its permissions to its immediate parent
-        // once it's been created.
-        permissions_cache->insert(make_pair(path, make_pair(true, permissions)));
-      }
-    } else {
-      permissions = it->second.second;
-    }
-  }
-}
-
-Status Coordinator::FinalizeSuccessfulInsert() {
-  PermissionCache permissions_cache;
-  HdfsFsCache::HdfsFsMap filesystem_connection_cache;
-  HdfsOperationSet partition_create_ops(&filesystem_connection_cache);
-
-  // INSERT finalization happens in the five following steps
-  // 1. If OVERWRITE, remove all the files in the target directory
-  // 2. Create all the necessary partition directories.
-  HdfsTableDescriptor* hdfs_table;
-  RETURN_IF_ERROR(DescriptorTbl::CreateHdfsTblDescriptor(query_ctx_.desc_tbl,
-      finalize_params_.table_id, obj_pool(), &hdfs_table));
-  DCHECK(hdfs_table != nullptr)
-      << "INSERT target table not known in descriptor table: "
-      << finalize_params_.table_id;
-
-  // Loop over all partitions that were updated by this insert, and create the set of
-  // filesystem operations required to create the correct partition structure on disk.
-  for (const PartitionStatusMap::value_type& partition: per_partition_status_) {
-    SCOPED_TIMER(ADD_CHILD_TIMER(query_profile_, "Overwrite/PartitionCreationTimer",
-          "FinalizationTimer"));
-    // INSERT allows writes to tables that have partitions on multiple filesystems.
-    // So we need to open connections to different filesystems as necessary. We use a
-    // local connection cache and populate it with one connection per filesystem that the
-    // partitions are on.
-    hdfsFS partition_fs_connection;
-    RETURN_IF_ERROR(HdfsFsCache::instance()->GetConnection(
-      partition.second.partition_base_dir, &partition_fs_connection,
-          &filesystem_connection_cache));
-
-    // Look up the partition in the descriptor table.
-    stringstream part_path_ss;
-    if (partition.second.id == -1) {
-      // If this is a non-existant partition, use the default partition location of
-      // <base_dir>/part_key_1=val/part_key_2=val/...
-      part_path_ss << finalize_params_.hdfs_base_dir << "/" << partition.first;
-    } else {
-      HdfsPartitionDescriptor* part = hdfs_table->GetPartition(partition.second.id);
-      DCHECK(part != nullptr)
-          << "table_id=" << hdfs_table->id() << " partition_id=" << partition.second.id
-          << "\n" <<  PrintThrift(runtime_state()->instance_ctx());
-      part_path_ss << part->location();
-    }
-    const string& part_path = part_path_ss.str();
-    bool is_s3_path = IsS3APath(part_path.c_str());
-
-    // If this is an overwrite insert, we will need to delete any updated partitions
-    if (finalize_params_.is_overwrite) {
-      if (partition.first.empty()) {
-        // If the root directory is written to, then the table must not be partitioned
-        DCHECK(per_partition_status_.size() == 1);
-        // We need to be a little more careful, and only delete data files in the root
-        // because the tmp directories the sink(s) wrote are there also.
-        // So only delete files in the table directory - all files are treated as data
-        // files by Hive and Impala, but directories are ignored (and may legitimately
-        // be used to store permanent non-table data by other applications).
-        int num_files = 0;
-        // hfdsListDirectory() only sets errno if there is an error, but it doesn't set
-        // it to 0 if the call succeed. When there is no error, errno could be any
-        // value. So need to clear errno before calling it.
-        // Once HDFS-8407 is fixed, the errno reset won't be needed.
-        errno = 0;
-        hdfsFileInfo* existing_files =
-            hdfsListDirectory(partition_fs_connection, part_path.c_str(), &num_files);
-        if (existing_files == nullptr && errno == EAGAIN) {
-          errno = 0;
-          existing_files =
-              hdfsListDirectory(partition_fs_connection, part_path.c_str(), &num_files);
-        }
-        // hdfsListDirectory() returns nullptr not only when there is an error but also
-        // when the directory is empty(HDFS-8407). Need to check errno to make sure
-        // the call fails.
-        if (existing_files == nullptr && errno != 0) {
-          return Status(GetHdfsErrorMsg("Could not list directory: ", part_path));
-        }
-        for (int i = 0; i < num_files; ++i) {
-          const string filename = path(existing_files[i].mName).filename().string();
-          if (existing_files[i].mKind == kObjectKindFile && !IsHiddenFile(filename)) {
-            partition_create_ops.Add(DELETE, existing_files[i].mName);
-          }
-        }
-        hdfsFreeFileInfo(existing_files, num_files);
-      } else {
-        // This is a partition directory, not the root directory; we can delete
-        // recursively with abandon, after checking that it ever existed.
-        // TODO: There's a potential race here between checking for the directory
-        // and a third-party deleting it.
-        if (FLAGS_insert_inherit_permissions && !is_s3_path) {
-          // There is no directory structure in S3, so "inheriting" permissions is not
-          // possible.
-          // TODO: Try to mimic inheriting permissions for S3.
-          PopulatePathPermissionCache(
-              partition_fs_connection, part_path, &permissions_cache);
-        }
-        // S3 doesn't have a directory structure, so we technically wouldn't need to
-        // CREATE_DIR on S3. However, libhdfs always checks if a path exists before
-        // carrying out an operation on that path. So we still need to call CREATE_DIR
-        // before we access that path due to this limitation.
-        if (hdfsExists(partition_fs_connection, part_path.c_str()) != -1) {
-          partition_create_ops.Add(DELETE_THEN_CREATE, part_path);
-        } else {
-          // Otherwise just create the directory.
-          partition_create_ops.Add(CREATE_DIR, part_path);
-        }
-      }
-    } else if (!is_s3_path
-        || !query_ctx_.client_request.query_options.s3_skip_insert_staging) {
-      // If the S3_SKIP_INSERT_STAGING query option is set, then the partition directories
-      // would have already been created by the table sinks.
-      if (FLAGS_insert_inherit_permissions && !is_s3_path) {
-        PopulatePathPermissionCache(
-            partition_fs_connection, part_path, &permissions_cache);
-      }
-      if (hdfsExists(partition_fs_connection, part_path.c_str()) == -1) {
-        partition_create_ops.Add(CREATE_DIR, part_path);
-      }
-    }
-  }
-
-  // We're done with the HDFS descriptor - free up its resources.
-  hdfs_table->ReleaseResources();
-  hdfs_table = nullptr;
-
-  {
-    SCOPED_TIMER(ADD_CHILD_TIMER(query_profile_, "Overwrite/PartitionCreationTimer",
-          "FinalizationTimer"));
-    if (!partition_create_ops.Execute(
-        ExecEnv::GetInstance()->hdfs_op_thread_pool(), false)) {
-      for (const HdfsOperationSet::Error& err: partition_create_ops.errors()) {
-        // It's ok to ignore errors creating the directories, since they may already
-        // exist. If there are permission errors, we'll run into them later.
-        if (err.first->op() != CREATE_DIR) {
-          return Status(Substitute(
-              "Error(s) deleting partition directories. First error (of $0) was: $1",
-              partition_create_ops.errors().size(), err.second));
-        }
-      }
-    }
-  }
-
-  // 3. Move all tmp files
-  HdfsOperationSet move_ops(&filesystem_connection_cache);
-  HdfsOperationSet dir_deletion_ops(&filesystem_connection_cache);
-
-  for (FileMoveMap::value_type& move: files_to_move_) {
-    // Empty destination means delete, so this is a directory. These get deleted in a
-    // separate pass to ensure that we have moved all the contents of the directory first.
-    if (move.second.empty()) {
-      VLOG_ROW << "Deleting file: " << move.first;
-      dir_deletion_ops.Add(DELETE, move.first);
-    } else {
-      VLOG_ROW << "Moving tmp file: " << move.first << " to " << move.second;
-      if (FilesystemsMatch(move.first.c_str(), move.second.c_str())) {
-        move_ops.Add(RENAME, move.first, move.second);
-      } else {
-        move_ops.Add(MOVE, move.first, move.second);
-      }
-    }
-  }
-
-  {
-    SCOPED_TIMER(ADD_CHILD_TIMER(query_profile_, "FileMoveTimer", "FinalizationTimer"));
-    if (!move_ops.Execute(ExecEnv::GetInstance()->hdfs_op_thread_pool(), false)) {
-      stringstream ss;
-      ss << "Error(s) moving partition files. First error (of "
-         << move_ops.errors().size() << ") was: " << move_ops.errors()[0].second;
-      return Status(ss.str());
-    }
-  }
-
-  // 4. Delete temp directories
-  {
-    SCOPED_TIMER(ADD_CHILD_TIMER(query_profile_, "FileDeletionTimer",
-         "FinalizationTimer"));
-    if (!dir_deletion_ops.Execute(ExecEnv::GetInstance()->hdfs_op_thread_pool(), false)) {
-      stringstream ss;
-      ss << "Error(s) deleting staging directories. First error (of "
-         << dir_deletion_ops.errors().size() << ") was: "
-         << dir_deletion_ops.errors()[0].second;
-      return Status(ss.str());
-    }
-  }
-
-  // 5. Optionally update the permissions of the created partition directories
-  // Do this last so that we don't make a dir unwritable before we write to it.
-  if (FLAGS_insert_inherit_permissions) {
-    HdfsOperationSet chmod_ops(&filesystem_connection_cache);
-    for (const PermissionCache::value_type& perm: permissions_cache) {
-      bool new_dir = perm.second.first;
-      if (new_dir) {
-        short permissions = perm.second.second;
-        VLOG_QUERY << "INSERT created new directory: " << perm.first
-                   << ", inherited permissions are: " << oct << permissions;
-        chmod_ops.Add(CHMOD, perm.first, permissions);
-      }
-    }
-    if (!chmod_ops.Execute(ExecEnv::GetInstance()->hdfs_op_thread_pool(), false)) {
-      stringstream ss;
-      ss << "Error(s) setting permissions on newly created partition directories. First"
-         << " error (of " << chmod_ops.errors().size() << ") was: "
-         << chmod_ops.errors()[0].second;
-      return Status(ss.str());
-    }
-  }
-
-  return Status::OK();
-}
-
-Status Coordinator::FinalizeQuery() {
+Status Coordinator::FinalizeHdfsDml() {
   // All instances must have reported their final statuses before finalization, which is a
   // post-condition of Wait. If the query was not successful, still try to clean up the
   // staging directory.
   DCHECK(has_called_wait_);
-  DCHECK(needs_finalization_);
+  DCHECK(finalize_params() != nullptr);
+  bool is_transactional = finalize_params()->__isset.write_id;
 
-  VLOG_QUERY << "Finalizing query: " << query_id();
+  VLOG_QUERY << "Finalizing query: " << PrintId(query_id());
   SCOPED_TIMER(finalization_timer_);
-  Status return_status = GetStatus();
+  Status return_status = UpdateExecState(Status::OK(), nullptr, FLAGS_hostname);
   if (return_status.ok()) {
-    return_status = FinalizeSuccessfulInsert();
+    HdfsTableDescriptor* hdfs_table;
+    DCHECK(query_ctx().__isset.desc_tbl_serialized);
+    RETURN_IF_ERROR(DescriptorTbl::CreateHdfsTblDescriptor(
+            query_ctx().desc_tbl_serialized, finalize_params()->table_id, obj_pool(),
+            &hdfs_table));
+    DCHECK(hdfs_table != nullptr)
+        << "INSERT target table not known in descriptor table: "
+        << finalize_params()->table_id;
+    // There is no need for finalization for transactional inserts.
+    if (!is_transactional) {
+      // 'write_id' is NOT set, therefore we need to do some finalization, e.g. moving
+      // files or delete old files in case of INSERT OVERWRITE.
+      return_status = dml_exec_state_.FinalizeHdfsInsert(*finalize_params(),
+          query_ctx().client_request.query_options.s3_skip_insert_staging,
+          hdfs_table, query_profile_);
+    }
+    hdfs_table->ReleaseResources();
+  } else if (is_transactional) {
+    parent_request_state_->AbortTransaction();
   }
 
   stringstream staging_dir;
-  DCHECK(finalize_params_.__isset.staging_dir);
-  staging_dir << finalize_params_.staging_dir << "/" << PrintId(query_id(),"_") << "/";
+  DCHECK(finalize_params()->__isset.staging_dir);
+  staging_dir << finalize_params()->staging_dir << "/" << PrintId(query_id(),"_") << "/";
 
   hdfsFS hdfs_conn;
   RETURN_IF_ERROR(HdfsFsCache::instance()->GetConnection(staging_dir.str(), &hdfs_conn));
@@ -783,236 +696,260 @@ Status Coordinator::FinalizeQuery() {
   return return_status;
 }
 
-Status Coordinator::WaitForBackendCompletion() {
-  unique_lock<mutex> l(lock_);
-  while (num_remaining_backends_ > 0 && query_status_.ok()) {
-    VLOG_QUERY << "Coordinator waiting for backends to finish, "
-               << num_remaining_backends_ << " remaining";
-    backend_completion_cv_.Wait(l);
+void Coordinator::WaitForBackends() {
+  int32_t num_remaining = backend_exec_complete_barrier_->pending();
+  if (num_remaining > 0) {
+    VLOG_QUERY << "Coordinator waiting for backends to finish, " << num_remaining
+               << " remaining. query_id=" << PrintId(query_id());
+    backend_exec_complete_barrier_->Wait();
   }
-  if (query_status_.ok()) {
-    VLOG_QUERY << "All backends finished successfully.";
-  } else {
-    VLOG_QUERY << "All backends finished due to one or more errors. "
-               << query_status_.GetDetail();
-  }
-
-  return query_status_;
 }
 
 Status Coordinator::Wait() {
-  lock_guard<mutex> l(wait_lock_);
+  lock_guard<SpinLock> l(wait_lock_);
   SCOPED_TIMER(query_profile_->total_time_counter());
   if (has_called_wait_) return Status::OK();
   has_called_wait_ = true;
 
   if (stmt_type_ == TStmtType::QUERY) {
     DCHECK(coord_instance_ != nullptr);
-    return UpdateStatus(coord_instance_->WaitForOpen(), FLAGS_hostname, true,
-        runtime_state()->fragment_instance_id());
+    return UpdateExecState(coord_instance_->WaitForOpen(),
+        &coord_instance_->runtime_state()->fragment_instance_id(), FLAGS_hostname);
   }
-
   DCHECK_EQ(stmt_type_, TStmtType::DML);
-  // Query finalization can only happen when all backends have reported
-  // relevant state. They only have relevant state to report in the parallel
-  // INSERT case, otherwise all the relevant state is from the coordinator
-  // fragment which will be available after Open() returns.
-  // Ignore the returned status if finalization is required., since FinalizeQuery() will
-  // pick it up and needs to execute regardless.
-  Status status = WaitForBackendCompletion();
-  if (!needs_finalization_ && !status.ok()) return status;
-
-  // Execution of query fragments has finished. We don't need to hold onto query execution
-  // resources while we finalize the query.
-  ReleaseExecResources();
-  // Query finalization is required only for HDFS table sinks
-  if (needs_finalization_) RETURN_IF_ERROR(FinalizeQuery());
-  // Release admission control resources after we'd done the potentially heavyweight
-  // finalization.
-  ReleaseAdmissionControlResources();
-
+  // DML finalization can only happen when all backends have completed all side-effects
+  // and reported relevant state.
+  WaitForBackends();
+  if (finalize_params() != nullptr) {
+    RETURN_IF_ERROR(UpdateExecState(
+            FinalizeHdfsDml(), nullptr, FLAGS_hostname));
+  }
+  // DML requests are finished at this point.
+  RETURN_IF_ERROR(SetNonErrorTerminalState(ExecState::RETURNED_RESULTS));
   query_profile_->AddInfoString(
-      "DML Stats", DataSink::OutputDmlStats(per_partition_status_, "\n"));
-  // For DML queries, when Wait is done, the query is complete.
-  ComputeQuerySummary();
-  return status;
-}
-
-Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos) {
-  VLOG_ROW << "GetNext() query_id=" << query_id();
-  DCHECK(has_called_wait_);
-  SCOPED_TIMER(query_profile_->total_time_counter());
-
-  if (returned_all_results_) {
-    // May be called after the first time we set *eos. Re-set *eos and return here;
-    // already torn-down coord_sink_ so no more work to do.
-    *eos = true;
-    return Status::OK();
-  }
-
-  DCHECK(coord_sink_ != nullptr)
-      << "GetNext() called without result sink. Perhaps Prepare() failed and was not "
-      << "checked?";
-  Status status = coord_sink_->GetNext(runtime_state(), results, max_rows, eos);
-
-  // if there was an error, we need to return the query's error status rather than
-  // the status we just got back from the local executor (which may well be CANCELLED
-  // in that case).  Coordinator fragment failed in this case so we log the query_id.
-  RETURN_IF_ERROR(UpdateStatus(status, FLAGS_hostname, true,
-      runtime_state()->fragment_instance_id()));
-
-  if (*eos) {
-    returned_all_results_ = true;
-    // release query execution resources here, since we won't be fetching more result rows
-    ReleaseExecResources();
-    // wait for all backends to complete before computing the summary
-    // TODO: relocate this so GetNext() won't have to wait for backends to complete?
-    RETURN_IF_ERROR(WaitForBackendCompletion());
-    // Release admission control resources after backends are finished.
-    ReleaseAdmissionControlResources();
-    // if the query completed successfully, compute the summary
-    if (query_status_.ok()) ComputeQuerySummary();
-  }
-
+      "DML Stats", dml_exec_state_.OutputPartitionStats("\n"));
   return Status::OK();
 }
 
-void Coordinator::Cancel(const Status* cause) {
-  lock_guard<mutex> l(lock_);
-  // if the query status indicates an error, cancellation has already been initiated;
-  // prevent others from cancelling a second time
-  if (!query_status_.ok()) return;
+Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos,
+    int64_t block_on_wait_time_us) {
+  VLOG_ROW << "GetNext() query_id=" << PrintId(query_id());
+  DCHECK(has_called_wait_);
+  SCOPED_TIMER(query_profile_->total_time_counter());
 
-  // TODO: This should default to OK(), not CANCELLED if there is no cause (or callers
-  // should explicitly pass Status::OK()). Fragment instances may be cancelled at the end
-  // of a successful query. Need to clean up relationship between query_status_ here and
-  // in QueryExecState. See IMPALA-4279.
-  query_status_ = (cause != nullptr && !cause->ok()) ? *cause : Status::CANCELLED;
-  CancelInternal();
+  if (ReturnedAllResults()) {
+    // Nothing left to do: already in a terminal state and no more results.
+    *eos = true;
+    return Status::OK();
+  }
+  DCHECK(coord_instance_ != nullptr) << "Exec() should be called first";
+  DCHECK(coord_sink_ != nullptr)     << "Exec() should be called first";
+  RuntimeState* runtime_state = coord_instance_->runtime_state();
+
+  // If FETCH_ROWS_TIMEOUT_MS is 0, then the timeout passed to PlanRootSink::GetNext()
+  // should be 0 as well so that the method waits for rows indefinitely.
+  // If the first row has been fetched, then set the timeout to FETCH_ROWS_TIMEOUT_MS. If
+  // the first row has not been fetched, then it is possible the client spent time
+  // waiting for the query to 'finish' before issuing a GetNext() request.
+  int64_t timeout_us;
+  if (parent_request_state_->fetch_rows_timeout_us() == 0) {
+    timeout_us = 0;
+  } else {
+    timeout_us = !first_row_fetched_ ?
+        max(static_cast<int64_t>(1),
+            parent_request_state_->fetch_rows_timeout_us() - block_on_wait_time_us) :
+        parent_request_state_->fetch_rows_timeout_us();
+  }
+
+  Status status = coord_sink_->GetNext(runtime_state, results, max_rows, eos, timeout_us);
+  if (!first_row_fetched_ && results->size() > 0) {
+    query_events_->MarkEvent("First row fetched");
+    first_row_fetched_ = true;
+  }
+  RETURN_IF_ERROR(UpdateExecState(
+          status, &runtime_state->fragment_instance_id(), FLAGS_hostname));
+  if (*eos) RETURN_IF_ERROR(SetNonErrorTerminalState(ExecState::RETURNED_RESULTS));
+  return Status::OK();
 }
 
-void Coordinator::CancelInternal() {
-  VLOG_QUERY << "Cancel() query_id=" << query_id();
-  // TODO: remove when restructuring cancellation, which should happen automatically
-  // as soon as the coordinator knows that the query is finished
-  DCHECK(!query_status_.ok());
+void Coordinator::Cancel() {
+  // Illegal to call Cancel() before Exec() returns, so there's no danger of the cancel
+  // RPC passing the exec RPC.
+  DCHECK_LE(exec_rpcs_complete_barrier_.pending(), 0) << "Exec() must be called first";
+  discard_result(SetNonErrorTerminalState(ExecState::CANCELLED));
+  // CancelBackends() is called for all transitions into a terminal state except
+  // for RETURNED_RESULTS. We need to call it now because after Cancel() is called
+  // the coordinator is not guaranteed to get UpdateBackendExecStatus() calls, and
+  // so we need to unblock the backend_exec_complete_barrier_.
+  // TODO: Remove this once IMPALA-6984 is fixed. It won't be necessary since
+  // CancelBackends() will be called when transitioning to RETURNED_RESULTS.
+  if (ReturnedAllResults()) CancelBackends();
+}
 
+void Coordinator::CancelBackends() {
   int num_cancelled = 0;
   for (BackendState* backend_state: backend_states_) {
     DCHECK(backend_state != nullptr);
     if (backend_state->Cancel()) ++num_cancelled;
   }
+  backend_exec_complete_barrier_->NotifyRemaining();
+
   VLOG_QUERY << Substitute(
       "CancelBackends() query_id=$0, tried to cancel $1 backends",
       PrintId(query_id()), num_cancelled);
-  backend_completion_cv_.NotifyAll();
-
-  ReleaseExecResourcesLocked();
-  ReleaseAdmissionControlResourcesLocked();
-  // Report the summary with whatever progress the query made before being cancelled.
-  ComputeQuerySummary();
 }
 
-Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& params) {
-  VLOG_FILE << "UpdateBackendExecStatus()  backend_idx=" << params.coord_state_idx;
-  if (params.coord_state_idx >= backend_states_.size()) {
+Status Coordinator::UpdateBackendExecStatus(const ReportExecStatusRequestPB& request,
+    const TRuntimeProfileForest& thrift_profiles) {
+  const int32_t coord_state_idx = request.coord_state_idx();
+  VLOG_FILE << "UpdateBackendExecStatus() query_id=" << PrintId(query_id())
+            << " backend_idx=" << coord_state_idx;
+
+  if (coord_state_idx >= backend_states_.size()) {
     return Status(TErrorCode::INTERNAL_ERROR,
         Substitute("Unknown backend index $0 (max known: $1)",
-            params.coord_state_idx, backend_states_.size() - 1));
+            coord_state_idx, backend_states_.size() - 1));
   }
-  BackendState* backend_state = backend_states_[params.coord_state_idx];
-  // TODO: return here if returned_all_results_?
-  // TODO: return CANCELLED in that case? Although that makes the cancellation propagation
-  // path more irregular.
+  BackendState* backend_state = backend_states_[coord_state_idx];
 
-  // TODO: only do this when the sink is done; probably missing a done field
-  // in TReportExecStatus for that
-  if (params.__isset.insert_exec_status) {
-    UpdateInsertExecStatus(params.insert_exec_status);
+  if (thrift_profiles.__isset.host_profile) {
+    backend_state->UpdateHostProfile(thrift_profiles.host_profile);
   }
 
-  if (backend_state->ApplyExecStatusReport(params, &exec_summary_, &progress_)) {
-    // This report made this backend done, so update the status and
-    // num_remaining_backends_.
-
-    // for now, abort the query if we see any error except if returned_all_results_ is
-    // true (UpdateStatus() initiates cancellation, if it hasn't already been)
-    // TODO: clarify control flow here, it's unclear we should even process this status
-    // report if returned_all_results_ is true
+  if (backend_state->ApplyExecStatusReport(request, thrift_profiles, &exec_summary_,
+          &progress_, &dml_exec_state_)) {
+    // This backend execution has completed.
+    if (VLOG_QUERY_IS_ON) {
+      // Don't log backend completion if the query has already been cancelled.
+      int pending_backends = backend_exec_complete_barrier_->pending();
+      if (pending_backends >= 1) {
+        VLOG_QUERY << "Backend completed:"
+                   << " host=" << TNetworkAddressToString(backend_state->impalad_address())
+                   << " remaining=" << pending_backends
+                   << " query_id=" << PrintId(query_id());
+        BackendState::LogFirstInProgress(backend_states_);
+      }
+    }
     bool is_fragment_failure;
     TUniqueId failed_instance_id;
     Status status = backend_state->GetStatus(&is_fragment_failure, &failed_instance_id);
-    if (!status.ok() && !returned_all_results_) {
-      Status ignored =
-          UpdateStatus(status, TNetworkAddressToString(backend_state->impalad_address()),
-              is_fragment_failure, failed_instance_id);
-      return Status::OK();
-    }
+    if (!status.ok()) {
+      // We may start receiving status reports before all exec rpcs are complete.
+      // Can't apply state transition until no more exec rpcs will be sent.
+      exec_rpcs_complete_barrier_.Wait();
 
-    lock_guard<mutex> l(lock_);
-    DCHECK_GT(num_remaining_backends_, 0);
-    if (VLOG_QUERY_IS_ON && num_remaining_backends_ > 1) {
-      VLOG_QUERY << "Backend completed: "
-          << " host=" << backend_state->impalad_address()
-          << " remaining=" << num_remaining_backends_ - 1;
-      BackendState::LogFirstInProgress(backend_states_);
+      // Iterate through all instance exec statuses, and use each fragment's AuxErrorInfo
+      // to possibly blacklist any "faulty" nodes.
+      UpdateBlacklistWithAuxErrorInfo(request);
+
+      // Transition the status if we're not already in a terminal state. This won't block
+      // because either this transitions to an ERROR state or the query is already in
+      // a terminal state.
+      discard_result(UpdateExecState(status,
+              is_fragment_failure ? &failed_instance_id : nullptr,
+              TNetworkAddressToString(backend_state->impalad_address())));
     }
-    if (--num_remaining_backends_ == 0 || !status.ok()) {
-      backend_completion_cv_.NotifyAll();
+    // We've applied all changes from the final status report - notify waiting threads.
+    discard_result(backend_exec_complete_barrier_->Notify());
+
+    // Mark backend_state as closed and release the backend_state's resources if
+    // necessary.
+    vector<BackendState*> releasable_backends;
+    backend_resource_state_->MarkBackendFinished(backend_state, &releasable_backends);
+    if (!releasable_backends.empty()) {
+      ReleaseBackendAdmissionControlResources(releasable_backends);
+      backend_resource_state_->BackendsReleased(releasable_backends);
+      for (int i = 0; i < releasable_backends.size(); ++i) {
+        backend_released_barrier_.Notify();
+      }
     }
-    return Status::OK();
+    num_completed_backends_->Add(1);
   }
-  // If all results have been returned, return a cancelled status to force the fragment
+  // If query execution has terminated, return a cancelled status to force the fragment
   // instance to stop executing.
-  if (returned_all_results_) return Status::CANCELLED;
-
-  return Status::OK();
+  return IsExecuting() ? Status::OK() : Status::CANCELLED;
 }
 
-void Coordinator::UpdateInsertExecStatus(const TInsertExecStatus& insert_exec_status) {
-  lock_guard<mutex> l(lock_);
-  for (const PartitionStatusMap::value_type& partition:
-       insert_exec_status.per_partition_status) {
-    TInsertPartitionStatus* status = &(per_partition_status_[partition.first]);
-    status->__set_num_modified_rows(
-        status->num_modified_rows + partition.second.num_modified_rows);
-    status->__set_kudu_latest_observed_ts(std::max(
-        partition.second.kudu_latest_observed_ts, status->kudu_latest_observed_ts));
-    status->__set_id(partition.second.id);
-    status->__set_partition_base_dir(partition.second.partition_base_dir);
+void Coordinator::UpdateBlacklistWithAuxErrorInfo(
+    const ReportExecStatusRequestPB& request) {
+  // If the Backend failed due to a RPC failure, blacklist the destination node of
+  // the failed RPC. Only blacklist one node per ReportExecStatusRequestPB to avoid
+  // blacklisting nodes too aggressively. Currently, only blacklist the first node
+  // that contains a valid RPCErrorInfoPB object.
+  for (auto instance_exec_status : request.instance_exec_status()) {
+    if (instance_exec_status.has_aux_error_info()
+        && instance_exec_status.aux_error_info().has_rpc_error_info()) {
+      RPCErrorInfoPB rpc_error_info =
+          instance_exec_status.aux_error_info().rpc_error_info();
+      DCHECK(rpc_error_info.has_dest_node());
+      DCHECK(rpc_error_info.has_posix_error_code());
+      const NetworkAddressPB& dest_node = rpc_error_info.dest_node();
 
-    if (partition.second.__isset.stats) {
-      if (!status->__isset.stats) status->__set_stats(TInsertStats());
-      DataSink::MergeDmlStats(partition.second.stats, &status->stats);
+      auto dest_node_and_be_state =
+          addr_to_backend_state_.find(FromNetworkAddressPB(dest_node));
+
+      // If the target address of the RPC is not known to the Coordinator, it cannot
+      // be blacklisted.
+      if (dest_node_and_be_state == addr_to_backend_state_.end()) {
+        string err_msg = "Query failed due to a failed RPC to an unknown target address "
+            + NetworkAddressPBToString(dest_node);
+        DCHECK(false) << err_msg;
+        LOG(ERROR) << err_msg;
+        continue;
+      }
+
+      // The execution parameters of the destination node for the failed RPC.
+      const BackendExecParams* dest_node_exec_params =
+          dest_node_and_be_state->second->exec_params();
+
+      // The Coordinator for the query should never be blacklisted.
+      if (dest_node_exec_params->is_coord_backend) {
+        VLOG_QUERY << "Query failed due to a failed RPC to the Coordinator";
+        continue;
+      }
+
+      // A set of RPC related posix error codes that should cause the target node
+      // of the failed RPC to be blacklisted.
+      static const set<int32_t> blacklistable_rpc_error_codes = {
+          ENOTCONN, // 107: Transport endpoint is not connected
+          ESHUTDOWN, // 108: Cannot send after transport endpoint shutdown
+          ECONNREFUSED  // 111: Connection refused
+      };
+
+      if (blacklistable_rpc_error_codes.find(rpc_error_info.posix_error_code())
+          != blacklistable_rpc_error_codes.end()) {
+        LOG(INFO) << "Blacklisting " << NetworkAddressPBToString(dest_node)
+                  << " because a RPC to it failed.";
+        ExecEnv::GetInstance()->cluster_membership_mgr()->BlacklistExecutor(
+            dest_node_exec_params->be_desc);
+        break;
+      }
     }
   }
-  files_to_move_.insert(
-      insert_exec_status.files_to_move.begin(), insert_exec_status.files_to_move.end());
 }
 
-
-uint64_t Coordinator::GetLatestKuduInsertTimestamp() const {
-  uint64_t max_ts = 0;
-  for (const auto& entry : per_partition_status_) {
-    max_ts = std::max(max_ts,
-        static_cast<uint64_t>(entry.second.kudu_latest_observed_ts));
+int64_t Coordinator::GetMaxBackendStateLagMs(TNetworkAddress* address) {
+  if (exec_rpcs_complete_barrier_.pending() > 0) {
+    // Exec() hadn't completed for all the backends, so we can't rely on
+    // 'last_report_time_ms_' being set yet.
+    return 0;
   }
-  return max_ts;
-}
-
-RuntimeState* Coordinator::runtime_state() {
-  return coord_instance_ == nullptr ? nullptr : coord_instance_->runtime_state();
-}
-
-bool Coordinator::PrepareCatalogUpdate(TUpdateCatalogRequest* catalog_update) {
-  // Assume we are called only after all fragments have completed
-  DCHECK(has_called_wait_);
-
-  for (const PartitionStatusMap::value_type& partition: per_partition_status_) {
-    catalog_update->created_partitions.insert(partition.first);
+  DCHECK_GT(backend_states_.size(), 0);
+  int64_t current_time = BackendState::GenerateReportTimestamp();
+  int64_t min_last_report_time_ms = current_time;
+  BackendState* min_state = nullptr;
+  for (BackendState* backend_state : backend_states_) {
+    if (backend_state->IsDone()) continue;
+    int64_t last_report_time_ms = backend_state->last_report_time_ms();
+    DCHECK_GT(last_report_time_ms, 0);
+    if (last_report_time_ms < min_last_report_time_ms) {
+      min_last_report_time_ms = last_report_time_ms;
+      min_state = backend_state;
+    }
   }
-
-  return catalog_update->created_partitions.size() != 0;
+  if (min_state == nullptr) return 0;
+  *address = min_state->krpc_impalad_address();
+  return current_time - min_last_report_time_ms;
 }
 
 // TODO: add histogram/percentile
@@ -1034,82 +971,164 @@ void Coordinator::ComputeQuerySummary() {
     fragment_stats->AddExecStats();
   }
 
-  stringstream info;
+  stringstream mem_info, cpu_user_info, cpu_system_info, bytes_read_info;
+  ResourceUtilization total_utilization;
   for (BackendState* backend_state: backend_states_) {
-    info << backend_state->impalad_address() << "("
-         << PrettyPrinter::Print(backend_state->GetPeakConsumption(), TUnit::BYTES)
-         << ") ";
+    ResourceUtilization utilization = backend_state->ComputeResourceUtilization();
+    total_utilization.Merge(utilization);
+    string network_address = TNetworkAddressToString(
+        backend_state->impalad_address());
+    mem_info << network_address << "("
+             << PrettyPrinter::Print(utilization.peak_per_host_mem_consumption,
+                 TUnit::BYTES) << ") ";
+    bytes_read_info << network_address << "("
+                    << PrettyPrinter::Print(utilization.bytes_read, TUnit::BYTES) << ") ";
+    cpu_user_info << network_address << "("
+                  << PrettyPrinter::Print(utilization.cpu_user_ns, TUnit::TIME_NS)
+                  << ") ";
+    cpu_system_info << network_address << "("
+                    << PrettyPrinter::Print(utilization.cpu_sys_ns, TUnit::TIME_NS)
+                    << ") ";
   }
-  query_profile_->AddInfoString("Per Node Peak Memory Usage", info.str());
+
+  // The definitions of these counters are in the top of this file.
+  COUNTER_SET(PROFILE_TotalBytesRead.Instantiate(query_profile_),
+      total_utilization.bytes_read);
+  COUNTER_SET(PROFILE_TotalCpuTime.Instantiate(query_profile_),
+      total_utilization.cpu_user_ns + total_utilization.cpu_sys_ns);
+  COUNTER_SET(PROFILE_TotalBytesSent.Instantiate(query_profile_),
+      total_utilization.scan_bytes_sent + total_utilization.exchange_bytes_sent);
+  COUNTER_SET(PROFILE_TotalScanBytesSent.Instantiate(query_profile_),
+      total_utilization.scan_bytes_sent);
+  COUNTER_SET(PROFILE_TotalInnerBytesSent.Instantiate(query_profile_),
+      total_utilization.exchange_bytes_sent);
+
+  double xchg_scan_ratio = 0;
+  if (total_utilization.bytes_read > 0) {
+    xchg_scan_ratio =
+        (double)total_utilization.scan_bytes_sent / total_utilization.bytes_read;
+  }
+  COUNTER_SET(PROFILE_ExchangeScanRatio.Instantiate(query_profile_), xchg_scan_ratio);
+
+  double inner_node_ratio = 0;
+  if (total_utilization.scan_bytes_sent > 0) {
+    inner_node_ratio =
+        (double)total_utilization.exchange_bytes_sent / total_utilization.scan_bytes_sent;
+  }
+  COUNTER_SET(PROFILE_InnerNodeSelectivityRatio.Instantiate(query_profile_),
+      inner_node_ratio);
+
+  // TODO(IMPALA-8126): Move to host profiles
+  query_profile_->AddInfoString("Per Node Peak Memory Usage", mem_info.str());
+  query_profile_->AddInfoString("Per Node Bytes Read", bytes_read_info.str());
+  query_profile_->AddInfoString("Per Node User Time", cpu_user_info.str());
+  query_profile_->AddInfoString("Per Node System Time", cpu_system_info.str());
 }
 
 string Coordinator::GetErrorLog() {
   ErrorLogMap merged;
-  for (BackendState* state: backend_states_) {
-    state->MergeErrorLog(&merged);
+  {
+    lock_guard<SpinLock> l(backend_states_init_lock_);
+    for (BackendState* state: backend_states_) state->MergeErrorLog(&merged);
   }
   return PrintErrorMapToString(merged);
 }
 
 void Coordinator::ReleaseExecResources() {
-  lock_guard<mutex> l(lock_);
-  ReleaseExecResourcesLocked();
-}
-
-void Coordinator::ReleaseExecResourcesLocked() {
-  if (released_exec_resources_) return;
-  released_exec_resources_ = true;
-  if (filter_routing_table_.size() > 0) {
+  lock_guard<shared_mutex> lock(filter_routing_table_->lock); // Exclusive lock.
+  if (filter_routing_table_->num_filters() > 0) {
     query_profile_->AddInfoString("Final filter table", FilterDebugString());
   }
 
-  {
-    lock_guard<SpinLock> l(filter_lock_);
-    for (auto& filter : filter_routing_table_) {
-      FilterState* state = &filter.second;
-      state->Disable(filter_mem_tracker_);
-    }
+  for (auto& filter : filter_routing_table_->id_to_filter) {
+    FilterState* state = &filter.second;
+    state->Disable(filter_mem_tracker_);
   }
   // This may be NULL while executing UDFs.
   if (filter_mem_tracker_ != nullptr) filter_mem_tracker_->Close();
-  // Need to protect against failed Prepare(), where root_sink() would not be set.
-  if (coord_sink_ != nullptr) coord_sink_->CloseConsumer();
-  // Now that we've released our own resources, can release query-wide resources.
-  if (query_state_ != nullptr) query_state_->ReleaseExecResourceRefcount();
   // At this point some tracked memory may still be used in the coordinator for result
   // caching. The query MemTracker will be cleaned up later.
 }
 
-void Coordinator::ReleaseAdmissionControlResources() {
-  lock_guard<mutex> l(lock_);
-  ReleaseAdmissionControlResourcesLocked();
-}
-
-void Coordinator::ReleaseAdmissionControlResourcesLocked() {
-  if (released_admission_control_resources_) return;
-  LOG(INFO) << "Release admssion control resources for query "
-            << PrintId(query_ctx_.query_id);
+void Coordinator::ReleaseQueryAdmissionControlResources() {
+  vector<BackendState*> unreleased_backends =
+      backend_resource_state_->CloseAndGetUnreleasedBackends();
+  if (!unreleased_backends.empty()) {
+    ReleaseBackendAdmissionControlResources(unreleased_backends);
+    backend_resource_state_->BackendsReleased(unreleased_backends);
+    for (int i = 0; i < unreleased_backends.size(); ++i) {
+      backend_released_barrier_.Notify();
+    }
+  }
+  // Wait for all backends to be released before calling
+  // AdmissionController::ReleaseQuery.
+  backend_released_barrier_.Wait();
+  LOG(INFO) << "Release admission control resources for query_id=" << PrintId(query_id());
   AdmissionController* admission_controller =
       ExecEnv::GetInstance()->admission_controller();
-  if (admission_controller != nullptr) admission_controller->ReleaseQuery(schedule_);
-  released_admission_control_resources_ = true;
+  DCHECK(admission_controller != nullptr);
+  admission_controller->ReleaseQuery(
+      schedule_, ComputeQueryResourceUtilization().peak_per_host_mem_consumption);
+  query_events_->MarkEvent("Released admission control resources");
+}
+
+void Coordinator::ReleaseBackendAdmissionControlResources(
+    const vector<BackendState*>& backend_states) {
+  AdmissionController* admission_controller =
+      ExecEnv::GetInstance()->admission_controller();
+  DCHECK(admission_controller != nullptr);
+  vector<TNetworkAddress> host_addrs;
+  for (auto backend_state : backend_states) {
+    host_addrs.push_back(backend_state->impalad_address());
+  }
+  admission_controller->ReleaseQueryBackends(schedule_, host_addrs);
+}
+
+Coordinator::ResourceUtilization Coordinator::ComputeQueryResourceUtilization() {
+  ResourceUtilization query_resource_utilization;
+  for (BackendState* backend_state: backend_states_) {
+    query_resource_utilization.Merge(backend_state->ComputeResourceUtilization());
+  }
+  return query_resource_utilization;
+}
+
+vector<TNetworkAddress> Coordinator::GetActiveBackends(
+    const vector<TNetworkAddress>& candidates) {
+  // Build set from vector so that runtime of this function is O(backend_states.size()).
+  unordered_set<TNetworkAddress> candidate_set(candidates.begin(), candidates.end());
+  vector<TNetworkAddress> result;
+  lock_guard<SpinLock> l(backend_states_init_lock_);
+  for (BackendState* backend_state : backend_states_) {
+    if (candidate_set.find(backend_state->impalad_address()) != candidate_set.end()
+        && !backend_state->IsDone()) {
+      result.push_back(backend_state->impalad_address());
+    }
+  }
+  return result;
 }
 
 void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
+  shared_lock<shared_mutex> lock(filter_routing_table_->lock);
   DCHECK_NE(filter_mode_, TRuntimeFilterMode::OFF)
       << "UpdateFilter() called although runtime filters are disabled";
-  DCHECK(exec_complete_barrier_.get() != nullptr)
+  DCHECK(backend_exec_complete_barrier_.get() != nullptr)
       << "Filters received before fragments started!";
-  exec_complete_barrier_->Wait();
-  DCHECK(filter_routing_table_complete_)
+
+  exec_rpcs_complete_barrier_.Wait();
+  DCHECK(filter_routing_table_->is_complete)
       << "Filter received before routing table complete";
 
   TPublishFilterParams rpc_params;
   unordered_set<int> target_fragment_idxs;
   {
-    lock_guard<SpinLock> l(filter_lock_);
-    FilterRoutingTable::iterator it = filter_routing_table_.find(params.filter_id);
-    if (it == filter_routing_table_.end()) {
+    lock_guard<SpinLock> l(filter_routing_table_->update_lock);
+    if (!IsExecuting()) {
+      LOG(INFO) << "Filter update received for non-executing query with id: "
+                << query_id();
+      return;
+    }
+    auto it = filter_routing_table_->id_to_filter.find(params.filter_id);
+    if (it == filter_routing_table_->id_to_filter.end()) {
       LOG(INFO) << "Could not find filter with id: " << params.filter_id;
       return;
     }
@@ -1150,9 +1169,7 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     if (state->is_bloom_filter()) {
       // Assign outgoing bloom filter.
       TBloomFilter& aggregated_filter = state->bloom_filter();
-      filter_mem_tracker_->Release(aggregated_filter.directory.size());
 
-      // TODO: Track memory used by 'rpc_params'.
       swap(rpc_params.bloom_filter, aggregated_filter);
       DCHECK(rpc_params.bloom_filter.always_false || rpc_params.bloom_filter.always_true
           || !rpc_params.bloom_filter.directory.empty());
@@ -1171,11 +1188,21 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
   rpc_params.__set_dst_query_id(query_id());
   rpc_params.__set_filter_id(params.filter_id);
 
+  // Waited for exec_rpcs_complete_barrier_ so backend_states_ is valid.
   for (BackendState* bs: backend_states_) {
     for (int fragment_idx: target_fragment_idxs) {
+      if (!IsExecuting()) goto cleanup;
       rpc_params.__set_dst_fragment_idx(fragment_idx);
       bs->PublishFilter(rpc_params);
     }
+  }
+
+cleanup:
+  // For bloom filters, the memory used in the filter_routing_table_ is transfered to
+  // rpc_params. Hence the Release() function on the filter_mem_tracker_ is called
+  // here to ensure that the MemTracker is updated after the memory is actually freed.
+  if (rpc_params.__isset.bloom_filter) {
+    filter_mem_tracker_->Release(rpc_params.bloom_filter.directory.size());
   }
 }
 
@@ -1198,7 +1225,7 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
       if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
         VLOG_QUERY << "Not enough memory to allocate filter: "
                    << PrettyPrinter::Print(heap_space, TUnit::BYTES)
-                   << " (query: " << coord->query_id() << ")";
+                   << " (query_id=" << PrintId(coord->query_id()) << ")";
         // Disable, as one missing update means a correct filter cannot be produced.
         Disable(coord->filter_mem_tracker_);
       } else {
@@ -1221,7 +1248,8 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
     } else if (min_max_filter_.always_false) {
       MinMaxFilter::Copy(params.min_max_filter, &min_max_filter_);
     } else {
-      MinMaxFilter::Or(params.min_max_filter, &min_max_filter_);
+      MinMaxFilter::Or(params.min_max_filter, &min_max_filter_,
+          ColumnType::FromThrift(desc_.src_expr.nodes[0].type));
     }
   }
 
@@ -1244,23 +1272,19 @@ void Coordinator::FilterState::Disable(MemTracker* tracker) {
   }
 }
 
-const TUniqueId& Coordinator::query_id() const {
-  return query_ctx_.query_id;
-}
-
 void Coordinator::GetTExecSummary(TExecSummary* exec_summary) {
   lock_guard<SpinLock> l(exec_summary_.lock);
   *exec_summary = exec_summary_.thrift_exec_summary;
 }
 
 MemTracker* Coordinator::query_mem_tracker() const {
-  return query_state()->query_mem_tracker();
+  return query_state_->query_mem_tracker();
 }
 
 void Coordinator::BackendsToJson(Document* doc) {
   Value states(kArrayType);
   {
-    lock_guard<mutex> l(lock_);
+    lock_guard<SpinLock> l(backend_states_init_lock_);
     for (BackendState* state : backend_states_) {
       Value val(kObjectType);
       state->ToJson(&val, doc);
@@ -1273,7 +1297,7 @@ void Coordinator::BackendsToJson(Document* doc) {
 void Coordinator::FInstanceStatsToJson(Document* doc) {
   Value states(kArrayType);
   {
-    lock_guard<mutex> l(lock_);
+    lock_guard<SpinLock> l(backend_states_init_lock_);
     for (BackendState* state : backend_states_) {
       Value val(kObjectType);
       state->InstanceStatsToJson(&val, doc);
@@ -1282,4 +1306,21 @@ void Coordinator::FInstanceStatsToJson(Document* doc) {
   }
   doc->AddMember("backend_instances", states, doc->GetAllocator());
 }
+
+const TQueryCtx& Coordinator::query_ctx() const {
+  return schedule_.request().query_ctx;
+}
+
+const TUniqueId& Coordinator::query_id() const {
+  return query_ctx().query_id;
+}
+
+const TFinalizeParams* Coordinator::finalize_params() const {
+  return schedule_.request().__isset.finalize_params
+      ? &schedule_.request().finalize_params : nullptr;
+}
+
+bool Coordinator::IsExecuting() {
+  ExecState current_state = exec_state_.Load();
+  return current_state == ExecState::EXECUTING;
 }

@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "runtime/exec-env.h"
 #include "runtime/hbase-table-factory.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.h"
@@ -53,8 +54,8 @@ HBaseTableWriter::HBaseTableWriter(HBaseTableDescriptor* table_desc,
     runtime_profile_(profile) { }
 
 Status HBaseTableWriter::Init(RuntimeState* state) {
-  RETURN_IF_ERROR(state->htable_factory()->GetTable(table_desc_->name(),
-      &table_));
+  RETURN_IF_ERROR(ExecEnv::GetInstance()->htable_factory()->GetTable(
+      table_desc_->table_name(), &table_));
   encoding_timer_ = ADD_TIMER(runtime_profile_, "EncodingTimer");
   htable_put_timer_ = ADD_TIMER(runtime_profile_, "HTablePutTimer");
 
@@ -64,7 +65,7 @@ Status HBaseTableWriter::Init(RuntimeState* state) {
         " one column in addition to the row key.");
   }
 
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   if (env == NULL) return Status("Error getting JNIEnv.");
   output_exprs_byte_sizes_.resize(num_col);
   cf_arrays_.reserve(num_col - 1);
@@ -91,7 +92,7 @@ Status HBaseTableWriter::Init(RuntimeState* state) {
 }
 
 Status HBaseTableWriter::InitJNI() {
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   if (env == NULL) return Status("Error getting JNIEnv.");
 
   RETURN_IF_ERROR(
@@ -114,7 +115,7 @@ Status HBaseTableWriter::InitJNI() {
 }
 
 Status HBaseTableWriter::AppendRows(RowBatch* batch) {
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   if (env == NULL) return Status("Error getting JNIEnv.");
 
   int limit = batch->num_rows();
@@ -200,7 +201,7 @@ Status HBaseTableWriter::AppendRows(RowBatch* batch) {
 }
 
 Status HBaseTableWriter::CleanUpJni() {
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   if (env == NULL) return Status("Error getting JNIEnv.");
 
   if (put_list_ != NULL) {

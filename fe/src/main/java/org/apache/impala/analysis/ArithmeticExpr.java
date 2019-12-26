@@ -133,17 +133,18 @@ public class ArithmeticExpr extends Expr {
   }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     if (children_.size() == 1) {
       if (op_.getPos() == OperatorPosition.UNARY_PREFIX) {
-        return op_.toString() + getChild(0).toSql();
+        return op_.toString() + getChild(0).toSql(options);
       } else {
         assert(op_.getPos() == OperatorPosition.UNARY_POSTFIX);
-        return getChild(0).toSql() + op_.toString();
+        return getChild(0).toSql(options) + op_.toString();
       }
     } else {
       Preconditions.checkState(children_.size() == 2);
-      return getChild(0).toSql() + " " + op_.toString() + " " + getChild(1).toSql();
+      return getChild(0).toSql(options) + " " + op_.toString() + " "
+          + getChild(1).toSql(options);
     }
   }
 
@@ -214,7 +215,7 @@ public class ArithmeticExpr extends Expr {
           throw new AnalysisException("Invalid non-integer argument to operation '" +
               op_.toString() + "': " + this.toSql());
         }
-        type_ = Type.getAssignmentCompatibleType(t0, t1, false);
+        type_ = Type.getAssignmentCompatibleType(t0, t1, false, false);
         // If both of the children are null, we'll default to the INT version of the
         // operator. This prevents the BE from seeing NULL_TYPE.
         if (type_.isNull()) type_ = Type.INT;
@@ -236,7 +237,7 @@ public class ArithmeticExpr extends Expr {
         fn_ = getBuiltinFunction(analyzer, op_.getName(), collectChildReturnTypes(),
             CompareMode.IS_SUPERTYPE_OF);
         Preconditions.checkNotNull(fn_);
-        castForFunctionCall(false);
+        castForFunctionCall(false, analyzer.isDecimalV2());
         type_ = fn_.getReturnType();
         return;
       default:

@@ -20,11 +20,13 @@ package org.apache.impala.planner;
 import java.util.List;
 
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TSinkAction;
+import org.apache.impala.thrift.TSortingOrder;
 
 import com.google.common.base.Preconditions;
 
@@ -73,13 +75,17 @@ public abstract class TableSink extends DataSink {
   }
 
   // Table which is to be populated by this sink.
-  protected final Table targetTable_;
+  protected final FeTable targetTable_;
   // The type of operation to be performed by this sink.
   protected final Op sinkOp_;
+  // One expression per result column for the query. Always non-null.
+  protected final List<Expr> outputExprs_;
 
-  public TableSink(Table targetTable, Op sinkAction) {
+  public TableSink(FeTable targetTable, Op sinkAction, List<Expr> outputExprs) {
+    Preconditions.checkState(outputExprs != null);
     targetTable_ = targetTable;
     sinkOp_ = sinkAction;
+    outputExprs_ = outputExprs;
   }
 
   /**
@@ -87,23 +93,37 @@ public abstract class TableSink extends DataSink {
    * Not all Ops are supported for all tables.
    * All parameters must be non-null, the lists in particular need to be empty if they
    * don't make sense for a certain table type.
-   * For HDFS tables 'sortColumns' specifies the indices into the list of non-clustering
-   * columns of the target table that are stored in the 'sort.columns' table property.
+   * For HDFS tables 'sortProperties' specifies two things, the indices into the list of
+   * non-clustering columns of the target table that are stored in the 'sort.columns'
+   * table property, and the sorting order.
    */
-  public static TableSink create(Table table, Op sinkAction,
-      List<Expr> partitionKeyExprs,  List<Integer> referencedColumns,
-      boolean overwrite, boolean inputIsClustered, List<Integer> sortColumns) {
+  public static TableSink create(FeTable table, Op sinkAction,
+      List<Expr> partitionKeyExprs, List<Expr> outputExprs,
+      List<Integer> referencedColumns, boolean overwrite,
+      boolean inputIsClustered, Pair<List<Integer>, TSortingOrder> sortProperties) {
+    return create(table, sinkAction, partitionKeyExprs, outputExprs, referencedColumns,
+        overwrite, inputIsClustered, sortProperties, -1);
+  }
+
+  /**
+   * Same as above, plus it takes an ACID write id in parameter 'writeId'.
+   */
+  public static TableSink create(FeTable table, Op sinkAction,
+      List<Expr> partitionKeyExprs, List<Expr> outputExprs,
+      List<Integer> referencedColumns,
+      boolean overwrite, boolean inputIsClustered,
+      Pair<List<Integer>, TSortingOrder> sortProperties, long writeId) {
     Preconditions.checkNotNull(partitionKeyExprs);
     Preconditions.checkNotNull(referencedColumns);
-    Preconditions.checkNotNull(sortColumns);
-    if (table instanceof HdfsTable) {
+    Preconditions.checkNotNull(sortProperties.first);
+    if (table instanceof FeFsTable) {
       // Hdfs only supports inserts.
       Preconditions.checkState(sinkAction == Op.INSERT);
       // Referenced columns don't make sense for an Hdfs table.
       Preconditions.checkState(referencedColumns.isEmpty());
-      return new HdfsTableSink(table, partitionKeyExprs, overwrite, inputIsClustered,
-          sortColumns);
-    } else if (table instanceof HBaseTable) {
+      return new HdfsTableSink(table, partitionKeyExprs,outputExprs, overwrite,
+          inputIsClustered, sortProperties, writeId);
+    } else if (table instanceof FeHBaseTable) {
       // HBase only supports inserts.
       Preconditions.checkState(sinkAction == Op.INSERT);
       // Partition clause doesn't make sense for an HBase table.
@@ -113,15 +133,15 @@ public abstract class TableSink extends DataSink {
       // Referenced columns don't make sense for an HBase table.
       Preconditions.checkState(referencedColumns.isEmpty());
       // Sort columns are not supported for HBase tables.
-      Preconditions.checkState(sortColumns.isEmpty());
+      Preconditions.checkState(sortProperties.first.isEmpty());
       // Create the HBaseTableSink and return it.
-      return new HBaseTableSink(table);
-    } else if (table instanceof KuduTable) {
+      return new HBaseTableSink(table, outputExprs);
+    } else if (table instanceof FeKuduTable) {
       // Kudu doesn't have a way to perform INSERT OVERWRITE.
       Preconditions.checkState(overwrite == false);
       // Sort columns are not supported for Kudu tables.
-      Preconditions.checkState(sortColumns.isEmpty());
-      return new KuduTableSink(table, sinkAction, referencedColumns);
+      Preconditions.checkState(sortProperties.first.isEmpty());
+      return new KuduTableSink(table, sinkAction, referencedColumns, outputExprs);
     } else {
       throw new UnsupportedOperationException(
           "Cannot create data sink into table of type: " + table.getClass().getName());

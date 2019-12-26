@@ -18,12 +18,20 @@
 import pytest
 from subprocess import check_call
 
+from tests.common.environ import ImpalaTestClusterProperties
+from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
+    SkipIfLocal, SkipIfCatalogV2)
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
+from CatalogObjects.ttypes import THdfsCompression
+
+
+IMPALA_TEST_CLUSTER_PROPERTIES = ImpalaTestClusterProperties.get_instance()
+
 
 # Tests the COMPUTE STATS command for gathering table and column stats.
 class TestComputeStats(ImpalaTestSuite):
@@ -41,16 +49,45 @@ class TestComputeStats(ImpalaTestSuite):
         create_uncompressed_text_dimension(cls.get_workload()))
 
   @SkipIfLocal.hdfs_blocks
+  @SkipIfS3.eventually_consistent
   def test_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats', vector, unique_database)
+
+  @SkipIfLocal.hdfs_blocks
+  @SkipIfS3.eventually_consistent
+  def test_compute_stats_avro(self, vector, unique_database, cluster_properties):
+    if cluster_properties.is_catalog_v2_cluster():
+      # IMPALA-7308: changed behaviour of various Avro edge cases significantly in the
+      # local catalog - the expected behaviour is different.
+      self.run_test_case('QueryTest/compute-stats-avro-catalog-v2', vector,
+                         unique_database)
+    else:
+      self.run_test_case('QueryTest/compute-stats-avro', vector, unique_database)
+
+  @SkipIfLocal.hdfs_blocks
+  @SkipIfS3.eventually_consistent
+  def test_compute_stats_decimal(self, vector, unique_database):
     # Test compute stats on decimal columns separately so we can vary between platforms
     # with and without write support for decimals (Hive < 0.11 and >= 0.11).
     self.run_test_case('QueryTest/compute-stats-decimal', vector, unique_database)
 
+  @SkipIfLocal.hdfs_blocks
+  @SkipIfS3.eventually_consistent
+  def test_compute_stats_date(self, vector, unique_database):
+    # Test compute stats on date columns separately.
+    self.run_test_case('QueryTest/compute-stats-date', vector, unique_database)
+
+  @SkipIfS3.eventually_consistent
   def test_compute_stats_incremental(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats-incremental', vector, unique_database)
 
+  @SkipIfS3.eventually_consistent
+  def test_compute_stats_complextype_warning(self, vector, unique_database):
+    self.run_test_case('QueryTest/compute-stats-complextype-warning', vector,
+        unique_database)
+
   @pytest.mark.execute_serially
+  @SkipIfS3.eventually_consistent
   def test_compute_stats_many_partitions(self, vector):
     # To cut down on test execution time, only run the compute stats test against many
     # partitions if performing an exhaustive test run.
@@ -58,6 +95,7 @@ class TestComputeStats(ImpalaTestSuite):
     self.run_test_case('QueryTest/compute-stats-many-partitions', vector)
 
   @pytest.mark.execute_serially
+  @SkipIfS3.eventually_consistent
   def test_compute_stats_keywords(self, vector):
     """IMPALA-1055: Tests compute stats with a db/table name that are keywords."""
     self.execute_query("drop database if exists `parquet` cascade")
@@ -69,7 +107,21 @@ class TestComputeStats(ImpalaTestSuite):
     finally:
       self.cleanup_db("parquet")
 
+  @SkipIfS3.eventually_consistent
+  def test_compute_stats_compression_codec(self, vector, unique_database):
+    """IMPALA-8254: Tests that running compute stats with compression_codec set
+    should not throw an error."""
+    table = "{0}.codec_tbl".format(unique_database)
+    self.execute_query_expect_success(self.client, "create table {0}(i int)"
+                                      .format(table))
+    for codec in THdfsCompression._NAMES_TO_VALUES.keys():
+      for c in [codec.lower(), codec.upper()]:
+        self.execute_query_expect_success(self.client, "compute stats {0}".format(table),
+                                          {"compression_codec": c})
+        self.execute_query_expect_success(self.client, "drop stats {0}".format(table))
+
   @SkipIfS3.hive
+  @SkipIfABFS.hive
   @SkipIfADLS.hive
   @SkipIfIsilon.hive
   @SkipIfLocal.hive
@@ -91,7 +143,7 @@ class TestComputeStats(ImpalaTestSuite):
       insert overwrite table {0}.{1} partition (p1=1, p2="pval")
       select id from functional.alltypestiny;
     """.format(unique_database, table_name)
-    check_call(["hive", "-e", create_load_data_stmts])
+    self.run_stmt_in_hive(create_load_data_stmts)
 
     # Make the table visible in Impala.
     self.execute_query("invalidate metadata %s.%s" % (unique_database, table_name))
@@ -118,6 +170,57 @@ class TestComputeStats(ImpalaTestSuite):
     assert(len(show_result.data) == 2)
     assert("1\tpval\t8" in show_result.data[0])
 
+  @SkipIfS3.eventually_consistent
+  @SkipIfCatalogV2.stats_pulling_disabled()
+  def test_pull_stats_profile(self, vector, unique_database):
+    """Checks that the frontend profile includes metrics when computing
+       incremental statistics.
+    """
+    try:
+      impalad = ImpalaCluster.get_e2e_test_cluster().impalads[0]
+      client = impalad.service.create_beeswax_client()
+      create = "create table test like functional.alltypes"
+      load = "insert into test partition(year, month) select * from functional.alltypes"
+      insert = """insert into test partition(year=2009, month=1) values
+                  (29349999, true, 4, 4, 4, 40,4.400000095367432,40.4,
+                  "10/21/09","4","2009-10-21 03:24:09.600000000")"""
+      stats_all = "compute incremental stats test"
+      stats_part = "compute incremental stats test partition (year=2009,month=1)"
+
+      # Checks that profile does not have metrics for incremental stats when
+      # the operation is not 'compute incremental stats'.
+      self.execute_query_expect_success(client, "use `%s`" % unique_database)
+      profile = self.execute_query_expect_success(client, create).runtime_profile
+      assert profile.count("StatsFetch") == 0
+      # Checks that incremental stats metrics are present when 'compute incremental
+      # stats' is run. Since the table has no stats, expect that no bytes are fetched.
+      self.execute_query_expect_success(client, load)
+      profile = self.execute_query_expect_success(client, stats_all).runtime_profile
+      assert profile.count("StatsFetch") > 1
+      assert profile.count("StatsFetch.CompressedBytes: 0") == 1
+      # Checks that bytes fetched is non-zero since incremental stats are present now
+      # and should have been fetched.
+      self.execute_query_expect_success(client, insert)
+      profile = self.execute_query_expect_success(client, stats_part).runtime_profile
+      assert profile.count("StatsFetch") > 1
+      assert profile.count("StatsFetch.CompressedBytes") == 1
+      assert profile.count("StatsFetch.CompressedBytes: 0") == 0
+      # Adds a partition, computes stats, and checks that the metrics in the profile
+      # reflect the operation.
+      alter = "alter table test add partition(year=2011, month=1)"
+      insert_new_partition = """
+          insert into test partition(year=2011, month=1) values
+          (29349999, true, 4, 4, 4, 40,4.400000095367432,40.4,
+          "10/21/09","4","2009-10-21 03:24:09.600000000")
+          """
+      self.execute_query_expect_success(client, alter)
+      self.execute_query_expect_success(client, insert_new_partition)
+      profile = self.execute_query_expect_success(client, stats_all).runtime_profile
+      assert profile.count("StatsFetch.TotalPartitions: 25") == 1
+      assert profile.count("StatsFetch.NumPartitionsWithStats: 24") == 1
+    finally:
+      client.close()
+
 # Tests compute stats on HBase tables. This test is separate from TestComputeStats,
 # because we want to use the existing machanism to disable running tests on hbase/none
 # based on the filesystem type (S3, Isilon, etc.).
@@ -133,13 +236,13 @@ class TestHbaseComputeStats(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format == 'hbase')
 
-  @pytest.mark.xfail(pytest.config.option.testing_remote_cluster,
+  @pytest.mark.xfail(IMPALA_TEST_CLUSTER_PROPERTIES.is_remote_cluster(),
                      reason=("Setting up HBase tests currently assumes a local "
                              "mini-cluster. See IMPALA-4661."))
   def test_hbase_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/hbase-compute-stats', vector, unique_database)
 
-  @pytest.mark.xfail(pytest.config.option.testing_remote_cluster,
+  @pytest.mark.xfail(IMPALA_TEST_CLUSTER_PROPERTIES.is_remote_cluster(),
                      reason=("Setting up HBase tests currently assumes a local "
                              "mini-cluster. See IMPALA-4661."))
   def test_hbase_compute_stats_incremental(self, vector, unique_database):

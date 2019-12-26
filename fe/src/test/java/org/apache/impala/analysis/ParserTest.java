@@ -21,7 +21,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import java.io.StringReader;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +29,7 @@ import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.BackendConfig;
 import org.junit.Test;
 
 import com.google.common.base.Preconditions;
@@ -65,14 +65,13 @@ public class ParserTest extends FrontendTestBase {
    * Asserts if stmt parses fine or the error string doesn't match and it is non-null.
    */
   public void ParserError(String stmt, String expectedErrorString) {
-    SqlScanner input = new SqlScanner(new StringReader(stmt));
-    SqlParser parser = new SqlParser(input);
-    Object result = null; // Save this object to make debugging easier
+    @SuppressWarnings("unused")
+    StatementBase result = null; // Save this object to make debugging easier
     try {
-      result = parser.parse().value;
-    } catch (Exception e) {
+      result = Parser.parse(stmt);
+    } catch (AnalysisException e) {
       if (expectedErrorString != null) {
-        String errorString = parser.getErrorMsg(stmt);
+        String errorString = e.getMessage();
         StringBuilder message = new StringBuilder();
         message.append("Got: ");
         message.append(errorString).append("\nExpected: ").append(expectedErrorString);
@@ -89,6 +88,28 @@ public class ParserTest extends FrontendTestBase {
    */
   public void ParserError(String stmt) {
     ParserError(stmt, null);
+  }
+
+  @Test
+  public void TestCopyTestCase() {
+    // Only QueryStmts are supported
+    ParsesOk("copy testcase to 'hdfs:///foo' select * from tbl");
+    ParsesOk("copy testcase to 'hdfs:///foo' with v as (select 1) select * from v");
+    ParsesOk("copy testcase to 'hdfs:///foo' select * from t1 union select * from t2");
+    // non QueryStmts aren not supported.
+    ParserError("copy testcase to 'hdfs:///foo' alter table foo add partition (p=1)");
+    ParserError("copy testcase to 'hdfs:///foo' insert into t values (1)");
+    // missing output directory.
+    ParserError("copy testcase to select * from tbl");
+    // missing quotes for the directory path.
+    ParserError("copy testcase to hdfs:///foo select * from tbl");
+
+    ParsesOk("copy testcase from 'hdfs:///foo'");
+    // missing quotes.
+    ParserError("copy testcase from hdfs:///foo");
+    ParserError("copy testcase");
+    // testcase is not a reserved word.
+    ParsesOk("select testcase from foo");
   }
 
   @Test
@@ -251,7 +272,7 @@ public class ParserTest extends FrontendTestBase {
   private void TestJoinHints(String stmt, String... expectedHints) {
     SelectStmt selectStmt = (SelectStmt) ParsesOk(stmt);
     Preconditions.checkState(selectStmt.getTableRefs().size() > 1);
-    List<String> actualHints = Lists.newArrayList();
+    List<String> actualHints = new ArrayList<>();
     assertTrue(selectStmt.getTableRefs().get(0).getJoinHints().isEmpty());
     for (int i = 1; i < selectStmt.getTableRefs().size(); ++i) {
       List<PlanHint> hints = selectStmt.getTableRefs().get(i).getJoinHints();
@@ -264,7 +285,7 @@ public class ParserTest extends FrontendTestBase {
   private void TestTableHints(String stmt, String... expectedHints) {
     SelectStmt selectStmt = (SelectStmt) ParsesOk(stmt);
     Preconditions.checkState(selectStmt.getTableRefs().size() > 0);
-    List<String> actualHints = Lists.newArrayList();
+    List<String> actualHints = new ArrayList<>();
     for (int i = 0; i < selectStmt.getTableRefs().size(); ++i) {
       List<PlanHint> hints = selectStmt.getTableRefs().get(i).getTableHints();
       for (PlanHint hint: hints) actualHints.add(hint.toString());
@@ -276,7 +297,7 @@ public class ParserTest extends FrontendTestBase {
   private void TestTableAndJoinHints(String stmt, String... expectedHints) {
     SelectStmt selectStmt = (SelectStmt) ParsesOk(stmt);
     Preconditions.checkState(selectStmt.getTableRefs().size() > 0);
-    List<String> actualHints = Lists.newArrayList();
+    List<String> actualHints = new ArrayList<>();
     for (int i = 0; i < selectStmt.getTableRefs().size(); ++i) {
       List<PlanHint> joinHints = selectStmt.getTableRefs().get(i).getJoinHints();
       for (PlanHint hint: joinHints) actualHints.add(hint.toString());
@@ -293,18 +314,26 @@ public class ParserTest extends FrontendTestBase {
    */
   private void TestSelectListHints(String stmt, String... expectedHints) {
     SelectStmt selectStmt = (SelectStmt) ParsesOk(stmt);
-    List<String> actualHints = Lists.newArrayList();
+    List<String> actualHints = new ArrayList<>();
     List<PlanHint> hints = selectStmt.getSelectList().getPlanHints();
     for (PlanHint hint: hints) actualHints.add(hint.toString());
     if (actualHints.isEmpty()) actualHints = Lists.newArrayList((String) null);
     assertEquals(Lists.newArrayList(expectedHints), actualHints);
   }
 
-  private void VerifyHints(List<PlanHint> actualHints, String... expectedHints) {
-    List<String> stringHints = Lists.newArrayList();
-    for (PlanHint hint: actualHints) stringHints.add(hint.toString());
-    if (stringHints.isEmpty()) stringHints = Lists.newArrayList((String) null);
-    assertEquals(Lists.newArrayList(expectedHints), stringHints);
+  /**
+   * Creates an insert into, an insert overwrite, and a CTAS statement with
+   * the given hints and checks that the parsed hints are the same as the expected hints.
+   */
+  private void TestInsertAndCtasHints(String insertPart, String ctasPart,
+        String[] hintStyle, String hints, String... expectedHints) {
+    String hintsPart = hintStyle[0] + hints + hintStyle[1];
+    TestInsertStmtHints(String.format("insert %%s into %s %%s select * from t",
+        insertPart), hintsPart, expectedHints);
+    TestInsertStmtHints(String.format("insert %%s overwrite %s %%s select * from t",
+        insertPart), hintsPart, expectedHints);
+    TestCtasHints(String.format("create %s table %s as select * from t",
+        hintsPart, ctasPart), expectedHints);
   }
 
   /**
@@ -313,8 +342,8 @@ public class ParserTest extends FrontendTestBase {
    */
   private void TestInsertStmtHints(String pattern, String hint, String... expectedHints) {
     for (InsertStmt.HintLocation loc: InsertStmt.HintLocation.values()) {
-      VerifyHints(((InsertStmt) ParsesOk(InjectInsertHint(pattern, hint, loc)))
-          .getPlanHints(), expectedHints);
+      InsertStmt insertStmt = (InsertStmt) ParsesOk(InjectInsertHint(pattern, hint, loc));
+      assertEquals(expectedHints, HintsToStrings(insertStmt.getPlanHints()));
     }
   }
 
@@ -328,22 +357,32 @@ public class ParserTest extends FrontendTestBase {
     }
   }
 
+  /**
+   * Parses stmt and checks that the CTAS hints stmt are the expected hints.
+   */
+  private void TestCtasHints(String stmt, String... expectedHints) {
+    CreateTableAsSelectStmt ctasStmt = (CreateTableAsSelectStmt) ParsesOk(stmt);
+    assertEquals(expectedHints, HintsToStrings(ctasStmt.getInsertStmt().getPlanHints()));
+  }
+
+  static private String[] HintsToStrings(List<PlanHint> hints) {
+    if (hints.isEmpty()) return new String[] { null };
+    String[] hintAsStrings = new String[hints.size()];
+    for (int i = 0; i < hints.size(); ++i) hintAsStrings[i] = hints.get(i).toString();
+    return hintAsStrings;
+  }
+
   @Test
   public void TestPlanHints() {
-    // All plan-hint styles embed a comma-separated list of hints.
-    String[][] hintStyles = new String[][] {
-        new String[] { "/* +", "*/" }, // traditional commented hint
-        new String[] { "-- +", "\n" }, // eol commented hint
-        new String[] { "\n-- +", "\n" }, // eol commented hint
-        new String[] { "[", "]" } // legacy style
-    };
     String[][] commentStyles = new String[][] {
         new String[] { "/*", "*/" }, // traditional comment
         new String[] { "--", "\n" } // eol comment
     };
-    for (String[] hintStyle: hintStyles) {
+    for (String[] hintStyle: hintStyles_) {
       String prefix = hintStyle[0];
       String suffix = hintStyle[1];
+      // Test unexpected token
+      ParserError(prefix + suffix,"Syntax error in line 1:\n" + prefix + suffix);
       // Test join hints.
       TestJoinHints(String.format(
           "select * from functional.alltypes a join %sbroadcast%s " +
@@ -389,17 +428,14 @@ public class ParserTest extends FrontendTestBase {
               "join %sshuffle%s functional.alltypes e using(string_col)",
               suffix, suffix, suffix, suffix, prefix, "", "", ""));
 
-      // Test insert hints.
-      TestInsertStmtHints("insert %s into t %s select * from t",
-           String.format("%snoshuffle%s", prefix, suffix), "noshuffle");
-      TestInsertStmtHints("insert %s overwrite t %s select * from t",
-           String.format("%snoshuffle%s", prefix, suffix), "noshuffle");
-      TestInsertStmtHints("insert %s into t partition(x, y) %s select * from t",
-           String.format("%snoshuffle%s", prefix, suffix), "noshuffle");
-      TestInsertStmtHints("insert %s into t(a, b) partition(x, y) %s select * from t",
-           String.format("%sshuffle%s", prefix, suffix), "shuffle");
-      TestInsertStmtHints("insert %s overwrite t(a, b) partition(x, y) %s select * from t",
-           String.format("%sfoo,bar,baz%s", prefix, suffix), "foo", "bar", "baz");
+      // Test insert/CTAS hints.
+      TestInsertAndCtasHints("t", "t", hintStyle, "noshuffle", "noshuffle");
+      TestInsertAndCtasHints("t partition(x, y)", "t partitioned by(x, y)",
+          hintStyle, "noshuffle", "noshuffle");
+      TestInsertAndCtasHints("t(a, b) partition(x, y)", "t partitioned by(x, y)",
+          hintStyle, "shuffle", "shuffle");
+      TestInsertAndCtasHints("t(a, b) partition(x, y)", "t partitioned by(x, y)",
+          hintStyle, "foo,bar,baz", "foo", "bar", "baz");
 
       // Test upsert hints.
       TestInsertStmtHints("upsert %s into t %s select * from t",
@@ -488,14 +524,29 @@ public class ParserTest extends FrontendTestBase {
       ParserErrorOnInsertStmtHints("insert %s into t %s select * from t",
            String.format("%shint_with_args(  a  ,  , ,,, b  )%s", prefix, suffix));
 
-      // Negative tests for hints cannot be specified at the both avilable locations.
+      TestInsertAndCtasHints("t", "t",
+          hintStyle, "hint_with_args(a)", "hint_with_args(a)");
+      TestInsertAndCtasHints("t", "t",
+          hintStyle, "clustered,shuffle,hint_with_args(a)",
+          "clustered", "shuffle", "hint_with_args(a)");
+      TestInsertAndCtasHints("t", "t",
+          hintStyle, "hint_with_args(a,b)", "hint_with_args(a,b)");
+      TestInsertAndCtasHints("t", "t",
+          hintStyle, "hint_with_args(a  , b)", "hint_with_args(a,b)");
+
+      ParserErrorOnInsertStmtHints("insert %s into t %s select * from t",
+          String.format("%shint_with_args(  a  ,  , ,,, b  )%s", prefix, suffix));
+      ParserError(String.format(
+         "create table t %shint_with_args(  a  ,  , ,,, b  )%s as select * from t",
+         prefix, suffix));
+
+      // Negative tests for hints cannot be specified at the both available locations.
       ParserError(String.format("insert %s into t %s select * from t",
            String.format("%sshuffle%s", prefix, suffix),
            String.format("%sclustered%s", prefix, suffix)));
       ParserError(String.format("upsert %s into t %s select * from t",
            String.format("%sshuffle%s", prefix, suffix),
            String.format("%sclustered%s", prefix, suffix)));
-
     }
     // No "+" at the beginning so the comment is not recognized as a hint.
     TestJoinHints("select * from functional.alltypes a join /* comment */" +
@@ -504,6 +555,8 @@ public class ParserTest extends FrontendTestBase {
         (String) null);
     TestInsertStmtHints("insert %s into t(a, b) partition(x, y) %s select 1",
         "/* comment */", (String) null);
+    TestCtasHints("create /* comment */ table t partitioned by (x, y) as select 1",
+        (String) null);
     TestSelectListHints("select /* -- +straight_join */ * from functional.alltypes",
         (String) null);
     TestSelectListHints("select /* abcdef +straight_join */ * from functional.alltypes",
@@ -1031,8 +1084,8 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk(String.format("select -%s", Double.toString(Double.MAX_VALUE)));
 
     // Test overflow and underflow
-    ParsesOk(String.format("select %s1", Double.toString(Double.MIN_VALUE)));
-    ParsesOk(String.format("select %s1", Double.toString(Double.MAX_VALUE)));
+    ParserError(String.format("select %s1", Double.toString(Double.MIN_VALUE)));
+    ParserError(String.format("select %s1", Double.toString(Double.MAX_VALUE)));
   }
 
   @Test
@@ -1149,6 +1202,19 @@ public class ParserTest extends FrontendTestBase {
     // Boolean literals
     ParsesOk("select true from t where true", BoolLiteral.class);
     ParsesOk("select false from t where false", BoolLiteral.class);
+
+    // Date literals
+    ParsesOk("select date '2011-01-01'", DateLiteral.class);
+    ParsesOk("select date '2011-1-01'", DateLiteral.class);
+    ParsesOk("select date '2011-1-1'", DateLiteral.class);
+    ParserError("select date '2011-001-1'");
+    ParserError("select date '2011-01-001'");
+    ParserError("select date '2011-oct-01'");
+    ParserError("select date '2011-01-0'");
+    ParserError("select date '2011-01-40'");
+    ParserError("select date '2011-01-'");
+    ParserError("select date '2011--01'");
+    ParserError("select date '2001-02-31'");
 
     // Null literal
     ParsesOk("select NULL from t where NULL", NullLiteral.class);
@@ -1390,8 +1456,14 @@ public class ParserTest extends FrontendTestBase {
   public void TestCastExprs() {
     ParsesOk("select cast(a + 5.0 as string) from t");
     ParsesOk("select cast(NULL as string) from t");
+    ParsesOk("select cast('05-01-2017' as timestamp format 'MM-dd-yyyy')");
+    ParsesOk("select cast('2017.01.02' as date format 'YYYY-MM-DD')");
     ParserError("select cast(a + 5.0 as badtype) from t");
     ParserError("select cast(a + 5.0, string) from t");
+    ParserError("select cast('05-01-2017' as timestamp format 12345)");
+    ParserError("select cast('05-01-2017' as timestamp format )");
+    ParserError("select cast('05-01-2017' as timestamp format NULL)");
+    ParserError("select cast('05-01-2017' as date format NULL)");
   }
 
   @Test
@@ -1974,7 +2046,7 @@ public class ParserTest extends FrontendTestBase {
       ParserError(String.format("CREATE %s Foo LOCATION", kw));
       ParserError(String.format("CREATE %s Foo LOCATION 'dfsd' 'dafdsf'", kw));
 
-      ParserError(String.format("CREATE Foo", kw));
+      ParserError(String.format("CREATE Foo"));
       ParserError(String.format("CREATE %s 'Foo'", kw));
       ParserError(String.format("CREATE %s", kw));
       ParserError(String.format("CREATE %s IF EXISTS Foo", kw));
@@ -2093,8 +2165,23 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestAlterTableAddColumn() {
+    for (String keyword: new String[]{"", "IF NOT EXISTS"}) {
+      ParsesOk(String.format("ALTER TABLE Foo ADD COLUMN %s i int", keyword));
+      ParsesOk(String.format("ALTER TABLE TestDb.Foo ADD COLUMN %s i int", keyword));
+
+      ParserError(String.format("ALTER TestDb.Foo ADD COLUMN %s", keyword));
+      ParserError(String.format("ALTER Foo ADD COLUMN %s", keyword));
+      ParserError(String.format("ALTER TABLE TestDb.Foo ADD COLUMN %s (i int)", keyword));
+      ParserError(String.format("ALTER TABLE Foo ADD COLUMN %s (i int)", keyword));
+      ParserError(String.format("ALTER Foo %s ADD COLUMN i int", keyword));
+      ParserError(String.format("ALTER TestDb.Foo %s ADD COLUMN i int", keyword));
+    }
+  }
+
+  @Test
   public void TestAlterTableAddReplaceColumns() {
-    String[] addReplaceKw = {"ADD", "REPLACE"};
+    String[] addReplaceKw = {"ADD", "ADD IF NOT EXISTS", "REPLACE"};
     for (String addReplace: addReplaceKw) {
       ParsesOk(String.format(
           "ALTER TABLE Foo %s COLUMNS (i int, s string)", addReplace));
@@ -2121,9 +2208,6 @@ public class ParserTest extends FrontendTestBase {
       ParserError(String.format("ALTER TestDb.Foo %s COLUMNS ()", addReplace));
       ParserError(String.format("ALTER Foo %s COLUMNS (i int, s string)", addReplace));
       ParserError(String.format("ALTER TABLE %s COLUMNS (i int, s string)", addReplace));
-      // Don't yet support ALTER TABLE ADD COLUMN syntax
-      ParserError(String.format("ALTER TABLE Foo %s COLUMN i int", addReplace));
-      ParserError(String.format("ALTER TABLE Foo %s COLUMN (i int)", addReplace));
     }
   }
 
@@ -2383,6 +2467,18 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestAlterTableZSortBy() {
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
+
+    ParsesOk("ALTER TABLE TEST SORT BY ZORDER (int_col, id)");
+    ParsesOk("ALTER TABLE TEST SORT BY ZORDER ()");
+    ParserError("ALTER TABLE TEST PARTITION (year=2009, month=4) SORT BY ZORDER " +
+        "(int_col, id)");
+
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+  }
+
+  @Test
   public void TestAlterTableOrViewRename() {
     for (String entity: Lists.newArrayList("TABLE", "VIEW")) {
       ParsesOk(String.format("ALTER %s TestDb.Foo RENAME TO TestDb.Foo2", entity));
@@ -2510,6 +2606,51 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("CREATE TABLE Foo LIKE PARQUET '/user/foo' SORT BY (id)");
     ParserError("CREATE TABLE Foo SORT BY (id) LIKE PARQUET '/user/foo'");
 
+    // SORT BY ZORDER clause
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
+
+    ParsesOk("CREATE TABLE Foo (i int, j int) SORT BY ZORDER ()");
+    ParsesOk("CREATE TABLE Foo (i int) SORT BY ZORDER (i)");
+    ParsesOk("CREATE TABLE Foo (i int) SORT BY ZORDER (j)");
+    ParsesOk("CREATE TABLE Foo (i int, j int) SORT BY ZORDER (i,j)");
+    ParsesOk("CREATE EXTERNAL TABLE Foo (i int, s string) SORT BY ZORDER (s) " +
+        "LOCATION '/test-warehouse/'");
+    ParsesOk("CREATE TABLE Foo (i int, s string) SORT BY ZORDER (s) COMMENT 'hello' " +
+        "LOCATION '/a/b/' TBLPROPERTIES ('123'='1234')");
+
+
+    // SORT BY ZORDER must be the first table option
+    ParserError("CREATE TABLE Foo (i int, s string) COMMENT 'hello' SORT BY ZORDER (s) " +
+        "LOCATION '/a/b/' TBLPROPERTIES ('123'='1234')");
+    ParserError("CREATE TABLE Foo (i int, s string) COMMENT 'hello' LOCATION '/a/b/' " +
+        "SORT BY ZORDER (s) TBLPROPERTIES ('123'='1234')");
+    ParserError("CREATE TABLE Foo (i int, s string) COMMENT 'hello' LOCATION '/a/b/' " +
+        "TBLPROPERTIES ('123'='1234') SORT BY ZORDER (s)");
+
+    // Malformed SORT BY ZORDER clauses
+    ParserError("CREATE TABLE Foo (i int, j int) SORT BY ZORDER");
+    ParserError("CREATE TABLE Foo (i int, j int) SORT BY ZORDER (i,)");
+    ParserError("CREATE TABLE Foo (i int, j int) SORT BY ZORDER (int)");
+
+    // Create table like other table with zsort columns
+    ParsesOk("CREATE TABLE Foo SORT BY ZORDER(bar) LIKE Baz STORED AS TEXTFILE " +
+        "LOCATION '/a/b'");
+    ParserError("CREATE TABLE SORT BY ZORDER(bar) Foo LIKE Baz STORED AS TEXTFILE " +
+        "LOCATION '/a/b'");
+    // SORT BY ZORDER must be the first table option
+    ParserError("CREATE TABLE Foo LIKE Baz STORED AS TEXTFILE LOCATION '/a/b' " +
+        "SORT BY ZORDER(bar)");
+
+    // CTAS with zsort columns
+    ParsesOk("CREATE TABLE Foo SORT BY ZORDER(bar) AS SELECT * FROM BAR");
+    ParserError("CREATE TABLE Foo AS SELECT * FROM BAR SORT BY ZORDER(bar)");
+
+    // Create table like file with zsort columns
+    ParsesOk("CREATE TABLE Foo LIKE PARQUET '/user/foo' SORT BY ZORDER (id)");
+    ParserError("CREATE TABLE Foo SORT BY ZORDER (id) LIKE PARQUET '/user/foo'");
+
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+
     // Column comments
     ParsesOk("CREATE TABLE Foo (i int COMMENT 'hello', s string)");
     ParsesOk("CREATE TABLE Foo (i int COMMENT 'hello', s string COMMENT 'hi')");
@@ -2543,6 +2684,34 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE TABLE foo (i INT, PRIMARY KEY) STORED AS KUDU");
     ParserError("CREATE TABLE foo (PRIMARY KEY(a), a INT) STORED AS KUDU");
     ParserError("CREATE TABLE foo (i INT) PRIMARY KEY (i) STORED AS KUDU");
+
+    // Primary key and foreign key specification.
+    ParsesOk("create table foo(id int, year int, primary key (id))");
+    ParsesOk("create table foo(id int, year int, primary key (id, year))");
+    ParsesOk("create table foo(id int, year int, primary key (id, year) disable "
+        + "novalidate rely)");
+    ParsesOk("create table foo(id int, year int, primary key (id, year) "
+        + "novalidate rely)");
+    ParsesOk("create table foo(id int, year int, primary key (id, year) "
+        + "rely)");
+    ParserError("create table foo(id int, year string, primary key(id), primary key"
+        + "(year))");
+    ParsesOk("create table fk(id int, year int, primary key (id, year) disable "
+        + "novalidate rely, foreign key(id) REFERENCES pk(id) DISABLE NOVALIDATE RELY)");
+    ParsesOk("create table foo(id int, year int, foreign key (id) references "
+        + "pk(id))");
+    ParsesOk("create table fk(id int, year string, foreign key(year) references pk"
+        + "(year), primary key(id))");
+    ParsesOk("create table foo(id int, year int, primary key (id, year) enable "
+        + "novalidate rely)");
+    // Different order of constraints is not supported.
+    ParserError("create table foo(id int, year int, primary key (id, year) novalidate "
+        + "disable rely)");
+    ParserError("create table fk(id int, year int, foreign key(id) REFERENCES pk(id) "
+        + "NOVALIDATE DISABLE RELY)");
+    // Multiple foreign keys
+    ParsesOk("create table fk(id int, year string, primary key(id), foreign key(id) "
+        + "references pk(id), foreign key (year) references pk(year))");
 
     // Table Properties
     String[] tblPropTypes = {"TBLPROPERTIES", "WITH SERDEPROPERTIES"};
@@ -2874,12 +3043,19 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("ALTER VIEW Bar AS SELECT a, b, c FROM t");
     ParsesOk("ALTER VIEW Bar AS VALUES(1, 2, 3)");
     ParsesOk("ALTER VIEW Bar AS SELECT 1, 2, 3 UNION ALL select 4, 5, 6");
+    ParsesOk("ALTER VIEW Bar (x, y, z) AS SELECT a, b, c from t");
+    ParsesOk("ALTER VIEW Bar (x, y COMMENT 'foo', z) AS SELECT a, b, c from t");
 
     ParsesOk("ALTER VIEW Foo.Bar AS SELECT 1, 2, 3");
     ParsesOk("ALTER VIEW Foo.Bar AS SELECT a, b, c FROM t");
     ParsesOk("ALTER VIEW Foo.Bar AS VALUES(1, 2, 3)");
     ParsesOk("ALTER VIEW Foo.Bar AS SELECT 1, 2, 3 UNION ALL select 4, 5, 6");
     ParsesOk("ALTER VIEW Foo.Bar AS WITH t AS (SELECT 1, 2, 3) SELECT * FROM t");
+    ParsesOk("ALTER VIEW Foo.Bar (x, y, z) AS SELECT a, b, c from t");
+    ParsesOk("ALTER VIEW Foo.Bar (x, y, z COMMENT 'foo') AS SELECT a, b, c from t");
+
+    // Mismatched number of columns in column definition and view definition parses ok.
+    ParsesOk("ALTER VIEW Bar (x, y) AS SELECT 1, 2, 3");
 
     // Must be ALTER VIEW not ALTER TABLE.
     ParserError("ALTER TABLE Foo.Bar AS SELECT 1, 2, 3");
@@ -2889,6 +3065,14 @@ public class ParserTest extends FrontendTestBase {
     ParserError("ALTER VIEW Foo.Bar SELECT 1, 2, 3");
     // Missing view definition.
     ParserError("ALTER VIEW Foo.Bar AS");
+    // Empty column definition not allowed.
+    ParserError("ALTER VIEW Foo.Bar () AS SELECT c FROM t");
+    // Column definitions cannot include types.
+    ParserError("ALTER VIEW Foo.Bar (x int) AS SELECT c FROM t");
+    ParserError("ALTER VIEW Foo.Bar (x int COMMENT 'x') AS SELECT c FROM t");
+    // A type does not parse as an identifier.
+    ParserError("ALTER VIEW Foo.Bar (int COMMENT 'x') AS SELECT c FROM t");
+
     // Invalid view definitions. A view definition must be a query statement.
     ParserError("ALTER VIEW Foo.Bar AS INSERT INTO t select * from t");
     ParserError("ALTER VIEW Foo.Bar AS UPSERT INTO t select * from t");
@@ -3093,6 +3277,7 @@ public class ParserTest extends FrontendTestBase {
     TypeDefsParseOk("BINARY");
     TypeDefsParseOk("DECIMAL");
     TypeDefsParseOk("TIMESTAMP");
+    TypeDefsParseOk("DATE");
 
     // Test decimal.
     TypeDefsParseOk("DECIMAL");
@@ -3150,6 +3335,7 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("refresh Foo.S partition (col=2)");
     ParsesOk("refresh Foo.S partition (col1 = 2, col2 = 3)");
     ParsesOk("refresh functions Foo");
+    ParsesOk("refresh authorization");
 
     ParserError("invalidate");
     ParserError("invalidate metadata Foo.S.S");
@@ -3160,26 +3346,38 @@ public class ParserTest extends FrontendTestBase {
     ParserError("refresh Foo.S partition (col1 = 2, col2)");
     ParserError("refresh Foo.S partition ()");
     ParserError("refresh functions Foo.S");
+    ParserError("refresh authorization Foo");
   }
 
   @Test
   public void TestComputeDropStats() {
     String[] prefixes = {"compute", "drop"};
+    String[] okSuffixes = {"stats bar", "stats `bar`", "stats foo.bar",
+        "stats `foo`.`bar`"};
+    String[] okComputeSuffixes = {"(ab)", "(ab, bc)", "()"};
+    String[] errorSuffixes = {
+     // Missing table name.
+     "stats",
+     // Missing 'stats' keyword.
+     "`bar`",
+     // Cannot use string literal as table name.
+     "stats 'foo'",
+     // Cannot analyze multiple tables in one stmt.
+     "stats foo bar"
+    };
 
     for (String prefix: prefixes) {
-      ParsesOk(prefix + " stats bar");
-      ParsesOk(prefix + " stats `bar`");
-      ParsesOk(prefix + " stats foo.bar");
-      ParsesOk(prefix + " stats `foo`.`bar`");
-
-      // Missing table name.
-      ParserError(prefix + " stats");
-      // Missing 'stats' keyword.
-      ParserError(prefix + " foo");
-      // Cannot use string literal as table name.
-      ParserError(prefix + " stats 'foo'");
-      // Cannot analyze multiple tables in one stmt.
-      ParserError(prefix + " stats foo bar");
+      for (String suffix: okSuffixes) {
+        ParsesOk(prefix + " " + suffix);
+      }
+      for (String suffix: errorSuffixes) {
+        ParserError(prefix + " " + suffix);
+      }
+    }
+    for (String suffix: okSuffixes) {
+      for (String computeSuffix: okComputeSuffixes) {
+        ParsesOk("compute" + " " + suffix + " " + computeSuffix);
+      }
     }
   }
 
@@ -3192,9 +3390,9 @@ public class ParserTest extends FrontendTestBase {
         "c, b, c from t\n" +
         "^\n" +
         "Encountered: IDENTIFIER\n" +
-        "Expected: ALTER, COMPUTE, CREATE, DELETE, DESCRIBE, DROP, EXPLAIN, GRANT, " +
-        "INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, SHOW, TRUNCATE, " +
-        "UPDATE, UPSERT, USE, VALUES, WITH\n");
+        "Expected: ALTER, COMMENT, COMPUTE, COPY, CREATE, DELETE, DESCRIBE, DROP, " +
+            "EXPLAIN, GRANT, INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, " +
+            "SHOW, TRUNCATE, UPDATE, UPSERT, USE, VALUES, WITH\n");
 
     // missing select list
     ParserError("select from t",
@@ -3202,9 +3400,9 @@ public class ParserTest extends FrontendTestBase {
         "select from t\n" +
         "       ^\n" +
         "Encountered: FROM\n" +
-        "Expected: ALL, CASE, CAST, DEFAULT, DISTINCT, EXISTS, " +
-        "FALSE, IF, INTERVAL, NOT, NULL, REPLACE, " +
-        "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
+        "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, IF, " +
+        "INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, " +
+        "IDENTIFIER");
 
     // missing from
     ParserError("select c, b, c where a = 5",
@@ -3229,8 +3427,8 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from t where\n" +
         "                           ^\n" +
         "Encountered: EOF\n" +
-        "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
-        "IF, INTERVAL, NOT, NULL, REPLACE, TRUNCATE, TRUE, IDENTIFIER\n");
+        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, IF, INTERVAL, LEFT, NOT, " +
+        "NULL, REPLACE, RIGHT, TRUNCATE, TRUE, IDENTIFIER");
 
     // missing predicate in where clause (group by)
     ParserError("select c, b, c from t where group by a, b",
@@ -3238,8 +3436,8 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from t where group by a, b\n" +
         "                            ^\n" +
         "Encountered: GROUP\n" +
-        "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
-        "IF, INTERVAL, NOT, NULL, REPLACE, TRUNCATE, TRUE, IDENTIFIER\n");
+        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, IF, INTERVAL, LEFT, NOT, " +
+        "NULL, REPLACE, RIGHT, TRUNCATE, TRUE, IDENTIFIER");
 
     // unmatched string literal starting with "
     ParserError("select c, \"b, c from t",
@@ -3299,8 +3497,8 @@ public class ParserTest extends FrontendTestBase {
         "...c,c,c,c,c,c,c,c,cd,c,d,d, ,c, from t\n" +
         "                             ^\n" +
         "Encountered: COMMA\n" +
-        "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
-        "IF, INTERVAL, NOT, NULL, REPLACE, TRUNCATE, TRUE, IDENTIFIER\n");
+        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, IF, INTERVAL, LEFT, NOT, " +
+        "NULL, REPLACE, RIGHT, TRUNCATE, TRUE, IDENTIFIER");
 
     // Parsing identifiers that have different names printed as EXPECTED
     ParserError("DROP DATA SRC foo",
@@ -3329,6 +3527,24 @@ public class ParserTest extends FrontendTestBase {
          "       ^\n" +
          "Encountered: EOF\n" +
          "Expected: =\n");
+
+    // End with \n
+    ParserError("SELECT\n",
+         "Syntax error in line 2:\n" +
+         "\n" +
+         "^\n" +
+         "Encountered: EOF\n" +
+         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, " +
+         "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, " +
+         "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
+    ParserError("SELECT\n\n",
+         "Syntax error in line 3:\n" +
+         "\n" +
+         "^\n" +
+         "Encountered: EOF\n" +
+         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, " +
+         "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, " +
+         "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
   }
 
   @Test
@@ -3498,88 +3714,125 @@ public class ParserTest extends FrontendTestBase {
 
   @Test
   public void TestGrantRevokePrivilege() {
-    Object[][] grantRevFormatStrs = {{"GRANT", "TO"}, {"REVOKE", "FROM"}};
-    for (Object[] formatStr: grantRevFormatStrs) {
-      ParsesOk(String.format("%s ALL ON TABLE foo %s myRole", formatStr));
+    String[][] grantRevoke = {{"GRANT", "TO"}, {"REVOKE", "FROM"}};
+    String[] resources = {"SERVER", "SERVER foo", "DATABASE foo", "TABLE foo",
+        "URI 'foo'"};
+    String[] badResources = {"DATABASE", "TABLE", "URI", "URI foo", "TABLE 'foo'",
+        "SERVER 'foo'", "DATABASE 'foo'"};
+    String[] privileges = {"SELECT", "INSERT", "ALL", "REFRESH", "CREATE", "ALTER",
+        "DROP"};
+    String[] badPrivileges = {"UPDATE", "DELETE", "UPSERT", "FAKE"};
+    String[] columnPrivResource = {
+        "SELECT (a, b) ON TABLE foo",
+        "SELECT () on TABLE foo",
+        "INSERT (a, b) ON TABLE foo",
+        "ALL (a, b) ON TABLE foo"
+    };
+    String[] badColumnPrivResource = {
+        "SELECT (a,) ON TABLE foo",
+        "SELECT (*) ON TABLE foo",
+        "SELECT (a), b ON TABLE foo",
+        "SELECT ((a)) ON TABLE foo",
+        "SELECT (a, b) ON URI foo",
+        "SELECT ON TABLE (a, b) foo"
+    };
+    String[] idents = {"myRole", "GROUP myGroup", "USER user", "ROLE myRole"};
+    String[] badIdents = {"GROUP", "ROLE", "GROUP group", "GROUP role", "USER role",
+        "FOOBAR foobar", ""};
 
-      // KW_ROLE is optional (Hive requires KW_ROLE, but Impala does not).
-      ParsesOk(String.format("%s ALL ON TABLE foo %s ROLE myRole", formatStr));
+    // Good SQL
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .forEach(this::ParsesOk);
 
-      ParsesOk(String.format("%s ALL ON DATABASE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s ALL ON URI 'foo' %s  myRole", formatStr));
+    // Good SQL with grant option
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .stream()
+        .filter(s -> s.contains("GRANT"))
+        .map(s -> s + " WITH GRANT OPTION")
+        .forEach(this::ParsesOk);
 
-      ParsesOk(String.format("%s INSERT ON TABLE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s INSERT ON DATABASE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s INSERT ON URI 'foo' %s  myRole", formatStr));
+    // Good SQL with revoke option
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .stream()
+        .filter(s -> s.contains("REVOKE"))
+        .map(s -> s.replace("REVOKE", "REVOKE GRANT OPTION FOR"))
+        .forEach(this::ParsesOk);
 
-      ParsesOk(String.format("%s SELECT ON TABLE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT ON TABLE %s myRole", formatStr));
-      ParsesOk(String.format("%s SELECT ON DATABASE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT ON DATABASE %s myRole", formatStr));
-      ParsesOk(String.format("%s SELECT ON URI 'foo' %s myRole", formatStr));
-      ParserError(String.format("%s SELECT ON URI %s myRole", formatStr));
+    // Column SQL
+    createColumnPrivSql(grantRevoke, columnPrivResource, idents)
+        .forEach(this::ParsesOk);
 
-      // Column-level authorization on TABLE scope
-      ParsesOk(String.format("%s SELECT (a, b) ON TABLE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s SELECT () ON TABLE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s INSERT (a, b) ON TABLE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s ALL (a, b) ON TABLE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT (*) ON TABLE foo %s myRole", formatStr));
+    // Bad Resources
+    createPrivSQL(grantRevoke, badResources, privileges, idents)
+        .forEach(this::ParserError);
 
-      ParserError(String.format("%s SELECT (a,) ON TABLE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT a, b ON TABLE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT (a), b ON TABLE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT ON TABLE (a, b) foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT ((a)) ON TABLE foo %s myRole", formatStr));
-      ParserError(String.format("%s SELECT (a, b) ON DATABASE foo %s myRole",
-          formatStr));
-      ParserError(String.format("%s SELECT (a, b) ON URI 'foo' %s myRole", formatStr));
+    // Bad privileges
+    createPrivSQL(grantRevoke, resources, badPrivileges, idents)
+        .forEach(this::ParserError);
 
-      // Server scope does not accept a name.
-      ParsesOk(String.format("%s ALL ON SERVER %s myRole", formatStr));
-      ParsesOk(String.format("%s INSERT ON SERVER %s myRole", formatStr));
-      ParsesOk(String.format("%s SELECT ON SERVER %s myRole", formatStr));
+    // Bad idents
+    createPrivSQL(grantRevoke, resources, privileges, badIdents)
+        .forEach(this::ParserError);
 
-      // URIs are string literals
-      ParserError(String.format("%s ALL ON URI foo %s myRole", formatStr));
-      ParserError(String.format("%s ALL ON DATABASE 'foo' %s myRole", formatStr));
-      ParserError(String.format("%s ALL ON TABLE 'foo' %s myRole", formatStr));
+    // Bad SQL with grant option
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .stream()
+        .filter(s -> s.contains("GRANT"))
+        .map(s -> s + " WITH GRANT")
+        .forEach(this::ParserError);
 
-      // No object name (only works for SERVER scope)
-      ParserError(String.format("GRANT ALL ON TABLE FROM myrole", formatStr));
-      ParserError(String.format("GRANT ALL ON DATABASE FROM myrole", formatStr));
-      ParserError(String.format("GRANT ALL ON URI FROM myrole", formatStr));
+    // Bad SQL with grant option
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .stream()
+        .filter(s -> s.contains("GRANT"))
+        .map(s -> s + " WITH")
+        .forEach(this::ParserError);
 
-      // No role specified
-      ParserError(String.format("%s ALL ON TABLE foo %s", formatStr));
-      // Invalid privilege
-      ParserError(String.format("%s FAKE ON TABLE foo %s myRole", formatStr));
+    // Bad SQL with revoke option (omit for)
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .stream()
+        .filter(s -> s.contains("REVOKE"))
+        .map(s -> s.replace("REVOKE", "REVOKE GRANT OPTION"))
+        .forEach(this::ParserError);
+
+    // Bad SQL with revoke option (omit option for)
+    createPrivSQL(grantRevoke, resources, privileges, idents)
+        .stream()
+        .filter(s -> s.contains("REVOKE"))
+        .map(s -> s.replace("REVOKE", "REVOKE GRANT"))
+        .forEach(this::ParserError);
+  }
+
+  private static List<String> createPrivSQL(String[][] formats, String[] resources,
+      String[] privileges, String[] idents) {
+    List<String> result = new ArrayList<>();
+
+    for (String[] formatStr : formats) {
+      for (String resource : resources) {
+        for (String privilege : privileges) {
+          for (String ident : idents) {
+            result.add(String.format("%s %s ON %s %s %s", formatStr[0], privilege,
+                resource, formatStr[1], ident));
+          }
+        }
+      }
     }
-    ParsesOk("GRANT ALL ON TABLE foo TO myRole WITH GRANT OPTION");
-    ParsesOk("GRANT ALL ON DATABASE foo TO myRole WITH GRANT OPTION");
-    ParsesOk("GRANT ALL ON SERVER TO myRole WITH GRANT OPTION");
-    ParsesOk("GRANT ALL ON URI '/abc/' TO myRole WITH GRANT OPTION");
-    ParserError("GRANT ALL ON TABLE foo TO myRole WITH GRANT");
-    ParserError("GRANT ALL ON TABLE foo TO myRole WITH");
-    ParserError("GRANT ALL ON TABLE foo TO ROLE");
-    ParserError("REVOKE ALL ON TABLE foo TO ROLE");
+    return result;
+  }
 
-    ParsesOk("REVOKE GRANT OPTION FOR ALL ON TABLE foo FROM myRole");
-    ParsesOk("REVOKE GRANT OPTION FOR ALL ON DATABASE foo FROM myRole");
-    ParsesOk("REVOKE GRANT OPTION FOR ALL ON SERVER FROM myRole");
-    ParsesOk("REVOKE GRANT OPTION FOR ALL ON URI '/abc/' FROM myRole");
-    ParserError("REVOKE GRANT OPTION ALL ON URI '/abc/' FROM myRole");
-    ParserError("REVOKE GRANT ALL ON URI '/abc/' FROM myRole");
+  private static List<String> createColumnPrivSql(String[][] formats,
+      String[] privResource, String[] idents) {
+    List<String> result = new ArrayList<>();
 
-    ParserError("ALL ON TABLE foo TO myrole");
-    ParserError("ALL ON TABLE foo FROM myrole");
-
-    ParserError("GRANT ALL ON TABLE foo FROM myrole");
-    ParserError("REVOKE ALL ON TABLE foo TO myrole");
-
-    ParserError("GRANT UPDATE ON TABLE foo TO myRole");
-    ParserError("GRANT DELETE ON TABLE foo TO myRole");
-    ParserError("GRANT UPSERT ON TABLE foo TO myRole");
+    for (String[] formatStr : formats) {
+      for (String pr : privResource) {
+        for (String ident : idents) {
+          result.add(String.format("%s %s %s %s", formatStr[0], pr, formatStr[1],
+              ident));
+        }
+      }
+    }
+    return result;
   }
 
   @Test
@@ -3595,22 +3848,28 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestShowGrantRole() {
-    // Show all grants on a role
-    ParsesOk("SHOW GRANT ROLE foo");
+  public void TestShowGrantPrincipal() {
+    for (String type: new String[]{"ROLE", "USER", "GROUP"}) {
+      // Show all grants on a particular principal type.
+      ParsesOk(String.format("SHOW GRANT %s foo", type));
 
-    // Show grants on a specific object
-    ParsesOk("SHOW GRANT ROLE foo ON SERVER");
-    ParsesOk("SHOW GRANT ROLE foo ON DATABASE foo");
-    ParsesOk("SHOW GRANT ROLE foo ON TABLE foo");
-    ParsesOk("SHOW GRANT ROLE foo ON TABLE foo.bar");
-    ParsesOk("SHOW GRANT ROLE foo ON URI '/abc/123'");
+      // Show grants on a specific object
+      ParsesOk(String.format("SHOW GRANT %s foo ON SERVER", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON DATABASE foo", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON TABLE foo", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON TABLE foo.bar", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON COLUMN bar.baz", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON COLUMN foo.bar.baz", type));
+      ParsesOk(String.format("SHOW GRANT %s foo ON URI '/abc/123'", type));
 
-    ParserError("SHOW GRANT ROLE");
-    ParserError("SHOW GRANT ROLE foo ON SERVER foo");
-    ParserError("SHOW GRANT ROLE foo ON DATABASE");
-    ParserError("SHOW GRANT ROLE foo ON TABLE");
-    ParserError("SHOW GRANT ROLE foo ON URI abc");
+      ParserError(String.format("SHOW GRANT %s", type));
+      ParserError(String.format("SHOW GRANT %s foo ON SERVER foo", type));
+      ParserError(String.format("SHOW GRANT %s foo ON DATABASE", type));
+      ParserError(String.format("SHOW GRANT %s foo ON TABLE", type));
+      ParserError(String.format("SHOW GRANT %s foo ON COLUMN", type));
+      ParserError(String.format("SHOW GRANT %s foo ON URI abc", type));
+    }
+    ParserError("SHOW GRANT FOO bar");
   }
 
   @Test
@@ -3672,5 +3931,186 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("CREATE TABLE functional.test_table (col INT);");
     ParsesOk("DESCRIBE functional.alltypes;");
     ParsesOk("SET num_nodes=1;");
+  }
+
+  @Test
+  public void TestCommentOn() {
+    ParsesOk("COMMENT ON DATABASE db IS 'comment'");
+    ParsesOk("COMMENT ON DATABASE db IS ''");
+    ParsesOk("COMMENT ON DATABASE db IS NULL");
+    ParserError("COMMENT ON DATABASE IS 'comment'");
+    ParserError("COMMENT ON DATABASE db IS");
+
+    for (String tbl : new String[]{"db.t", "t"}) {
+      ParsesOk(String.format("COMMENT ON TABLE %s IS 'comment'", tbl));
+      ParsesOk(String.format("COMMENT ON TABLE %s IS ''", tbl));
+      ParsesOk(String.format("COMMENT ON TABLE %s IS NULL", tbl));
+
+      ParsesOk(String.format("COMMENT ON VIEW %s IS 'comment'", tbl));
+      ParsesOk(String.format("COMMENT ON VIEW %s IS ''", tbl));
+      ParsesOk(String.format("COMMENT ON VIEW %s IS NULL", tbl));
+    }
+    ParserError("COMMENT ON TABLE IS 'comment'");
+    ParserError("COMMENT ON TABLE tbl IS");
+
+    ParserError("COMMENT ON VIEW IS 'comment'");
+    ParserError("COMMENT ON VIEW tbl IS");
+
+    for (String col : new String[]{"db.tbl.col", "tbl.col"}) {
+      ParsesOk(String.format("COMMENT ON COLUMN %s IS 'comment'", col));
+      ParsesOk(String.format("COMMENT ON COLUMN %s IS ''", col));
+      ParsesOk(String.format("COMMENT ON COLUMN %s IS NULL", col));
+    }
+    ParserError("COMMENT on col IS 'comment'");
+    ParserError("COMMENT on db.tbl.col IS");
+    ParserError("COMMENT on tbl.col IS");
+  }
+
+  @Test
+  public void TestAlterDatabaseSetOwner() {
+    for (String valid : new String[]{"foo", "user", "owner"}) {
+      ParsesOk(String.format("ALTER DATABASE %s SET OWNER USER %s", valid, valid));
+      ParsesOk(String.format("ALTER DATABASE %s SET OWNER ROLE %s", valid, valid));
+    }
+
+    for (String invalid : new String[]{"'foo'", "''", "NULL"}) {
+      ParserError(String.format("ALTER DATABASE %s SET OWNER ROLE %s", invalid, invalid));
+      ParserError(String.format("ALTER DATABASE %s SET OWNER USER %s", invalid, invalid));
+    }
+
+    ParserError("ALTER DATABASE db SET ABC USER foo");
+    ParserError("ALTER DATABASE db SET ABC ROLE foo");
+    ParserError("ALTER DATABASE db SET OWNER ABC foo");
+    ParserError("ALTER DATABASE db SET OWNER USER");
+    ParserError("ALTER DATABASE SET OWNER foo");
+    ParserError("ALTER DATABASE SET OWNER USER foo");
+    ParserError("ALTER DATABASE db SET OWNER ROLE");
+    ParserError("ALTER DATABASE SET OWNER ROLE foo");
+    ParserError("ALTER DATABASE SET OWNER");
+  }
+
+  @Test
+  public void TestAlterTableOrViewSetOwner() {
+    for (String type : new String[]{"TABLE", "VIEW"}) {
+      for (String valid : new String[]{"foo", "user", "owner"}) {
+        ParsesOk(String.format("ALTER %s %s SET OWNER USER %s", type, valid, valid));
+        ParsesOk(String.format("ALTER %s %s SET OWNER ROLE %s", type, valid, valid));
+      }
+
+      for (String invalid : new String[]{"'foo'", "''", "NULL"}) {
+        ParserError(String.format("ALTER %s %s SET OWNER ROLE %s", type, invalid, invalid));
+        ParserError(String.format("ALTER %s %s SET OWNER USER %s", type, invalid, invalid));
+      }
+
+      ParserError(String.format("ALTER %s tbl PARTITION(i=1) SET OWNER ROLE foo", type));
+      ParserError(String.format("ALTER %s tbl SET ABC USER foo", type));
+      ParserError(String.format("ALTER %s tbl SET ABC ROLE foo", type));
+      ParserError(String.format("ALTER %s tbl SET OWNER ABC foo", type));
+      ParserError(String.format("ALTER %s tbl SET OWNER USER", type));
+      ParserError(String.format("ALTER %s SET OWNER foo", type));
+      ParserError(String.format("ALTER %s SET OWNER USER foo", type));
+      ParserError(String.format("ALTER %s tbl SET OWNER ROLE", type));
+      ParserError(String.format("ALTER %s SET OWNER ROLE foo", type));
+      ParserError(String.format("ALTER %s SET OWNER", type));
+    }
+  }
+
+  @Test
+  public void TestAdminFns() {
+    // Any combination of whitespace is ok.
+    ParsesOk(":foobar()");
+    ParsesOk(": foobar()");
+    ParsesOk(":\tfoobar()");
+    ParsesOk("   :\tfoobar()");
+    ParsesOk("\n:foobar()");
+    ParsesOk("\n:foobar(123)");
+    ParsesOk("\n:foobar(123, 456)");
+    ParsesOk("\n:foobar('foo', 'bar')");
+    ParsesOk("\n:foobar('foo', 'bar', 1, -1, 1234, 99, false)");
+
+    // Any identifier is supported.
+    ParsesOk(": 1a()");
+
+    // Must be prefixed with colon.
+    ParserError("foobar()");
+    ParserError("  foobar()");
+
+    // Non-identifiers not supported.
+    ParserError(": 1()");
+    ParserError(": 'string'()");
+    ParserError(": a.b()");
+
+    // Must be single function with parens. Cannot have multiple statements.
+    ParserError(": shutdown");
+    ParserError(": shutdown foo");
+    ParserError(": shutdown() other()");
+    ParserError(": shutdown(); other()");
+    ParserError(": shutdown(), other()");
+    ParserError(": shutdown() :other()");
+    ParserError(": shutdown() :other()");
+    ParserError(": shutdown('hostA'); :shutdown('hostB');");
+  }
+
+  @Test
+  public void TestIdentifier() {
+    ParsesOk("select * from foo.bar_123");
+    ParsesOk("select * from foo. bar_123");
+    ParsesOk("select * from foo .bar_123");
+    ParsesOk("select * from foo . bar_123");
+
+    ParsesOk("select * from foo.123_bar");
+    ParsesOk("select * from foo. 123_bar");
+    ParsesOk("select * from foo .123_bar");
+    ParsesOk("select * from foo . 123_bar");
+
+    ParsesOk("select * from 123_foo.bar");
+    ParsesOk("select * from 123_foo. bar");
+    ParsesOk("select * from 123_foo .bar");
+    ParsesOk("select * from 123_foo . bar");
+
+    ParsesOk("select * from 123_foo.123_bar");
+    ParsesOk("select * from 123_foo. 123_bar");
+    ParsesOk("select * from 123_foo .123_bar");
+    ParsesOk("select * from 123_foo . 123_bar");
+
+    // We do not allow identifiers that are ambiguous with exponential.
+    ParserError("select * from foo.4e1");
+    ParserError("select * from 4e1.bar");
+
+    ParserError("select * from .123_bar");
+    ParserError("select * from . 123_bar");
+  }
+
+  @Test
+  public void TestLineBreakEnd() {
+    ParserError("--test\n");
+    ParserError("--test\n  ");
+    ParserError("SELECT\n");
+    ParserError("SELECT\n  ");
+    ParserError("SHOW\n");
+    ParserError("SHOW\n  ");
+    ParserError("INSERT\n");
+    ParserError("INSERT\n  ");
+    ParserError("DROP\n");
+    ParserError("DROP\n  ");
+    ParserError("  \n");
+    ParserError("\n  ");
+    ParserError("\n");
+
+    ParserError("SELECT\n\n");
+    ParserError("SELECT\n\n\n");
+    ParserError("SELECT\n\n \n");
+    ParserError("SELECT\n \n\n");
+    ParserError("SELECT\n\n  ");
+    ParserError("SELECT  \n\n");
+
+    ParsesOk("--test\nSELECT 1\n");
+    ParsesOk("--test\nSELECT 1\n  ");
+  }
+
+  @Test
+  public void TestCreateBucketedTable() {
+    ParserError("Create table bucketed_tbl(order_id int, order_name string)"
+            + "clustered by (order_id) into 5 buckets", "Syntax error");
   }
 }

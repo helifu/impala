@@ -17,13 +17,18 @@
 
 // All rights reserved.
 
-#include <stdlib.h>
-
 #include <algorithm>
-#include <tuple>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <tuple>  // IWYU pragma: keep
+#include <utility>
+#include <vector>
 
-#include <boost/optional.hpp>
-#include <glog/stl_logging.h>
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/stringprintf.h"
@@ -32,8 +37,9 @@
 #include "kudu/util/interval_tree-inl.h"
 #include "kudu/util/test_util.h"
 
-using std::vector;
+using std::pair;
 using std::string;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -187,16 +193,16 @@ static vector<IntInterval> CreateRandomIntervals(int n = 100) {
   for (int i = 0; i < n; i++) {
     int l = rand() % 100; // NOLINT(runtime/threadsafe_fn)
     int r = l + rand() % 20; // NOLINT(runtime/threadsafe_fn)
-    intervals.push_back(IntInterval(l, r, i));
+    intervals.emplace_back(l, r, i);
   }
   return intervals;
 }
 
 TEST_F(TestIntervalTree, TestBasic) {
   vector<IntInterval> intervals;
-  intervals.push_back(IntInterval(1, 2, 1));
-  intervals.push_back(IntInterval(3, 4, 2));
-  intervals.push_back(IntInterval(1, 4, 3));
+  intervals.emplace_back(1, 2, 1);
+  intervals.emplace_back(3, 4, 2);
+  intervals.emplace_back(1, 4, 3);
   IntervalTree<IntTraits> t(intervals);
 
   for (int i = 0; i <= 5; i++) {

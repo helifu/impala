@@ -39,19 +39,22 @@ typedef std::unordered_map<string, beeswax::TQueryOptionLevel::type>
 // Macro to help generate functions that use or manipulate query options.
 // If the DCHECK is hit then handle the missing query option below and update
 // the DCHECK.
+// Specifically, the DCHECK will make sure that the number of elements in
+// the map _TImpalaQueryOptions_VALUES_TO_NAMES automatically generated in
+// ImpalaService_types.cpp is equal to the largest integer associated with an
+// option in the enum TImpalaQueryOptions (defined in ImpalaService.thrift)
+// plus one. Thus, the second argument to the DCHECK has to be updated every
+// time we add or remove a query option to/from the enum TImpalaQueryOptions.
 #define QUERY_OPTS_TABLE\
   DCHECK_EQ(_TImpalaQueryOptions_VALUES_TO_NAMES.size(),\
-      TImpalaQueryOptions::IDLE_SESSION_TIMEOUT + 1);\
-  QUERY_OPT_FN(abort_on_default_limit_exceeded, ABORT_ON_DEFAULT_LIMIT_EXCEEDED,\
-      TQueryOptionLevel::DEPRECATED)\
+      TImpalaQueryOptions::BROADCAST_BYTES_LIMIT + 1);\
+  REMOVED_QUERY_OPT_FN(abort_on_default_limit_exceeded, ABORT_ON_DEFAULT_LIMIT_EXCEEDED)\
   QUERY_OPT_FN(abort_on_error, ABORT_ON_ERROR, TQueryOptionLevel::REGULAR)\
-  QUERY_OPT_FN(allow_unsupported_formats, ALLOW_UNSUPPORTED_FORMATS,\
-      TQueryOptionLevel::DEPRECATED)\
+  REMOVED_QUERY_OPT_FN(allow_unsupported_formats, ALLOW_UNSUPPORTED_FORMATS)\
   QUERY_OPT_FN(batch_size, BATCH_SIZE, TQueryOptionLevel::DEVELOPMENT)\
   QUERY_OPT_FN(debug_action, DEBUG_ACTION, TQueryOptionLevel::DEVELOPMENT)\
-  QUERY_OPT_FN(default_order_by_limit, DEFAULT_ORDER_BY_LIMIT,\
-      TQueryOptionLevel::DEPRECATED)\
-  QUERY_OPT_FN(disable_cached_reads, DISABLE_CACHED_READS, TQueryOptionLevel::DEPRECATED)\
+  REMOVED_QUERY_OPT_FN(default_order_by_limit, DEFAULT_ORDER_BY_LIMIT)\
+  REMOVED_QUERY_OPT_FN(disable_cached_reads, DISABLE_CACHED_READS)\
   QUERY_OPT_FN(disable_outermost_topn, DISABLE_OUTERMOST_TOPN,\
       TQueryOptionLevel::DEVELOPMENT)\
   QUERY_OPT_FN(disable_codegen, DISABLE_CODEGEN, TQueryOptionLevel::REGULAR)\
@@ -59,7 +62,7 @@ typedef std::unordered_map<string, beeswax::TQueryOptionLevel::type>
   QUERY_OPT_FN(hbase_cache_blocks, HBASE_CACHE_BLOCKS, TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(hbase_caching, HBASE_CACHING, TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(max_errors, MAX_ERRORS, TQueryOptionLevel::ADVANCED)\
-  QUERY_OPT_FN(max_io_buffers, MAX_IO_BUFFERS, TQueryOptionLevel::DEPRECATED)\
+  REMOVED_QUERY_OPT_FN(max_io_buffers, MAX_IO_BUFFERS)\
   QUERY_OPT_FN(max_scan_range_length, MAX_SCAN_RANGE_LENGTH,\
       TQueryOptionLevel::DEVELOPMENT)\
   QUERY_OPT_FN(mem_limit, MEM_LIMIT, TQueryOptionLevel::REGULAR)\
@@ -68,16 +71,15 @@ typedef std::unordered_map<string, beeswax::TQueryOptionLevel::type>
   QUERY_OPT_FN(compression_codec, COMPRESSION_CODEC, TQueryOptionLevel::REGULAR)\
   QUERY_OPT_FN(parquet_file_size, PARQUET_FILE_SIZE, TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(request_pool, REQUEST_POOL, TQueryOptionLevel::REGULAR)\
-  QUERY_OPT_FN(reservation_request_timeout, RESERVATION_REQUEST_TIMEOUT,\
-      TQueryOptionLevel::DEPRECATED)\
+  REMOVED_QUERY_OPT_FN(reservation_request_timeout, RESERVATION_REQUEST_TIMEOUT)\
   QUERY_OPT_FN(sync_ddl, SYNC_DDL, TQueryOptionLevel::REGULAR)\
-  QUERY_OPT_FN(v_cpu_cores, V_CPU_CORES, TQueryOptionLevel::DEPRECATED)\
-  QUERY_OPT_FN(rm_initial_mem, RM_INITIAL_MEM, TQueryOptionLevel::DEPRECATED)\
+  REMOVED_QUERY_OPT_FN(v_cpu_cores, V_CPU_CORES)\
+  REMOVED_QUERY_OPT_FN(rm_initial_mem, RM_INITIAL_MEM)\
   QUERY_OPT_FN(query_timeout_s, QUERY_TIMEOUT_S, TQueryOptionLevel::REGULAR)\
   QUERY_OPT_FN(buffer_pool_limit, BUFFER_POOL_LIMIT, TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(appx_count_distinct, APPX_COUNT_DISTINCT, TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(disable_unsafe_spills, DISABLE_UNSAFE_SPILLS, TQueryOptionLevel::REGULAR)\
-  QUERY_OPT_FN(seq_compression_mode, SEQ_COMPRESSION_MODE, TQueryOptionLevel::REGULAR)\
+  REMOVED_QUERY_OPT_FN(seq_compression_mode, SEQ_COMPRESSION_MODE)\
   QUERY_OPT_FN(exec_single_node_rows_threshold, EXEC_SINGLE_NODE_ROWS_THRESHOLD,\
       TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(optimize_partition_key_scans, OPTIMIZE_PARTITION_KEY_SCANS,\
@@ -85,8 +87,7 @@ typedef std::unordered_map<string, beeswax::TQueryOptionLevel::type>
   QUERY_OPT_FN(replica_preference, REPLICA_PREFERENCE, TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(schedule_random_replica, SCHEDULE_RANDOM_REPLICA,\
       TQueryOptionLevel::ADVANCED)\
-  QUERY_OPT_FN(scan_node_codegen_threshold, SCAN_NODE_CODEGEN_THRESHOLD,\
-      TQueryOptionLevel::DEPRECATED)\
+  REMOVED_QUERY_OPT_FN(scan_node_codegen_threshold, SCAN_NODE_CODEGEN_THRESHOLD)\
   QUERY_OPT_FN(disable_streaming_preaggregations, DISABLE_STREAMING_PREAGGREGATIONS,\
       TQueryOptionLevel::REGULAR)\
   QUERY_OPT_FN(runtime_filter_mode, RUNTIME_FILTER_MODE, TQueryOptionLevel::REGULAR)\
@@ -130,11 +131,79 @@ typedef std::unordered_map<string, beeswax::TQueryOptionLevel::type>
       TQueryOptionLevel::ADVANCED)\
   QUERY_OPT_FN(max_row_size, MAX_ROW_SIZE, TQueryOptionLevel::REGULAR)\
   QUERY_OPT_FN(idle_session_timeout, IDLE_SESSION_TIMEOUT, TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(compute_stats_min_sample_size, COMPUTE_STATS_MIN_SAMPLE_SIZE,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(exec_time_limit_s, EXEC_TIME_LIMIT_S, TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(shuffle_distinct_exprs, SHUFFLE_DISTINCT_EXPRS,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(max_mem_estimate_for_admission, MAX_MEM_ESTIMATE_FOR_ADMISSION,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(thread_reservation_limit, THREAD_RESERVATION_LIMIT,\
+      TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(thread_reservation_aggregate_limit, THREAD_RESERVATION_AGGREGATE_LIMIT,\
+      TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(kudu_read_mode, KUDU_READ_MODE, TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(allow_erasure_coded_files, ALLOW_ERASURE_CODED_FILES,\
+      TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(timezone, TIMEZONE, TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(scan_bytes_limit, SCAN_BYTES_LIMIT,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(cpu_limit_s, CPU_LIMIT_S, TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(topn_bytes_limit, TOPN_BYTES_LIMIT, TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(client_identifier, CLIENT_IDENTIFIER, TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(resource_trace_ratio, RESOURCE_TRACE_RATIO, TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(num_remote_executor_candidates, NUM_REMOTE_EXECUTOR_CANDIDATES,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(num_rows_produced_limit, NUM_ROWS_PRODUCED_LIMIT,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(\
+      planner_testcase_mode, PLANNER_TESTCASE_MODE, TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(default_file_format, DEFAULT_FILE_FORMAT, TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(parquet_timestamp_type, PARQUET_TIMESTAMP_TYPE,\
+      TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(parquet_read_page_index, PARQUET_READ_PAGE_INDEX,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(parquet_write_page_index, PARQUET_WRITE_PAGE_INDEX,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(parquet_page_row_count_limit, PARQUET_PAGE_ROW_COUNT_LIMIT,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(disable_hdfs_num_rows_estimate, DISABLE_HDFS_NUM_ROWS_ESTIMATE,\
+      TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(default_hints_insert_statement, DEFAULT_HINTS_INSERT_STATEMENT,\
+      TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(spool_query_results, SPOOL_QUERY_RESULTS,\
+      TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(default_transactional_type, DEFAULT_TRANSACTIONAL_TYPE,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(statement_expression_limit, STATEMENT_EXPRESSION_LIMIT,\
+      TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(max_statement_length_bytes, MAX_STATEMENT_LENGTH_BYTES,\
+      TQueryOptionLevel::REGULAR)\
+  QUERY_OPT_FN(disable_data_cache, DISABLE_DATA_CACHE,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(max_result_spooling_mem, MAX_RESULT_SPOOLING_MEM,\
+      TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(max_spilled_result_spooling_mem, MAX_SPILLED_RESULT_SPOOLING_MEM,\
+      TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(disable_hbase_num_rows_estimate, DISABLE_HBASE_NUM_ROWS_ESTIMATE,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(fetch_rows_timeout_ms, FETCH_ROWS_TIMEOUT_MS,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(now_string, NOW_STRING, TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(parquet_object_store_split_size, PARQUET_OBJECT_STORE_SPLIT_SIZE,\
+      TQueryOptionLevel::ADVANCED)\
+  QUERY_OPT_FN(mem_limit_executors, MEM_LIMIT_EXECUTORS, TQueryOptionLevel::DEVELOPMENT)\
+  QUERY_OPT_FN(broadcast_bytes_limit, BROADCAST_BYTES_LIMIT, TQueryOptionLevel::ADVANCED)
   ;
 
 /// Enforce practical limits on some query options to avoid undesired query state.
-  static const int64_t SPILLABLE_BUFFER_LIMIT = 1LL << 40; // 1 TB
-  static const int64_t ROW_SIZE_LIMIT = 1LL << 40; // 1 TB
+static const int64_t SPILLABLE_BUFFER_LIMIT = 1LL << 40; // 1 TB
+static const int64_t ROW_SIZE_LIMIT = 1LL << 40; // 1 TB
+
+/// Limits on the query size are intended to be large. Prevent them from being set
+/// to small values (which can prevent clients from executing anything).
+static const int32_t MIN_STATEMENT_EXPRESSION_LIMIT = 1 << 10; // 1024
+static const int32_t MIN_MAX_STATEMENT_LENGTH_BYTES = 1 << 10; // 1 KB
 
 /// Converts a TQueryOptions struct into a map of key, value pairs.  Options that
 /// aren't set and lack defaults in common/thrift/ImpalaInternalService.thrift are
@@ -150,7 +219,7 @@ std::string DebugQueryOptions(const TQueryOptions& query_options);
 
 /// Bitmask for the values of TQueryOptions.
 /// TODO: Find a way to set the size based on the number of fields.
-typedef std::bitset<64> QueryOptionsMask;
+typedef std::bitset<128> QueryOptionsMask;
 
 /// Updates the query options in dst from those in src where the query option is set
 /// (i.e. src->__isset.PROPERTY is true) and the corresponding bit in mask is set. If
@@ -164,6 +233,12 @@ void OverlayQueryOptions(const TQueryOptions& src, const QueryOptionsMask& mask,
 /// is set. An empty string value will reset the key to its default value.
 Status SetQueryOption(const std::string& key, const std::string& value,
     TQueryOptions* query_options, QueryOptionsMask* set_query_options_mask);
+
+/// Validates the query options after they have all been set. Returns a Status indicating
+/// the results of running the validation rules. The majority of the query options
+/// validation is done in SetQueryOption. However, more complex validations rules (e.g.
+/// validating that one config is greater than another config) are run here.
+Status ValidateQueryOptions(TQueryOptions* query_options);
 
 /// Parse a "," separated key=value pair of query options and set it in 'query_options'.
 /// If the same query option is specified more than once, the last one wins. The

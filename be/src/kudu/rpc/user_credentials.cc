@@ -17,11 +17,15 @@
 
 #include "kudu/rpc/user_credentials.h"
 
+#include <cstddef>
 #include <string>
+#include <utility>
 
-#include <boost/functional/hash.hpp>
+#include <boost/functional/hash/hash.hpp>
 
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/status.h"
+#include "kudu/util/user.h"
 
 using std::string;
 
@@ -36,8 +40,11 @@ void UserCredentials::set_real_user(string real_user) {
   real_user_ = std::move(real_user);
 }
 
+Status UserCredentials::SetLoggedInRealUser() {
+  return GetLoggedInUser(&real_user_);
+}
+
 string UserCredentials::ToString() const {
-  // Does not print the password.
   return strings::Substitute("{real_user=$0}", real_user_);
 }
 

@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "service/client-request-state.h"
 #include "util/auth-util.h"
+
+#include <boost/algorithm/string.hpp>
+
+#include "service/client-request-state.h"
 #include "util/network-util.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
+#include "kudu/security/init.h"
+#include "exec/kudu-util.h"
 
 using namespace std;
 using boost::algorithm::is_any_of;
@@ -31,25 +36,25 @@ namespace impala {
 // Pattern for hostname substitution.
 static const string HOSTNAME_PATTERN = "_HOST";
 
-  const string& GetEffectiveUser(const TSessionState& session) {
-    if (session.__isset.delegated_user && !session.delegated_user.empty()) {
-      return session.delegated_user;
-    }
-    return session.connected_user;
+const string& GetEffectiveUser(const TSessionState& session) {
+  if (session.__isset.delegated_user && !session.delegated_user.empty()) {
+    return session.delegated_user;
   }
+  return session.connected_user;
+}
 
-  const string& GetEffectiveUser(const ImpalaServer::SessionState& session) {
-    return session.do_as_user.empty() ? session.connected_user : session.do_as_user;
-  }
+const string& GetEffectiveUser(const ImpalaServer::SessionState& session) {
+  return session.do_as_user.empty() ? session.connected_user : session.do_as_user;
+}
 
-  Status CheckProfileAccess(const string& user, const string& effective_user,
-      bool has_access) {
-    if (user.empty() || (user == effective_user && has_access)) return Status::OK();
-    stringstream ss;
-    ss << "User " << user << " is not authorized to access the runtime profile or "
-       << "execution summary.";
-    return Status(ss.str());
-  }
+Status CheckProfileAccess(const string& user, const string& effective_user,
+    bool has_access) {
+  if (user.empty() || (user == effective_user && has_access)) return Status::OK();
+  stringstream ss;
+  ss << "User " << user << " is not authorized to access the runtime profile or "
+     << "execution summary.";
+  return Status(ss.str());
+}
 
 // Replaces _HOST with the hostname if it occurs in the principal string.
 Status ReplacePrincipalHostFormat(string* out_principal) {
@@ -83,25 +88,9 @@ Status GetInternalKerberosPrincipal(string* out_principal) {
 
 Status ParseKerberosPrincipal(const string& principal, string* service_name,
     string* hostname, string* realm) {
-  vector<string> names;
-
-  split(names, principal, is_any_of("/"));
-  if (names.size() != 2) return Status(TErrorCode::BAD_PRINCIPAL_FORMAT, principal);
-
-  *service_name = names[0];
-
-  string remaining_principal = names[1];
-  split(names, remaining_principal, is_any_of("@"));
-  if (names.size() != 2) return Status(TErrorCode::BAD_PRINCIPAL_FORMAT, principal);
-
-  *hostname = names[0];
-  *realm = names[1];
-
+  KUDU_RETURN_IF_ERROR(kudu::security::Krb5ParseName(principal, service_name,
+      hostname, realm), strings::Substitute("bad principal format $0", principal));
   return Status::OK();
-}
-
-bool IsKerberosEnabled() {
-  return !FLAGS_principal.empty();
 }
 
 }

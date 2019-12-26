@@ -71,11 +71,10 @@ public class SelectNode extends PlanNode {
     if (getChild(0).cardinality_ == -1) {
       cardinality_ = -1;
     } else {
-      cardinality_ =
-          Math.round(((double) getChild(0).cardinality_) * computeSelectivity());
+      cardinality_ = applyConjunctsSelectivity(getChild(0).cardinality_);
       Preconditions.checkState(cardinality_ >= 0);
     }
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
       LOG.trace("stats Select: cardinality=" + Long.toString(cardinality_));
     }
@@ -83,7 +82,13 @@ public class SelectNode extends PlanNode {
 
   @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    // TODO: add an estimate
+    // The select node initializes a single row-batch which it recycles on every
+    // GetNext() call made to its child node. The memory attached to that
+    // row-batch is the only memory counted against this node. Since that
+    // attached memory depends on how the nodes under it manage memory
+    // ownership, it becomes increasingly difficult to accurately estimate this
+    // node's peak mem usage. Considering that, we estimate zero bytes for it to
+    // make sure it does not affect overall estimations in any way.
     nodeResourceProfile_ = ResourceProfile.noReservation(0);
   }
 
@@ -94,8 +99,8 @@ public class SelectNode extends PlanNode {
     output.append(String.format("%s%s:%s\n", prefix, id_.toString(), displayName_));
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
       if (!conjuncts_.isEmpty()) {
-        output.append(detailPrefix + "predicates: " +
-            getExplainString(conjuncts_) + "\n");
+        output.append(detailPrefix
+            + "predicates: " + Expr.getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     return output.toString();

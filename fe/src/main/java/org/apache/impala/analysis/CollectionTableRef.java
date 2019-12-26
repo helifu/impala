@@ -18,7 +18,6 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.common.AnalysisException;
 import com.google.common.base.Preconditions;
 
@@ -81,7 +80,7 @@ public class CollectionTableRef extends TableRef {
   public void analyze(Analyzer analyzer) throws AnalysisException {
     if (isAnalyzed_) return;
     desc_ = analyzer.registerTableRef(this);
-    if (isRelative() && !analyzer.isWithClause()) {
+    if (isRelative() && !analyzer.hasWithClause()) {
       SlotDescriptor parentSlotDesc = analyzer.registerSlotRef(resolvedPath_);
       parentSlotDesc.setItemTupleDesc(desc_);
       collectionExpr_ = new SlotRef(parentSlotDesc);
@@ -103,11 +102,13 @@ public class CollectionTableRef extends TableRef {
       // Register a table-level privilege request as well as a column-level privilege request
       // for the collection-typed column.
       Preconditions.checkNotNull(resolvedPath_.getRootTable());
-      analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_);
-      analyzer.registerPrivReq(new PrivilegeRequestBuilder().
-          allOf(Privilege.SELECT).onColumn(desc_.getTableName().getDb(),
-          desc_.getTableName().getTbl(), desc_.getPath().getRawPath().get(0))
-          .toRequest());
+      analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_,
+          requireGrantOption_);
+      analyzer.registerPrivReq(builder ->
+          builder.allOf(Privilege.SELECT)
+              .onColumn(desc_.getTableName().getDb(), desc_.getTableName().getTbl(),
+                  desc_.getPath().getRawPath().get(0),
+                  resolvedPath_.getRootTable().getOwnerUser()).build());
     }
     isAnalyzed_ = true;
     analyzeTableSample(analyzer);

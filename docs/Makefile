@@ -26,7 +26,7 @@ pdf: build/impala.pdf
 ALL_DEPS=Makefile impala.ditamap shared/*.xml images/* topics/*.xml
 
 build/html/index.html: impala_html.ditaval ${ALL_DEPS}
-	dita -i impala.ditamap -f html5 -o $(dir $@) -filter $<
+	./build-doc.sh xhtml $(dir $@) $< gen-html.log
 
 build/impala.pdf: impala_pdf.ditaval ${ALL_DEPS}
-	dita -i impala.ditamap -f pdf -o $(dir $@) -filter $<
+	./build-doc.sh pdf $(dir $@) $< gen-pdf.log

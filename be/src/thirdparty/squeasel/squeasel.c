@@ -209,7 +209,7 @@ struct socket {
 };
 
 char* SAFE_HTTP_METHODS[] = {
-  "GET", "POST", "HEAD", "PROPFIND", "MKCOL" };
+  "GET", "POST", "HEAD", "PROPFIND", "MKCOL", "OPTIONS" };
 
 // See https://www.owasp.org/index.php/Test_HTTP_Methods_(OTG-CONFIG-006) for details.
 #ifdef ALLOW_UNSAFE_HTTP_METHODS
@@ -693,20 +693,32 @@ static int match_prefix(const char *pattern, int pattern_len, const char *str) {
   return j;
 }
 
-// HTTP 1.1 assumes keep alive if "Connection:" header is not set
-// This function must tolerate situations when connection info is not
-// set up, for example if request parsing failed.
 static int should_keep_alive(const struct sq_connection *conn) {
   const char *http_version = conn->request_info.http_version;
   const char *header = sq_get_header(conn, "Connection");
+
+  // Start by checking our own internal request state and configuration.
   if (conn->must_close ||
-      conn->status_code == 401 ||
-      sq_strcasecmp(conn->ctx->config[ENABLE_KEEP_ALIVE], "yes") != 0 ||
-      (header != NULL && sq_strcasecmp(header, "keep-alive") != 0) ||
-      (header == NULL && http_version && strcmp(http_version, "1.1"))) {
+      sq_strcasecmp(conn->ctx->config[ENABLE_KEEP_ALIVE], "yes") != 0) {
     return 0;
   }
-  return 1;
+
+  // Now consider the HTTP version and "Connection:" header.
+
+  // If we couldn't parse an HTTP version, assume 1.0.
+  //
+  // We must tolerate situations when connection info is not set up, for
+  // example if HTTP request parsing failed.
+  int http_1_0 = !http_version || sq_strcasecmp(http_version, "1.0") == 0;
+  if (!header) {
+    // HTTP 1.1 assumes keep alive if the "Connection:" header is not set.
+    return !http_1_0;
+  }
+
+  // With HTTP 1.0, keep alive only if the "Connection: keep-alive" header
+  // exists. Otherwise, keep alive unless the "Connection: close" header exists.
+  return (http_1_0 && sq_strcasecmp(header, "keep-alive") == 0) ||
+         (!http_1_0 && sq_strcasecmp(header, "close") != 0);
 }
 
 static const char *suggest_connection_header(const struct sq_connection *conn) {
@@ -923,6 +935,18 @@ static int64_t push(FILE *fp, SOCKET sock, SSL *ssl, const char *buf,
   return sent;
 }
 
+// Wait for either 'fd' or 'wakeup_fds' to have readable data.
+static void wait_for_readable_or_wakeup(struct sq_context *ctx,
+    int fd, int timeout_ms) {
+  struct pollfd pfd[2];
+  pfd[0].fd = fd;
+  pfd[0].events = POLLIN;
+  pfd[1].fd = ctx->wakeup_fds[0];
+  pfd[1].events = POLLIN;
+  int poll_rc;
+  RETRY_ON_EINTR(poll_rc, poll(pfd, 2, timeout_ms));
+}
+
 // Read from IO channel - opened file descriptor, socket, or SSL descriptor.
 // Return negative value on error, or number of bytes read on success.
 static int pull(FILE *fp, struct sq_connection *conn, char *buf, int len) {
@@ -939,7 +963,7 @@ static int pull(FILE *fp, struct sq_connection *conn, char *buf, int len) {
 #endif
   } else {
     RETRY_ON_EINTR(nread, recv(conn->client.sock, buf, (size_t) len, 0));
-    if (nread == -1) {
+    if (nread == -1 && errno != EAGAIN) {
       cry(conn, "error reading: %s", strerror(errno));
     }
   }
@@ -1057,6 +1081,7 @@ static int alloc_vprintf2(char **buf, const char *fmt, va_list ap) {
     if (!*buf) break;
     va_copy(ap_copy, ap);
     len = vsnprintf(*buf, size, fmt, ap_copy);
+    va_end(ap_copy);
   }
 
   return len;
@@ -1076,12 +1101,14 @@ static int alloc_vprintf(char **buf, size_t size, const char *fmt, va_list ap) {
   // On second pass, actually print the message.
   va_copy(ap_copy, ap);
   len = vsnprintf(NULL, 0, fmt, ap_copy);
+  va_end(ap_copy);
 
   if (len < 0) {
     // C runtime is not standard compliant, vsnprintf() returned -1.
     // Switch to alternative code path that uses incremental allocations.
     va_copy(ap_copy, ap);
     len = alloc_vprintf2(buf, fmt, ap);
+    va_end(ap_copy);
   } else if (len > (int) size &&
       (size = len + 1) > 0 &&
       (*buf = (char *) malloc(size)) == NULL) {
@@ -1089,6 +1116,7 @@ static int alloc_vprintf(char **buf, size_t size, const char *fmt, va_list ap) {
   } else {
     va_copy(ap_copy, ap);
     vsnprintf(*buf, size, fmt, ap_copy);
+    va_end(ap_copy);
   }
 
   return len;
@@ -1111,7 +1139,9 @@ int sq_vprintf(struct sq_connection *conn, const char *fmt, va_list ap) {
 int sq_printf(struct sq_connection *conn, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  return sq_vprintf(conn, fmt, ap);
+  int ret_val = sq_vprintf(conn, fmt, ap);
+  va_end(ap);
+  return ret_val;
 }
 
 int sq_url_decode(const char *src, int src_len, char *dst,
@@ -2529,6 +2559,14 @@ static int read_request(FILE *fp, struct sq_connection *conn,
   int request_len, n = 0;
 
   request_len = get_request_len(buf, *nread);
+  if (request_len == 0) {
+    // If we are starting to read a new request, with nothing buffered,
+    // wait for either the beginning of the request, or for the shutdown
+    // signal.
+    wait_for_readable_or_wakeup(conn->ctx, fp ? fileno(fp) : conn->client.sock,
+        atoi(conn->ctx->config[REQUEST_TIMEOUT]));
+  }
+
   while (conn->ctx->stop_flag == 0 &&
          *nread < bufsiz && request_len == 0 &&
          (n = pull(fp, conn, buf + *nread, bufsiz - *nread)) > 0) {
@@ -3210,8 +3248,7 @@ static void handle_ssi_file_request(struct sq_connection *conn,
     conn->must_close = 1;
     fclose_on_exec(&file);
     sq_printf(conn, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/html\r\nConnection: %s\r\n\r\n",
-              suggest_connection_header(conn));
+              "Content-Type: text/html\r\nConnection: close\r\n\r\n");
     send_ssi_file(conn, path, &file, 0);
     sq_fclose(&file);
   }
@@ -3220,9 +3257,16 @@ static void handle_ssi_file_request(struct sq_connection *conn,
 static void send_options(struct sq_connection *conn) {
   conn->status_code = 200;
 
+  #ifdef ALLOW_UNSAFE_HTTP_METHODS
   sq_printf(conn, "%s", "HTTP/1.1 200 OK\r\n"
             "Allow: GET, POST, HEAD, CONNECT, PUT, DELETE, OPTIONS, PROPFIND, MKCOL\r\n"
-            "DAV: 1\r\n\r\n");
+            "DAV: 1\r\n"
+            "Content-Length: 0\r\n\r\n");
+  #else
+    sq_printf(conn, "%s", "HTTP/1.1 200 OK\r\n"
+            "Allow: GET, POST, HEAD, OPTIONS, PROPFIND, MKCOL\r\n"
+            "Content-Length: 0\r\n\r\n");
+  #endif
 }
 
 // Writes PROPFIND properties for a collection element
@@ -3844,6 +3888,7 @@ static void handle_request(struct sq_connection *conn) {
   char path[PATH_MAX];
   int uri_len, ssl_index;
   struct file file = STRUCT_FILE_INITIALIZER;
+  sq_callback_result_t callback_result = SQ_HANDLED_OK;
 
   if ((conn->request_info.query_string = strchr(ri->uri, '?')) != NULL) {
     * ((char *) conn->request_info.query_string++) = '\0';
@@ -3865,8 +3910,10 @@ static void handle_request(struct sq_connection *conn) {
              !check_authorization(conn, path)) {
     send_authorization_request(conn);
   } else if (conn->ctx->callbacks.begin_request != NULL &&
-      conn->ctx->callbacks.begin_request(conn)) {
+      ((callback_result = conn->ctx->callbacks.begin_request(conn))
+          != SQ_CONTINUE_HANDLING)) {
     // Do nothing, callback has served the request
+    conn->must_close = (callback_result == SQ_HANDLED_CLOSE_CONNECTION);
 #if defined(USE_WEBSOCKET)
   } else if (is_websocket_request(conn)) {
     handle_websocket_request(conn);
@@ -4292,11 +4339,38 @@ static int set_ssl_option(struct sq_context *ctx) {
     (void) SSL_CTX_use_certificate_chain_file(ctx->ssl_ctx, pem);
   }
 
-  if (ctx->config[SSL_CIPHERS] != NULL &&
-      (SSL_CTX_set_cipher_list(ctx->ssl_ctx, ctx->config[SSL_CIPHERS]) == 0)) {
-    cry(fc(ctx), "SSL_CTX_set_cipher_list: error setting ciphers (%s): %s",
-        ctx->config[SSL_CIPHERS], ssl_error());
-    return 0;
+  if (ctx->config[SSL_CIPHERS] != NULL) {
+    if (SSL_CTX_set_cipher_list(ctx->ssl_ctx, ctx->config[SSL_CIPHERS]) == 0) {
+      cry(fc(ctx), "SSL_CTX_set_cipher_list: error setting ciphers (%s): %s",
+          ctx->config[SSL_CIPHERS], ssl_error());
+      return 0;
+    }
+#ifndef OPENSSL_NO_ECDH
+#if OPENSSL_VERSION_NUMBER < 0x10002000L
+    // OpenSSL 1.0.1 and below only support setting a single ECDH curve at once.
+    // We choose prime256v1 because it's the first curve listed in the "modern
+    // compatibility" section of the Mozilla Server Side TLS recommendations,
+    // accessed Feb. 2017.
+    EC_KEY* ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (ecdh == NULL) {
+      cry(fc(ctx), "EC_KEY_new_by_curve_name: %s", ssl_error());
+    } else {
+      int rc = SSL_CTX_set_tmp_ecdh(ctx->ssl_ctx, ecdh);
+      if (rc <= 0) {
+        cry(fc(ctx), "SSL_CTX_set_tmp_ecdh: %s", ssl_error());
+      }
+      EC_KEY_free(ecdh);
+    }
+#elif OPENSSL_VERSION_NUMBER < 0x10100000L
+    // OpenSSL 1.0.2 provides the set_ecdh_auto API which internally figures out
+    // the best curve to use.
+    int rc = SSL_CTX_set_ecdh_auto(ctx->ssl_ctx, 1);
+    if (rc <= 0) {
+      cry(fc(ctx), "SSL_CTX_set_ecdh_auto: %s", ssl_error());
+    }
+#endif
+#endif
+
   }
 
   return 1;
@@ -4427,7 +4501,14 @@ static int is_valid_uri(const char *uri) {
   return uri[0] == '/' || (uri[0] == '*' && uri[1] == '\0');
 }
 
-static int getreq(struct sq_connection *conn, char *ebuf, size_t ebuf_len) {
+
+typedef enum {
+  GETREQ_OK,
+  GETREQ_KEEPALIVE_TIMEOUT,
+  GETREQ_ERROR
+} GetReqResult;
+
+static GetReqResult getreq(struct sq_connection *conn, char *ebuf, size_t ebuf_len) {
   const char *cl;
 
   ebuf[0] = '\0';
@@ -4438,11 +4519,13 @@ static int getreq(struct sq_connection *conn, char *ebuf, size_t ebuf_len) {
 
   if (conn->request_len == 0 && conn->data_len == conn->buf_size) {
     snprintf(ebuf, ebuf_len, "%s", "Request Too Large");
+    return GETREQ_ERROR;
   } else if (conn->request_len <= 0) {
-    snprintf(ebuf, ebuf_len, "%s", "Client closed connection");
+    return GETREQ_KEEPALIVE_TIMEOUT;
   } else if (parse_http_message(conn->buf, conn->buf_size,
                                 &conn->request_info) <= 0) {
     snprintf(ebuf, ebuf_len, "Bad request: [%.*s]", conn->data_len, conn->buf);
+    return GETREQ_ERROR;
   } else {
     // Request is valid
     if ((cl = get_header(&conn->request_info, "Content-Length")) != NULL) {
@@ -4455,7 +4538,7 @@ static int getreq(struct sq_connection *conn, char *ebuf, size_t ebuf_len) {
     }
     conn->birth_time = time(NULL);
   }
-  return ebuf[0] == '\0';
+  return GETREQ_OK;
 }
 
 struct sq_connection *sq_download(const char *host, int port, int use_ssl,
@@ -4476,6 +4559,7 @@ struct sq_connection *sq_download(const char *host, int port, int use_ssl,
     sq_close_connection(conn);
     conn = NULL;
   }
+  va_end(ap);
 
   return conn;
 }
@@ -4484,6 +4568,7 @@ static void process_new_connection(struct sq_connection *conn) {
   struct sq_request_info *ri = &conn->request_info;
   int keep_alive_enabled, keep_alive, discard_len;
   char ebuf[100];
+  GetReqResult getreq_status;
 
   keep_alive_enabled = !strcmp(conn->ctx->config[ENABLE_KEEP_ALIVE], "yes");
   keep_alive = 0;
@@ -4492,8 +4577,11 @@ static void process_new_connection(struct sq_connection *conn) {
   // to crule42.
   conn->data_len = 0;
   do {
-    if (!getreq(conn, ebuf, sizeof(ebuf))) {
-      send_http_error(conn, 500, "Server Error", "%s", ebuf);
+    getreq_status = getreq(conn, ebuf, sizeof(ebuf));
+    if (getreq_status != GETREQ_OK) {
+      if (getreq_status == GETREQ_ERROR) {
+        send_http_error(conn, 500, "Server Error", "%s", ebuf);
+      }
       conn->must_close = 1;
     } else if (!is_valid_uri(conn->request_info.uri)) {
       char* encoded = (char*) malloc(SQ_BUF_LEN);
@@ -4507,7 +4595,7 @@ static void process_new_connection(struct sq_connection *conn) {
       send_http_error(conn, 505, "Bad HTTP version", "%s", ebuf);
     }
 
-    if (ebuf[0] == '\0') {
+    if (getreq_status == GETREQ_OK) {
       handle_request(conn);
       if (conn->ctx->callbacks.end_request != NULL) {
         conn->ctx->callbacks.end_request(conn, conn->status_code);

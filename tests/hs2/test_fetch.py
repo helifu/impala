@@ -18,9 +18,15 @@
 
 import pytest
 import re
-from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session
+
+from time import sleep
+from time import time
+from tests.common.errors import Timeout
+from tests.hs2.hs2_test_suite import (HS2TestSuite, needs_session,
+    create_op_handle_without_secret)
 from TCLIService import TCLIService, constants
 from TCLIService.ttypes import TTypeId
+
 
 # Simple test to make sure all the HS2 types are supported for both the row and
 # column-oriented versions of the HS2 protocol.
@@ -110,6 +116,22 @@ class TestFetch(HS2TestSuite):
     self.__verify_char_max_len(column_types[2], 32)
     self.close(execute_statement_resp.operationHandle)
 
+    # Verify the result metadata for the DATE type.
+    execute_statement_req.statement =\
+        "SELECT * FROM functional.date_tbl ORDER BY date_col LIMIT 1"
+    execute_statement_resp = self.hs2_client.ExecuteStatement(execute_statement_req)
+    HS2TestSuite.check_response(execute_statement_resp)
+    results = self.fetch_at_most(execute_statement_resp.operationHandle,
+                                 TCLIService.TFetchOrientation.FETCH_NEXT, 1, 1)
+    assert len(results.results.rows) == 1
+    metadata_resp = self.result_metadata(execute_statement_resp.operationHandle)
+    column_types = metadata_resp.schema.columns
+    assert len(column_types) == 3
+    self.__verify_primitive_type(TTypeId.INT_TYPE, column_types[0])
+    self.__verify_primitive_type(TTypeId.DATE_TYPE, column_types[1])
+    self.__verify_primitive_type(TTypeId.DATE_TYPE, column_types[2])
+    self.close(execute_statement_resp.operationHandle)
+
   def __query_and_fetch(self, query):
     execute_statement_req = TCLIService.TExecuteStatementReq()
     execute_statement_req.sessionHandle = self.session_handle
@@ -117,11 +139,11 @@ class TestFetch(HS2TestSuite):
     execute_statement_resp = self.hs2_client.ExecuteStatement(execute_statement_req)
     HS2TestSuite.check_response(execute_statement_resp)
 
+    # Do the actual fetch with a valid request.
     fetch_results_req = TCLIService.TFetchResultsReq()
     fetch_results_req.operationHandle = execute_statement_resp.operationHandle
     fetch_results_req.maxRows = 1024
-    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-    HS2TestSuite.check_response(fetch_results_resp)
+    fetch_results_resp = self.fetch(fetch_results_req)
 
     return fetch_results_resp
 
@@ -158,6 +180,12 @@ class TestFetch(HS2TestSuite):
     num_rows, result = self.column_results_to_string(fetch_results_resp.results.columns)
     assert result == "car  \n"
 
+    # Date
+    fetch_results_resp = self.__query_and_fetch(
+      "SELECT * from functional.date_tbl ORDER BY date_col LIMIT 1")
+    num_rows, result = self.column_results_to_string(fetch_results_resp.results.columns)
+    assert result == ("0, 0001-01-01, 0001-01-01\n")
+
   @needs_session()
   def test_show_partitions(self):
     """Regression test for IMPALA-1330"""
@@ -190,8 +218,7 @@ class TestFetch(HS2TestSuite):
     fetch_results_req = TCLIService.TFetchResultsReq()
     fetch_results_req.operationHandle = execute_statement_resp.operationHandle
     fetch_results_req.maxRows = 100
-    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-    HS2TestSuite.check_response(fetch_results_resp)
+    fetch_results_resp = self.fetch(fetch_results_req)
 
     assert len(fetch_results_resp.results.rows) == 1
     assert fetch_results_resp.results.startRowOffset == 0
@@ -224,8 +251,7 @@ class TestFetch(HS2TestSuite):
     fetch_results_req = TCLIService.TFetchResultsReq()
     fetch_results_req.operationHandle = execute_statement_resp.operationHandle
     fetch_results_req.maxRows = 1
-    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-    HS2TestSuite.check_response(fetch_results_resp)
+    fetch_results_resp = self.fetch(fetch_results_req)
     assert fetch_results_resp.results.columns[0].boolVal is not None
 
     assert self.column_results_to_string(
@@ -235,3 +261,35 @@ class TestFetch(HS2TestSuite):
   def test_compute_stats(self):
     """Exercise the child query path"""
     self.__query_and_fetch("compute stats functional.alltypes")
+
+  @needs_session()
+  def test_invalid_secret(self):
+    """Test that the FetchResults, GetResultSetMetadata and CloseOperation APIs validate
+    the session secret."""
+    execute_req = TCLIService.TExecuteStatementReq(
+        self.session_handle, "select 'something something'")
+    execute_resp = self.hs2_client.ExecuteStatement(execute_req)
+    HS2TestSuite.check_response(execute_resp)
+
+    good_handle = execute_resp.operationHandle
+    bad_handle = create_op_handle_without_secret(good_handle)
+
+    # Fetching and closing operations with an invalid handle should be a no-op, i.e.
+    # the later operations with the good handle should succeed.
+    HS2TestSuite.check_invalid_query(self.hs2_client.FetchResults(
+        TCLIService.TFetchResultsReq(operationHandle=bad_handle, maxRows=1024)),
+        expect_legacy_err=True)
+    HS2TestSuite.check_invalid_query(self.hs2_client.GetResultSetMetadata(
+        TCLIService.TGetResultSetMetadataReq(operationHandle=bad_handle)),
+        expect_legacy_err=True)
+    HS2TestSuite.check_invalid_query(self.hs2_client.CloseOperation(
+        TCLIService.TCloseOperationReq(operationHandle=bad_handle)),
+        expect_legacy_err=True)
+
+    # Ensure that the good handle remained valid.
+    HS2TestSuite.check_response(self.hs2_client.FetchResults(
+        TCLIService.TFetchResultsReq(operationHandle=good_handle, maxRows=1024)))
+    HS2TestSuite.check_response(self.hs2_client.GetResultSetMetadata(
+        TCLIService.TGetResultSetMetadataReq(operationHandle=good_handle)))
+    HS2TestSuite.check_response(self.hs2_client.CloseOperation(
+        TCLIService.TCloseOperationReq(operationHandle=good_handle)))

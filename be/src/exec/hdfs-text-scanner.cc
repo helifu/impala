@@ -22,7 +22,7 @@
 #include "codegen/llvm-codegen.h"
 #include "exec/delimited-text-parser.h"
 #include "exec/delimited-text-parser.inline.h"
-#include "exec/hdfs-lzo-text-scanner.h"
+#include "exec/hdfs-plugin-text-scanner.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/scanner-context.inline.h"
 #include "exec/text-converter.h"
@@ -76,26 +76,25 @@ HdfsTextScanner::~HdfsTextScanner() {
 Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const vector<HdfsFileDesc*>& files) {
   vector<ScanRange*> compressed_text_scan_ranges;
-  int compressed_text_files = 0;
-  vector<HdfsFileDesc*> lzo_text_files;
+  map<string, vector<HdfsFileDesc*>> plugin_text_files;
   for (int i = 0; i < files.size(); ++i) {
     THdfsCompression::type compression = files[i]->file_compression;
     switch (compression) {
       case THdfsCompression::NONE:
         // For uncompressed text we just issue all ranges at once.
         // TODO: Lz4 is splittable, should be treated similarly.
-        RETURN_IF_ERROR(scan_node->AddDiskIoRanges(files[i]));
+        RETURN_IF_ERROR(scan_node->AddDiskIoRanges(files[i], EnqueueLocation::TAIL));
         break;
 
       case THdfsCompression::GZIP:
       case THdfsCompression::SNAPPY:
       case THdfsCompression::SNAPPY_BLOCKED:
       case THdfsCompression::BZIP2:
-        ++compressed_text_files;
+      case THdfsCompression::DEFLATE:
         for (int j = 0; j < files[i]->splits.size(); ++j) {
-          // In order to decompress gzip-, snappy- and bzip2-compressed text files, we
-          // need to read entire files. Only read a file if we're assigned the first split
-          // to avoid reading multi-block files with multiple scanners.
+          // In order to decompress gzip-, snappy-, bzip2- and deflate-compressed text
+          // files, we need to read entire files. Only read a file if we're assigned the
+          // first split to avoid reading multi-block files with multiple scanners.
           ScanRange* split = files[i]->splits[j];
 
           // We only process the split that starts at offset 0.
@@ -118,39 +117,43 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
           ScanRange* file_range = scan_node->AllocateScanRange(files[i]->fs,
               files[i]->filename.c_str(), files[i]->file_length, 0,
               metadata->partition_id, split->disk_id(), split->expected_local(),
-              BufferOpts(split->try_cache(), files[i]->mtime));
+              files[i]->is_erasure_coded, files[i]->mtime,
+              BufferOpts(split->cache_options()));
           compressed_text_scan_ranges.push_back(file_range);
           scan_node->max_compressed_text_file_length()->Set(files[i]->file_length);
         }
         break;
 
-      case THdfsCompression::LZO:
-        // lzo-compressed text need to be processed by the specialized HdfsLzoTextScanner.
-        // Note that any LZO_INDEX files (no matter what the case of their suffix) will be
-        // filtered by the planner.
-        {
-        #ifndef NDEBUG
-          // No straightforward way to do this in one line inside a DCHECK, so for once
-          // we'll explicitly use NDEBUG to avoid executing debug-only code.
-          string lower_filename = files[i]->filename;
-          to_lower(lower_filename);
-          DCHECK(!ends_with(lower_filename, LZO_INDEX_SUFFIX));
-        #endif
-          lzo_text_files.push_back(files[i]);
+      default: {
+        // Other compression formats are only supported by a plugin.
+        auto it = _THdfsCompression_VALUES_TO_NAMES.find(compression);
+        if (it == _THdfsCompression_VALUES_TO_NAMES.end()) {
+          return Status(Substitute(
+                "Unexpected compression enum value: $0", static_cast<int>(compression)));
         }
-        break;
-
-      default:
-        DCHECK(false);
+#ifndef NDEBUG
+        // Note any LZO_INDEX files (no matter what the case of their suffix) should be
+        // filtered by the planner.
+        // No straightforward way to do this in one line inside a DCHECK, so for once
+        // we'll explicitly use NDEBUG to avoid executing debug-only code.
+        string lower_filename = files[i]->filename;
+        to_lower(lower_filename);
+        DCHECK(!ends_with(lower_filename, LZO_INDEX_SUFFIX));
+#endif
+        plugin_text_files[it->second].push_back(files[i]);
+      }
     }
   }
-  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(compressed_text_scan_ranges,
-          compressed_text_files));
-  if (lzo_text_files.size() > 0) {
-    // This will dlopen the lzo binary and can fail if the lzo binary is not present.
-    RETURN_IF_ERROR(HdfsLzoTextScanner::IssueInitialRanges(scan_node, lzo_text_files));
+  if (compressed_text_scan_ranges.size() > 0) {
+    RETURN_IF_ERROR(scan_node->AddDiskIoRanges(compressed_text_scan_ranges,
+          EnqueueLocation::TAIL));
   }
-
+  for (const auto& entry : plugin_text_files) {
+    DCHECK_GT(entry.second.size(), 0) << "List should be non-empty";
+    // This can fail if the plugin library can't be loaded.
+    RETURN_IF_ERROR(HdfsPluginTextScanner::IssueInitialRanges(
+          scan_node, entry.second, entry.first));
+  }
   return Status::OK();
 }
 
@@ -190,10 +193,20 @@ void HdfsTextScanner::Close(RowBatch* row_batch) {
 
 Status HdfsTextScanner::InitNewRange() {
   DCHECK_EQ(scan_state_, CONSTRUCTED);
+
+  auto compression_type = stream_ ->file_desc()->file_compression;
   // Update the decompressor based on the compression type of the file in the context.
-  DCHECK(stream_->file_desc()->file_compression != THdfsCompression::SNAPPY)
+  DCHECK(compression_type != THdfsCompression::SNAPPY)
       << "FE should have generated SNAPPY_BLOCKED instead.";
-  RETURN_IF_ERROR(UpdateDecompressor(stream_->file_desc()->file_compression));
+  // In Hadoop, text files compressed into .DEFLATE files contain
+  // deflate with zlib wrappings as opposed to raw deflate, which
+  // is what THdfsCompression::DEFLATE implies. Since deflate is
+  // the default compression algorithm used in Hadoop, it makes
+  // sense to map it to type DEFAULT in Impala instead
+  if (compression_type == THdfsCompression::DEFLATE) {
+    compression_type = THdfsCompression::DEFAULT;
+  }
+  RETURN_IF_ERROR(UpdateDecompressor(compression_type));
 
   HdfsPartitionDescriptor* hdfs_partition = context_->partition_descriptor();
   char field_delim = hdfs_partition->field_delim();
@@ -203,7 +216,7 @@ Status HdfsTextScanner::InitNewRange() {
     collection_delim = '\0';
   }
 
-  delimited_text_parser_.reset(new DelimitedTextParser(
+  delimited_text_parser_.reset(new TupleDelimitedTextParser(
       scan_node_->hdfs_table()->num_cols(), scan_node_->num_partition_keys(),
       scan_node_->is_materialized_col(), hdfs_partition->line_delim(),
       field_delim, collection_delim, hdfs_partition->escape_char()));
@@ -413,7 +426,7 @@ Status HdfsTextScanner::ProcessRange(RowBatch* row_batch, int* num_tuples) {
       break;
     }
 
-    if (row_batch->AtCapacity() || scan_node_->ReachedLimit()) break;
+    if (row_batch->AtCapacity() || scan_node_->ReachedLimitShared()) break;
   }
   return Status::OK();
 }
@@ -444,7 +457,7 @@ Status HdfsTextScanner::GetNextInternal(RowBatch* row_batch) {
     int num_tuples;
     RETURN_IF_ERROR(ProcessRange(row_batch, &num_tuples));
   }
-  if (scan_node_->ReachedLimit()) {
+  if (scan_node_->ReachedLimitShared()) {
     eos_ = true;
     scan_state_ = DONE;
     return Status::OK();
@@ -767,8 +780,7 @@ Status HdfsTextScanner::Codegen(HdfsScanNodeBase* node,
 Status HdfsTextScanner::Open(ScannerContext* context) {
   RETURN_IF_ERROR(HdfsScanner::Open(context));
 
-  parse_delimiter_timer_ = ADD_CHILD_TIMER(scan_node_->runtime_profile(),
-      "DelimiterParseTime", ScanNode::SCANNER_THREAD_TOTAL_WALLCLOCK_TIME);
+  parse_delimiter_timer_ = ADD_TIMER(scan_node_->runtime_profile(), "DelimiterParseTime");
 
   // Allocate the scratch space for two pass parsing.  The most fields we can go
   // through in one parse pass is the batch size (tuples) * the number of fields per tuple
@@ -844,7 +856,8 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
     const bool copy_strings = !string_slot_offsets_.empty() &&
         stream_->file_desc()->file_compression == THdfsCompression::NONE;
     int max_added_tuples = (scan_node_->limit() == -1) ?
-        num_tuples : scan_node_->limit() - scan_node_->rows_returned();
+        num_tuples :
+        scan_node_->limit() - scan_node_->rows_returned_shared();
     int tuples_returned = 0;
     // Call jitted function if possible
     if (write_tuples_fn_ != nullptr) {

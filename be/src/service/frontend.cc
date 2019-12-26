@@ -37,16 +37,24 @@ using namespace impala;
 
 // Authorization related flags. Must be set to valid values to properly configure
 // authorization.
+DEFINE_string(authorization_provider,
+    "sentry",
+    "Specifies the type of internally-provided authorization provider to use. "
+    "['ranger', 'sentry' (default)]");
+DEFINE_string(authorization_factory_class,
+    "",
+    "Specifies the class name that implements the authorization provider. "
+    "This will override the authorization_provider flag if both are specified.");
+DEFINE_string(ranger_service_type, "hive", "Specifies the Ranger service type.");
+DEFINE_string(ranger_app_id, "",
+    "Specifies the Ranger application ID. Ranger application ID is an ID to "
+    "uniquely identify the application that communicates with Ranger. This flag is "
+    "required when authorization with Ranger is enabled.");
 DEFINE_string(server_name, "", "The name to use for securing this impalad "
-    "server during authorization. Set to enable authorization. By default, the "
-    "authorization policy will be loaded from the catalog server (via the statestore)."
-    "To use a file based authorization policy, set --authorization_policy_file.");
-DEFINE_string(authorization_policy_file, "", "HDFS path to the authorization policy "
-    "file. If set, authorization will be enabled and the authorization policy will be "
-    "read from a file.");
+    "server during authorization. Set to enable authorization.");
 DEFINE_string(authorization_policy_provider_class,
     "org.apache.sentry.provider.common.HadoopGroupResourceAuthorizationProvider",
-    "Advanced: The authorization policy provider class name.");
+    "Advanced: The authorization policy provider class name for Sentry.");
 DEFINE_string(authorized_proxy_user_config, "",
     "Specifies the set of authorized proxy users (users who can delegate to other "
     "users during authorization) and whom they are allowed to delegate. "
@@ -57,6 +65,16 @@ DEFINE_string(authorized_proxy_user_config, "",
     "users. For example: hue=user1,user2;admin=*");
 DEFINE_string(authorized_proxy_user_config_delimiter, ",",
     "Specifies the delimiter used in authorized_proxy_user_config. ");
+DEFINE_string(authorized_proxy_group_config, "",
+    "Specifies the set of authorized proxy groups (users who can delegate to other "
+    "users belonging to the specified groups during authorization) and whom they are "
+    "allowed to delegate. Input is a semicolon-separated list of key=value pairs of "
+    "authorized proxy users to the group(s) they can delegate to. These groups are "
+    "specified as a list of groups separated by a delimiter (which defaults to comma and "
+    "may be changed via --authorized_proxy_group_config_delimiter), or '*' to indicate "
+    "all users. For example: hue=group1,group2;admin=*");
+DEFINE_string(authorized_proxy_group_config_delimiter, ",",
+    "Specifies the delimiter used in authorized_proxy_group_config. ");
 DEFINE_string(kudu_master_hosts, "", "Specifies the default Kudu master(s). The given "
     "value should be a comma separated list of hostnames or IP addresses; ports are "
     "optional.");
@@ -68,9 +86,11 @@ Frontend::Frontend() {
     {"getExplainPlan", "([B)Ljava/lang/String;", &get_explain_plan_id_},
     {"getHadoopConfig", "([B)[B", &get_hadoop_config_id_},
     {"getAllHadoopConfigs", "()[B", &get_hadoop_configs_id_},
+    {"getHadoopGroups", "([B)[B", &get_hadoop_groups_id_},
     {"checkConfiguration", "()Ljava/lang/String;", &check_config_id_},
-    {"updateCatalogCache", "([[B)[B", &update_catalog_cache_id_},
-    {"updateMembership", "([B)V", &update_membership_id_},
+    {"updateCatalogCache", "([B)[B", &update_catalog_cache_id_},
+    {"updateExecutorMembership", "([B)V", &update_membership_id_},
+    {"getCatalogMetrics", "()[B", &get_catalog_metrics_id_},
     {"getTableNames", "([B)[B", &get_table_names_id_},
     {"describeDb", "([B)[B", &describe_db_id_},
     {"describeTable", "([B)[B", &describe_table_id_},
@@ -81,40 +101,46 @@ Frontend::Frontend() {
     {"getFunctions", "([B)[B", &get_functions_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
     {"getRoles", "([B)[B", &show_roles_id_},
-    {"getRolePrivileges", "([B)[B", &get_role_privileges_id_},
+    {"getPrincipalPrivileges", "([B)[B", &get_principal_privileges_id_},
     {"execHiveServer2MetadataOp", "([B)[B", &exec_hs2_metadata_op_id_},
     {"setCatalogIsReady", "()V", &set_catalog_is_ready_id_},
     {"waitForCatalog", "()V", &wait_for_catalog_id_},
     {"loadTableData", "([B)[B", &load_table_data_id_},
     {"getTableFiles", "([B)[B", &get_table_files_id_},
     {"showCreateFunction", "([B)Ljava/lang/String;", &show_create_function_id_},
-    {"buildTestDescriptorTable", "([B)[B", &build_test_descriptor_table_id_}
+    {"buildTestDescriptorTable", "([B)[B", &build_test_descriptor_table_id_},
+    {"callQueryCompleteHooks", "([B)V", &call_query_complete_hooks_id_},
+    {"abortTransaction", "(J)V", &abort_txn_},
+    {"unregisterTransaction", "(J)V", &unregister_txn_},
   };
 
-  JNIEnv* jni_env = getJNIEnv();
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
+  JniLocalFrame jni_frame;
+  ABORT_IF_ERROR(jni_frame.push(jni_env));
+
   // create instance of java class JniFrontend
-  fe_class_ = jni_env->FindClass("org/apache/impala/service/JniFrontend");
-  EXIT_IF_EXC(jni_env);
+  jclass fe_class = jni_env->FindClass("org/apache/impala/service/JniFrontend");
+  ABORT_IF_EXC(jni_env);
 
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
-    ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, fe_class_, &(methods[i])));
+    ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, fe_class, &(methods[i])));
   };
 
   jbyteArray cfg_bytes;
   ABORT_IF_ERROR(GetThriftBackendGflags(jni_env, &cfg_bytes));
 
-  jobject fe = jni_env->NewObject(fe_class_, fe_ctor_, cfg_bytes);
-  EXIT_IF_EXC(jni_env);
+  jobject fe = jni_env->NewObject(fe_class, fe_ctor_, cfg_bytes);
+  ABORT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
 }
 
-Status Frontend::UpdateCatalogCache(const vector<TUpdateCatalogCacheRequest>& req,
+Status Frontend::UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
     TUpdateCatalogCacheResponse* resp) {
   return JniUtil::CallJniMethod(fe_, update_catalog_cache_id_, req, resp);
 }
 
-Status Frontend::UpdateMembership(const TUpdateMembershipRequest& req) {
+Status Frontend::UpdateExecutorMembership(const TUpdateExecutorMembershipRequest& req) {
   return JniUtil::CallJniMethod(fe_, update_membership_id_, req);
 }
 
@@ -124,8 +150,13 @@ Status Frontend::DescribeDb(const TDescribeDbParams& params,
 }
 
 Status Frontend::DescribeTable(const TDescribeTableParams& params,
-    TDescribeResult* response) {
-  return JniUtil::CallJniMethod(fe_, describe_table_id_, params, response);
+    const TSessionState& session, TDescribeResult* response) {
+  TDescribeTableParams tparams;
+  tparams.__set_output_style(params.output_style);
+  if (params.__isset.table_name) tparams.__set_table_name(params.table_name);
+  if (params.__isset.result_struct) tparams.__set_result_struct(params.result_struct);
+  tparams.__set_session(session);
+  return JniUtil::CallJniMethod(fe_, describe_table_id_, tparams, response);
 }
 
 Status Frontend::ShowCreateTable(const TTableName& table_name, string* response) {
@@ -134,6 +165,10 @@ Status Frontend::ShowCreateTable(const TTableName& table_name, string* response)
 
 Status Frontend::ShowCreateFunction(const TGetFunctionsParams& params, string* response) {
   return JniUtil::CallJniMethod(fe_, show_create_function_id_, params, response);
+}
+
+Status Frontend::GetCatalogMetrics(TGetCatalogMetricsResult* resp) {
+  return JniUtil::CallJniMethod(fe_, get_catalog_metrics_id_, resp);
 }
 
 Status Frontend::GetTableNames(const string& db, const string* pattern,
@@ -165,9 +200,9 @@ Status Frontend::GetStats(const TShowStatsParams& params,
   return JniUtil::CallJniMethod(fe_, get_stats_id_, params, result);
 }
 
-Status Frontend::GetRolePrivileges(const TShowGrantRoleParams& params,
+Status Frontend::GetPrincipalPrivileges(const TShowGrantPrincipalParams& params,
     TResultSet* result) {
-  return JniUtil::CallJniMethod(fe_, get_role_privileges_id_, params, result);
+  return JniUtil::CallJniMethod(fe_, get_principal_privileges_id_, params, result);
 }
 
 Status Frontend::GetFunctions(TFunctionCategory::type fn_category, const string& db,
@@ -203,23 +238,9 @@ Status Frontend::GetExplainPlan(
 Status Frontend::ValidateSettings() {
   // Use FE to check Hadoop config setting
   // TODO: check OS setting
-  stringstream ss;
-  JNIEnv* jni_env = getJNIEnv();
-  JniLocalFrame jni_frame;
-  RETURN_IF_ERROR(jni_frame.push(jni_env));
-  jstring error_string =
-      static_cast<jstring>(jni_env->CallObjectMethod(fe_, check_config_id_));
-  RETURN_ERROR_IF_EXC(jni_env);
-  jboolean is_copy;
-  const char *str = jni_env->GetStringUTFChars(error_string, &is_copy);
-  RETURN_ERROR_IF_EXC(jni_env);
-  ss << str;
-  jni_env->ReleaseStringUTFChars(error_string, str);
-  RETURN_ERROR_IF_EXC(jni_env);
-
-  if (ss.str().size() > 0) {
-    return Status(ss.str());
-  }
+  string err;
+  RETURN_IF_ERROR(JniCall::instance_method(fe_, check_config_id_).Call(&err));
+  if (!err.empty()) return Status(err);
   return Status::OK();
 }
 
@@ -237,8 +258,21 @@ Status Frontend::GetHadoopConfig(const TGetHadoopConfigRequest& request,
   return JniUtil::CallJniMethod(fe_, get_hadoop_config_id_, request, response);
 }
 
+Status Frontend::GetHadoopGroups(const TGetHadoopGroupsRequest& request,
+    TGetHadoopGroupsResponse* response) {
+  return JniUtil::CallJniMethod(fe_, get_hadoop_groups_id_, request, response);
+}
+
 Status Frontend::LoadData(const TLoadDataReq& request, TLoadDataResp* response) {
   return JniUtil::CallJniMethod(fe_, load_table_data_id_, request, response);
+}
+
+Status Frontend::AbortTransaction(int64_t transaction_id) {
+  return JniUtil::CallJniMethod(fe_, abort_txn_, transaction_id);
+}
+
+Status Frontend::UnregisterTransaction(int64_t transaction_id) {
+  return JniUtil::CallJniMethod(fe_, unregister_txn_, transaction_id);
 }
 
 bool Frontend::IsAuthorizationError(const Status& status) {
@@ -246,8 +280,9 @@ bool Frontend::IsAuthorizationError(const Status& status) {
 }
 
 void Frontend::SetCatalogIsReady() {
-  JNIEnv* jni_env = getJNIEnv();
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
   jni_env->CallVoidMethod(fe_, set_catalog_is_ready_id_);
+  ABORT_IF_EXC(jni_env);
 }
 
 void Frontend::WaitForCatalog() {
@@ -256,8 +291,9 @@ void Frontend::WaitForCatalog() {
     SleepForMs(FLAGS_stress_catalog_init_delay_ms);
   }
 #endif
-  JNIEnv* jni_env = getJNIEnv();
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
   jni_env->CallVoidMethod(fe_, wait_for_catalog_id_);
+  ABORT_IF_EXC(jni_env);
 }
 
 Status Frontend::GetTableFiles(const TShowFilesParams& params, TResultSet* result) {
@@ -267,4 +303,9 @@ Status Frontend::GetTableFiles(const TShowFilesParams& params, TResultSet* resul
 Status Frontend::BuildTestDescriptorTable(const TBuildTestDescriptorTableParams& params,
     TDescriptorTable* result) {
   return JniUtil::CallJniMethod(fe_, build_test_descriptor_table_id_, params, result);
+}
+
+// Call FE post-query execution hook
+Status Frontend::CallQueryCompleteHooks(const TQueryCompleteContext& context) {
+  return JniUtil::CallJniMethod(fe_, call_query_complete_hooks_id_, context);
 }

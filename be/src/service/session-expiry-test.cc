@@ -21,9 +21,12 @@
 #include "rpc/thrift-client.h"
 #include "service/fe-support.h"
 #include "service/impala-server.h"
+#include "statestore/statestore.h"
 #include "testutil/gtest-util.h"
 #include "testutil/in-process-servers.h"
+#include "util/asan.h"
 #include "util/impalad-metrics.h"
+#include "util/metrics.h"
 #include "util/time.h"
 
 #include "common/names.h"
@@ -32,6 +35,7 @@ using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 using namespace impala;
 
+DECLARE_bool(abort_on_config_error);
 DECLARE_int32(idle_session_timeout);
 DECLARE_int32(be_port);
 DECLARE_int32(beeswax_port);
@@ -41,13 +45,26 @@ DECLARE_int32(beeswax_port);
 // TODO: Come up with a short-running test that confirms a session will keep itself alive
 // that doesn't depend upon being rescheduled in a timely fashion.
 
+// Object pool containing all objects that must live for the duration of the process.
+// E.g. objects that are singletons and never destroyed in a real daemon (so don't support
+// tear-down logic), but which we create multiple times in unit tests. We leak this pool
+// instead of destroying it to avoid destroying the contained objects.
+static ObjectPool* perm_objects;
+
 TEST(SessionTest, TestExpiry) {
   const int NUM_SESSIONS = 5;
   const int MAX_IDLE_TIMEOUT_MS = 4000;
   FLAGS_idle_session_timeout = 1;
-  InProcessStatestore* ips = InProcessStatestore::StartWithEphemeralPorts();
-  InProcessImpalaServer* impala =
-      InProcessImpalaServer::StartWithEphemeralPorts("localhost", ips->port());
+  // Skip validation checks for in-process backend.
+  FLAGS_abort_on_config_error = false;
+  MetricGroup* metrics = perm_objects->Add(new MetricGroup("statestore"));
+  Statestore* statestore = perm_objects->Add(new Statestore(metrics));
+  IGNORE_LEAKING_OBJECT(statestore);
+  // Pass in 0 to have the statestore use an ephemeral port for the service.
+  ABORT_IF_ERROR(statestore->Init(0));
+  InProcessImpalaServer* impala;
+  ASSERT_OK(InProcessImpalaServer::StartWithEphemeralPorts(
+      "localhost", statestore->port(), &impala));
   IntCounter* expired_metric =
       impala->metrics()->FindMetricForTesting<IntCounter>(
           ImpaladMetricKeys::NUM_SESSIONS_EXPIRED);
@@ -68,11 +85,11 @@ TEST(SessionTest, TestExpiry) {
     // Create five Beeswax clients and five HS2 clients (each HS2 gets one session each)
     for (int i = 0; i < NUM_SESSIONS; ++i) {
       beeswax_clients[i].reset(new ThriftClient<ImpalaServiceClient>(
-              "localhost", impala->beeswax_port()));
+              "localhost", impala->GetBeeswaxPort()));
       EXPECT_OK(beeswax_clients[i]->Open());
 
       hs2_clients[i].reset(new ThriftClient<ImpalaHiveServer2ServiceClient>(
-              "localhost", impala->hs2_port()));
+              "localhost", impala->GetHS2Port()));
       EXPECT_OK(hs2_clients[i]->Open());
       TOpenSessionResp response;
       TOpenSessionReq request;
@@ -101,11 +118,14 @@ TEST(SessionTest, TestExpiry) {
   // work). Sleep to allow the threads closing the session to complete before tearing down
   // the server.
   SleepForMs(1000);
+  statestore->ShutdownForTesting();
 }
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
   InitFeSupport();
+  perm_objects = new ObjectPool;
+  IGNORE_LEAKING_OBJECT(perm_objects);
   return RUN_ALL_TESTS();
 }

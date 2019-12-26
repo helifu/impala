@@ -17,48 +17,61 @@
 
 package org.apache.impala.authorization;
 
+import com.google.common.base.Preconditions;
+
 import java.util.EnumSet;
 
-import org.apache.sentry.core.model.db.DBModelAction;
-
 /**
- * Maps an Impala Privilege to one or more Hive Access "Actions".
+ * List of Impala privileges. Declare them in the order from least allowing to most
+ * allowing privilege so EnumSet used in {@link Privilege#getImpliedPrivileges()} can
+ * iterate them in this order. This helps in more efficiently checking for VIEW_METADATA
+ * and ANY privilege if the user does have access to the resource.
  */
 public enum Privilege {
-  ALL(DBModelAction.ALL, false),
-  ALTER(DBModelAction.ALL, false),
-  DROP(DBModelAction.ALL, false),
-  CREATE(DBModelAction.ALL, false),
-  INSERT(DBModelAction.INSERT, false),
-  SELECT(DBModelAction.SELECT, false),
+  SELECT,
+  INSERT,
+  REFRESH,
+  ALTER,
+  DROP,
+  CREATE,
+  ALL,
+  OWNER,
   // Privileges required to view metadata on a server object.
-  VIEW_METADATA(EnumSet.of(DBModelAction.INSERT, DBModelAction.SELECT), true),
+  VIEW_METADATA(true),
   // Special privilege that is used to determine if the user has any valid privileges
   // on a target object.
-  ANY(EnumSet.allOf(DBModelAction.class), true),
-  ;
+  ANY(true);
 
-  private final EnumSet<DBModelAction> actions;
+  static {
+    ALL.implied_ = EnumSet.of(ALL);
+    OWNER.implied_ = EnumSet.of(OWNER);
+    ALTER.implied_ = EnumSet.of(ALTER);
+    DROP.implied_ = EnumSet.of(DROP);
+    CREATE.implied_ = EnumSet.of(CREATE);
+    INSERT.implied_ = EnumSet.of(INSERT);
+    SELECT.implied_ = EnumSet.of(SELECT);
+    REFRESH.implied_ = EnumSet.of(REFRESH);
+    VIEW_METADATA.implied_ = EnumSet.of(INSERT, SELECT, REFRESH);
+    ANY.implied_ = EnumSet.of(ALL, OWNER, ALTER, DROP, CREATE, INSERT, SELECT,
+        REFRESH);
 
+    for (Privilege privilege: values()) {
+      Preconditions.checkNotNull(privilege.implied_);
+    }
+  }
+
+  private EnumSet<Privilege> implied_;
   // Determines whether to check if the user has ANY the privileges defined in the
   // actions list or whether to check if the user has ALL of the privileges in the
   // actions list.
   private final boolean anyOf_;
 
-  private Privilege(EnumSet<DBModelAction> actions, boolean anyOf) {
-    this.actions = actions;
+  Privilege() {
+    anyOf_ = false;
+  }
+
+  Privilege(boolean anyOf) {
     this.anyOf_ = anyOf;
-  }
-
-  private Privilege(DBModelAction action, boolean anyOf) {
-    this(EnumSet.of(action), anyOf);
-  }
-
-  /*
-   * Returns the set of Hive Access Actions mapping to this Privilege.
-   */
-  public EnumSet<DBModelAction> getHiveActions() {
-    return actions;
   }
 
   /*
@@ -66,5 +79,10 @@ public enum Privilege {
    * actions list or whether to check if the user has ALL of the privileges in the
    * actions list.
    */
-  public boolean getAnyOf() { return anyOf_; }
+  public boolean hasAnyOf() { return anyOf_; }
+
+  /**
+   * Gets list of implied privileges for this privilege.
+   */
+  public EnumSet<Privilege> getImpliedPrivileges() { return implied_; }
 }

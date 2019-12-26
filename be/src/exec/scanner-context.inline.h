@@ -68,6 +68,7 @@ inline bool ScannerContext::Stream::ReadBytes(int64_t length, uint8_t** buf,
 }
 
 inline bool ScannerContext::Stream::SkipBytes(int64_t length, Status* status) {
+  DCHECK_GE(length, 0);
   int64_t bytes_left = length;
   // Skip bytes from the boundary buffer first.
   if (boundary_buffer_bytes_left_ > 0) {
@@ -102,6 +103,10 @@ inline bool ScannerContext::Stream::SkipBytes(int64_t length, Status* status) {
 inline bool ScannerContext::Stream::SkipText(Status* status) {
   int64_t len;
   RETURN_IF_FALSE(ReadVLong(&len, status));
+  if (len < 0) {
+    *status = Status("SkipText: length is negative");
+    return false;
+  }
   RETURN_IF_FALSE(SkipBytes(len, status));
   return true;
 }
@@ -141,6 +146,7 @@ inline bool ScannerContext::Stream::ReadVLong(int64_t* value, Status* status) {
   RETURN_IF_FALSE(ReadBytes(1, reinterpret_cast<uint8_t**>(&firstbyte), status));
 
   int len = ReadWriteUtil::DecodeVIntSize(*firstbyte);
+  bool is_negative = ReadWriteUtil::IsNegativeVInt(*firstbyte);
   if (len > ReadWriteUtil::MAX_VINT_LEN) {
     *status = Status("ReadVLong: size is too big");
     return false;
@@ -160,9 +166,8 @@ inline bool ScannerContext::Stream::ReadVLong(int64_t* value, Status* status) {
     *value = (*value << 8) | (bytes[i] & 0xFF);
   }
 
-  if (ReadWriteUtil::IsNegativeVInt(*firstbyte)) {
-    *value = *value ^ (static_cast<int64_t>(-1));
-  }
+  if (is_negative) *value = *value ^ (static_cast<int64_t>(-1));
+
   return true;
 }
 

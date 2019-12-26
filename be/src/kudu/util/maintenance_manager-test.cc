@@ -16,22 +16,34 @@
 // under the License.
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <ostream>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include <gflags/gflags.h>
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/maintenance_manager.h"
-#include "kudu/util/mem_tracker.h"
+#include "kudu/util/maintenance_manager.pb.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/mutex.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
 using std::shared_ptr;
+using std::string;
 using std::vector;
 using strings::Substitute;
 
@@ -58,12 +70,12 @@ class MaintenanceManagerTest : public KuduTest {
     options.num_threads = 2;
     options.polling_interval_ms = 1;
     options.history_size = kHistorySize;
-    manager_.reset(new MaintenanceManager(options));
+    manager_.reset(new MaintenanceManager(options, kFakeUuid));
     manager_->set_memory_pressure_func_for_tests(
         [&](double* consumption) {
           return indicate_memory_pressure_.load();
         });
-    ASSERT_OK(manager_->Init(kFakeUuid));
+    ASSERT_OK(manager_->Start());
   }
 
   void TearDown() override {
@@ -273,26 +285,62 @@ TEST_F(MaintenanceManagerTest, TestLogRetentionPrioritization) {
   manager_->RegisterOp(&op3);
 
   // We want to do the low IO op first since it clears up some log retention.
-  ASSERT_EQ(&op1, manager_->FindBestOp());
+  auto op_and_why = manager_->FindBestOp();
+  ASSERT_EQ(&op1, op_and_why.first);
+  EXPECT_EQ(op_and_why.second, "free 104857600 bytes of WAL");
 
   manager_->UnregisterOp(&op1);
 
   // Low IO is taken care of, now we find the op that clears the most log retention and ram.
   // However, with the default settings, we won't bother running any of these operations
   // which only retain 100MB of logs.
-  ASSERT_EQ(nullptr, manager_->FindBestOp());
+  op_and_why = manager_->FindBestOp();
+  ASSERT_EQ(nullptr, op_and_why.first);
+  EXPECT_EQ(op_and_why.second, "no ops with positive improvement");
 
   // If we change the target WAL size, we will select these ops.
   FLAGS_log_target_replay_size_mb = 50;
-  ASSERT_EQ(&op3, manager_->FindBestOp());
+  op_and_why = manager_->FindBestOp();
+  ASSERT_EQ(&op3, op_and_why.first);
+  EXPECT_EQ(op_and_why.second, "104857600 bytes log retention");
 
   manager_->UnregisterOp(&op3);
 
-  ASSERT_EQ(&op2, manager_->FindBestOp());
+  op_and_why = manager_->FindBestOp();
+  ASSERT_EQ(&op2, op_and_why.first);
+  EXPECT_EQ(op_and_why.second, "104857600 bytes log retention");
 
   manager_->UnregisterOp(&op2);
 }
 
+// Test retrieving a list of an op's running instances
+TEST_F(MaintenanceManagerTest, TestRunningInstances) {
+  TestMaintenanceOp op("op", MaintenanceOp::HIGH_IO_USAGE);
+  op.set_perf_improvement(10);
+  op.set_remaining_runs(2);
+  op.set_sleep_time(MonoDelta::FromSeconds(1));
+  manager_->RegisterOp(&op);
+
+  // Check that running instances are added to the maintenance manager's collection,
+  // and fields are getting filled.
+  ASSERT_EVENTUALLY([&]() {
+      MaintenanceManagerStatusPB status_pb;
+      manager_->GetMaintenanceManagerStatusDump(&status_pb);
+      ASSERT_EQ(status_pb.running_operations_size(), 2);
+      const MaintenanceManagerStatusPB_OpInstancePB& instance1 = status_pb.running_operations(0);
+      const MaintenanceManagerStatusPB_OpInstancePB& instance2 = status_pb.running_operations(1);
+      ASSERT_EQ(instance1.name(), op.name());
+      ASSERT_NE(instance1.thread_id(), instance2.thread_id());
+    });
+
+  // Wait for instances to complete.
+  manager_->UnregisterOp(&op);
+
+  // Check that running instances are removed from collection after completion.
+  MaintenanceManagerStatusPB status_pb;
+  manager_->GetMaintenanceManagerStatusDump(&status_pb);
+  ASSERT_EQ(status_pb.running_operations_size(), 0);
+}
 // Test adding operations and make sure that the history of recently completed operations
 // is correct in that it wraps around and doesn't grow.
 TEST_F(MaintenanceManagerTest, TestCompletedOpsHistory) {

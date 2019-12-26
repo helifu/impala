@@ -114,6 +114,7 @@ public class InPredicate extends Predicate {
             toSqlImpl());
       }
       Subquery subquery = (Subquery)getChild(1);
+      subquery.getStatement().setIsRuntimeScalar(false);
       if (!subquery.returnsScalarColumn()) {
         throw new AnalysisException("Subquery must return a single column: " +
             subquery.toSql());
@@ -151,7 +152,7 @@ public class InPredicate extends Predicate {
       }
       boolean useSetLookup = allConstant;
       // Threshold based on InPredicateBenchmark results
-      int setLookupThreshold = children_.get(0).getType().isStringType() ? 6 : 2;
+      int setLookupThreshold = children_.get(0).getType().isStringType() ? 2 : 6;
       if (children_.size() - 1 < setLookupThreshold) useSetLookup = false;
 
       // Only lookup fn_ if all subqueries have been rewritten. If the second child is a
@@ -167,7 +168,7 @@ public class InPredicate extends Predicate {
       }
       Preconditions.checkNotNull(fn_);
       Preconditions.checkState(fn_.getReturnType().isBoolean());
-      castForFunctionCall(false);
+      castForFunctionCall(false, analyzer.isDecimalV2());
     }
 
     // TODO: Fix selectivity_ for nested predicate
@@ -201,14 +202,14 @@ public class InPredicate extends Predicate {
   }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     StringBuilder strBuilder = new StringBuilder();
     String notStr = (isNotIn_) ? "NOT " : "";
-    strBuilder.append(getChild(0).toSql() + " " + notStr + "IN ");
+    strBuilder.append(getChild(0).toSql(options) + " " + notStr + "IN ");
     boolean hasSubquery = contains(Subquery.class);
     if (!hasSubquery) strBuilder.append("(");
     for (int i = 1; i < children_.size(); ++i) {
-      strBuilder.append(getChild(i).toSql());
+      strBuilder.append(getChild(i).toSql(options));
       strBuilder.append((i+1 != children_.size()) ? ", " : "");
     }
     if (!hasSubquery) strBuilder.append(")");

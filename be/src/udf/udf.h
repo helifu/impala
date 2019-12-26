@@ -34,6 +34,12 @@
 #define NOEXCEPT
 #endif
 
+// Macro to prepend to function definitions that will export the symbols to be visible
+// for loading by Impala. It is recommended that UDFs be built with the compiler flags
+// "-fvisibility=hidden -fvisibility-inlines-hidden" and only functions that are entry
+// points for UDFs be exported with this macro.
+#define IMPALA_UDF_EXPORT __attribute__ ((visibility ("default")))
+
 /// This is the only Impala header required to develop UDFs and UDAs. This header
 /// contains the types that need to be used and the FunctionContext object. The context
 /// object serves as the interface object between the UDF/UDA and the impala process.
@@ -54,6 +60,7 @@ struct IntVal;
 struct BigIntVal;
 struct StringVal;
 struct TimestampVal;
+struct DateVal;
 
 /// A FunctionContext is passed to every UDF/UDA and is the interface for the UDF to the
 /// rest of the system. It contains APIs to examine the system state, report errors and
@@ -77,6 +84,7 @@ class FunctionContext {
     TYPE_DOUBLE,
     TYPE_TIMESTAMP,
     TYPE_STRING,
+    TYPE_DATE,
     // Not used - maps to CHAR(N), which is not supported for UDFs and UDAs.
     TYPE_FIXED_BUFFER,
     TYPE_DECIMAL,
@@ -524,7 +532,9 @@ struct FloatVal : public AnyVal {
   }
 
   bool operator==(const FloatVal& other) const {
-    return is_null == other.is_null && val == other.val;
+    if (is_null && other.is_null) return true;
+    if (is_null || other.is_null) return false;
+    return val == other.val;
   }
   bool operator!=(const FloatVal& other) const { return !(*this == other); }
 };
@@ -573,6 +583,35 @@ struct TimestampVal : public AnyVal {
   bool operator!=(const TimestampVal& other) const { return !(*this == other); }
 };
 
+/// Represents a DATE value.
+/// - The minimum and maximum dates are 0001-01-01 and 9999-12-31. Valid dates must fall
+///   in this range.
+/// - Internally represents DATE values as number of days since 1970-01-01.
+/// - This representation was chosen to be the same (bit-by-bit) as Parquet's date type.
+///   (https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#date)
+/// - Proleptic Gregorian calendar is used to calculate the number of days since epoch,
+///   which can lead to different representation of historical dates compared to Hive.
+///   (https://en.wikipedia.org/wiki/Proleptic_Gregorian_calendar).
+struct DateVal : public AnyVal {
+  typedef int32_t underlying_type_t;
+  underlying_type_t val;
+
+  explicit DateVal(underlying_type_t val = 0) : val(val) { }
+
+  static DateVal null() {
+    DateVal result;
+    result.is_null = true;
+    return result;
+  }
+
+  bool operator==(const DateVal& other) const {
+    if (is_null && other.is_null) return true;
+    if (is_null || other.is_null) return false;
+    return val == other.val;
+  }
+  bool operator!=(const DateVal& other) const { return !(*this == other); }
+};
+
 /// A String value represented as a buffer + length.
 /// Note: there is a difference between a NULL string (is_null == true) and an
 /// empty string (len == 0).
@@ -599,7 +638,9 @@ struct StringVal : public AnyVal {
 
   /// Construct a StringVal from NULL-terminated c-string. Note: this does not make a
   /// copy of ptr so the underlying string must exist as long as this StringVal does.
-  StringVal(const char* ptr) : len(strlen(ptr)), ptr((uint8_t*)ptr) {}
+  StringVal(const char* ptr)
+    : len(strlen(ptr)),
+      ptr(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(ptr))) {}
 
   /// Creates a StringVal, allocating a new buffer with 'len'. This should
   /// be used to return StringVal objects in UDF/UDAs that need to allocate new

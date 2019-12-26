@@ -20,24 +20,32 @@ package org.apache.impala.catalog;
 import java.util.List;
 import java.util.Set;
 
+import com.google.common.base.Preconditions;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.JniUtil;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TErrorCode;
+import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
+import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
 import org.apache.impala.thrift.TStatus;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import com.google.common.base.Joiner;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
 
 /**
  * Represents a table with incomplete metadata. The metadata may be incomplete because
  * it has not yet been loaded or because of errors encountered during the loading
  * process.
+ *
+ * NOTE: this is used on the catalogd (CatalogServiceCatalog) and on the "v1"
+ * ImpaladCatalog. LocalCatalog does not use this, and instead uses
+ * FailedLoadLocalTable to represent a failed table.
  */
-public class IncompleteTable extends Table {
+public class IncompleteTable extends Table implements FeIncompleteTable {
   // The cause for the incomplete metadata. If there is no cause given (cause_ = null),
   // then this is assumed to be an uninitialized table (table that does not have
   // its metadata loaded).
@@ -53,6 +61,7 @@ public class IncompleteTable extends Table {
    * Returns the cause (ImpalaException) which led to this table's metadata being
    * incomplete.
    */
+  @Override
   public ImpalaException getCause() { return cause_; }
 
   /**
@@ -71,7 +80,8 @@ public class IncompleteTable extends Table {
 
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
+      throws TableLoadingException {
     if (cause_ instanceof TableLoadingException) {
       throw (TableLoadingException) cause_;
     } else {
@@ -128,5 +138,13 @@ public class IncompleteTable extends Table {
   public static IncompleteTable createFailedMetadataLoadTable(Db db, String name,
       ImpalaException e) {
     return new IncompleteTable(db, name, e);
+  }
+
+  @Override
+  public TGetPartialCatalogObjectResponse getPartialInfo(
+      TGetPartialCatalogObjectRequest req) throws TableLoadingException {
+    Preconditions.checkNotNull(cause_);
+    Throwables.propagateIfPossible(cause_, TableLoadingException.class);
+    throw new TableLoadingException(cause_.getMessage());
   }
 }

@@ -15,34 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "common/thread-debug-info.h"
 #include "service/impala-server.h"
 #include "service/impala-server.inline.h"
 
 #include <algorithm>
+#include <type_traits>
+
+#include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/join.hpp>
+#include <boost/bind.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/unordered_set.hpp>
 #include <jni.h>
-#include <thrift/protocol/TDebugProtocol.h>
-#include <gtest/gtest.h>
-#include <boost/bind.hpp>
-#include <boost/algorithm/string.hpp>
 #include <gperftools/heap-profiler.h>
 #include <gperftools/malloc_extension.h>
+#include <gtest/gtest.h>
 #include <gutil/strings/substitute.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/prettywriter.h>
+#include <thrift/protocol/TDebugProtocol.h>
 
 #include "common/logging.h"
 #include "common/version.h"
 #include "rpc/thrift-util.h"
-#include "runtime/raw-value.h"
+#include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
-#include "service/hs2-util.h"
+#include "runtime/raw-value.h"
+#include "scheduling/admission-controller.h"
 #include "service/client-request-state.h"
+#include "service/hs2-util.h"
 #include "service/query-options.h"
 #include "service/query-result-set.h"
 #include "util/auth-util.h"
 #include "util/debug-util.h"
 #include "util/impalad-metrics.h"
+#include "util/metrics.h"
+#include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
 #include "util/string-parser.h"
 
@@ -65,15 +74,16 @@ const TProtocolVersion::type MAX_SUPPORTED_HS2_VERSION =
 #define HS2_RETURN_ERROR(return_val, error_msg, error_state) \
   do { \
     return_val.status.__set_statusCode(thrift::TStatusCode::ERROR_STATUS); \
-    return_val.status.__set_errorMessage(error_msg); \
-    return_val.status.__set_sqlState(error_state); \
+    return_val.status.__set_errorMessage((error_msg)); \
+    return_val.status.__set_sqlState((error_state)); \
     return; \
   } while (false)
 
 #define HS2_RETURN_IF_ERROR(return_val, status, error_state) \
   do { \
-    if (UNLIKELY(!status.ok())) { \
-      HS2_RETURN_ERROR(return_val, status.GetDetail(), error_state); \
+    const Status& _status = (status); \
+    if (UNLIKELY(!_status.ok())) { \
+      HS2_RETURN_ERROR(return_val, _status.GetDetail(), (error_state)); \
       return; \
     } \
   } while (false)
@@ -81,22 +91,11 @@ const TProtocolVersion::type MAX_SUPPORTED_HS2_VERSION =
 DECLARE_string(hostname);
 DECLARE_int32(webserver_port);
 DECLARE_int32(idle_session_timeout);
+DECLARE_int32(disconnected_session_timeout);
 
 namespace impala {
 
 const string IMPALA_RESULT_CACHING_OPT = "impala.resultset.cache.size";
-
-// Helper function to translate between Beeswax and HiveServer2 type
-static TOperationState::type QueryStateToTOperationState(
-    const beeswax::QueryState::type& query_state) {
-  switch (query_state) {
-    case beeswax::QueryState::CREATED: return TOperationState::INITIALIZED_STATE;
-    case beeswax::QueryState::RUNNING: return TOperationState::RUNNING_STATE;
-    case beeswax::QueryState::FINISHED: return TOperationState::FINISHED_STATE;
-    case beeswax::QueryState::EXCEPTION: return TOperationState::ERROR_STATE;
-    default: return TOperationState::UKNOWN_STATE;
-  }
-}
 
 void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     TMetadataOpRequest* request, TOperationHandle* handle, thrift::TStatus* status) {
@@ -112,7 +111,8 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
   }
   ScopedSessionState scoped_session(this);
   shared_ptr<SessionState> session;
-  Status get_session_status = scoped_session.WithSession(session_id, &session);
+  Status get_session_status =
+      scoped_session.WithSession(session_id, SecretArg::Session(secret), &session);
   if (!get_session_status.ok()) {
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
     status->__set_errorMessage(get_session_status.GetDetail());
@@ -131,6 +131,7 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
   }
   TQueryCtx query_ctx;
   PrepareQueryContext(&query_ctx);
+  ScopedThreadContext tdi_context(GetThreadDebugInfo(), query_ctx.query_id);
   session->ToThrift(session_id, &query_ctx.session);
   request->__set_session(query_ctx.session);
 
@@ -161,7 +162,7 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     return;
   }
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::FINISHED);
+  request_state->UpdateNonErrorExecState(ClientRequestState::ExecState::FINISHED);
 
   Status inflight_status = SetQueryInflight(session, request_state);
   if (!inflight_status.ok()) {
@@ -172,31 +173,27 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     return;
   }
   handle->__set_hasResultSet(true);
-  // TODO: create secret for operationId
+  // Secret is inherited from session.
   TUniqueId operation_id = request_state->query_id();
-  TUniqueIdToTHandleIdentifier(operation_id, operation_id, &(handle->operationId));
+  TUniqueIdToTHandleIdentifier(operation_id, secret, &(handle->operationId));
   status->__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
 
-Status ImpalaServer::FetchInternal(const TUniqueId& query_id, int32_t fetch_size,
-    bool fetch_first, TFetchResultsResp* fetch_results) {
-  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
-  if (UNLIKELY(request_state == nullptr)) {
-    return Status(Substitute("Invalid query handle: $0", PrintId(query_id)));
-  }
-
-  // FetchResults doesn't have an associated session handle, so we presume that this
-  // request should keep alive the same session that orignated the query.
-  ScopedSessionState session_handle(this);
-  const TUniqueId session_id = request_state->session_id();
-  shared_ptr<SessionState> session;
-  RETURN_IF_ERROR(session_handle.WithSession(session_id, &session));
-
+Status ImpalaServer::FetchInternal(ClientRequestState* request_state,
+    SessionState* session, int32_t fetch_size, bool fetch_first,
+    TFetchResultsResp* fetch_results, int32_t* num_results) {
   // Make sure ClientRequestState::Wait() has completed before fetching rows. Wait()
   // ensures that rows are ready to be fetched (e.g., Wait() opens
   // ClientRequestState::output_exprs_, which are evaluated in
   // ClientRequestState::FetchRows() below).
-  request_state->BlockOnWait();
+  int64_t block_on_wait_time_us = 0;
+  if (!request_state->BlockOnWait(
+          request_state->fetch_rows_timeout_us(), &block_on_wait_time_us)) {
+    fetch_results->status.__set_statusCode(thrift::TStatusCode::STILL_EXECUTING_STATUS);
+    fetch_results->__set_hasMoreRows(true);
+    fetch_results->__isset.results = false;
+    return Status::OK();
+  }
 
   lock_guard<mutex> frl(*request_state->fetch_rows_lock());
   lock_guard<mutex> l(*request_state->lock());
@@ -205,7 +202,6 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id, int32_t fetch_size
   RETURN_IF_ERROR(request_state->query_status());
 
   if (request_state->num_rows_fetched() == 0) {
-    request_state->query_events()->MarkEvent("First row fetched");
     request_state->set_fetched_rows();
   }
 
@@ -220,7 +216,9 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id, int32_t fetch_size
       TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V1 : session->hs2_version;
   scoped_ptr<QueryResultSet> result_set(QueryResultSet::CreateHS2ResultSet(
       version, *(request_state->result_metadata()), &(fetch_results->results)));
-  RETURN_IF_ERROR(request_state->FetchRows(fetch_size, result_set.get()));
+  RETURN_IF_ERROR(
+      request_state->FetchRows(fetch_size, result_set.get(), block_on_wait_time_us));
+  *num_results = result_set->size();
   fetch_results->__isset.results = true;
   fetch_results->__set_hasMoreRows(!request_state->eos());
   return Status::OK();
@@ -238,7 +236,8 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
     RETURN_IF_ERROR(THandleIdentifierToTUniqueId(execute_request.sessionHandle.sessionId,
         &session_id, &secret));
 
-    RETURN_IF_ERROR(GetSessionState(session_id, &session_state));
+    RETURN_IF_ERROR(
+        GetSessionState(session_id, SecretArg::Session(secret), &session_state));
     session_state->ToThrift(session_id, &query_ctx->session);
     lock_guard<mutex> l(session_state->lock);
     query_ctx->client_request.query_options = session_state->QueryOptions();
@@ -265,7 +264,7 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
   }
   // Only query options not set in the session or confOverlay can be overridden by the
   // pool options.
-  AddPoolQueryOptions(query_ctx, ~set_query_options_mask);
+  AddPoolConfiguration(query_ctx, ~set_query_options_mask);
   VLOG_QUERY << "TClientRequest.queryOptions: "
              << ThriftDebugString(query_ctx->client_request.query_options);
   return Status::OK();
@@ -274,42 +273,61 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
 // HiveServer2 API
 void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     const TOpenSessionReq& request) {
-  // DO NOT log this Thrift struct in its entirety, in case a bad client sets the
-  // password.
-  VLOG_QUERY << "OpenSession(): username=" << request.username;
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   // Generate session ID and the secret
-  TUniqueId session_id;
+  uuid secret_uuid;
+  uuid session_uuid;
   {
     lock_guard<mutex> l(uuid_lock_);
-    uuid secret = uuid_generator_();
-    uuid session_uuid = uuid_generator_();
-    return_val.sessionHandle.sessionId.guid.assign(
-        session_uuid.begin(), session_uuid.end());
-    return_val.sessionHandle.sessionId.secret.assign(secret.begin(), secret.end());
-    DCHECK_EQ(return_val.sessionHandle.sessionId.guid.size(), 16);
-    DCHECK_EQ(return_val.sessionHandle.sessionId.secret.size(), 16);
-    return_val.__isset.sessionHandle = true;
-    UUIDToTUniqueId(session_uuid, &session_id);
+    secret_uuid = crypto_uuid_generator_();
+    session_uuid = crypto_uuid_generator_();
   }
+  return_val.sessionHandle.sessionId.guid.assign(
+      session_uuid.begin(), session_uuid.end());
+  return_val.sessionHandle.sessionId.secret.assign(
+      secret_uuid.begin(), secret_uuid.end());
+  DCHECK_EQ(return_val.sessionHandle.sessionId.guid.size(), 16);
+  DCHECK_EQ(return_val.sessionHandle.sessionId.secret.size(), 16);
+  return_val.__isset.sessionHandle = true;
+  TUniqueId session_id, secret;
+  UUIDToTUniqueId(session_uuid, &session_id);
+  UUIDToTUniqueId(secret_uuid, &secret);
+
+  // DO NOT log this Thrift struct in its entirety, in case a bad client sets the
+  // password.
+  VLOG_QUERY << "Opening session: " << PrintId(session_id) << " username: "
+             << request.username;
+
   // create a session state: initialize start time, session type, database and default
   // query options.
-  // TODO: put secret in session state map and check it
   // TODO: Fix duplication of code between here and ConnectionStart().
-  shared_ptr<SessionState> state = make_shared<SessionState>(this);
+  shared_ptr<SessionState> state = make_shared<SessionState>(this, session_id, secret);
   state->closed = false;
   state->start_time_ms = UnixMillis();
   state->session_type = TSessionType::HIVESERVER2;
   state->network_address = ThriftServer::GetThreadConnectionContext()->network_address;
   state->last_accessed_ms = UnixMillis();
-  state->hs2_version = min(MAX_SUPPORTED_HS2_VERSION, request.client_protocol);
+  // request.client_protocol is not guaranteed to be a valid TProtocolVersion::type, so
+  // loading it can cause undefined behavior. Instead, we copy it to a value of the
+  // "underlying type" of the enum, then copy it back to state->hs_version only once we
+  // have clamped it to be at most MAX_SUPPORTED_HS2_VERSION.
+  std::underlying_type_t<decltype(request.client_protocol)> protocol_integer;
+  memcpy(&protocol_integer, &request.client_protocol, sizeof(request.client_protocol));
+  state->hs2_version = static_cast<TProtocolVersion::type>(
+      min<decltype(protocol_integer)>(MAX_SUPPORTED_HS2_VERSION, protocol_integer));
   state->kudu_latest_observed_ts = 0;
 
   // If the username was set by a lower-level transport, use it.
-  const ThriftServer::Username& username =
-      ThriftServer::GetThreadConnectionContext()->username;
-  if (!username.empty()) {
-    state->connected_user = username;
+  const ThriftServer::ConnectionContext* connection_context =
+      ThriftServer::GetThreadConnectionContext();
+  if (!connection_context->username.empty()) {
+    state->connected_user = connection_context->username;
+    if (!connection_context->do_as_user.empty()) {
+      state->do_as_user = connection_context->do_as_user;
+      Status status = AuthorizeProxyUser(state->connected_user, state->do_as_user);
+      HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
+    }
   } else {
     state->connected_user = request.username;
   }
@@ -337,7 +355,8 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
             &state->set_query_options_mask);
         if (status.ok() && iequals(v.first, "idle_session_timeout")) {
           state->session_timeout = state->set_query_options.idle_session_timeout;
-          VLOG_QUERY << "OpenSession(): idle_session_timeout="
+          VLOG_QUERY << "OpenSession(): session: " << PrintId(session_id)
+                     << " idle_session_timeout="
                      << PrettyPrinter::Print(state->session_timeout, TUnit::TIME_S);
         }
       }
@@ -347,9 +366,16 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   TQueryOptionsToMap(state->QueryOptions(), &return_val.configuration);
 
   // OpenSession() should return the coordinator's HTTP server address.
-  const string& http_addr = lexical_cast<string>(
-      MakeNetworkAddress(FLAGS_hostname, FLAGS_webserver_port));
+  const string& http_addr = TNetworkAddressToString(MakeNetworkAddress(
+      FLAGS_hostname, FLAGS_webserver_port));
   return_val.configuration.insert(make_pair("http_addr", http_addr));
+
+  {
+    lock_guard<mutex> l(connection_to_sessions_map_lock_);
+    const TUniqueId& connection_id = ThriftServer::GetThreadConnectionId();
+    connection_to_sessions_map_[connection_id].insert(session_id);
+    state->connections.insert(connection_id);
+  }
 
   // Put the session state in session_state_map_
   {
@@ -357,17 +383,13 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     session_state_map_.insert(make_pair(session_id, state));
   }
 
-  {
-    lock_guard<mutex> l(connection_to_sessions_map_lock_);
-    const TUniqueId& connection_id = ThriftServer::GetThreadConnectionId();
-    connection_to_sessions_map_[connection_id].push_back(session_id);
-  }
-
   ImpaladMetrics::IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS->Increment(1);
 
   return_val.__isset.configuration = true;
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
   return_val.serverProtocolVersion = state->hs2_version;
+  VLOG_QUERY << "Opened session: " << PrintId(session_id) << " username: "
+             << request.username;
 }
 
 void ImpalaServer::CloseSession(TCloseSessionResp& return_val,
@@ -379,13 +401,16 @@ void ImpalaServer::CloseSession(TCloseSessionResp& return_val,
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
       request.sessionHandle.sessionId, &session_id, &secret), SQLSTATE_GENERAL_ERROR);
   HS2_RETURN_IF_ERROR(return_val,
-      CloseSessionInternal(session_id, false), SQLSTATE_GENERAL_ERROR);
+      CloseSessionInternal(
+          session_id, SecretArg::Session(secret), /* ignore_if_absent= */ false),
+      SQLSTATE_GENERAL_ERROR);
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
 
 void ImpalaServer::GetInfo(TGetInfoResp& return_val,
     const TGetInfoReq& request) {
   VLOG_QUERY << "GetInfo(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TUniqueId session_id;
   TUniqueId secret;
@@ -393,7 +418,8 @@ void ImpalaServer::GetInfo(TGetInfoResp& return_val,
       request.sessionHandle.sessionId, &session_id, &secret), SQLSTATE_GENERAL_ERROR);
   ScopedSessionState session_handle(this);
   shared_ptr<SessionState> session;
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Session(secret), &session),
       SQLSTATE_GENERAL_ERROR);
 
   switch (request.infoType) {
@@ -414,6 +440,7 @@ void ImpalaServer::GetInfo(TGetInfoResp& return_val,
 void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
     const TExecuteStatementReq& request) {
   VLOG_QUERY << "ExecuteStatement(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
   // We ignore the runAsync flag here: Impala's queries will always run asynchronously,
   // and will block on fetch. To the client, this looks like Hive's synchronous mode; the
   // difference is that rows are not available when ExecuteStatement() returns.
@@ -427,12 +454,13 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
       request.sessionHandle.sessionId, &session_id, &secret), SQLSTATE_GENERAL_ERROR);
   ScopedSessionState session_handle(this);
   shared_ptr<SessionState> session;
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Session(secret), &session),
       SQLSTATE_GENERAL_ERROR);
   if (session == NULL) {
-    HS2_RETURN_IF_ERROR(
-        return_val, Status(Substitute("Invalid session id: $0",
-            PrintId(session_id))), SQLSTATE_GENERAL_ERROR);
+    string err_msg = Substitute("Invalid session id: $0", PrintId(session_id));
+    VLOG(1) << err_msg;
+    HS2_RETURN_IF_ERROR(return_val, Status::Expected(err_msg), SQLSTATE_GENERAL_ERROR);
   }
 
   // Optionally enable result caching to allow restarting fetches.
@@ -446,7 +474,7 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
           iter->second.c_str(), iter->second.size(), &parse_result);
       if (parse_result != StringParser::PARSE_SUCCESS) {
         HS2_RETURN_IF_ERROR(
-            return_val, Status(Substitute("Invalid value '$0' for '$1' option.",
+            return_val, Status::Expected(Substitute("Invalid value '$0' for '$1' option.",
                 iter->second, IMPALA_RESULT_CACHING_OPT)), SQLSTATE_GENERAL_ERROR);
       }
     }
@@ -456,6 +484,10 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
   status = Execute(&query_ctx, session, &request_state);
   HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
 
+  // Start thread to wait for results to become available.
+  status = request_state->WaitAsync();
+  if (!status.ok()) goto return_error;
+
   // Optionally enable result caching on the ClientRequestState.
   if (cache_num_rows > 0) {
     status = request_state->SetResultCache(
@@ -464,10 +496,6 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
         cache_num_rows);
     if (!status.ok()) goto return_error;
   }
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
-  // Start thread to wait for results to become available.
-  status = request_state->WaitAsync();
-  if (!status.ok()) goto return_error;
   // Once the query is running do a final check for session closure and add it to the
   // set of in-flight queries.
   status = SetQueryInflight(session, request_state);
@@ -475,8 +503,8 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
   return_val.__isset.operationHandle = true;
   return_val.operationHandle.__set_operationType(TOperationType::EXECUTE_STATEMENT);
   return_val.operationHandle.__set_hasResultSet(request_state->returns_result_set());
-  // TODO: create secret for operationId and store the secret in request_state
-  TUniqueIdToTHandleIdentifier(request_state->query_id(), request_state->query_id(),
+  // Secret is inherited from session.
+  TUniqueIdToTHandleIdentifier(request_state->query_id(), secret,
                                &return_val.operationHandle.operationId);
   return_val.status.__set_statusCode(
       apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
@@ -492,6 +520,7 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
 void ImpalaServer::GetTypeInfo(TGetTypeInfoResp& return_val,
     const TGetTypeInfoReq& request) {
   VLOG_QUERY << "GetTypeInfo(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_TYPE_INFO);
@@ -510,6 +539,7 @@ void ImpalaServer::GetTypeInfo(TGetTypeInfoResp& return_val,
 void ImpalaServer::GetCatalogs(TGetCatalogsResp& return_val,
     const TGetCatalogsReq& request) {
   VLOG_QUERY << "GetCatalogs(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_CATALOGS);
@@ -528,6 +558,7 @@ void ImpalaServer::GetCatalogs(TGetCatalogsResp& return_val,
 void ImpalaServer::GetSchemas(TGetSchemasResp& return_val,
     const TGetSchemasReq& request) {
   VLOG_QUERY << "GetSchemas(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_SCHEMAS);
@@ -546,6 +577,7 @@ void ImpalaServer::GetSchemas(TGetSchemasResp& return_val,
 void ImpalaServer::GetTables(TGetTablesResp& return_val,
     const TGetTablesReq& request) {
   VLOG_QUERY << "GetTables(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_TABLES);
@@ -564,6 +596,7 @@ void ImpalaServer::GetTables(TGetTablesResp& return_val,
 void ImpalaServer::GetTableTypes(TGetTableTypesResp& return_val,
     const TGetTableTypesReq& request) {
   VLOG_QUERY << "GetTableTypes(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_TABLE_TYPES);
@@ -583,6 +616,7 @@ void ImpalaServer::GetTableTypes(TGetTableTypesResp& return_val,
 void ImpalaServer::GetColumns(TGetColumnsResp& return_val,
     const TGetColumnsReq& request) {
   VLOG_QUERY << "GetColumns(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_COLUMNS);
@@ -601,6 +635,7 @@ void ImpalaServer::GetColumns(TGetColumnsResp& return_val,
 void ImpalaServer::GetFunctions(TGetFunctionsResp& return_val,
     const TGetFunctionsReq& request) {
   VLOG_QUERY << "GetFunctions(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
 
   TMetadataOpRequest req;
   req.__set_opcode(TMetadataOpcode::GET_FUNCTIONS);
@@ -616,6 +651,42 @@ void ImpalaServer::GetFunctions(TGetFunctionsResp& return_val,
   VLOG_QUERY << "GetFunctions(): return_val=" << ThriftDebugString(return_val);
 }
 
+void ImpalaServer::GetPrimaryKeys(TGetPrimaryKeysResp& return_val,
+    const TGetPrimaryKeysReq& request) {
+  VLOG_QUERY << "GetPrimaryKeys(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
+
+  TMetadataOpRequest req;
+  req.__set_opcode(TMetadataOpcode::GET_PRIMARY_KEYS);
+  req.__set_get_primary_keys_req(request);
+
+  TOperationHandle handle;
+  thrift::TStatus status;
+  ExecuteMetadataOp(request.sessionHandle.sessionId, &req, &handle, &status);
+  return_val.__set_operationHandle(handle);
+  return_val.__set_status(status);
+
+  VLOG_QUERY << "GetPrimaryKeys(): return_val=" << ThriftDebugString(return_val);
+}
+
+void ImpalaServer::GetCrossReference(TGetCrossReferenceResp& return_val,
+    const TGetCrossReferenceReq& request) {
+  VLOG_QUERY << "GetCrossReference(): request=" << ThriftDebugString(request);
+  HS2_RETURN_IF_ERROR(return_val, CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
+
+  TMetadataOpRequest req;
+  req.__set_opcode(TMetadataOpcode::GET_CROSS_REFERENCE);
+  req.__set_get_cross_reference_req(request);
+
+  TOperationHandle handle;
+  thrift::TStatus status;
+  ExecuteMetadataOp(request.sessionHandle.sessionId, &req, &handle, &status);
+  return_val.__set_operationHandle(handle);
+  return_val.__set_status(status);
+
+  VLOG_QUERY << "GetCrossReference(): return_val=" << ThriftDebugString(return_val);
+}
+
 void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
     const TGetOperationStatusReq& request) {
   if (request.operationHandle.operationId.guid.size() == 0) {
@@ -627,11 +698,12 @@ void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
     return;
   }
 
-  // TODO: check secret
+  // Secret is inherited from session.
   TUniqueId query_id;
-  TUniqueId secret;
+  TUniqueId op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
   VLOG_ROW << "GetOperationStatus(): query_id=" << PrintId(query_id);
 
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
@@ -644,13 +716,14 @@ void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
   ScopedSessionState session_handle(this);
   const TUniqueId session_id = request_state->session_id();
   shared_ptr<SessionState> session;
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(
+          session_id, SecretArg::Operation(op_secret, query_id), &session),
       SQLSTATE_GENERAL_ERROR);
 
   {
     lock_guard<mutex> l(*request_state->lock());
-    TOperationState::type operation_state = QueryStateToTOperationState(
-        request_state->query_state());
+    TOperationState::type operation_state = request_state->TOperationState();
     return_val.__set_operationState(operation_state);
     if (operation_state == TOperationState::ERROR_STATE) {
       DCHECK(!request_state->query_status().ok());
@@ -665,9 +738,10 @@ void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
 void ImpalaServer::CancelOperation(TCancelOperationResp& return_val,
     const TCancelOperationReq& request) {
   TUniqueId query_id;
-  TUniqueId secret;
+  TUniqueId op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "CancelOperation(): query_id=" << PrintId(query_id);
 
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
@@ -678,7 +752,8 @@ void ImpalaServer::CancelOperation(TCancelOperationResp& return_val,
   }
   ScopedSessionState session_handle(this);
   const TUniqueId session_id = request_state->session_id();
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Operation(op_secret, query_id)),
       SQLSTATE_GENERAL_ERROR);
   HS2_RETURN_IF_ERROR(return_val, CancelInternal(query_id, true), SQLSTATE_GENERAL_ERROR);
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
@@ -686,10 +761,20 @@ void ImpalaServer::CancelOperation(TCancelOperationResp& return_val,
 
 void ImpalaServer::CloseOperation(TCloseOperationResp& return_val,
     const TCloseOperationReq& request) {
+  TCloseImpalaOperationReq request2;
+  request2.operationHandle = request.operationHandle;
+  TCloseImpalaOperationResp tmp_resp;
+  CloseImpalaOperation(tmp_resp, request2);
+  return_val.status = tmp_resp.status;
+}
+
+void ImpalaServer::CloseImpalaOperation(TCloseImpalaOperationResp& return_val,
+    const TCloseImpalaOperationReq& request) {
   TUniqueId query_id;
-  TUniqueId secret;
+  TUniqueId op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "CloseOperation(): query_id=" << PrintId(query_id);
 
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
@@ -700,8 +785,16 @@ void ImpalaServer::CloseOperation(TCloseOperationResp& return_val,
   }
   ScopedSessionState session_handle(this);
   const TUniqueId session_id = request_state->session_id();
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Operation(op_secret, query_id)),
       SQLSTATE_GENERAL_ERROR);
+  if (request_state->stmt_type() == TStmtType::DML) {
+    Status query_status;
+    if (request_state->GetDmlStats(&return_val.dml_result, &query_status)) {
+      return_val.__isset.dml_result = true;
+    }
+  }
+
   // TODO: use timeout to get rid of unwanted request_state.
   HS2_RETURN_IF_ERROR(return_val, UnregisterQuery(query_id, true),
       SQLSTATE_GENERAL_ERROR);
@@ -711,11 +804,11 @@ void ImpalaServer::CloseOperation(TCloseOperationResp& return_val,
 void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
     const TGetResultSetMetadataReq& request) {
   // Convert Operation id to TUniqueId and get the query exec state.
-  // TODO: check secret
   TUniqueId query_id;
-  TUniqueId secret;
+  TUniqueId op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "GetResultSetMetadata(): query_id=" << PrintId(query_id);
 
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
@@ -727,7 +820,8 @@ void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
   }
   ScopedSessionState session_handle(this);
   const TUniqueId session_id = request_state->session_id();
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Operation(op_secret, query_id)),
       SQLSTATE_GENERAL_ERROR);
   {
     lock_guard<mutex> l(*request_state->lock());
@@ -763,17 +857,36 @@ void ImpalaServer::FetchResults(TFetchResultsResp& return_val,
   bool fetch_first = request.orientation == TFetchOrientation::FETCH_FIRST;
 
   // Convert Operation id to TUniqueId and get the query exec state.
-  // TODO: check secret
   TUniqueId query_id;
-  TUniqueId secret;
+  TUniqueId op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
   VLOG_ROW << "FetchResults(): query_id=" << PrintId(query_id)
            << " fetch_size=" << request.maxRows;
 
-  // FetchInternal takes care of extending the session
-  Status status = FetchInternal(query_id, request.maxRows, fetch_first, &return_val);
-  VLOG_ROW << "FetchResults(): #results=" << return_val.results.rows.size()
+  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
+  if (UNLIKELY(request_state == nullptr)) {
+    string err_msg = Substitute("Invalid query handle: $0", PrintId(query_id));
+    VLOG(1) << err_msg;
+    HS2_RETURN_ERROR(return_val, err_msg, SQLSTATE_GENERAL_ERROR);
+  }
+
+  // Validate the secret and keep the session that originated the query alive.
+  ScopedSessionState session_handle(this);
+  const TUniqueId session_id = request_state->session_id();
+  shared_ptr<SessionState> session;
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(
+          session_id, SecretArg::Operation(op_secret, query_id), &session),
+      SQLSTATE_GENERAL_ERROR);
+
+  int32_t num_results = 0;
+  Status status = FetchInternal(request_state.get(), session.get(), request.maxRows,
+      fetch_first, &return_val, &num_results);
+
+  VLOG_ROW << "FetchResults(): query_id=" << PrintId(query_id)
+           << " #results=" << num_results
            << " has_more=" << (return_val.hasMoreRows ? "true" : "false");
   if (!status.ok()) {
     // Only unregister the query if the underlying error is unrecoverable.
@@ -787,15 +900,16 @@ void ImpalaServer::FetchResults(TFetchResultsResp& return_val,
       discard_result(UnregisterQuery(query_id, false, &status));
     }
     HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
+    return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
   }
-  return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
 
 void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
   TUniqueId query_id;
-  TUniqueId secret;
+  TUniqueId op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
 
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
   if (UNLIKELY(request_state.get() == nullptr)) {
@@ -808,19 +922,48 @@ void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
   // should keep alive the same session that orignated the query.
   ScopedSessionState session_handle(this);
   const TUniqueId session_id = request_state->session_id();
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
-                      SQLSTATE_GENERAL_ERROR);
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Operation(op_secret, query_id)),
+      SQLSTATE_GENERAL_ERROR);
 
   stringstream ss;
-  if (request_state->coord() != NULL) {
+  Coordinator* coord = request_state->GetCoordinator();
+  if (coord != nullptr) {
     // Report progress
-    ss << request_state->coord()->progress().ToString() << "\n";
+    ss << coord->progress().ToString() << "\n";
   }
+  // Report the query status, if the query failed.
+  {
+    // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
+    // guaranteed to see the error query_status.
+    lock_guard<mutex> l(*request_state->lock());
+    Status query_status = request_state->query_status();
+    DCHECK_EQ(request_state->exec_state() == ClientRequestState::ExecState::ERROR,
+        !query_status.ok());
+    // If the query status is !ok, include the status error message at the top of the log.
+    if (!query_status.ok()) ss << query_status.GetDetail();
+  }
+
   // Report analysis errors
   ss << join(request_state->GetAnalysisWarnings(), "\n");
-  if (request_state->coord() != NULL) {
+  // Report queuing reason if the admission controller queued the query.
+  const string* admission_result = request_state->summary_profile()->GetInfoString(
+      AdmissionController::PROFILE_INFO_KEY_ADMISSION_RESULT);
+  if (admission_result != nullptr) {
+    if (*admission_result == AdmissionController::PROFILE_INFO_VAL_QUEUED) {
+      ss << AdmissionController::PROFILE_INFO_KEY_ADMISSION_RESULT << " : "
+         << *admission_result << "\n";
+      const string* queued_reason = request_state->summary_profile()->GetInfoString(
+          AdmissionController::PROFILE_INFO_KEY_LAST_QUEUED_REASON);
+      if (queued_reason != nullptr) {
+        ss << AdmissionController::PROFILE_INFO_KEY_LAST_QUEUED_REASON << " : "
+           << *queued_reason << "\n";
+      }
+    }
+  }
+  if (coord != nullptr) {
     // Report execution errors
-    ss << request_state->coord()->GetErrorLog();
+    ss << coord->GetErrorLog();
   }
   return_val.log = ss.str();
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
@@ -831,19 +974,24 @@ void ImpalaServer::GetExecSummary(TGetExecSummaryResp& return_val,
   TUniqueId session_id;
   TUniqueId secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.sessionHandle.sessionId, &session_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.sessionHandle.sessionId, &session_id, &secret),
+      SQLSTATE_GENERAL_ERROR);
   ScopedSessionState session_handle(this);
   shared_ptr<SessionState> session;
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(
+          session_id, SecretArg::Session(secret), &session),
       SQLSTATE_GENERAL_ERROR);
   if (session == NULL) {
     HS2_RETURN_ERROR(return_val, Substitute("Invalid session id: $0",
         PrintId(session_id)), SQLSTATE_GENERAL_ERROR);
   }
 
-  TUniqueId query_id;
-  HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+  TUniqueId query_id, op_secret;
+  HS2_RETURN_IF_ERROR(return_val,
+      THandleIdentifierToTUniqueId(
+          request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
 
   TExecSummary summary;
   Status status = GetExecSummary(query_id, GetEffectiveUser(*session), &summary);
@@ -852,29 +1000,48 @@ void ImpalaServer::GetExecSummary(TGetExecSummaryResp& return_val,
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
 
-void ImpalaServer::GetRuntimeProfile(TGetRuntimeProfileResp& return_val,
-    const TGetRuntimeProfileReq& request) {
+void ImpalaServer::GetRuntimeProfile(
+    TGetRuntimeProfileResp& return_val, const TGetRuntimeProfileReq& request) {
   TUniqueId session_id;
   TUniqueId secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
       request.sessionHandle.sessionId, &session_id, &secret), SQLSTATE_GENERAL_ERROR);
   ScopedSessionState session_handle(this);
   shared_ptr<SessionState> session;
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(
+          session_id, SecretArg::Session(secret), &session),
       SQLSTATE_GENERAL_ERROR);
   if (session == NULL) {
     HS2_RETURN_ERROR(return_val, Substitute("Invalid session id: $0",
         PrintId(session_id)), SQLSTATE_GENERAL_ERROR);
   }
 
-  TUniqueId query_id;
+  TUniqueId query_id, op_secret;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
-      request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
+      request.operationHandle.operationId, &query_id, &op_secret),
+      SQLSTATE_GENERAL_ERROR);
 
   stringstream ss;
-  HS2_RETURN_IF_ERROR(return_val, GetRuntimeProfileStr(query_id,
-      GetEffectiveUser(*session), false, &ss), SQLSTATE_GENERAL_ERROR);
-  return_val.__set_profile(ss.str());
+  TRuntimeProfileTree thrift_profile;
+  rapidjson::Document json_profile(rapidjson::kObjectType);
+  HS2_RETURN_IF_ERROR(return_val,
+      GetRuntimeProfileOutput(query_id, GetEffectiveUser(*session), request.format, &ss,
+          &thrift_profile, &json_profile),
+      SQLSTATE_GENERAL_ERROR);
+  if (request.format == TRuntimeProfileFormat::THRIFT) {
+    return_val.__set_thrift_profile(thrift_profile);
+  } else if (request.format == TRuntimeProfileFormat::JSON) {
+    rapidjson::StringBuffer sb;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(sb);
+    json_profile.Accept(writer);
+    ss << sb.GetString();
+    return_val.__set_profile(ss.str());
+  } else {
+    DCHECK(request.format == TRuntimeProfileFormat::STRING
+        || request.format == TRuntimeProfileFormat::BASE64);
+    return_val.__set_profile(ss.str());
+  }
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
 
@@ -896,5 +1063,44 @@ void ImpalaServer::RenewDelegationToken(TRenewDelegationTokenResp& return_val,
   return_val.status.__set_errorMessage("Not implemented");
 }
 
+void ImpalaServer::AddSessionToConnection(
+    const TUniqueId& session_id, SessionState* session) {
+  const TUniqueId& connection_id = ThriftServer::GetThreadConnectionId();
+  {
+    boost::lock_guard<boost::mutex> l(connection_to_sessions_map_lock_);
+    connection_to_sessions_map_[connection_id].insert(session_id);
+  }
 
+  boost::lock_guard<boost::mutex> session_lock(session->lock);
+  if (session->connections.empty()) {
+    // This session was previously disconnected but now has an associated
+    // connection. It should no longer be considered for the disconnected timeout.
+    UnregisterSessionTimeout(FLAGS_disconnected_session_timeout);
+  }
+  session->connections.insert(connection_id);
+}
+
+void ImpalaServer::PingImpalaHS2Service(TPingImpalaHS2ServiceResp& return_val,
+    const TPingImpalaHS2ServiceReq& req) {
+  VLOG_QUERY << "PingImpalaHS2Service(): request=" << ThriftDebugString(req);
+  TUniqueId session_id;
+  TUniqueId secret;
+  HS2_RETURN_IF_ERROR(return_val,
+      THandleIdentifierToTUniqueId(req.sessionHandle.sessionId, &session_id, &secret),
+      SQLSTATE_GENERAL_ERROR);
+  ScopedSessionState session_handle(this);
+  shared_ptr<SessionState> session;
+  HS2_RETURN_IF_ERROR(return_val,
+      session_handle.WithSession(session_id, SecretArg::Session(secret), &session),
+      SQLSTATE_GENERAL_ERROR);
+  if (session == NULL) {
+    HS2_RETURN_ERROR(return_val,
+        Substitute("Invalid session id: $0", PrintId(session_id)),
+        SQLSTATE_GENERAL_ERROR);
+  }
+
+  return_val.__set_version(GetVersionString(true));
+  return_val.__set_webserver_address(ExecEnv::GetInstance()->webserver()->url());
+  VLOG_RPC << "PingImpalaHS2Service(): return_val=" << ThriftDebugString(return_val);
+}
 }

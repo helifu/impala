@@ -22,8 +22,8 @@ import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.CastExpr;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
+import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TypeDef;
-import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 
 /**
@@ -67,7 +67,7 @@ public class RemoveRedundantStringCast implements ExprRewriteRule {
         (expr.getChild(0).ignoreImplicitCast() instanceof CastExpr) &&
         expr.getChild(0).ignoreImplicitCast().getType().isStringType() &&
         expr.getChild(1).getType().isStringType() &&
-        expr.getChild(1).isLiteral();
+        Expr.IS_LITERAL.apply(expr.getChild(1));
 
     if (!isPotentiallyRedundantCast) return expr;
     // Ignore the implicit casts added during parsing.
@@ -78,11 +78,12 @@ public class RemoveRedundantStringCast implements ExprRewriteRule {
     Expr castForRedundancyCheck = new CastExpr(new TypeDef(castExpr.getType()),
         new CastExpr(new TypeDef(castExprChild.getType()), literalExpr));
     castForRedundancyCheck.analyze(analyzer);
-    LiteralExpr resultOfReverseCast = LiteralExpr.create(castForRedundancyCheck,
-        analyzer.getQueryCtx());
+    LiteralExpr resultOfReverseCast = LiteralExpr.createBounded(castForRedundancyCheck,
+        analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
     // Need to trim() while comparing char(n) types as conversion might add trailing
     // spaces to the 'resultOfReverseCast'.
-    if (!resultOfReverseCast.isNullLiteral() &&
+    if (resultOfReverseCast != null &&
+        !Expr.IS_NULL_VALUE.apply(resultOfReverseCast) &&
         resultOfReverseCast.getStringValue().trim()
             .equals(literalExpr.getStringValue().trim())) {
       return new BinaryPredicate(op, castExprChild,

@@ -27,10 +27,13 @@
 #include <gutil/strings/substitute.h>
 
 #include "catalog/catalog-service-client-wrapper.h"
-#include "runtime/client-cache-types.h"
-#include "util/metrics.h"
 #include "rpc/thrift-client.h"
 #include "rpc/thrift-util.h"
+#include "runtime/client-cache-types.h"
+#include "util/debug-util.h"
+#include "util/metrics-fwd.h"
+#include "util/network-util.h"
+#include "util/time.h"
 
 #include "common/status.h"
 
@@ -239,7 +242,7 @@ class ClientConnection {
     try {
       (client_->*f)(*response, request, &send_done);
     } catch (const apache::thrift::transport::TTransportException& e) {
-      if (send_done && IsRecvTimeoutTException(e)) {
+      if (send_done && IsReadTimeoutTException(e)) {
         return RecvTimeoutStatus(typeid(*response).name());
       }
 
@@ -261,6 +264,51 @@ class ClientConnection {
     return Status::OK();
   }
 
+  /// Return struct for DoRpcWithRetry() that allows callers to distinguish between
+  /// failures in getting a client and failures sending the RPC.
+  struct RpcStatus {
+    Status status;
+
+    // Set to true if 'status' is not OK and the error occurred while getting the client.
+    bool client_error;
+
+    static RpcStatus OK() { return {Status::OK(), false}; }
+  };
+
+  /// Helper that retries constructing a client and calling DoRpc() up to 'retries' times
+  /// with 'delay_ms' delay between retries. This handles both RPC failures and failures
+  /// to get a client from 'client_cache'.  'debug_fn' is a Status-returning function that
+  /// can be used to inject errors into the RPC.
+  template <class F, class DebugF, class Request, class Response>
+  static RpcStatus DoRpcWithRetry(ClientCache<T>* client_cache, TNetworkAddress address,
+      const F& f, const Request& request, int retries, int64_t delay_ms,
+      const DebugF& debug_fn, Response* response) {
+    Status rpc_status;
+    Status client_status;
+
+    // Try to send the RPC as many times as requested before failing.
+    for (int i = 0; i < retries; ++i) {
+      if (i > 0) SleepForMs(delay_ms); // Delay before retrying.
+      ClientConnection<T> client(client_cache, address, &client_status);
+      if (!client_status.ok()) continue;
+
+      rpc_status = debug_fn();
+      if (!rpc_status.ok()) {
+        LOG(INFO) << "Injected RPC error to " << TNetworkAddressToString(address) << ": "
+                  << rpc_status.GetDetail();
+        continue;
+      }
+
+      rpc_status = client.DoRpc(f, request, response);
+      if (rpc_status.ok()) break;
+      LOG(INFO) << "RPC to " << TNetworkAddressToString(address) << " failed "
+                << rpc_status.GetDetail();
+    }
+    if (!client_status.ok()) return {client_status, true};
+    if (!rpc_status.ok()) return {rpc_status, false};
+    return RpcStatus::OK();
+  }
+
   /// In certain cases, the server may take longer to provide an RPC response than
   /// the configured socket timeout. Callers may wish to retry receiving the response.
   /// This is safe if and only if DoRpc() returned RPC_RECV_TIMEOUT.
@@ -271,7 +319,7 @@ class ClientConnection {
     try {
       (client_->*recv_func)(*response);
     } catch (const apache::thrift::transport::TTransportException& e) {
-      if (IsRecvTimeoutTException(e)) {
+      if (IsReadTimeoutTException(e)) {
         return RecvTimeoutStatus(typeid(*response).name());
       }
       // If it's not timeout exception, then the connection is broken, stop retrying.

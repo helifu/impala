@@ -17,12 +17,17 @@
 
 #include "kudu/util/curl_util.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <ostream>
 
 #include <curl/curl.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/openssl_util.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/scoped_cleanup.h"
 
 namespace kudu {
 
@@ -59,8 +64,9 @@ EasyCurl::~EasyCurl() {
   curl_easy_cleanup(curl_);
 }
 
-Status EasyCurl::FetchURL(const std::string& url, faststring* buf) {
-  return DoRequest(url, nullptr, buf);
+Status EasyCurl::FetchURL(const std::string& url, faststring* dst,
+                          const std::vector<std::string>& headers) {
+  return DoRequest(url, nullptr, dst, headers);
 }
 
 Status EasyCurl::PostToURL(const std::string& url,
@@ -71,12 +77,28 @@ Status EasyCurl::PostToURL(const std::string& url,
 
 Status EasyCurl::DoRequest(const std::string& url,
                            const std::string* post_data,
-                           faststring* dst) {
+                           faststring* dst,
+                           const std::vector<std::string>& headers) {
   CHECK_NOTNULL(dst)->clear();
 
-  RETURN_NOT_OK(TranslateError(curl_easy_setopt(
-      curl_, CURLOPT_SSL_VERIFYPEER,
-      static_cast<long>(verify_peer_)))); // NOLINT(runtime/int)
+  if (!verify_peer_) {
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(
+        curl_, CURLOPT_SSL_VERIFYHOST, 0)));
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(
+        curl_, CURLOPT_SSL_VERIFYPEER, 0)));
+  }
+
+  // Add headers if specified.
+  struct curl_slist* curl_headers = nullptr;
+  auto clean_up_curl_slist = MakeScopedCleanup([&]() {
+    curl_slist_free_all(curl_headers);
+  });
+
+  for (const auto& header : headers) {
+    curl_headers = CHECK_NOTNULL(curl_slist_append(curl_headers, header.c_str()));
+  }
+  RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, curl_headers)));
+
   RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_URL, url.c_str())));
   if (return_headers_) {
     RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_HEADER, 1)));
@@ -89,8 +111,14 @@ Status EasyCurl::DoRequest(const std::string& url,
                                                   post_data->c_str())));
   }
 
+  RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_HTTPAUTH, CURLAUTH_ANY)));
+  if (timeout_.Initialized()) {
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1)));
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS,
+        timeout_.ToMilliseconds())));
+  }
   RETURN_NOT_OK(TranslateError(curl_easy_perform(curl_)));
-  long rc; // NOLINT(runtime/int) curl wants a long
+  long rc; // NOLINT(*) curl wants a long
   RETURN_NOT_OK(TranslateError(curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &rc)));
   if (rc != 200) {
     return Status::RemoteError(strings::Substitute("HTTP $0", rc));

@@ -17,8 +17,10 @@
 
 #include "exec/kudu-table-sink.h"
 
-#include <kudu/client/write_op.h>
 #include <sstream>
+
+#include <boost/bind.hpp>
+#include <kudu/client/write_op.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
 #include "exec/kudu-util.h"
@@ -61,15 +63,12 @@ using kudu::client::KuduError;
 
 namespace impala {
 
-const static string& ROOT_PARTITION_KEY =
-    g_ImpalaInternalService_constants.ROOT_PARTITION_KEY;
-
 // Send 7MB buffers to Kudu, matching a hard-coded size in Kudu (KUDU-1693).
 const static int INDIVIDUAL_BUFFER_SIZE = 7 * 1024 * 1024;
 
-KuduTableSink::KuduTableSink(const RowDescriptor* row_desc, const TDataSink& tsink,
-    RuntimeState* state)
-  : DataSink(row_desc, "KuduTableSink", state),
+KuduTableSink::KuduTableSink(TDataSinkId sink_id, const RowDescriptor* row_desc,
+    const TDataSink& tsink, RuntimeState* state)
+  : DataSink(sink_id, row_desc, "KuduTableSink", state),
     table_id_(tsink.table_sink.target_table_id),
     sink_action_(tsink.table_sink.action),
     kudu_table_sink_(tsink.table_sink.kudu_table_sink),
@@ -92,15 +91,7 @@ Status KuduTableSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracke
       << "TableDescriptor must be an instance KuduTableDescriptor.";
   table_desc_ = static_cast<const KuduTableDescriptor*>(table_desc);
 
-  // Add a 'root partition' status in which to collect write statistics
-  TInsertPartitionStatus root_status;
-  root_status.__set_num_modified_rows(0L);
-  root_status.__set_id(-1L);
-  TKuduDmlStats kudu_dml_stats;
-  kudu_dml_stats.__set_num_row_errors(0L);
-  root_status.__set_stats(TInsertStats());
-  root_status.stats.__set_kudu_stats(kudu_dml_stats);
-  state->per_partition_status()->insert(make_pair(ROOT_PARTITION_KEY, root_status));
+  state->dml_exec_state()->InitForKuduDml();
 
   // Add counters
   total_rows_ = ADD_COUNTER(profile(), "TotalNumRows", TUnit::UNIT);
@@ -129,8 +120,8 @@ Status KuduTableSink::Open(RuntimeState* state) {
   }
   client_tracked_bytes_ = required_mem;
 
-  RETURN_IF_ERROR(
-      state->exec_env()->GetKuduClient(table_desc_->kudu_master_addresses(), &client_));
+  RETURN_IF_ERROR(ExecEnv::GetInstance()->GetKuduClient(
+      table_desc_->kudu_master_addresses(), &client_));
   KUDU_RETURN_IF_ERROR(client_->OpenTable(table_desc_->table_name(), &table_),
       "Unable to open Kudu table");
 
@@ -145,12 +136,20 @@ Status KuduTableSink::Open(RuntimeState* state) {
       return Status(strings::Substitute(
           "Table $0 has fewer columns than expected.", table_desc_->name()));
     }
-    ColumnType type = KuduDataTypeToColumnType(table_->schema().Column(col_idx).type());
+    const KuduColumnSchema& kudu_col = table_->schema().Column(col_idx);
+    const ColumnType& type =
+        KuduDataTypeToColumnType(kudu_col.type(), kudu_col.type_attributes());
     if (type != output_expr_evals_[i]->root().type()) {
       return Status(strings::Substitute("Column $0 has unexpected type. ($1 vs. $2)",
           table_->schema().Column(col_idx).name(), type.DebugString(),
           output_expr_evals_[i]->root().type().DebugString()));
     }
+  }
+
+  // Cache Kudu column nullabilities to avoid non-inlined slow calls to the Kudu client
+  // Schema accessor.
+  for (int i = 0; i < table_->schema().num_columns(); i++) {
+    kudu_column_nullabilities_.push_back(table_->schema().Column(i).is_nullable());
   }
 
   session_ = client_->NewSession();
@@ -215,7 +214,6 @@ Status KuduTableSink::Send(RuntimeState* state, RowBatch* batch) {
   SCOPED_TIMER(profile()->total_time_counter());
   expr_results_pool_->Clear();
   RETURN_IF_ERROR(state->CheckQueryState());
-  const KuduSchema& table_schema = table_->schema();
 
   // Collect all write operations and apply them together so the time in Apply() can be
   // easily timed.
@@ -240,7 +238,7 @@ Status KuduTableSink::Send(RuntimeState* state, RowBatch* batch) {
 
       void* value = output_expr_evals_[j]->GetValue(current_row);
       if (value == nullptr) {
-        if (table_schema.Column(col).is_nullable()) {
+        if (kudu_column_nullabilities_[col]) {
           KUDU_RETURN_IF_ERROR(write->mutable_row()->SetNull(col),
               "Could not add Kudu WriteOp.");
           continue;
@@ -256,13 +254,14 @@ Status KuduTableSink::Send(RuntimeState* state, RowBatch* batch) {
         }
       }
 
-      PrimitiveType type = output_expr_evals_[j]->root().type().type;
+      const ColumnType& type = output_expr_evals_[j]->root().type();
       Status s = WriteKuduValue(col, type, value, true, write->mutable_row());
       // This can only fail if we set a col to an incorrect type, which would be a bug in
       // planning, so we can DCHECK.
-      DCHECK(s.ok()) << "WriteKuduValue failed for col = "
-                     << table_schema.Column(col).name() << " and type = "
-                     << output_expr_evals_[j]->root().type() << ": " << s.GetDetail();
+      DCHECK(s.ok()) << "WriteKuduValue failed for col '"
+                     << table_->schema().Column(col).name()
+                     << "' of type '" << type << "': "
+                     << s.GetDetail();
       RETURN_IF_ERROR(s);
     }
     if (add_row) write_ops.push_back(move(write));
@@ -336,12 +335,9 @@ Status KuduTableSink::FlushFinal(RuntimeState* state) {
     VLOG_RPC << "Ignoring Flush() error status: " << flush_status.ToString();
   }
   Status status = CheckForErrors(state);
-  TInsertPartitionStatus& insert_status =
-      (*state->per_partition_status())[ROOT_PARTITION_KEY];
-  insert_status.__set_num_modified_rows(
-      total_rows_->value() - num_row_errors_->value());
-  insert_status.stats.kudu_stats.__set_num_row_errors(num_row_errors_->value());
-  insert_status.__set_kudu_latest_observed_ts(client_->GetLatestObservedTimestamp());
+  state->dml_exec_state()->SetKuduDmlStats(
+      total_rows_->value() - num_row_errors_->value(), num_row_errors_->value(),
+      client_->GetLatestObservedTimestamp());
   return status;
 }
 

@@ -21,7 +21,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 
 import org.apache.hadoop.hbase.HConstants;
@@ -35,8 +38,9 @@ import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseColumn;
-import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
@@ -52,28 +56,55 @@ import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TScanRange;
 import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
-import org.apache.impala.util.MembershipSnapshot;
+import org.apache.impala.thrift.TScanRangeSpec;
+import org.apache.impala.util.BitUtil;
+import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 /**
  * Full scan of an HBase table.
  * Only families/qualifiers specified in TupleDescriptor will be retrieved in the backend.
  */
 public class HBaseScanNode extends ScanNode {
+  // The suggested value for "hbase.client.scan.setCaching", which batches maxCaching
+  // rows per fetch request to the HBase region server. If the value is too high,
+  // then the hbase region server will have a hard time (GC pressure and long response
+  // times). If the value is too small, then there will be extra trips to the hbase
+  // region server.
+  // Default to 1024 and update it based on row size estimate such that each batch size
+  // won't exceed 500MB.
+  private final static int MAX_HBASE_FETCH_BATCH_SIZE = 500 * 1024 * 1024;
+  private final static int DEFAULT_SUGGESTED_CACHING = 1024;
+
+  // Used for memory estimation when the column max size stat is missing (happens only
+  // in case of string type columns).
+  private final static int DEFAULT_STRING_COL_BYTES = 32 * 1024;
+
+  // Used for memory estimation to clamp the max estimate to 128 MB in case of
+  // missing stats.
+  private final static int DEFAULT_MAX_ESTIMATE_BYTES = 128 * 1024 * 1024;
+
+  // Used for memory estimation to clamp the min estimate to 4 KB which is min
+  // block size that can be allocated by the mem-pool.
+  private final static int DEFAULT_MIN_ESTIMATE_BYTES = 4 * 1024;
+
   private final static Logger LOG = LoggerFactory.getLogger(HBaseScanNode.class);
   private final TupleDescriptor desc_;
 
   // One range per clustering column. The range bounds are expected to be constants.
   // A null entry means there's no range restriction for that particular key.
   // If keyRanges is non-null it always contains as many entries as there are clustering
-  // cols.
-  private List<ValueRange> keyRanges_;
+  // cols. Don't replace this variable after init().
+  private List<ValueRange> keyRanges_ = new ArrayList<>();
+
+  // The list of conjuncts used to create the key ranges. Used if we must estimate
+  // cardinality based on row count stats. Don't replace this variable after init().
+  private List<Expr> keyConjuncts_ = new ArrayList<>();
 
   // derived from keyRanges_; empty means unbounded;
   // initialize start/stopKey_ to be unbounded.
@@ -86,17 +117,8 @@ public class HBaseScanNode extends ScanNode {
   private boolean isEmpty_ = false;
 
   // List of HBase Filters for generating thrift message. Filled in finalize().
-  private final List<THBaseFilter> filters_ = new ArrayList<THBaseFilter>();
+  private final List<THBaseFilter> filters_ = new ArrayList<>();
 
-  // The suggested value for "hbase.client.scan.setCaching", which batches maxCaching
-  // rows per fetch request to the HBase region server. If the value is too high,
-  // then the hbase region server will have a hard time (GC pressure and long response
-  // times). If the value is too small, then there will be extra trips to the hbase
-  // region server.
-  // Default to 1024 and update it based on row size estimate such that each batch size
-  // won't exceed 500MB.
-  private final static int MAX_HBASE_FETCH_BATCH_SIZE = 500 * 1024 * 1024;
-  private final static int DEFAULT_SUGGESTED_CACHING = 1024;
   private int suggestedCaching_ = DEFAULT_SUGGESTED_CACHING;
 
   public HBaseScanNode(PlanNodeId id, TupleDescriptor desc) {
@@ -104,13 +126,23 @@ public class HBaseScanNode extends ScanNode {
     desc_ = desc;
   }
 
-  public void setKeyRanges(List<ValueRange> keyRanges) {
-    Preconditions.checkNotNull(keyRanges);
-    keyRanges_ = keyRanges;
-  }
-
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
+    FeTable table = desc_.getTable();
+    // determine scan predicates for clustering cols
+    for (int i = 0; i < table.getNumClusteringCols(); ++i) {
+      SlotDescriptor slotDesc = analyzer.getColumnSlot(
+          desc_, table.getColumns().get(i));
+      if (slotDesc == null || !slotDesc.getType().isStringType()) {
+        // the hbase row key is mapped to a non-string type
+        // (since it's stored in ASCII it will be lexicographically ordered,
+        // and non-string comparisons won't work)
+        keyRanges_.add(null);
+      } else {
+        keyRanges_.add(createHBaseValueRange(slotDesc));
+      }
+    }
+
     checkForSupportedFileFormats();
     assignConjuncts(analyzer);
     conjuncts_ = orderConjunctsByCost(conjuncts_);
@@ -122,9 +154,73 @@ public class HBaseScanNode extends ScanNode {
     analyzer.materializeSlots(conjuncts_);
     computeMemLayout(analyzer);
     computeScanRangeLocations(analyzer);
+    Preconditions.checkState(!scanRangeSpecs_.isSetSplit_specs());
+
+    // Make sure key ranges are not changed any more. So startKey_ and stopKey_ are
+    // stable too. These invariants make it safe to reuse row estimation results in
+    // computeStats.
+    keyRanges_ = Collections.unmodifiableList(keyRanges_);
+    keyConjuncts_ = Collections.unmodifiableList(keyConjuncts_);
 
     // Call computeStats() after materializing slots and computing the mem layout.
     computeStats(analyzer);
+  }
+
+  /**
+   * Transform '=', '<[=]' and '>[=]' comparisons for given slot into
+   * ValueRange. Also removes those predicates which were used for the construction
+   * of ValueRange from 'conjuncts_'. Only looks at comparisons w/ string constants
+   * (ie, the bounds of the result can be evaluated with Expr::GetValue(NULL)).
+   * HBase row key filtering works only if the row key is mapped to a string column and
+   * the expression is a string constant expression.
+   * If there are multiple competing comparison predicates that could be used
+   * to construct a ValueRange, only the first one from each category is chosen.
+   */
+  private ValueRange createHBaseValueRange(SlotDescriptor d) {
+    ListIterator<Expr> i = conjuncts_.listIterator();
+    ValueRange result = null;
+    while (i.hasNext()) {
+      Expr e = i.next();
+      if (!(e instanceof BinaryPredicate)) continue;
+      BinaryPredicate comp = (BinaryPredicate) e;
+      if ((comp.getOp() == BinaryPredicate.Operator.NE)
+          || (comp.getOp() == BinaryPredicate.Operator.DISTINCT_FROM)
+          || (comp.getOp() == BinaryPredicate.Operator.NOT_DISTINCT)) {
+        continue;
+      }
+      Expr slotBinding = comp.getSlotBinding(d.getId());
+      if (slotBinding == null || !slotBinding.isConstant() ||
+          !slotBinding.getType().equals(Type.STRING)) {
+        continue;
+      }
+
+      if (comp.getOp() == BinaryPredicate.Operator.EQ) {
+        i.remove();
+        keyConjuncts_.add(e);
+        return ValueRange.createEqRange(slotBinding);
+      }
+
+      if (result == null) result = new ValueRange();
+
+      // TODO: do we need copies here?
+      if (comp.getOp() == BinaryPredicate.Operator.GT
+          || comp.getOp() == BinaryPredicate.Operator.GE) {
+        if (result.getLowerBound() == null) {
+          result.setLowerBound(slotBinding);
+          result.setLowerBoundInclusive(comp.getOp() == BinaryPredicate.Operator.GE);
+          i.remove();
+          keyConjuncts_.add(e);
+        }
+      } else {
+        if (result.getUpperBound() == null) {
+          result.setUpperBound(slotBinding);
+          result.setUpperBoundInclusive(comp.getOp() == BinaryPredicate.Operator.LE);
+          i.remove();
+          keyConjuncts_.add(e);
+       }
+      }
+    }
+    return result;
   }
 
   /**
@@ -134,7 +230,7 @@ public class HBaseScanNode extends ScanNode {
    * expression evaluates to null, then there's nothing to scan because Hbase row key
    * cannot be null.
    * At present, we only do row key filtering for string-mapped keys. String-mapped keys
-   * are always encded as ascii.
+   * are always encoded as ASCII.
    * ValueRange is null if there is no predicate on the row-key.
    */
   private void setStartStopKey(Analyzer analyzer) throws ImpalaException {
@@ -147,11 +243,15 @@ public class HBaseScanNode extends ScanNode {
         Preconditions.checkState(rowRange.getLowerBound().isConstant());
         Preconditions.checkState(
             rowRange.getLowerBound().getType().equals(Type.STRING));
-        LiteralExpr val = LiteralExpr.create(rowRange.getLowerBound(),
-            analyzer.getQueryCtx());
+        LiteralExpr val = LiteralExpr.createBounded(rowRange.getLowerBound(),
+            analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
+        // TODO: Make this a Preconditions.checkState(). If we get here,
+        // and the value is not a string literal, then we've got a predicate
+        // that we removed from the conjunct list, but which we won't evaluate
+        // as a key. That is, we'll produce wrong query results.
         if (val instanceof StringLiteral) {
           StringLiteral litVal = (StringLiteral) val;
-          startKey_ = convertToBytes(litVal.getStringValue(),
+          startKey_ = convertToBytes(litVal.getUnescapedValue(),
               !rowRange.getLowerBoundInclusive());
         } else {
           // lower bound is null.
@@ -163,11 +263,11 @@ public class HBaseScanNode extends ScanNode {
         Preconditions.checkState(rowRange.getUpperBound().isConstant());
         Preconditions.checkState(
             rowRange.getUpperBound().getType().equals(Type.STRING));
-        LiteralExpr val = LiteralExpr.create(rowRange.getUpperBound(),
-            analyzer.getQueryCtx());
+        LiteralExpr val = LiteralExpr.createBounded(rowRange.getUpperBound(),
+            analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
         if (val instanceof StringLiteral) {
           StringLiteral litVal = (StringLiteral) val;
-          stopKey_ = convertToBytes(litVal.getStringValue(),
+          stopKey_ = convertToBytes(litVal.getUnescapedValue(),
               rowRange.getUpperBoundInclusive());
         } else {
           // lower bound is null.
@@ -190,44 +290,86 @@ public class HBaseScanNode extends ScanNode {
   @Override
   public void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
-
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("computing stats for HbaseScan on " + tbl.getHBaseTableName());
+    }
     ValueRange rowRange = keyRanges_.get(0);
     if (isEmpty_) {
       cardinality_ = 0;
     } else if (rowRange != null && rowRange.isEqRange()) {
       cardinality_ = 1;
+    } else if (inputCardinality_ >= 0) {
+      // We have run computeStats successfully. Don't need to estimate cardinality again
+      // (IMPALA-8912). Check some invariants if computeStats has been called.
+      Preconditions.checkState(numNodes_ > 0);
+      Preconditions.checkState(cardinality_ >= 0);
+      cardinality_ = inputCardinality_;
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Reuse last stats: inputCardinality_=" + inputCardinality_);
+      }
     } else {
-      // Set maxCaching so that each fetch from hbase won't return a batch of more than
-      // MAX_HBASE_FETCH_BATCH_SIZE bytes.
-      Pair<Long, Long> estimate = tbl.getEstimatedRowStats(startKey_, stopKey_);
-      cardinality_ = estimate.first.longValue();
-      if (estimate.second.longValue() > 0) {
-        suggestedCaching_ = (int)
-            Math.max(MAX_HBASE_FETCH_BATCH_SIZE / estimate.second.longValue(), 1);
+      Pair<Long, Long> estimate;
+      if (analyzer.getQueryOptions().isDisable_hbase_num_rows_estimate()) {
+        estimate = new Pair<>(-1L, -1L);
+      } else {
+        // Set maxCaching so that each fetch from hbase won't return a batch of more than
+        // MAX_HBASE_FETCH_BATCH_SIZE bytes.
+        // May return -1 for the estimate if insufficient data is available.
+        estimate = tbl.getEstimatedRowStats(startKey_, stopKey_);
+      }
+      if (estimate.first == -1) {
+        // No useful estimate. Rely on HMS row count stats.
+        // This works only if HBase stats are available in HMS. This is true
+        // for the Impala tests, and may be true for some applications.
+        cardinality_ = tbl.getTTableStats().getNum_rows();
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("Fallback to use table stats in HMS: num_rows=" + cardinality_);
+        }
+        // TODO: What do do if neither HBase nor HMS provide a row count estimate?
+        // Is there some third, ulitimate fallback?
+        // Apply estimated key range selectivity from original key conjuncts
+        if (cardinality_ > 0 && keyConjuncts_ != null) {
+          cardinality_ =
+            applySelectivity(cardinality_, computeCombinedSelectivity(keyConjuncts_));
+        }
+      } else {
+        // Use the HBase sampling scan to estimate cardinality. Note that,
+        // in tests, this estimate has proven to be very rough: off by
+        // 2x or more.
+        cardinality_ = estimate.first;
+        if (estimate.second > 0) {
+          suggestedCaching_ = (int)
+              Math.max(MAX_HBASE_FETCH_BATCH_SIZE / estimate.second, 1);
+        }
       }
     }
     inputCardinality_ = cardinality_;
 
-    cardinality_ *= computeSelectivity();
-    cardinality_ = Math.max(1, cardinality_);
-    cardinality_ = capAtLimit(cardinality_);
+    if (cardinality_ > 0) {
+      cardinality_ = applyConjunctsSelectivity(cardinality_);
+    } else {
+      // Safe guard for cardinality_ < -1, e.g. when hbase sampling fails and numRows
+      // in HMS is abnormally set to be < -1.
+      cardinality_ = Math.max(-1, cardinality_);
+    }
+    cardinality_ = capCardinalityAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
-      LOG.trace("computeStats HbaseScan: cardinality=" + Long.toString(cardinality_));
+      LOG.trace("computeStats HbaseScan: cardinality=" + cardinality_);
     }
 
-    // Assume that each node in the cluster gets a scan range, unless there are fewer
+    // Assume that each executor in the cluster gets a scan range, unless there are fewer
     // scan ranges than nodes.
-    numNodes_ = Math.max(1,
-        Math.min(scanRanges_.size(), MembershipSnapshot.getCluster().numNodes()));
+    numNodes_ = Math.max(1, Math.min(scanRangeSpecs_.getConcrete_rangesSize(),
+                                ExecutorMembershipSnapshot.getCluster().numExecutors()));
     if (LOG.isTraceEnabled()) {
-      LOG.trace("computeStats HbaseScan: #nodes=" + Integer.toString(numNodes_));
+      LOG.trace("computeStats HbaseScan: #nodes=" + numNodes_);
     }
   }
 
   @Override
   protected String debugString() {
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
     return Objects.toStringHelper(this)
         .add("tid", desc_.getId().asInt())
         .add("hiveTblName", tbl.getFullName())
@@ -265,9 +407,14 @@ public class HBaseScanNode extends ScanNode {
 
         StringLiteral literal = (StringLiteral) bindingExpr;
         HBaseColumn col = (HBaseColumn) slot.getColumn();
-        filters_.add(new THBaseFilter(
-            col.getColumnFamily(), col.getColumnQualifier(),
-            (byte) hbaseOp.ordinal(), literal.getUnescapedValue()));
+        // IMPALA-7929: Since the qualifier can be null (e.g. for the key column of an
+        // HBase table), the qualifier field must be optional in order to express the
+        // null value. Constructors in Thrift do not set optional fields, so the qualifier
+        // must be set separately.
+        THBaseFilter thbf = new THBaseFilter(col.getColumnFamily(),
+            (byte) hbaseOp.ordinal(), literal.getUnescapedValue());
+        thbf.setQualifier(col.getColumnQualifier());
+        filters_.add(thbf);
         analyzer.materializeSlots(Lists.newArrayList(e));
       }
     }
@@ -276,7 +423,7 @@ public class HBaseScanNode extends ScanNode {
   @Override
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.HBASE_SCAN_NODE;
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
     msg.hbase_scan_node =
       new THBaseScanNode(desc_.getId().asInt(), tbl.getHBaseTableName());
     if (!filters_.isEmpty()) {
@@ -291,19 +438,16 @@ public class HBaseScanNode extends ScanNode {
    * of that region server.
    */
   private void computeScanRangeLocations(Analyzer analyzer) {
-    scanRanges_ = Lists.newArrayList();
+    scanRangeSpecs_ = new TScanRangeSpec();
 
     // For empty scan node, return an empty list.
     if (isEmpty_) return;
 
     // Retrieve relevant HBase regions and their region servers
-    HBaseTable tbl = (HBaseTable) desc_.getTable();
-    org.apache.hadoop.hbase.client.Table hbaseTbl = null;
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
     List<HRegionLocation> regionsLoc;
     try {
-      hbaseTbl = tbl.getHBaseTable();
-      regionsLoc = HBaseTable.getRegionsInRange(hbaseTbl, startKey_, stopKey_);
-      hbaseTbl.close();
+      regionsLoc = FeHBaseTable.Util.getRegionsInRange(tbl, startKey_, stopKey_);
     } catch (IOException e) {
       throw new RuntimeException(
           "couldn't retrieve HBase table (" + tbl.getHBaseTableName() + ") info:\n"
@@ -313,7 +457,7 @@ public class HBaseScanNode extends ScanNode {
     // Convert list of HRegionLocation to Map<hostport, List<HRegionLocation>>.
     // The List<HRegionLocations>'s end up being sorted by start key/end key, because
     // regionsLoc is sorted that way.
-    Map<String, List<HRegionLocation>> locationMap = Maps.newHashMap();
+    Map<String, List<HRegionLocation>> locationMap = new HashMap<>();
     for (HRegionLocation regionLoc: regionsLoc) {
       String locHostPort = regionLoc.getHostnamePort();
       if (locationMap.containsKey(locHostPort)) {
@@ -348,11 +492,12 @@ public class HBaseScanNode extends ScanNode {
           TNetworkAddress networkAddress = addressToTNetworkAddress(locEntry.getKey());
           scanRangeLocation.addToLocations(
               new TScanRangeLocation(analyzer.getHostIndex().getIndex(networkAddress)));
-          scanRanges_.add(scanRangeLocation);
 
           TScanRange scanRange = new TScanRange();
           scanRange.setHbase_key_range(keyRange);
           scanRangeLocation.setScan_range(scanRange);
+
+          scanRangeSpecs_.addToConcrete_ranges(scanRangeLocation);
         }
         prevEndKey = curRegEndKey;
       }
@@ -400,7 +545,7 @@ public class HBaseScanNode extends ScanNode {
   @Override
   protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
-    HBaseTable table = (HBaseTable) desc_.getTable();
+    FeHBaseTable table = (FeHBaseTable) desc_.getTable();
     StringBuilder output = new StringBuilder();
     if (isEmpty_) {
       output.append(prefix + "empty scan node\n");
@@ -414,6 +559,10 @@ public class HBaseScanNode extends ScanNode {
     output.append(String.format("%s%s:%s [%s%s]\n", prefix, id_.toString(),
         displayName_, table.getFullName(), aliasStr));
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
+      if (!keyConjuncts_.isEmpty()) {
+        output.append(detailPrefix + "key predicates: " +
+            Expr.getExplainString(keyConjuncts_, detailLevel) + "\n");
+      }
       if (!Bytes.equals(startKey_, HConstants.EMPTY_START_ROW)) {
         output.append(detailPrefix + "start key: " + printKey(startKey_) + "\n");
       }
@@ -438,8 +587,8 @@ public class HBaseScanNode extends ScanNode {
         output.append('\n');
       }
       if (!conjuncts_.isEmpty()) {
-        output.append(
-            detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+        output.append(detailPrefix
+            + "predicates: " + Expr.getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
@@ -496,17 +645,74 @@ public class HBaseScanNode extends ScanNode {
 
   @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    // TODO: What's a good estimate of memory consumption?
-    nodeResourceProfile_ =  ResourceProfile.noReservation(1024L * 1024L * 1024L);
+    FeHBaseTable tbl = (FeHBaseTable) desc_.getTable();
+    // The first column in an HBase table is always the key column.
+    HBaseColumn keyCol = (HBaseColumn) tbl.getColumns().get(0);
+
+    List<HBaseColumn> colsToFetchFromHBase = new ArrayList<>();
+    for (SlotDescriptor slot : desc_.getSlots()) {
+      HBaseColumn col = (HBaseColumn) tbl.getColumn(slot.getLabel());
+      // Will add key column separately, since its always fetched.
+      if (col.getColumnFamily().equals(FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY)) continue;
+      colsToFetchFromHBase.add(col);
+    }
+    // Add the key column.
+    colsToFetchFromHBase.add(keyCol);
+    long mem_estimate = memoryEstimateForFetchingColumns(colsToFetchFromHBase);
+    mem_estimate = Math.max(mem_estimate, DEFAULT_MIN_ESTIMATE_BYTES);
+    nodeResourceProfile_ = ResourceProfile.noReservation(mem_estimate);
   }
 
   /**
-   * Returns the per-host upper bound of memory that any number of concurrent scan nodes
-   * will use. Used for estimating the per-host memory requirement of queries.
+   * Returns an estimate of memory required by the HBase scan node for fetching
+   * the given list of HBase columns. Primarily used as a helper function but
+   * also exposed at the package level for testing.
    */
-  public static long getPerHostMemUpperBound() {
-    // TODO: What's a good estimate of memory consumption?
-    return 1024L * 1024L * 1024L;
+  protected static long memoryEstimateForFetchingColumns(List<HBaseColumn> columns) {
+    // In HBase, every column value is stored in the following format:
+    // http://hbase.apache.org/0.94/book/regions.arch.html#keyvalue
+    // and out of this only rowKey per row and (columnFamily, columnQualifier and
+    // columnValue) per column per row are allocated. The following estimations are based
+    // on that and its interaction with the mem-pool. Currently, we do an
+    // allocate-clear cycle on mem-pool for each row fetched from HBase (See
+    // HBaseTableScanner::Next()). To get an approx upper limit on mem
+    // allocation, we take the max row size possible and assume all possible
+    // chunk sizes below it have been allocated in previous row iterations. So,
+    // for a value of n bytes the max possible mem allocation for a mem pool
+    // that only uses power of 2 chunk sizes will be:
+    // (2^(ceil((log(n))+1) - 1) ~ 2 * BitUtil.roundUpToPowerOf2(n)
+    long maxRowSize = 0;
+    boolean isMissingStats = false;
+    for (HBaseColumn col : columns) {
+      long colMaxSize = col.getStats().getMaxSize();
+      if (col.getType().isStringType()) {
+        if (colMaxSize == -1) {
+          colMaxSize = DEFAULT_STRING_COL_BYTES;
+          isMissingStats = true;
+        }
+        // Round off string col size to next power of 2. For strings less than
+        // 512 KB (MemPool::MAX_CHUNK_SIZE) this ensures enough contribution to
+        // the max row size so that the final round off can accommodate any
+        // fluctuations in size. For larger strings, this approximates that it
+        // completely takes up the new chunk allocated for it.
+        colMaxSize = BitUtil.roundUpToPowerOf2(colMaxSize);
+      }
+      Preconditions.checkState(colMaxSize != -1);
+      maxRowSize += colMaxSize;
+      if (!col.getColumnFamily().equals(FeHBaseTable.Util.ROW_KEY_COLUMN_FAMILY)) {
+        // For non-key columns, their respective column family and column qualifier
+        // strings need to be fetched and mem needs to be allocated for that too.
+        maxRowSize += col.getColumnFamily().length() + col.getColumnQualifier().length();
+      }
+    }
+    // Use the max allocation assuming all possible chunk sizes below it have
+    // been allocated.
+    long mem_estimate = BitUtil.roundUpToPowerOf2(maxRowSize) * 2;
+    // We use a default of 32 KB for string cols that dont have max length set.
+    // Assuming such large cols are uncommon we set an upper limit to avoid extreme
+    // overestimation.
+    if (isMissingStats) mem_estimate = Math.min(mem_estimate, DEFAULT_MAX_ESTIMATE_BYTES);
+    return mem_estimate;
   }
 
   @Override

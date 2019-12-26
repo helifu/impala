@@ -22,75 +22,31 @@
 #include "common/status.h"
 #include "gutil/strings/substitute.h"
 #include "service/impala-server.h"
-#include "runtime/query-exec-mgr.h"
 #include "runtime/query-state.h"
 #include "runtime/fragment-instance-state.h"
 #include "runtime/exec-env.h"
-#include "testutil/fault-injection-util.h"
 
 #include "common/names.h"
 
 using namespace impala;
 
+DECLARE_string(debug_actions);
+
 ImpalaInternalService::ImpalaInternalService() {
   impala_server_ = ExecEnv::GetInstance()->impala_server();
   DCHECK(impala_server_ != nullptr);
-  query_exec_mgr_ = ExecEnv::GetInstance()->query_exec_mgr();
-  DCHECK(query_exec_mgr_ != nullptr);
-}
-
-void ImpalaInternalService::ExecQueryFInstances(TExecQueryFInstancesResult& return_val,
-    const TExecQueryFInstancesParams& params) {
-  VLOG_QUERY << "ExecQueryFInstances():" << " query_id=" << params.query_ctx.query_id;
-  FAULT_INJECTION_RPC_DELAY(RPC_EXECQUERYFINSTANCES);
-  DCHECK(params.__isset.coord_state_idx);
-  DCHECK(params.__isset.query_ctx);
-  DCHECK(params.__isset.fragment_ctxs);
-  DCHECK(params.__isset.fragment_instance_ctxs);
-  query_exec_mgr_->StartQuery(params).SetTStatus(&return_val);
 }
 
 template <typename T> void SetUnknownIdError(
     const string& id_type, const TUniqueId& id, T* status_container) {
   Status status(ErrorMsg(TErrorCode::INTERNAL_ERROR,
-      Substitute("Unknown $0 id: $1", id_type, lexical_cast<string>(id))));
+      Substitute("Unknown $0 id: $1", id_type, PrintId(id))));
   status.SetTStatus(status_container);
-}
-
-void ImpalaInternalService::CancelQueryFInstances(
-    TCancelQueryFInstancesResult& return_val,
-    const TCancelQueryFInstancesParams& params) {
-  VLOG_QUERY << "CancelQueryFInstances(): query_id=" << params.query_id;
-  FAULT_INJECTION_RPC_DELAY(RPC_CANCELQUERYFINSTANCES);
-  DCHECK(params.__isset.query_id);
-  QueryState::ScopedRef qs(params.query_id);
-  if (qs.get() == nullptr) {
-    SetUnknownIdError("query", params.query_id, &return_val);
-    return;
-  }
-  qs->Cancel();
-}
-
-void ImpalaInternalService::ReportExecStatus(TReportExecStatusResult& return_val,
-    const TReportExecStatusParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_REPORTEXECSTATUS);
-  DCHECK(params.__isset.query_id);
-  DCHECK(params.__isset.coord_state_idx);
-  impala_server_->ReportExecStatus(return_val, params);
-}
-
-void ImpalaInternalService::TransmitData(TTransmitDataResult& return_val,
-    const TTransmitDataParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_TRANSMITDATA);
-  DCHECK(params.__isset.dest_fragment_instance_id);
-  DCHECK(params.__isset.sender_id);
-  DCHECK(params.__isset.dest_node_id);
-  impala_server_->TransmitData(return_val, params);
 }
 
 void ImpalaInternalService::UpdateFilter(TUpdateFilterResult& return_val,
     const TUpdateFilterParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_UPDATEFILTER);
+  DebugActionNoFail(FLAGS_debug_actions, "UPDATE_FILTER_DELAY");
   DCHECK(params.__isset.filter_id);
   DCHECK(params.__isset.query_id);
   DCHECK(params.__isset.bloom_filter || params.__isset.min_max_filter);
@@ -99,7 +55,7 @@ void ImpalaInternalService::UpdateFilter(TUpdateFilterResult& return_val,
 
 void ImpalaInternalService::PublishFilter(TPublishFilterResult& return_val,
     const TPublishFilterParams& params) {
-  FAULT_INJECTION_RPC_DELAY(RPC_PUBLISHFILTER);
+  DebugActionNoFail(FLAGS_debug_actions, "PUBLISH_FILTER_DELAY");
   DCHECK(params.__isset.filter_id);
   DCHECK(params.__isset.dst_query_id);
   DCHECK(params.__isset.dst_fragment_idx);

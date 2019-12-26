@@ -17,6 +17,7 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.analysis.Analyzer;
@@ -39,7 +40,6 @@ import org.apache.impala.util.BitUtil;
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Hash join between left child (outer) and right child (inner). One child must be the
@@ -65,7 +65,7 @@ public class HashJoinNode extends JoinNode {
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
     super.init(analyzer);
-    List<BinaryPredicate> newEqJoinConjuncts = Lists.newArrayList();
+    List<BinaryPredicate> newEqJoinConjuncts = new ArrayList<>();
     ExprSubstitutionMap combinedChildSmap = getCombinedChildSmap();
     for (Expr c: eqJoinConjuncts_) {
       BinaryPredicate eqPred =
@@ -82,7 +82,14 @@ public class HashJoinNode extends JoinNode {
           throw new InternalException("Cannot compare " +
               t0.toSql() + " to " + t1.toSql() + " in join predicate.");
         }
-        Type compatibleType = Type.getAssignmentCompatibleType(t0, t1, false);
+        Type compatibleType = Type.getAssignmentCompatibleType(
+            t0, t1, false, analyzer.isDecimalV2());
+        if (compatibleType.isInvalid()) {
+          throw new InternalException(String.format(
+              "Unable create a hash join with equi-join predicate %s " +
+              "because the operands cannot be cast without loss of precision. " +
+              "Operand types: %s = %s.", eqPred.toSql(), t0.toSql(), t1.toSql()));
+        }
         Preconditions.checkState(compatibleType.isDecimal() ||
             compatibleType.isStringType());
         try {
@@ -181,11 +188,11 @@ public class HashJoinNode extends JoinNode {
 
       if (!otherJoinConjuncts_.isEmpty()) {
         output.append(detailPrefix + "other join predicates: ")
-        .append(getExplainString(otherJoinConjuncts_) + "\n");
+            .append(Expr.getExplainString(otherJoinConjuncts_, detailLevel) + "\n");
       }
       if (!conjuncts_.isEmpty()) {
         output.append(detailPrefix + "other predicates: ")
-        .append(getExplainString(conjuncts_) + "\n");
+            .append(Expr.getExplainString(conjuncts_, detailLevel) + "\n");
       }
       if (!runtimeFilters_.isEmpty()) {
         output.append(detailPrefix + "runtime filters: ");
@@ -205,11 +212,12 @@ public class HashJoinNode extends JoinNode {
       perInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
       perInstanceDataBytes = -1;
     } else {
+      // TODO: IMPALA-4224: update this once we can share the broadcast join data between
+      // finstances. Currently this implicitly assumes that each instance has a copy of
+      // the hash tables.
       perInstanceDataBytes = (long) Math.ceil(getChild(1).cardinality_
           * getChild(1).avgRowSize_);
       // Assume the rows are evenly divided among instances.
-      // TODO-MT: this estimate is not quite right with parallel plans. Fix it before
-      // we allow executing parallel plans with joins.
       if (distrMode_ == DistributionMode.PARTITIONED) {
         perInstanceDataBytes /= numInstances;
       }
@@ -236,11 +244,11 @@ public class HashJoinNode extends JoinNode {
     // to serve as input and output buffers while repartitioning.
     long maxRowBufferSize =
         computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
-    long perInstanceMinBufferBytes =
+    long perInstanceMinMemReservation =
         bufferSize * (minBuffers - 2) + maxRowBufferSize * 2;
     nodeResourceProfile_ = new ResourceProfileBuilder()
         .setMemEstimateBytes(perInstanceMemEstimate)
-        .setMinReservationBytes(perInstanceMinBufferBytes)
+        .setMinMemReservationBytes(perInstanceMinMemReservation)
         .setSpillableBufferBytes(bufferSize)
         .setMaxRowBufferBytes(maxRowBufferSize).build();
   }

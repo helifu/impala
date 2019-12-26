@@ -26,6 +26,15 @@ import tempfile
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 
 class TestScratchDir(CustomClusterTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def setup_class(cls):
+    if cls.exploration_strategy() != 'exhaustive':
+      pytest.skip('runs only in exhaustive')
+    super(TestScratchDir, cls).setup_class()
 
   # Query with order by requires spill to disk if intermediate results don't fit in mem
   spill_query = """
@@ -39,7 +48,7 @@ class TestScratchDir(CustomClusterTestSuite):
       """
   # Buffer pool limit that is low enough to force Impala to spill to disk when executing
   # spill_query.
-  buffer_pool_limit = "32m"
+  buffer_pool_limit = "45m"
 
   def count_nonempty_dirs(self, dirs):
     count = 0
@@ -82,7 +91,8 @@ class TestScratchDir(CustomClusterTestSuite):
         scratch because all directories are on same disk."""
     normal_dirs = self.generate_dirs(5)
     self._start_impala_cluster([
-      '--impalad_args="-logbuflevel=-1 -scratch_dirs={0}"'.format(','.join(normal_dirs))])
+      '--impalad_args=-logbuflevel=-1 -scratch_dirs={0}'.format(','.join(normal_dirs)),
+      '--impalad_args=--allow_multiple_scratch_dirs_per_device=false'])
     self.assert_impalad_log_contains("INFO", "Using scratch directory ",
                                     expected_count=1)
     exec_option = vector.get_value('exec_option')
@@ -95,7 +105,7 @@ class TestScratchDir(CustomClusterTestSuite):
   @pytest.mark.execute_serially
   def test_no_dirs(self, vector):
     """ Test we can execute a query with no scratch dirs """
-    self._start_impala_cluster(['--impalad_args="-logbuflevel=-1 -scratch_dirs="'])
+    self._start_impala_cluster(['--impalad_args=-logbuflevel=-1 -scratch_dirs='])
     self.assert_impalad_log_contains("WARNING",
         "Running without spill to disk: no scratch directories provided\.")
     exec_option = vector.get_value('exec_option')
@@ -112,7 +122,7 @@ class TestScratchDir(CustomClusterTestSuite):
     """ Test we can execute a query with only bad non-writable scratch """
     non_writable_dirs = self.generate_dirs(5, writable=False)
     self._start_impala_cluster([
-      '--impalad_args="-logbuflevel=-1 -scratch_dirs={0}"'.format(
+      '--impalad_args=-logbuflevel=-1 -scratch_dirs={0}'.format(
       ','.join(non_writable_dirs))])
     self.assert_impalad_log_contains("ERROR", "Running without spill to disk: could "
         + "not use any scratch directories in list:.*. See previous "
@@ -134,7 +144,7 @@ class TestScratchDir(CustomClusterTestSuite):
     """ Test that non-existing directories are not created or used """
     non_existing_dirs = self.generate_dirs(5, non_existing=True)
     self._start_impala_cluster([
-      '--impalad_args="-logbuflevel=-1 -scratch_dirs={0}"'.format(
+      '--impalad_args=-logbuflevel=-1 -scratch_dirs={0}'.format(
       ','.join(non_existing_dirs))])
     self.assert_impalad_log_contains("ERROR", "Running without spill to disk: could "
         + "not use any scratch directories in list:.*. See previous "
@@ -158,7 +168,7 @@ class TestScratchDir(CustomClusterTestSuite):
         have permissions changed or are removed after impalad startup."""
     dirs = self.generate_dirs(3);
     self._start_impala_cluster([
-      '--impalad_args="-logbuflevel=-1 -scratch_dirs={0}"'.format(','.join(dirs)),
+      '--impalad_args=-logbuflevel=-1 -scratch_dirs={0}'.format(','.join(dirs)),
       '--impalad_args=--allow_multiple_scratch_dirs_per_device=true'])
     self.assert_impalad_log_contains("INFO", "Using scratch directory ",
                                     expected_count=len(dirs))

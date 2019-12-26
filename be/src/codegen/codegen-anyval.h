@@ -41,7 +41,7 @@ namespace impala {
 /// generated instructions perform the integer manipulation equivalent to setting the
 /// fields of the original struct type.
 //
-/// Lowered types:
+/// Lowered types (in x86-64 ABI):
 /// TYPE_BOOLEAN/BooleanVal: i16
 /// TYPE_TINYINT/TinyIntVal: i16
 /// TYPE_SMALLINT/SmallIntVal: i32
@@ -50,9 +50,11 @@ namespace impala {
 /// TYPE_FLOAT/FloatVal: i64
 /// TYPE_DOUBLE/DoubleVal: { i8, double }
 /// TYPE_STRING,TYPE_VARCHAR,TYPE_CHAR,TYPE_FIXED_UDA_INTERMEDIATE/StringVal: { i64, i8* }
+/// TYPE_ARRAY/TYPE_MAP/CollectionVal: { i64, i8* }
 /// TYPE_TIMESTAMP/TimestampVal: { i64, i64 }
 /// TYPE_DECIMAL/DecimalVal (isn't lowered):
 /// %"struct.impala_udf::DecimalVal" { {i8}, [15 x i8], {i128} }
+/// TYPE_DATE/DateVal: i64
 //
 /// TODO:
 /// - unit tests
@@ -68,6 +70,8 @@ class CodegenAnyVal {
   static const char* LLVM_STRINGVAL_NAME;
   static const char* LLVM_TIMESTAMPVAL_NAME;
   static const char* LLVM_DECIMALVAL_NAME;
+  static const char* LLVM_DATEVAL_NAME;
+  static const char* LLVM_COLLECTIONVAL_NAME;
 
   /// Creates a call to 'fn', which should return a (lowered) *Val, and returns the result.
   /// This abstracts over the x64 calling convention, in particular for functions returning
@@ -166,11 +170,11 @@ class CodegenAnyVal {
   void SetVal(float val);
   void SetVal(double val);
 
-  /// Getters for StringVals.
+  /// Getters for StringVals and CollectionVals.
   llvm::Value* GetPtr();
   llvm::Value *GetLen();
 
-  /// Setters for StringVals.
+  /// Setters for StringVals and CollectionVals.
   void SetPtr(llvm::Value* ptr);
   void SetLen(llvm::Value* len);
 
@@ -226,14 +230,36 @@ class CodegenAnyVal {
   void WriteToSlot(const SlotDescriptor& slot_desc, llvm::Value* tuple,
       llvm::Value* pool_val, llvm::BasicBlock* insert_before = nullptr);
 
+  /// Rewrites the bit values of a value in a canonical form.
+  /// Floating point values may be "NaN".  Nominally, NaN != NaN, but
+  /// for grouping purposes we want that to not be the case.
+  /// Therefore all NaN values need to be converted into a consistent
+  /// form where all bits are the same.  This method will do that -
+  /// ensure that all NaN values have the same bit pattern.
+  /// Similarly, -0 == +0 is handled here.
+  ///
+  /// Generically speaking, a canonical form of a value ensures that
+  /// all ambiguity is removed from a value's bit settings -- if there
+  /// are bits that can be freely changed without changing the logical
+  /// value of the value. (Currently this only has an impact for NaN
+  /// float and double values.)
+  void ConvertToCanonicalForm();
+
+  /// Replaces negative floating point zero with positive zero,
+  /// leaves everything else unchanged.
+  llvm::Value* ConvertToPositiveZero(llvm::Value* val);
+
   /// Returns the i1 result of this == other. this and other must be non-null.
   llvm::Value* Eq(CodegenAnyVal* other);
 
   /// Compares this *Val to the value of 'native_ptr'. 'native_ptr' should be a pointer to
   /// a native type, e.g. StringValue, or TimestampValue. This *Val should match
   /// 'native_ptr's type (e.g. if this is an IntVal, 'native_ptr' should have type i32*).
-  /// Returns the i1 result of the equality comparison.
-  llvm::Value* EqToNativePtr(llvm::Value* native_ptr);
+  /// Returns the i1 result of the equality comparison. "inclusive_equality" means that
+  /// the scope of equality will be expanded to include considering as equal scenarios
+  /// that would otherwise resolve to not-equal, such as a comparison of floating-point
+  /// "NaN" values.
+  llvm::Value* EqToNativePtr(llvm::Value* native_ptr, bool inclusive_equality = false);
 
   /// Returns the i32 result of comparing this value to 'other' (similar to
   /// RawValue::Compare()). This and 'other' must be non-null. Return value is < 0 if

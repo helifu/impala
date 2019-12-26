@@ -20,21 +20,25 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 
 #include <boost/thread/mutex.hpp>
+#include <gtest/gtest_prod.h> // for FRIEND_TEST
 
+#include "common/atomic.h"
 #include "common/hdfs.h"
 #include "common/status.h"
+#include "runtime/bufferpool/buffer-pool.h"
 #include "util/condition-variable.h"
 #include "util/internal-queue.h"
 
 namespace impala {
-class MemTracker;
-
 namespace io {
 class DiskIoMgr;
-class RequestContext;
+class DiskQueue;
 class ExclusiveHdfsFileHandle;
+class FileReader;
+class RequestContext;
 class ScanRange;
 
 /// Buffer struct that is used by the caller and IoMgr to pass read buffers.
@@ -42,6 +46,11 @@ class ScanRange;
 /// time.
 class BufferDescriptor {
  public:
+  /// Create a buffer descriptor allocated from the buffer pool. Public to
+  /// allow access by DiskIoMgr.
+  BufferDescriptor(ScanRange* scan_range, BufferPool::ClientHandle* bp_client,
+      BufferPool::BufferHandle handle);
+
   ~BufferDescriptor() {
     DCHECK(buffer_ == nullptr); // Check we didn't leak a buffer.
   }
@@ -52,27 +61,14 @@ class BufferDescriptor {
   int64_t len() { return len_; }
   bool eosr() { return eosr_; }
 
-  /// Returns the offset within the scan range that this buffer starts at
-  int64_t scan_range_offset() const { return scan_range_offset_; }
-
-  /// Transfer ownership of buffer memory from 'mem_tracker_' to 'dst' and set
-  /// 'mem_tracker_' to 'dst'. 'mem_tracker_' and 'dst' must be non-NULL. Does not
-  /// check memory limits on 'dst': the caller should check the memory limit if a
-  /// different memory limit may apply to 'dst'. If the buffer was a client-provided
-  /// buffer, transferring is not allowed.
-  /// TODO: IMPALA-3209: revisit this as part of scanner memory usage revamp.
-  void TransferOwnership(MemTracker* dst);
-
  private:
-  friend class DiskIoMgr;
+  DISALLOW_COPY_AND_ASSIGN(BufferDescriptor);
+  /// This class is tightly coupled with ScanRange. Making them friends is easiest.
   friend class ScanRange;
-  friend class RequestContext;
+  friend class HdfsFileReader;
 
-  /// Create a buffer descriptor for a new reader, range and data buffer. The buffer
-  /// memory should already be accounted against 'mem_tracker'.
-  BufferDescriptor(DiskIoMgr* io_mgr, RequestContext* reader,
-      ScanRange* scan_range, uint8_t* buffer, int64_t buffer_len,
-      MemTracker* mem_tracker);
+  /// Create a buffer descriptor for a range and data buffer.
+  BufferDescriptor(ScanRange* scan_range, uint8_t* buffer, int64_t buffer_len);
 
   /// Return true if this is a cached buffer owned by HDFS.
   bool is_cached() const;
@@ -81,19 +77,17 @@ class BufferDescriptor {
   /// constructing the scan range.
   bool is_client_buffer() const;
 
-  DiskIoMgr* const io_mgr_;
-
-  /// Reader that this buffer is for.
-  RequestContext* const reader_;
-
-  /// The current tracker this buffer is associated with. After initialisation,
-  /// NULL for cached buffers and non-NULL for all other buffers.
-  MemTracker* mem_tracker_;
+  /// Releases memory resources for this buffer. If the buffer was allocated with
+  /// DiskIoMgr::AllocateBuffersForRange(), frees the buffer. Otherwise (e.g. a client
+  /// or HDFS cache buffer), just prepares this descriptor to be destroyed. After this
+  /// is called, buffer() is NULL. Does not acquire 'lock_'.
+  void Free();
 
   /// Scan range that this buffer is for. Non-NULL when initialised.
   ScanRange* const scan_range_;
 
-  /// buffer with the read contents
+  /// Buffer for the read contents. Must be set to NULL in Free() before destruction
+  /// of a descriptor.
   uint8_t* buffer_;
 
   /// length of buffer_. For buffers from cached reads, the length is 0.
@@ -105,10 +99,10 @@ class BufferDescriptor {
   /// true if the current scan range is complete
   bool eosr_ = false;
 
-  /// Status of the read to this buffer. if status is not ok, 'buffer' is nullptr
-  Status status_;
-
-  int64_t scan_range_offset_ = 0;
+  // Handle to an allocated buffer and the client used to allocate it buffer. Only used
+  // for non-external buffers.
+  BufferPool::ClientHandle* bp_client_ = nullptr;
+  BufferPool::BufferHandle handle_;
 };
 
 /// The request type, read or write associated with a request range.
@@ -117,6 +111,20 @@ struct RequestType {
     READ,
     WRITE,
   };
+};
+
+/// ReadOutput describes the possible outcomes of the DoRead() function.
+enum class ReadOutcome {
+  // The last (eosr) buffer was successfully enqueued.
+  SUCCESS_EOSR,
+  // The buffer was successfully enqueued but we are not at eosr and can schedule
+  // the next read.
+  SUCCESS_NO_EOSR,
+  // The scan range is blocked waiting for the next buffer.
+  BLOCKED_ON_BUFFER,
+  // The scan range is cancelled (either by caller or because of an error). No more
+  // reads will be scheduled.
+  CANCELLED
 };
 
 /// Represents a contiguous sequence of bytes in a single file.
@@ -158,47 +166,68 @@ class RequestRange : public InternalQueue<RequestRange>::Node {
 /// Param struct for different combinations of buffering.
 struct BufferOpts {
  public:
-  // Set options for a read into an IoMgr-allocated or HDFS-cached buffer. Caching is
-  // enabled if 'try_cache' is true, the file is in the HDFS cache and 'mtime' matches
-  // the modified time of the cached file in the HDFS cache.
-  BufferOpts(bool try_cache, int64_t mtime)
-    : try_cache_(try_cache),
-      mtime_(mtime),
+
+  /// Different caching options available for a scan range.
+  ///
+  /// If USE_HDFS_CACHE is set, a read will first be probed against the HDFS cache for
+  /// any hits. If there is a miss, it will fall back to reading from the underlying
+  /// storage. Please note that HDFS cache are only used for local reads. Reads from
+  /// remote locations (e.g. another HDFS data node) will not be cached in the HDFS cache.
+  ///
+  /// If USE_DATA_CACHE is set, any read from the underlying storage will first be probed
+  /// against the data cache. If there is a cache miss in data cache, data will be
+  /// inserted into the data cache upon IO completion. The data cache is usually used for
+  /// caching non-local HDFS data (e.g. remote HDFS data or S3).
+  enum {
+    NO_CACHING  = 0,
+    USE_HDFS_CACHE = 1 << 0,
+    USE_DATA_CACHE = 1 << 2
+  };
+
+  /// Set options for a read into an IoMgr-allocated or HDFS-cached buffer.
+  /// 'cache_options' specifies the caching options used. Please see comments
+  /// of 'USE_HDFS_CACHE' and 'USE_DATA_CACHE' for details of the caching options.
+  BufferOpts(int cache_options)
+    : cache_options_(cache_options),
       client_buffer_(nullptr),
       client_buffer_len_(-1) {}
 
   /// Set options for an uncached read into an IoMgr-allocated buffer.
   static BufferOpts Uncached() {
-    return BufferOpts(false, NEVER_CACHE, nullptr, -1);
+    return BufferOpts(NO_CACHING, nullptr, -1);
   }
 
   /// Set options to read the entire scan range into 'client_buffer'. The length of the
-  /// buffer, 'client_buffer_len', must fit the entire scan range. HDFS caching is not
-  /// enabled in this case.
-  static BufferOpts ReadInto(uint8_t* client_buffer, int64_t client_buffer_len) {
-    return BufferOpts(false, NEVER_CACHE, client_buffer, client_buffer_len);
+  /// buffer, 'client_buffer_len', must fit the entire scan range. HDFS caching shouldn't
+  /// be enabled in this case.
+  static BufferOpts ReadInto(uint8_t* client_buffer, int64_t client_buffer_len,
+      int cache_options) {
+    DCHECK_EQ(cache_options & USE_HDFS_CACHE, 0);
+    return BufferOpts(cache_options, client_buffer, client_buffer_len);
+  }
+
+  /// Use only when you don't want to to read the entire scan range, but only sub-ranges
+  /// in it. In this case you can copy the relevant parts from the HDFS cache into the
+  /// client buffer. The length of the buffer, 'client_buffer_len' must fit the
+  /// concatenation of all the sub-ranges.
+  static BufferOpts ReadInto(int cache_options, uint8_t* client_buffer,
+      int64_t client_buffer_len) {
+    return BufferOpts(cache_options, client_buffer, client_buffer_len);
   }
 
  private:
   friend class ScanRange;
+  friend class HdfsFileReader;
+  FRIEND_TEST(DataCacheTest, TestBasics);
 
-  BufferOpts(
-      bool try_cache, int64_t mtime, uint8_t* client_buffer, int64_t client_buffer_len)
-    : try_cache_(try_cache),
-      mtime_(mtime),
+  BufferOpts(int cache_options, uint8_t* client_buffer,
+      int64_t client_buffer_len)
+    : cache_options_(cache_options),
       client_buffer_(client_buffer),
       client_buffer_len_(client_buffer_len) {}
 
-  /// If 'mtime_' is set to NEVER_CACHE, the file handle will never be cached, because
-  /// the modification time won't match.
-  const static int64_t NEVER_CACHE = -1;
-
-  /// If true, read from HDFS cache if possible.
-  const bool try_cache_;
-
-  /// Last modified time of the file associated with the scan range. If set to
-  /// NEVER_CACHE, caching is disabled.
-  const int64_t mtime_;
+  /// Specify options to enable HDFS and data caches.
+  const int cache_options_;
 
   /// A destination buffer provided by the client, nullptr and -1 if no buffer.
   uint8_t* const client_buffer_;
@@ -214,84 +243,167 @@ class ScanRange : public RequestRange {
 
   virtual ~ScanRange();
 
+  /// Defines an internal range within this ScanRange.
+  struct SubRange {
+    int64_t offset;
+    int64_t length;
+  };
+
   /// Resets this scan range object with the scan range description. The scan range
   /// is for bytes [offset, offset + len) in 'file' on 'fs' (which is nullptr for the
-  /// local filesystem). The scan range must fall within the file bounds (offset >= 0
-  /// and offset + len <= file_length). 'disk_id' is the disk queue to add the range
-  /// to. If 'expected_local' is true, a warning is generated if the read did not
-  /// come from a local disk. 'buffer_opts' specifies buffer management options -
-  /// see the DiskIoMgr class comment and the BufferOpts comments for details.
+  /// local filesystem). The scan range must be non-empty and fall within the file bounds
+  /// (len > 0 and offset >= 0 and offset + len <= file_length). 'disk_id' is the disk
+  /// queue to add the range to. If 'expected_local' is true, a warning is generated if
+  /// the read did not come from a local disk. 'mtime' is the last modification time for
+  /// 'file'; the mtime must change when the file changes. 'is_erasure_coded' is whether
+  /// 'file' is stored using HDFS erasure coding.
+  /// 'buffer_opts' specifies buffer management options - see the DiskIoMgr class comment
+  /// and the BufferOpts comments for details.
   /// 'meta_data' is an arbitrary client-provided pointer for any auxiliary data.
+  ///
+  /// TODO: IMPALA-4249: clarify if a ScanRange can be reused after Reset(). Currently
+  /// it is not generally safe to do so, but some unit tests reuse ranges after
+  /// successfully reading to eos.
   void Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset, int disk_id,
-      bool expected_local, const BufferOpts& buffer_opts, void* meta_data = nullptr);
+      bool expected_local, bool is_erasure_coded, int64_t mtime,
+      const BufferOpts& buffer_opts, void* meta_data = nullptr);
+
+  /// Same as above, but it also adds sub-ranges. No need to merge contiguous sub-ranges
+  /// in advance, as this method will do the merge.
+  void Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset, int disk_id,
+      bool expected_local, bool is_erasure_coded, int64_t mtime,
+      const BufferOpts& buffer_opts, std::vector<SubRange>&& sub_ranges,
+      void* meta_data = nullptr);
 
   void* meta_data() const { return meta_data_; }
-  bool try_cache() const { return try_cache_; }
+  int cache_options() const { return cache_options_; }
+  bool UseHdfsCache() const { return (cache_options_ & BufferOpts::USE_HDFS_CACHE) != 0; }
+  bool UseDataCache() const { return (cache_options_ & BufferOpts::USE_DATA_CACHE) != 0; }
+  bool read_in_flight() const { return read_in_flight_; }
   bool expected_local() const { return expected_local_; }
+  bool is_erasure_coded() const { return is_erasure_coded_; }
+  int64_t bytes_to_read() const { return bytes_to_read_; }
 
   /// Returns the next buffer for this scan range. buffer is an output parameter.
   /// This function blocks until a buffer is ready or an error occurred. If this is
   /// called when all buffers have been returned, *buffer is set to nullptr and Status::OK
-  /// is returned.
+  /// is returned. If this returns buffer->eos() or an error status, then all buffers
+  /// owned by the scan range were either returned to callers of GetNext() or freed.
   /// Only one thread can be in GetNext() at any time.
   Status GetNext(std::unique_ptr<BufferDescriptor>* buffer) WARN_UNUSED_RESULT;
 
-  /// Cancel this scan range. This cleans up all queued buffers and
-  /// wakes up any threads blocked on GetNext().
-  /// Status is the reason the range was cancelled. Must not be ok().
-  /// Status is returned to the user in GetNext().
+  /// Returns the buffer to the scan range. This must be called for every buffer
+  /// returned by GetNext(). After calling this, the buffer descriptor is invalid
+  /// and cannot be accessed.
+  void ReturnBuffer(std::unique_ptr<BufferDescriptor> buffer);
+
+  /// Cancel this scan range. This waits for any in-flight read operations to complete,
+  /// cleans up all buffers owned by the scan range (i.e. queued or unused buffers)
+  /// and wakes up any threads blocked on GetNext(). Status is a non-ok status with the
+  /// reason the range was cancelled, e.g. CANCELLED_INTERNALLY if the range was cancelled
+  /// because it was not needed, or another error if an error was encountered while
+  /// scanning the range. Status is returned to the any callers of GetNext().
   void Cancel(const Status& status);
 
   /// return a descriptive string for debug.
   std::string DebugString() const;
 
+  /// Non-HDFS files (e.g. local files) do not use mtime, so they should use this known
+  /// bogus mtime.
+  const static int64_t INVALID_MTIME = -1;
+
   int64_t mtime() const { return mtime_; }
 
+  bool HasSubRanges() const { return !sub_ranges_.empty(); }
+
  private:
+  DISALLOW_COPY_AND_ASSIGN(ScanRange);
+
+  /////////////////////////////////////////
+  /// BEGIN: private members that are accessed by other io:: classes
   friend class BufferDescriptor;
+  friend class DiskQueue;
   friend class DiskIoMgr;
+  friend class DiskIoMgrTest;
   friend class RequestContext;
+  friend class HdfsFileReader;
+  friend class LocalFileReader;
+
+  // Tag for the buffer associated with range. See external_buffer_tag_ for details.
+  enum class ExternalBufferTag { CLIENT_BUFFER, CACHED_BUFFER, NO_BUFFER };
 
   /// Initialize internal fields
   void InitInternal(DiskIoMgr* io_mgr, RequestContext* reader);
 
-  /// Enqueues a buffer for this range. This does not block.
-  /// Returns true if this scan range has hit the queue capacity, false otherwise.
-  /// The caller passes ownership of buffer to the scan range and it is not
-  /// valid to access buffer after this call. The reader lock must be held by the
-  /// caller.
-  bool EnqueueBuffer(const boost::unique_lock<boost::mutex>& reader_lock,
+  /// If data is cached, returns ok() and * read_succeeded is set to true. Also enqueues
+  /// a ready buffer from the cached data.
+  /// If the data is not cached, returns ok() and *read_succeeded is set to false.
+  /// Returns a non-ok status if it ran into a non-continuable error.
+  /// The reader lock must be held by the caller.
+  Status ReadFromCache(const boost::unique_lock<boost::mutex>& reader_lock,
+      bool* read_succeeded) WARN_UNUSED_RESULT;
+
+  /// Add buffers for the range to read data into and schedule the range if blocked.
+  /// If 'returned' is true, the buffers returned from GetNext() that are being recycled
+  /// via ReturnBuffer(). Otherwise the buffers are newly allocated buffers to be added.
+  void AddUnusedBuffers(
+      std::vector<std::unique_ptr<BufferDescriptor>>&& buffers, bool returned);
+
+  /// Called from a disk I/O thread to read the next buffer of data for this range. The
+  /// returned ReadOutcome describes what the result of the read was. 'disk_id' is the
+  /// ID of the disk queue. 'queue' is updated with the sizes and latencies of reads from
+  /// the underlying filesystem. Caller must not hold 'lock_'.
+  ReadOutcome DoRead(DiskQueue* queue, int disk_id);
+
+  /// Cleans up a buffer that was not returned to the client.
+  /// Either ReturnBuffer() or CleanUpBuffer() is called for every BufferDescriptor.
+  /// The caller must hold 'lock_' via 'scan_range_lock'.
+  /// This function may acquire 'file_reader_->lock()'
+  void CleanUpBuffer(const boost::unique_lock<boost::mutex>& scan_range_lock,
       std::unique_ptr<BufferDescriptor> buffer);
 
-  /// Cleanup any queued buffers (i.e. due to cancellation). This cannot
-  /// be called with any locks taken.
-  void CleanupQueuedBuffers();
+  /// Same as CleanUpBuffer() except cleans up multiple buffers and caller must not
+  /// hold 'lock_'.
+  void CleanUpBuffers(std::vector<std::unique_ptr<BufferDescriptor>>&& buffers);
 
-  /// Validates the internal state of this range. lock_ must be taken
-  /// before calling this.
-  bool Validate();
+  /// Same as Cancel() except it doesn't remove the scan range from
+  /// reader_->active_scan_ranges_ or call WaitForInFlightRead(). This allows for
+  /// custom handling of in flight reads or active scan ranges. For example, this is
+  /// invoked by RequestContext::Cancel(), which removes the range itself to avoid
+  /// invalidating its active_scan_ranges_ iterator. It is also invoked by disk IO
+  /// threads to propagate a read error for a range that is in flight (i.e. when
+  /// read_error is true), so 'read_in_flight_' is set to false and threads in
+  /// WaitForInFlightRead() are woken up. Note that this is tearing down the FileReader,
+  /// so it may block waiting for other threads that are performing IO.
+  void CancelInternal(const Status& status, bool read_error);
 
-  /// Maximum length in bytes for hdfsRead() calls.
-  int64_t MaxReadChunkSize() const;
+  /// Marks the scan range as blocked waiting for a buffer. Caller must not hold 'lock_'.
+  void SetBlockedOnBuffer();
 
-  /// Opens the file for this range. This function only modifies state in this range.
-  /// If 'use_file_handle_cache' is true and this is a local hdfs file, then this scan
-  /// range will not maintain an exclusive file handle. It will borrow an hdfs file
-  /// handle from the file handle cache for each Read(), so Open() does nothing.
-  /// If 'use_file_handle_cache' is false or this is a remote hdfs file or this is
-  /// a local OS file, Open() will open a file handle on the scan range for
-  /// exclusive use by this scan range. The scan range is the exclusive owner of the
-  /// file handle, and the file handle is destroyed in Close().
-  /// All local OS files are opened using normal OS file APIs.
-  Status Open(bool use_file_handle_cache) WARN_UNUSED_RESULT;
+  ExternalBufferTag external_buffer_tag() const { return external_buffer_tag_; }
 
-  /// Closes the file for this range. This function only modifies state in this range.
-  void Close();
+  /// If non-OK, this scan range has been cancelled. This status is the reason for
+  /// cancellation - CANCELLED_INTERNALLY if cancelled without error, or another status
+  /// if an error caused cancellation. Note that a range can be cancelled without
+  /// cancelling the owning context. This means that ranges can be cancelled or hit errors
+  /// without aborting all scan ranges.
+  //
+  /// Writers must hold both 'lock_' and 'file_reader_->lock()'. Readers must hold either
+  /// 'lock_' or 'file_reader_->lock()'. This prevents the range from being cancelled
+  /// while any thread is inside a critical section.
+  Status cancel_status_;
 
-  /// Reads from this range into 'buffer', which has length 'buffer_len' bytes. Returns
-  /// the number of bytes read. The read position in this scan range is updated.
-  Status Read(uint8_t* buffer, int64_t buffer_len, int64_t* bytes_read,
-      bool* eosr) WARN_UNUSED_RESULT;
+  /// Only for testing
+  void SetFileReader(std::unique_ptr<FileReader> file_reader);
+
+  /// END: private members that are accessed by other io:: classes
+  /////////////////////////////////////////
+
+  /// Enqueues a ready buffer with valid data for this range. This does not block.
+  /// The caller passes ownership of buffer to the scan range and it is not
+  /// valid to access buffer after this call. Returns false if the scan range was
+  /// cancelled.
+  bool EnqueueReadyBuffer(std::unique_ptr<BufferDescriptor> buffer);
 
   /// Get the read statistics from the Hdfs file handle and aggregate them to
   /// the RequestContext. This clears the statistics on this file handle.
@@ -299,22 +411,56 @@ class ScanRange : public RequestRange {
   /// pointer.
   void GetHdfsStatistics(hdfsFile fh);
 
-  /// Reads from the DN cache. On success, sets cached_buffer_ to the DN buffer
-  /// and *read_succeeded to true.
-  /// If the data is not cached, returns ok() and *read_succeeded is set to false.
-  /// Returns a non-ok status if it ran into a non-continuable error.
-  ///  The reader lock must be held by the caller.
-  Status ReadFromCache(const boost::unique_lock<boost::mutex>& reader_lock,
-      bool* read_succeeded) WARN_UNUSED_RESULT;
+  /// Remove a buffer from 'unused_iomgr_buffers_' and update
+  /// 'unused_iomgr_buffer_bytes_'. If 'unused_iomgr_buffers_' is empty, return NULL.
+  /// 'lock_' must be held by the caller via 'scan_range_lock'.
+  std::unique_ptr<BufferDescriptor> GetUnusedBuffer(
+      const boost::unique_lock<boost::mutex>& scan_range_lock);
+
+  /// Clean up all buffers in 'unused_iomgr_buffers_'. Only valid to call when the scan
+  /// range is cancelled or at eos. The caller must hold 'lock_' via 'scan_range_lock'.
+  void CleanUpUnusedBuffers(const boost::unique_lock<boost::mutex>& scan_range_lock);
+
+  /// Waits for any in-flight read to complete. Called after CancelInternal() to ensure
+  /// no more reads will occur for the scan range.
+  void WaitForInFlightRead();
+
+  /// Returns true if no more buffers will be returned to clients in the future,
+  /// either because of hitting eosr or cancellation.
+  bool all_buffers_returned(const boost::unique_lock<boost::mutex>& lock) const {
+    DCHECK(lock.mutex() == &lock_ && lock.owns_lock());
+    return !cancel_status_.ok() || (eosr_queued_ && ready_buffers_.empty());
+  }
+
+  /// Adds sub-ranges to this ScanRange. If sub_ranges is not empty, then ScanRange won't
+  /// read everything from its range, but will only read these sub-ranges.
+  /// Sub-ranges need to be ordered by 'offset' and cannot overlap with each other.
+  /// Doesn't need to merge continuous sub-ranges in advance, this method will do.
+  void InitSubRanges(std::vector<SubRange>&& sub_ranges);
+
+  /// Read the sub-ranges into buffer and track the current position in 'sub_range_pos_'.
+  /// If cached data is available, then memcpy() from it instead of actually reading the
+  /// files. 'queue' is updated with the latencies and sizes of reads from the underlying
+  /// filesystem.
+  Status ReadSubRanges(DiskQueue* queue, BufferDescriptor* buffer, bool* eof);
+
+  /// Validates the internal state of this range. lock_ must be taken
+  /// before calling this.
+  bool Validate();
+
+  /// Validates the sub-ranges. All sub-range must be inside of this ScanRange.
+  /// They need to be ordered by offset and cannot overlap.
+  bool ValidateSubRanges();
+
+  /// Merges adjacent and continuous sub-ranges.
+  void MergeSubRanges();
 
   /// Pointer to caller specified metadata. This is untouched by the io manager
   /// and the caller can put whatever auxiliary data in here.
   void* meta_data_ = nullptr;
 
-  /// If true, this scan range is expected to be cached. Note that this might be wrong
-  /// since the block could have been uncached. In that case, the cached path
-  /// will fail and we'll just put the scan range on the normal read path.
-  bool try_cache_ = false;
+  /// Options for enabling HDFS caching and data cache.
+  int cache_options_;
 
   /// If true, we expect this scan range to be a local read. Note that if this is false,
   /// it does not necessarily mean we expect the read to be remote, and that we never
@@ -323,94 +469,113 @@ class ScanRange : public RequestRange {
   /// TODO: we can do more with this
   bool expected_local_ = false;
 
-  /// Total number of bytes read remotely. This is necessary to maintain a count of
-  /// the number of remote scan ranges. Since IO statistics can be collected multiple
-  /// times for a scan range, it is necessary to keep some state about whether this
-  /// scan range has already been counted as remote. There is also a requirement to
-  /// log the number of unexpected remote bytes for a scan range. To solve both
-  /// requirements, maintain num_remote_bytes_ on the ScanRange and push it to the
-  /// reader_ once at the close of the scan range.
-  int64_t num_remote_bytes_;
+  /// If true, the file associated with the scan range is erasure coded. Set in Reset().
+  bool is_erasure_coded_ = false;
+
+  /// Last modified time of the file associated with the scan range. Set in Reset().
+  int64_t mtime_;
 
   DiskIoMgr* io_mgr_ = nullptr;
 
   /// Reader/owner of the scan range
   RequestContext* reader_ = nullptr;
 
-  /// File handle either to hdfs or local fs (FILE*)
-  /// The hdfs file handle is stored here in three cases:
-  /// 1. The file handle cache is off (max_cached_file_handles == 0).
-  /// 2. The scan range is using hdfs caching.
-  /// -OR-
-  /// 3. The hdfs file is expected to be remote (expected_local_ == false)
-  /// In each case, the scan range gets a new ExclusiveHdfsFileHandle at Open(),
-  /// owns it exclusively, and destroys it in Close().
-  union {
-    FILE* local_file_ = nullptr;
-    ExclusiveHdfsFileHandle* exclusive_hdfs_fh_;
-  };
-
   /// Tagged union that holds a buffer for the cases when there is a buffer allocated
   /// externally from DiskIoMgr that is associated with the scan range.
-  enum class ExternalBufferTag { CLIENT_BUFFER, CACHED_BUFFER, NO_BUFFER };
   ExternalBufferTag external_buffer_tag_;
-  union {
-    /// Valid if the 'external_buffer_tag_' is CLIENT_BUFFER.
-    struct {
-      /// Client-provided buffer to read the whole scan range into.
-      uint8_t* data;
 
-      /// Length of the client-provided buffer.
-      int64_t len;
-    } client_buffer_;
+  /// Valid if the 'external_buffer_tag_' is CLIENT_BUFFER.
+  struct {
+    /// Client-provided buffer to read the whole scan range into.
+    uint8_t* data = nullptr;
 
-    /// Valid and non-NULL if the external_buffer_tag_ is CACHED_BUFFER, which means
-    /// that a cached read succeeded and all the bytes for the range are in this buffer.
-    struct hadoopRzBuffer* cached_buffer_ = nullptr;
-  };
+    /// Length of the client-provided buffer.
+    int64_t len = 0;
+  } client_buffer_;
+
+  /// Valid if reading file contents from cache was successful.
+  struct {
+    /// Pointer to the contents of the file.
+    uint8_t* data = nullptr;
+    /// Length of the contents.
+    int64_t len = 0;
+  } cache_;
+
+  /// The number of buffers that have been returned to a client via GetNext() that have
+  /// not yet been returned with ReturnBuffer().
+  AtomicInt32 num_buffers_in_reader_{0};
 
   /// Lock protecting fields below.
-  /// This lock should not be taken during Open()/Read()/Close().
+  /// This lock should not be taken during FileReader::Open()/Read()/Close().
   /// If RequestContext::lock_ and this lock need to be held simultaneously,
   /// RequestContext::lock_ must be taken first.
   boost::mutex lock_;
 
-  /// Number of bytes read so far for this scan range
-  int bytes_read_;
+  /// Buffers to read into, used if the 'external_buffer_tag_' is NO_BUFFER. These are
+  /// initially populated when the client calls AllocateBuffersForRange() and
+  /// and are used to read scanned data into. Buffers are taken from this vector for
+  /// every read and added back, if needed, when the client calls ReturnBuffer().
+  std::vector<std::unique_ptr<BufferDescriptor>> unused_iomgr_buffers_;
 
-  /// Status for this range. This is non-ok if is_cancelled_ is true.
-  /// Note: an individual range can fail without the RequestContext being
-  /// cancelled. This allows us to skip individual ranges.
-  Status status_;
+  /// Total number of bytes of buffers in 'unused_iomgr_buffers_'.
+  int64_t unused_iomgr_buffer_bytes_ = 0;
+
+  /// Cumulative bytes of I/O mgr buffers taken from 'unused_iomgr_buffers_' by DoRead().
+  /// Used to infer how many bytes of buffers need to be held onto to read the rest of
+  /// the scan range.
+  int64_t iomgr_buffer_cumulative_bytes_used_ = 0;
+
+  /// True if a disk thread is currently doing a read for this scan range. Set to true in
+  /// DoRead() and set to false in EnqueueReadyBuffer() or CancelInternal() when the
+  /// read completes and any buffer used for the read is either enqueued or freed.
+  bool read_in_flight_ = false;
 
   /// If true, the last buffer for this scan range has been queued.
+  /// If this is true and 'ready_buffers_' is empty, then no more buffers will be
+  /// returned to the caller by this scan range.
   bool eosr_queued_ = false;
 
-  /// If true, the last buffer for this scan range has been returned.
-  bool eosr_returned_ = false;
+  /// If true, this scan range is not scheduled because a buffer is not available for
+  /// the next I/O in the range. This can happen when the scan range is initially created
+  /// or if the buffers added to the range have all been filled with data an not yet
+  /// returned.
+  bool blocked_on_buffer_ = false;
 
-  /// If true, this scan range has been removed from the reader's in_flight_ranges
-  /// queue because the ready_buffers_ queue is full.
-  bool blocked_on_queue_ = false;
-
-  /// IO buffers that are queued for this scan range.
-  /// Condition variable for GetNext
-  ConditionVariable buffer_ready_cv_;
+  /// IO buffers that are queued for this scan range. When Cancel() is called
+  /// this is drained by the cancelling thread. I.e. this is always empty if
+  /// 'cancel_status_' is not OK.
   std::deque<std::unique_ptr<BufferDescriptor>> ready_buffers_;
 
-  /// Lock that should be taken during hdfs calls. Only one thread (the disk reading
-  /// thread) calls into hdfs at a time so this lock does not have performance impact.
-  /// This lock only serves to coordinate cleanup. Specifically it serves to ensure
-  /// that the disk threads are finished with HDFS calls before is_cancelled_ is set
-  /// to true and cleanup starts.
-  /// If this lock and lock_ need to be taken, lock_ must be taken first.
-  boost::mutex hdfs_lock_;
+  /// Condition variable for threads in GetNext() that are waiting for the next buffer
+  /// and threads in WaitForInFlightRead() that are waiting for a read to finish.
+  /// Signalled when a buffer is enqueued in 'ready_buffers_' or the scan range is
+  /// cancelled.
+  ConditionVariable buffer_ready_cv_;
 
-  /// If true, this scan range has been cancelled.
-  bool is_cancelled_ = false;
+  /// Number of bytes read by this scan range.
+  int64_t bytes_read_ = 0;
 
-  /// Last modified time of the file associated with the scan range
-  int64_t mtime_;
+  /// Polymorphic object that is responsible for doing file operations.
+  std::unique_ptr<FileReader> file_reader_;
+
+  /// If not empty, the ScanRange will only read these parts from the file.
+  std::vector<SubRange> sub_ranges_;
+
+  // Read position in the sub-ranges.
+  struct SubRangePosition {
+    /// Index of SubRange in 'ScanRange::sub_ranges_' to read next
+    int64_t index = 0;
+    /// Bytes already read from 'ScanRange::sub_ranges_[sub_range_index]'
+    int64_t bytes_read = 0;
+  };
+
+  /// Current read position in the sub-ranges.
+  SubRangePosition sub_range_pos_;
+
+  /// Number of bytes need to be read by this ScanRange. If there are no sub-ranges it
+  /// equals to 'len_'. If there are sub-ranges then it equals to the sum of the lengths
+  /// of the sub-ranges (which is less than or equal to 'len_').
+  int64_t bytes_to_read_ = 0;
 };
 
 /// Used to specify data to be written to a file and offset.
@@ -422,10 +587,10 @@ class WriteRange : public RequestRange {
   /// This callback is invoked on each WriteRange after the write is complete or the
   /// context is cancelled. The status returned by the callback parameter indicates
   /// if the write was successful (i.e. Status::OK), if there was an error
-  /// TStatusCode::RUNTIME_ERROR) or if the context was cancelled
-  /// (TStatusCode::CANCELLED). The callback is only invoked if this WriteRange was
-  /// successfully added (i.e. AddWriteRange() succeeded). No locks are held while
-  /// the callback is invoked.
+  /// TErrorCode::RUNTIME_ERROR) or if the context was cancelled
+  /// (TErrorCode::CANCELLED_INTERNALLY). The callback is only invoked if this
+  /// WriteRange was successfully added (i.e. AddWriteRange() succeeded). No locks are
+  /// held while the callback is invoked.
   typedef std::function<void(const Status&)> WriteDoneCallback;
   WriteRange(const std::string& file, int64_t file_offset, int disk_id,
       WriteDoneCallback callback);
@@ -441,12 +606,10 @@ class WriteRange : public RequestRange {
   void SetData(const uint8_t* buffer, int64_t len);
 
   const uint8_t* data() const { return data_; }
+  WriteDoneCallback callback() const { return callback_; }
 
  private:
-  friend class DiskIoMgr;
-  friend class RequestContext;
-  friend class ScanRange;
-
+  DISALLOW_COPY_AND_ASSIGN(WriteRange);
   /// Data to be written. RequestRange::len_ contains the length of data
   /// to be written.
   const uint8_t* data_;

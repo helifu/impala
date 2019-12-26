@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
-#ifndef IMPALA_UTIL_COLLECTION_METRICS_H
-#define IMPALA_UTIL_COLLECTION_METRICS_H
+#pragma once
 
 #include "util/metrics.h"
 
@@ -31,8 +29,6 @@
 #include <boost/accumulators/statistics/min.hpp>
 #include <boost/accumulators/statistics/max.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
-
-#include "util/pretty-printer.h"
 
 namespace impala {
 
@@ -74,35 +70,17 @@ class SetMetric : public Metric {
 
   void Reset() { value_.clear(); }
 
-  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* value) {
-    rapidjson::Value container(rapidjson::kObjectType);
-    AddStandardFields(document, &container);
-    rapidjson::Value metric_list(rapidjson::kArrayType);
-    for (const T& s: value_) {
-      rapidjson::Value entry_value;
-      ToJsonValue(s, TUnit::NONE, document, &entry_value);
-      metric_list.PushBack(entry_value, document->GetAllocator());
-    }
-    container.AddMember("items", metric_list, document->GetAllocator());
-    *value = container;
+  virtual TMetricKind::type ToPrometheus(
+      std::string name, std::stringstream* val, std::stringstream* metric_kind) override {
+    // this is not supported type in prometheus, so ignore
+    return TMetricKind::SET;
   }
 
-  virtual void ToLegacyJson(rapidjson::Document* document) {
-    rapidjson::Value metric_list(rapidjson::kArrayType);
-    for (const T& s: value_) {
-      rapidjson::Value entry_value;
-      ToJsonValue(s, TUnit::NONE, document, &entry_value);
-      metric_list.PushBack(entry_value, document->GetAllocator());
-    }
-    document->AddMember(key_.c_str(), metric_list, document->GetAllocator());
-  }
+  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* value) override;
 
-  virtual std::string ToHumanReadable() {
-    std::stringstream out;
-    PrettyPrinter::PrintStringList<std::set<T>>(
-        value_, TUnit::NONE, &out);
-    return out.str();
-  }
+  virtual void ToLegacyJson(rapidjson::Document* document) override;
+
+  virtual std::string ToHumanReadable() override;
 
  private:
   /// Lock protecting the set
@@ -110,18 +88,6 @@ class SetMetric : public Metric {
 
   /// The set of items
   std::set<T> value_;
-};
-
-/// Enum to define which statistic types are available in the StatsMetric
-struct StatsType {
-  enum type {
-    MIN = 1,
-    MAX = 2,
-    MEAN = 4,
-    STDDEV = 8,
-    COUNT = 16,
-    ALL = 31
-  };
 };
 
 /// Metric which accumulates min, max and mean of all values, plus a count of samples
@@ -133,7 +99,7 @@ struct StatsType {
 ///
 /// After construction, all statistics are ill-defined, but count will be 0. The first call
 /// to Update() will initialise all stats.
-template <typename T, int StatsSelection=StatsType::ALL>
+template <typename T, int StatsSelection>
 class StatsMetric : public Metric {
  public:
   static StatsMetric* CreateAndRegister(MetricGroup* metrics, const std::string& key,
@@ -156,109 +122,14 @@ class StatsMetric : public Metric {
     acc_ = Accumulator();
   }
 
-  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* val) {
-    boost::lock_guard<boost::mutex> l(lock_);
-    rapidjson::Value container(rapidjson::kObjectType);
-    AddStandardFields(document, &container);
-    rapidjson::Value units(PrintTUnit(unit_).c_str(), document->GetAllocator());
-    container.AddMember("units", units, document->GetAllocator());
+  virtual TMetricKind::type ToPrometheus(
+      std::string name, std::stringstream* val, std::stringstream* metric_kind) override;
 
-    if (StatsSelection & StatsType::COUNT) {
-      container.AddMember("count",
-          static_cast<uint64_t>(boost::accumulators::count(acc_)),
-          document->GetAllocator());
-    }
+  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* val) override;
 
-    if (boost::accumulators::count(acc_) > 0) {
-      container.AddMember("last", value_, document->GetAllocator());
+  virtual void ToLegacyJson(rapidjson::Document* document) override;
 
-      if (StatsSelection & StatsType::MIN) {
-        container.AddMember("min",
-            static_cast<uint64_t>(boost::accumulators::min(acc_)),
-            document->GetAllocator());
-      }
-
-      if (StatsSelection & StatsType::MAX) {
-        container.AddMember("max", boost::accumulators::max(acc_),
-            document->GetAllocator());
-      }
-
-      if (StatsSelection & StatsType::MEAN) {
-        container.AddMember("mean", boost::accumulators::mean(acc_),
-          document->GetAllocator());
-      }
-
-      if (StatsSelection & StatsType::STDDEV) {
-        container.AddMember("stddev", sqrt(boost::accumulators::variance(acc_)),
-            document->GetAllocator());
-      }
-    }
-    *val = container;
-  }
-
-  virtual void ToLegacyJson(rapidjson::Document* document) {
-    std::stringstream ss;
-    boost::lock_guard<boost::mutex> l(lock_);
-    rapidjson::Value container(rapidjson::kObjectType);
-
-    if (StatsSelection & StatsType::COUNT) {
-      container.AddMember("count", boost::accumulators::count(acc_),
-          document->GetAllocator());
-    }
-
-    if (boost::accumulators::count(acc_) > 0) {
-      container.AddMember("last", value_, document->GetAllocator());
-      if (StatsSelection & StatsType::MIN) {
-        container.AddMember("min", boost::accumulators::min(acc_),
-            document->GetAllocator());
-      }
-
-      if (StatsSelection & StatsType::MAX) {
-        container.AddMember("max", boost::accumulators::max(acc_),
-            document->GetAllocator());
-      }
-
-      if (StatsSelection & StatsType::MEAN) {
-        container.AddMember("mean", boost::accumulators::mean(acc_),
-          document->GetAllocator());
-      }
-
-      if (StatsSelection & StatsType::STDDEV) {
-        container.AddMember("stddev", sqrt(boost::accumulators::variance(acc_)),
-            document->GetAllocator());
-      }
-    }
-    document->AddMember(key_.c_str(), container, document->GetAllocator());
-  }
-
-  virtual std::string ToHumanReadable() {
-    std::stringstream out;
-    if (StatsSelection & StatsType::COUNT) {
-      out << "count: " << boost::accumulators::count(acc_);
-      if (boost::accumulators::count(acc_) > 0) out << ", ";
-    }
-    if (boost::accumulators::count(acc_) > 0) {
-
-      out << "last: " << PrettyPrinter::Print(value_, unit_);
-      if (StatsSelection & StatsType::MIN) {
-        out << ", min: " << PrettyPrinter::Print(boost::accumulators::min(acc_), unit_);
-      }
-
-      if (StatsSelection & StatsType::MAX) {
-        out << ", max: " << PrettyPrinter::Print(boost::accumulators::max(acc_), unit_);
-      }
-
-      if (StatsSelection & StatsType::MEAN) {
-        out << ", mean: " << PrettyPrinter::Print(boost::accumulators::mean(acc_), unit_);
-      }
-
-      if (StatsSelection & StatsType::STDDEV) {
-        out << ", stddev: " << PrettyPrinter::Print(
-            sqrt(boost::accumulators::variance(acc_)), unit_);
-      }
-    }
-    return out.str();
-  }
+  virtual std::string ToHumanReadable() override;
 
  private:
   /// The units of the values captured in this metric, used when pretty-printing.
@@ -281,6 +152,11 @@ class StatsMetric : public Metric {
 
 };
 
-};
-
-#endif
+// These template classes are instantiated in the .cc file.
+extern template class SetMetric<int32_t>;
+extern template class SetMetric<string>;
+extern template class StatsMetric<uint64_t, StatsType::ALL>;
+extern template class StatsMetric<double, StatsType::ALL>;
+extern template class StatsMetric<uint64_t, StatsType::MEAN>;
+extern template class StatsMetric<uint64_t, StatsType::MAX | StatsType::MEAN>;
+}

@@ -18,18 +18,20 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.impala.analysis.ColumnLineageGraph.ColumnLabel;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCreateOrAlterViewParams;
 import org.apache.impala.thrift.TTableName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Base class for CREATE VIEW and ALTER VIEW AS SELECT statements.
@@ -40,13 +42,16 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
 
   protected final boolean ifNotExists_;
   protected final TableName tableName_;
-  protected final ArrayList<ColumnDef> columnDefs_;
+  protected final List<ColumnDef> columnDefs_;
   protected final String comment_;
   protected final QueryStmt viewDefStmt_;
 
   // Set during analysis
   protected String dbName_;
   protected String owner_;
+
+  // Server name needed for privileges. Set during analysis.
+  protected String serverName_;
 
   // The original SQL-string given as view definition. Set during analysis.
   // Corresponds to Hive's viewOriginalText.
@@ -67,10 +72,10 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
 
   // Columns to use in the select list of the expanded SQL string and when registering
   // this view in the metastore. Set in analysis.
-  protected ArrayList<ColumnDef> finalColDefs_;
+  protected List<ColumnDef> finalColDefs_;
 
   public CreateOrAlterViewStmtBase(boolean ifNotExists, TableName tableName,
-      ArrayList<ColumnDef> columnDefs, String comment, QueryStmt viewDefStmt) {
+      List<ColumnDef> columnDefs, String comment, QueryStmt viewDefStmt) {
     Preconditions.checkNotNull(tableName);
     Preconditions.checkNotNull(viewDefStmt);
     this.ifNotExists_ = ifNotExists;
@@ -78,6 +83,12 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
     this.columnDefs_ = columnDefs;
     this.comment_ = comment;
     this.viewDefStmt_ = viewDefStmt;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
+    viewDefStmt_.collectTableRefs(tblRefs);
   }
 
   /**
@@ -109,7 +120,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
       }
     } else {
       // Create list of column definitions from the view-definition statement.
-      finalColDefs_ = Lists.newArrayList();
+      finalColDefs_ = new ArrayList<>();
       List<Expr> exprs = viewDefStmt_.getBaseTblResultExprs();
       List<String> labels = viewDefStmt_.getColLabels();
       Preconditions.checkState(exprs.size() == labels.size());
@@ -122,8 +133,13 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
 
     // Check that the column definitions have valid names, and that there are no
     // duplicate column names.
-    Set<String> distinctColNames = Sets.newHashSet();
+    Set<String> distinctColNames = new HashSet<>();
     for (ColumnDef colDesc: finalColDefs_) {
+      if (colDesc.getType() == Type.NULL) {
+        throw new AnalysisException(String.format("Unable to infer the column type " +
+            "for column '%s'. Use cast() to explicitly specify the column type for " +
+            "column '%s'.", colDesc.getColName(), colDesc.getColName()));
+      }
       colDesc.analyze(null);
       if (!distinctColNames.add(colDesc.getColName().toLowerCase())) {
         throw new AnalysisException("Duplicate column name: " + colDesc.getColName());
@@ -160,9 +176,9 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
    */
   protected void computeLineageGraph(Analyzer analyzer) {
     ColumnLineageGraph graph = analyzer.getColumnLineageGraph();
-    List<String> colDefs = Lists.newArrayList();
+    List<ColumnLabel> colDefs = new ArrayList<>();
     for (ColumnDef colDef: finalColDefs_) {
-      colDefs.add(dbName_ + "." + getTbl() + "." + colDef.getColName());
+      colDefs.add(new ColumnLabel(colDef.getColName(), new TableName(dbName_, getTbl())));
     }
     graph.addTargetColumnLabels(colDefs);
     graph.computeLineageGraph(viewDefStmt_.getResultExprs(), analyzer);
@@ -179,7 +195,8 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
     params.setIf_not_exists(getIfNotExists());
     params.setOriginal_view_def(originalViewDef_);
     params.setExpanded_view_def(inlineViewDef_);
-    if (comment_ != null) params.setComment(comment_);
+    params.setServer_name(serverName_);
+    params.setComment(comment_);
     return params;
   }
 
@@ -198,6 +215,19 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
   public String getOwner() {
     Preconditions.checkNotNull(owner_);
     return owner_;
+  }
+
+  /**
+   * Returns the column names in columnDefs_. Should only be called for non-null
+   * columnDefs_.
+   */
+  protected String getColumnNames() {
+    Preconditions.checkNotNull(columnDefs_);
+    List<String> columnNames = new ArrayList<>();
+    for (ColumnDef colDef : columnDefs_) {
+      columnNames.add(colDef.getColName());
+    }
+    return Joiner.on(", ").join(columnNames);
   }
 
   public boolean getIfNotExists() { return ifNotExists_; }

@@ -16,6 +16,8 @@
 // under the License.
 
 #include <sstream>
+
+#include "exprs/timezone_db.h"
 #include "runtime/raw-value.inline.h"
 #include "testutil/gtest-util.h"
 
@@ -46,6 +48,10 @@ TEST_F(RawValueTest, Compare) {
   s2 = -32767;
   EXPECT_GT(RawValue::Compare(&s1, &s2, TYPE_SMALLINT), 0);
   EXPECT_LT(RawValue::Compare(&s2, &s1, TYPE_SMALLINT), 0);
+
+  DateValue d1(-719162), d2(719162);
+  EXPECT_LT(RawValue::Compare(&d1, &d2, TYPE_DATE), 0);
+  EXPECT_GT(RawValue::Compare(&d2, &d1, TYPE_DATE), 0);
 }
 
 TEST_F(RawValueTest, TypeChar) {
@@ -173,7 +179,8 @@ TEST_F(RawValueTest, TemplatizedHash) {
     RawValue::GetHashValue(&string_value,ColumnType::CreateVarcharType(
     ColumnType::MAX_VARCHAR_LENGTH), seed));
 
-  TimestampValue timestamp_value = TimestampValue::FromUnixTime(253433923200);
+  Timezone utc_tz = cctz::utc_time_zone();
+  TimestampValue timestamp_value = TimestampValue::FromUnixTime(253433923200, utc_tz);
   EXPECT_EQ(RawValue::GetHashValue<impala::TimestampValue>(
     &timestamp_value, TYPE_TIMESTAMP, seed),RawValue::GetHashValue(
     &timestamp_value, TYPE_TIMESTAMP, seed));
@@ -192,8 +199,11 @@ TEST_F(RawValueTest, TemplatizedHash) {
   Decimal16Value d16_value(123456789);
   EXPECT_EQ(RawValue::GetHashValue<impala::Decimal16Value>(&d16_value, d16_type, seed),
     RawValue::GetHashValue(&d16_value, d16_type, seed));
+
+  DateValue date_value(1234567);
+  EXPECT_EQ(RawValue::GetHashValue<impala::DateValue>(&date_value, TYPE_DATE, seed),
+    RawValue::GetHashValue(&date_value, TYPE_DATE, seed));
 }
 
 }
 
-IMPALA_TEST_MAIN();

@@ -18,9 +18,8 @@
 package org.apache.impala.analysis;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-
-import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableDropColParams;
 import org.apache.impala.thrift.TAlterTableParams;
@@ -55,10 +54,10 @@ public class AlterTableDropColStmt extends AlterTableStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    Table t = getTargetTable();
+    FeTable t = getTargetTable();
     // TODO: Support column-level DDL on HBase tables. Requires updating the column
     // mappings along with the table columns.
-    if (t instanceof HBaseTable) {
+    if (t instanceof FeHBaseTable) {
       throw new AnalysisException("ALTER TABLE DROP COLUMN not currently supported " +
           "on HBase tables.");
     }

@@ -18,6 +18,7 @@
 #include <string>
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/lexical_cast.hpp>
 #include <gutil/strings/substitute.h>
 #include <openssl/ssl.h>
@@ -25,9 +26,16 @@
 #include "common/init.h"
 #include "testutil/gtest-util.h"
 #include "testutil/scoped-flag-setter.h"
-#include "util/webserver.h"
-#include "util/default-path-handlers.h"
 
+#include "util/default-path-handlers.h"
+#include "util/kudu-status-util.h"
+#include "util/metrics.h"
+#include "util/os-util.h"
+#include "util/webserver.h"
+
+#include "kudu/security/test/mini_kdc.h"
+
+DECLARE_bool(webserver_require_spnego);
 DECLARE_int32(webserver_port);
 DECLARE_string(webserver_password_file);
 DECLARE_string(webserver_certificate_file);
@@ -36,10 +44,12 @@ DECLARE_string(webserver_private_key_password_cmd);
 DECLARE_string(webserver_x_frame_options);
 DECLARE_string(ssl_cipher_list);
 DECLARE_string(ssl_minimum_version);
+DECLARE_bool(ldap_passwords_in_clear_ok);
 
 #include "common/names.h"
 
 using boost::asio::ip::tcp;
+namespace filesystem = boost::filesystem;
 using namespace impala;
 using namespace rapidjson;
 using namespace strings;
@@ -54,13 +64,13 @@ const string ESCAPED_VALUE = "&lt;script language=&apos;javascript&apos;&gt;";
 // Adapted from:
 // http://stackoverflow.com/questions/10982717/get-html-without-header-with-boostasio
 Status HttpGet(const string& host, const int32_t& port, const string& url_path,
-    ostream* out, int expected_code = 200) {
+    ostream* out, int expected_code = 200, const string& method = "GET") {
   try {
     tcp::iostream request_stream;
     request_stream.connect(host, lexical_cast<string>(port));
     if (!request_stream) return Status("Could not connect request_stream");
 
-    request_stream << "GET " << url_path << " HTTP/1.1\r\n";
+    request_stream << method << " " << url_path << " HTTP/1.1\r\n";
     request_stream << "Host: " << host << ":" << port <<  "\r\n";
     request_stream << "Accept: */*\r\n";
     request_stream << "Cache-Control: no-cache\r\n";
@@ -97,7 +107,8 @@ Status HttpGet(const string& host, const int32_t& port, const string& url_path,
 }
 
 TEST(Webserver, SmokeTest) {
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_OK(webserver.Start());
   AddDefaultUrlCallbacks(&webserver);
 
@@ -105,18 +116,20 @@ TEST(Webserver, SmokeTest) {
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, "/", &contents));
 }
 
-void AssertArgsCallback(bool* success, const Webserver::ArgumentMap& args,
+void AssertArgsCallback(bool* success, const Webserver::WebRequest& req,
     Document* document) {
+  const auto& args = req.parsed_args;
   *success = args.find(TEST_ARG) != args.end();
 }
 
 TEST(Webserver, ArgsTest) {
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
 
   const string ARGS_TEST_PATH = "/args-test";
   bool success = false;
   Webserver::UrlCallback callback = bind<void>(AssertArgsCallback, &success , _1, _2);
-  webserver.RegisterUrlCallback(ARGS_TEST_PATH, "json-test.tmpl", callback);
+  webserver.RegisterUrlCallback(ARGS_TEST_PATH, "json-test.tmpl", callback, true);
 
   ASSERT_OK(webserver.Start());
   stringstream contents;
@@ -128,29 +141,31 @@ TEST(Webserver, ArgsTest) {
   ASSERT_TRUE(success) << "Did not find " << TEST_ARG;
 }
 
-void JsonCallback(bool always_text, const Webserver::ArgumentMap& args,
+void JsonCallback(bool always_text, const Webserver::WebRequest& req,
     Document* document) {
-  document->AddMember(SALUTATION_KEY.c_str(), SALUTATION_VALUE.c_str(),
-      document->GetAllocator());
-  document->AddMember(TO_ESCAPE_KEY.c_str(), TO_ESCAPE_VALUE.c_str(),
-      document->GetAllocator());
+  document->AddMember(rapidjson::StringRef(SALUTATION_KEY.c_str()),
+      StringRef(SALUTATION_VALUE.c_str()), document->GetAllocator());
+  document->AddMember(rapidjson::StringRef(TO_ESCAPE_KEY.c_str()),
+      StringRef(TO_ESCAPE_VALUE.c_str()), document->GetAllocator());
   if (always_text) {
-    document->AddMember(Webserver::ENABLE_RAW_JSON_KEY, true, document->GetAllocator());
+    document->AddMember(rapidjson::StringRef(Webserver::ENABLE_RAW_HTML_KEY), true,
+        document->GetAllocator());
   }
 }
 
 TEST(Webserver, JsonTest) {
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
 
   const string JSON_TEST_PATH = "/json-test";
   const string RAW_TEXT_PATH = "/text";
   const string NO_TEMPLATE_PATH = "/no-template";
   Webserver::UrlCallback callback = bind<void>(JsonCallback, false, _1, _2);
-  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback);
-  webserver.RegisterUrlCallback(NO_TEMPLATE_PATH, "doesnt-exist.tmpl", callback);
+  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback, true);
+  webserver.RegisterUrlCallback(NO_TEMPLATE_PATH, "doesnt-exist.tmpl", callback, true);
 
   Webserver::UrlCallback text_callback = bind<void>(JsonCallback, true, _1, _2);
-  webserver.RegisterUrlCallback(RAW_TEXT_PATH, "json-test.tmpl", text_callback);
+  webserver.RegisterUrlCallback(RAW_TEXT_PATH, "json-test.tmpl", text_callback, true);
   ASSERT_OK(webserver.Start());
 
   stringstream contents;
@@ -174,7 +189,7 @@ TEST(Webserver, JsonTest) {
           Substitute("$0?raw", JSON_TEST_PATH), &raw_contents));
   ASSERT_TRUE(raw_contents.str().find("text/plain") != string::npos);
 
-  // Any callback that includes ENABLE_RAW_JSON_KEY should always return text.
+  // Any callback that includes ENABLE_RAW_HTML_KEY should always return text.
   stringstream raw_cb_contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, RAW_TEXT_PATH,
       &raw_cb_contents));
@@ -182,11 +197,12 @@ TEST(Webserver, JsonTest) {
 }
 
 TEST(Webserver, EscapingTest) {
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
 
   const string JSON_TEST_PATH = "/json-test";
   Webserver::UrlCallback callback = bind<void>(JsonCallback, false, _1, _2);
-  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback);
+  webserver.RegisterUrlCallback(JSON_TEST_PATH, "json-test.tmpl", callback, true);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, JSON_TEST_PATH, &contents));
@@ -195,7 +211,8 @@ TEST(Webserver, EscapingTest) {
 }
 
 TEST(Webserver, EscapeErrorUriTest) {
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port,
@@ -211,7 +228,8 @@ TEST(Webserver, SslTest) {
   auto key = ScopedFlagSetter<string>::Make(&FLAGS_webserver_private_key_file,
       Substitute("$0/be/src/testutil/server-key.pem", getenv("IMPALA_HOME")));
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_OK(webserver.Start());
 }
 
@@ -221,7 +239,8 @@ TEST(Webserver, SslBadCertTest) {
   auto key = ScopedFlagSetter<string>::Make(&FLAGS_webserver_private_key_file,
       Substitute("$0/be/src/testutil/server-key.pem", getenv("IMPALA_HOME")));
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_FALSE(webserver.Start().ok());
 }
 
@@ -233,7 +252,8 @@ TEST(Webserver, SslWithPrivateKeyPasswordTest) {
   auto cmd = ScopedFlagSetter<string>::Make(
       &FLAGS_webserver_private_key_password_cmd, "echo password");
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_OK(webserver.Start());
 }
 
@@ -245,7 +265,8 @@ TEST(Webserver, SslBadPrivateKeyPasswordTest) {
   auto cmd = ScopedFlagSetter<string>::Make(
       &FLAGS_webserver_private_key_password_cmd, "echo wrongpassword");
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_FALSE(webserver.Start().ok());
 }
 
@@ -260,14 +281,16 @@ TEST(Webserver, SslCipherSuite) {
   {
     auto ciphers = ScopedFlagSetter<string>::Make(
         &FLAGS_ssl_cipher_list, "not_a_cipher");
-    Webserver webserver(FLAGS_webserver_port);
+    MetricGroup metrics("webserver-test");
+    Webserver webserver("", FLAGS_webserver_port, &metrics);
     ASSERT_FALSE(webserver.Start().ok());
   }
 
   {
     auto ciphers = ScopedFlagSetter<string>::Make(
-        &FLAGS_ssl_cipher_list, "RC4-SHA");
-    Webserver webserver(FLAGS_webserver_port);
+        &FLAGS_ssl_cipher_list, "AES128-SHA");
+    MetricGroup metrics("webserver-test");
+    Webserver webserver("", FLAGS_webserver_port, &metrics);
     ASSERT_OK(webserver.Start());
   }
 }
@@ -283,7 +306,8 @@ TEST(Webserver, SslBadTlsVersion) {
   auto ssl_version = ScopedFlagSetter<string>::Make(
       &FLAGS_ssl_minimum_version, "not_a_version");
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_FALSE(webserver.Start().ok());
 }
 
@@ -306,18 +330,109 @@ TEST(Webserver, SslGoodTlsVersion) {
     auto ssl_version = ScopedFlagSetter<string>::Make(
         &FLAGS_ssl_minimum_version, v);
 
-    Webserver webserver(FLAGS_webserver_port);
+    MetricGroup metrics("webserver-test");
+    Webserver webserver("", FLAGS_webserver_port, &metrics);
     ASSERT_OK(webserver.Start());
   }
 
   for (auto v : unsupported_versions) {
     auto ssl_version = ScopedFlagSetter<string>::Make(&FLAGS_ssl_minimum_version, v);
 
-    Webserver webserver(FLAGS_webserver_port);
+    MetricGroup metrics("webserver-test");
+    Webserver webserver("", FLAGS_webserver_port, &metrics);
     EXPECT_FALSE(webserver.Start().ok()) << "Version: " << v;
   }
 }
 
+using kudu::MiniKdc;
+using kudu::MiniKdcOptions;
+
+void CheckAuthMetrics(MetricGroup* metrics, int num_negotiate_success,
+    int num_negotiate_failure, int num_cookie_success, int num_cookie_failure) {
+  IntCounter* negotiate_success_metric = metrics->FindMetricForTesting<IntCounter>(
+      "impala.webserver.total-negotiate-auth-success");
+  ASSERT_EQ(negotiate_success_metric->GetValue(), num_negotiate_success);
+  IntCounter* negotiate_failure_metric = metrics->FindMetricForTesting<IntCounter>(
+      "impala.webserver.total-negotiate-auth-failure");
+  ASSERT_EQ(negotiate_failure_metric->GetValue(), num_negotiate_failure);
+  IntCounter* cookie_success_metric = metrics->FindMetricForTesting<IntCounter>(
+      "impala.webserver.total-cookie-auth-success");
+  ASSERT_EQ(cookie_success_metric->GetValue(), num_cookie_success);
+  IntCounter* cookie_failure_metric = metrics->FindMetricForTesting<IntCounter>(
+      "impala.webserver.total-cookie-auth-failure");
+  ASSERT_EQ(cookie_failure_metric->GetValue(), num_cookie_failure);
+}
+
+TEST(Webserver, TestWithSpnego) {
+  MiniKdc kdc(MiniKdcOptions{});
+  KUDU_ASSERT_OK(kdc.Start());
+  kdc.SetKrb5Environment();
+
+  string kt_path;
+  KUDU_ASSERT_OK(kdc.CreateServiceKeytab("HTTP/127.0.0.1", &kt_path));
+  CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1));
+  KUDU_ASSERT_OK(kdc.CreateUserPrincipal("alice"));
+
+  gflags::FlagSaver saver;
+  FLAGS_webserver_require_spnego = true;
+  FLAGS_ldap_passwords_in_clear_ok = true;
+
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
+  ASSERT_OK(webserver.Start());
+
+  // Don't expect HTTP requests to work without Kerberos credentials.
+  stringstream contents;
+  ASSERT_ERROR_MSG(HttpGet("localhost", FLAGS_webserver_port, "/", &contents),
+      "Unexpected status code: 401");
+  // There should be one failed auth attempt.
+  CheckAuthMetrics(&metrics, 0, 1, 0, 0);
+
+  // TODO(todd) IMPALA-8987: import curl into native-toolchain and test this with
+  // authentication.
+  string curl_output;
+  if (RunShellProcess("curl --version", &curl_output)
+      && curl_output.find("GSS-API") != string::npos
+      && curl_output.find("SPNEGO") != string::npos) {
+    //if (system("curl --version") == 0) {
+    // Test that OPTIONS works with and without having kinit-ed.
+    string options_cmd =
+        Substitute("curl -X OPTIONS -v --negotiate -u : 'http://127.0.0.1:$0'",
+            FLAGS_webserver_port);
+    system(options_cmd.c_str());
+    KUDU_ASSERT_OK(kdc.Kinit("alice"));
+    system(options_cmd.c_str());
+
+    // Test that GET works with cookies.
+    filesystem::path cookie_dir = filesystem::unique_path();
+    filesystem::create_directories(cookie_dir);
+    filesystem::path cookie_path = cookie_dir / "cookiejar";
+    LOG(INFO) << "Storing cookies in " << cookie_path;
+    string curl_cmd =
+        Substitute("curl -c $0 -b $0 -X GET -v --negotiate -u : 'http://127.0.0.1:$1'",
+            cookie_path.string(), FLAGS_webserver_port);
+    // Run the command twice, the first time we should authenticate with SPNEGO, the
+    // second time with a cookie.
+    system(Substitute("$0 && $0", curl_cmd).c_str());
+    // There should be one more failed auth attempt, when curl first tries to connect
+    // without authentication, then one successful attempt, then a successful cookie auth.
+    CheckAuthMetrics(&metrics, 1, 2, 1, 0);
+
+    webserver.Stop();
+    MetricGroup metrics2("webserver-test");
+    Webserver webserver2("", FLAGS_webserver_port, &metrics2);
+    ASSERT_OK(webserver2.Start());
+    // Run the command again. We should get a failed cookie attempt because the new
+    // webserver uses a different HMAC key.
+    system(curl_cmd.c_str());
+    CheckAuthMetrics(&metrics2, 1, 1, 0, 1);
+
+    filesystem::remove_all(cookie_dir);
+  } else {
+    LOG(INFO) << "Skipping test, curl was not present or did not have the required "
+              << "features: " << curl_output;
+  }
+}
 
 TEST(Webserver, StartWithPasswordFileTest) {
   stringstream password_file;
@@ -325,12 +440,14 @@ TEST(Webserver, StartWithPasswordFileTest) {
   auto password =
       ScopedFlagSetter<string>::Make(&FLAGS_webserver_password_file, password_file.str());
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_OK(webserver.Start());
 
   // Don't expect HTTP requests to work without a password
   stringstream contents;
-  ASSERT_FALSE(HttpGet("localhost", FLAGS_webserver_port, "/", &contents).ok());
+  ASSERT_ERROR_MSG(HttpGet("localhost", FLAGS_webserver_port, "/", &contents),
+      "Unexpected status code: 401");
 }
 
 TEST(Webserver, StartWithMissingPasswordFileTest) {
@@ -339,12 +456,14 @@ TEST(Webserver, StartWithMissingPasswordFileTest) {
   auto password =
       ScopedFlagSetter<string>::Make(&FLAGS_webserver_password_file, password_file.str());
 
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_FALSE(webserver.Start().ok());
 }
 
 TEST(Webserver, DirectoryListingDisabledTest) {
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port,
@@ -352,7 +471,7 @@ TEST(Webserver, DirectoryListingDisabledTest) {
   ASSERT_TRUE(contents.str().find("Directory listing denied") != string::npos);
 }
 
-void FrameCallback(const Webserver::ArgumentMap& args, Document* document) {
+void FrameCallback(const Webserver::WebRequest& req, Document* document) {
   const string contents = "<frameset cols='50%,50%'><frame src='/metrics'></frameset>";
   Value value(contents.c_str(), document->GetAllocator());
   document->AddMember("contents", value, document->GetAllocator());
@@ -360,9 +479,10 @@ void FrameCallback(const Webserver::ArgumentMap& args, Document* document) {
 
 TEST(Webserver, NoFrameEmbeddingTest) {
   const string FRAME_TEST_PATH = "/frames_test";
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   Webserver::UrlCallback callback = bind<void>(FrameCallback, _1, _2);
-  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback);
+  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback, true);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port,
@@ -375,9 +495,10 @@ TEST(Webserver, FrameAllowEmbeddingTest) {
   const string FRAME_TEST_PATH = "/frames_test";
   auto x_frame_opt =
       ScopedFlagSetter<string>::Make(&FLAGS_webserver_x_frame_options, "ALLOWALL");
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   Webserver::UrlCallback callback = bind<void>(FrameCallback, _1, _2);
-  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback);
+  webserver.RegisterUrlCallback(FRAME_TEST_PATH, "raw_text.tmpl", callback, true);
   ASSERT_OK(webserver.Start());
   stringstream contents;
   ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port,
@@ -389,13 +510,15 @@ TEST(Webserver, FrameAllowEmbeddingTest) {
 
 const string STRING_WITH_NULL = "123456789\0ABCDE";
 
-void NullCharCallback(const Webserver::ArgumentMap& args, stringstream* out) {
+void NullCharCallback(const Webserver::WebRequest& req, stringstream* out,
+    kudu::HttpStatusCode* response) {
   (*out) << STRING_WITH_NULL;
 }
 
 TEST(Webserver, NullCharTest) {
   const string NULL_CHAR_TEST_PATH = "/null-char-test";
-  Webserver webserver(FLAGS_webserver_port);
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
   webserver.RegisterUrlCallback(NULL_CHAR_TEST_PATH, NullCharCallback);
   ASSERT_OK(webserver.Start());
   stringstream contents;
@@ -404,6 +527,15 @@ TEST(Webserver, NullCharTest) {
   ASSERT_TRUE(contents.str().find(STRING_WITH_NULL) != string::npos);
 }
 
+TEST(Webserver, Options) {
+  MetricGroup metrics("webserver-test");
+  Webserver webserver("", FLAGS_webserver_port, &metrics);
+  ASSERT_OK(webserver.Start());
+  stringstream contents;
+  ASSERT_OK(HttpGet("localhost", FLAGS_webserver_port, "/", &contents, 200, "OPTIONS"));
+  ASSERT_FALSE(contents.str().find("Allow: GET, POST, HEAD, OPTIONS, PROPFIND, MKCOL")
+      == string::npos);
+}
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

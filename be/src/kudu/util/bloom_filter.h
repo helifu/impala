@@ -17,9 +17,13 @@
 #ifndef KUDU_UTIL_BLOOM_FILTER_H
 #define KUDU_UTIL_BLOOM_FILTER_H
 
+#include <cstddef>
+#include <cstdint>
+
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/hash/city.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/slice.h"
 
@@ -55,8 +59,8 @@ class BloomKeyProbe {
 
     // Use the top and bottom halves of the 64-bit hash
     // as the two independent hash functions for mixing.
-    h_1_ = static_cast<uint32>(h);
-    h_2_ = static_cast<uint32>(h >> 32);
+    h_1_ = static_cast<uint32_t>(h);
+    h_2_ = static_cast<uint32_t>(h >> 32);
   }
 
   const Slice &key() const { return key_; }
@@ -69,6 +73,7 @@ class BloomKeyProbe {
   // Mix the given hash function with the second calculated hash
   // value. A sequence of independent hashes can be calculated
   // by repeatedly calling MixHash() on its previous result.
+  ATTRIBUTE_NO_SANITIZE_INTEGER
   uint32_t MixHash(uint32_t h) const {
     return h + h_2_;
   }

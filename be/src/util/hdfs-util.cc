@@ -24,6 +24,7 @@
 
 #include "common/names.h"
 #include "runtime/exec-env.h"
+#include "kudu/util/path_util.h"
 
 namespace impala {
 
@@ -85,6 +86,14 @@ bool IsS3APath(const char* path) {
   return strncmp(path, "s3a://", 6) == 0;
 }
 
+bool IsABFSPath(const char* path) {
+  if (strstr(path, ":/") == NULL) {
+    return ExecEnv::GetInstance()->default_fs().compare(0, 7, "abfs://") == 0 ||
+        ExecEnv::GetInstance()->default_fs().compare(0, 8, "abfss://") == 0;
+  }
+  return strncmp(path, "abfs://", 7) == 0 || strncmp(path, "abfss://", 8) == 0;
+}
+
 bool IsADLSPath(const char* path) {
   if (strstr(path, ":/") == NULL) {
     return ExecEnv::GetInstance()->default_fs().compare(0, 6, "adl://") == 0;
@@ -131,6 +140,16 @@ bool FilesystemsMatch(const char* path_a, const char* path_b) {
   // Both fully qualified: check the filesystem prefix.
   if (fs_a_name_length != fs_b_name_length) return false;
   return strncmp(path_a, path_b, fs_a_name_length) == 0;
+}
+
+string GetBaseName(const char* path) {
+  int fs_name_length = GetFilesystemNameLength(path);
+  if (fs_name_length >= strlen(path)) return ".";
+
+  string bname = kudu::BaseName(&(path[fs_name_length]));
+  if (bname.empty() || bname == "/") return ".";
+
+  return bname;
 }
 
 }

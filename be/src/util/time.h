@@ -22,6 +22,7 @@
 #include <time.h>
 #include <string>
 
+#include "common/global-types.h"
 #include "gutil/walltime.h"
 
 /// Utilities for collecting timings.
@@ -55,6 +56,19 @@ inline int64_t MonotonicSeconds() {
 /// above.
 inline int64_t UnixMillis() {
   return GetCurrentTimeMicros() / MICROS_PER_MILLI;
+}
+
+/// Return the time 'time_us' microseconds away from now in 'abs_time'.
+inline void TimeFromNowMicros(int64_t time_us, timespec* abs_time) {
+  clock_gettime(CLOCK_MONOTONIC, abs_time);
+  abs_time->tv_nsec += (time_us % MICROS_PER_SEC) * NANOS_PER_MICRO;
+  abs_time->tv_sec += time_us / MICROS_PER_SEC + abs_time->tv_nsec / NANOS_PER_SEC;
+  abs_time->tv_nsec %= NANOS_PER_SEC;
+}
+
+/// Return the time 'time_ms' milliseconds away from now in 'abs_time'.
+inline void TimeFromNowMillis(int64_t time_ms, timespec* abs_time) {
+  TimeFromNowMicros(time_ms * MICROS_PER_MILLI, abs_time);
 }
 
 /// Returns the number of microseconds that have passed since the Unix epoch. This is
@@ -101,6 +115,11 @@ std::string ToStringFromUnixMicros(int64_t us,
 
 /// Converts input microseconds-since-epoch to date-time string in UTC time zone.
 std::string ToUtcStringFromUnixMicros(int64_t us,
+    TimePrecision p = TimePrecision::Microsecond);
+
+/// Converts input microseconds-since-epoch to date-time string in 'tz' time zone.
+/// In the returned string fractional seconds are padded to precision 'p'.
+std::string ToStringFromUnixMicros(int64_t us, const Timezone& tz,
     TimePrecision p = TimePrecision::Microsecond);
 
 /// Convenience function to convert the current time, derived from UnixMicros(),

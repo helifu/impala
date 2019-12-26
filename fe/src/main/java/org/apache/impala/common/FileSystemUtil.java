@@ -17,23 +17,21 @@
 
 package org.apache.impala.common;
 
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URI;
-import java.util.UUID;
-
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.LocalFileSystem;
-import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
-import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.adl.AdlFileSystem;
+import org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem;
+import org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem;
+import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.client.HdfsAdmin;
 import org.apache.hadoop.hdfs.protocol.EncryptionZone;
@@ -41,8 +39,14 @@ import org.apache.impala.catalog.HdfsCompression;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Objects;
-import com.google.common.base.Preconditions;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Stack;
+import java.util.UUID;
 
 /**
  * Common utility functions for operating on FileSystem objects.
@@ -306,6 +310,7 @@ public class FileSystemUtil {
     if (isDistributedFileSystem(fs)) return true;
     // Blacklist FileSystems that are known to not to include storage UUIDs.
     return !(fs instanceof S3AFileSystem || fs instanceof LocalFileSystem ||
+        fs instanceof AzureBlobFileSystem || fs instanceof SecureAzureBlobFileSystem ||
         fs instanceof AdlFileSystem);
   }
 
@@ -338,6 +343,26 @@ public class FileSystemUtil {
   }
 
   /**
+   * Returns true iff the filesystem is AzureBlobFileSystem or
+   * SecureAzureBlobFileSystem. This function is unique in that there are 2
+   * distinct classes it checks for, but the ony functional difference is the
+   * use of wire encryption. Some features like OAuth authentication do require
+   * wire encryption but that does not matter in usages of this function.
+   */
+  public static boolean isABFSFileSystem(FileSystem fs) {
+    return fs instanceof AzureBlobFileSystem
+        || fs instanceof SecureAzureBlobFileSystem;
+  }
+
+  /**
+   * Returns true iff the path is on AzureBlobFileSystem or
+   * SecureAzureBlobFileSystem.
+   */
+  public static boolean isABFSFileSystem(Path path) throws IOException {
+    return isABFSFileSystem(path.getFileSystem(CONF));
+  }
+
+  /**
    * Returns true iff the filesystem is an instance of LocalFileSystem.
    */
   public static boolean isLocalFileSystem(FileSystem fs) {
@@ -365,10 +390,57 @@ public class FileSystemUtil {
     return isDistributedFileSystem(path.getFileSystem(CONF));
   }
 
+  /**
+   * Represents the type of filesystem being used. Typically associated with a
+   * {@link org.apache.hadoop.fs.FileSystem} instance that is used to read data.
+   *
+   * <p>
+   *   Unlike the {@code is*FileSystem} methods above. A FsType is more
+   *   generic in that it is capable of grouping different filesystems to the
+   *   same type. For example, the FsType {@link FsType#ADLS} maps to
+   *   multiple filesystems: {@link AdlFileSystem},
+   *   {@link AzureBlobFileSystem}, and {@link SecureAzureBlobFileSystem}.
+   * </p>
+   */
+  public enum FsType {
+    ADLS,
+    HDFS,
+    LOCAL,
+    S3;
+
+    private static final Map<String, FsType> SCHEME_TO_FS_MAPPING =
+        ImmutableMap.<String, FsType>builder()
+            .put("abfs", ADLS)
+            .put("abfss", ADLS)
+            .put("adl", ADLS)
+            .put("file", LOCAL)
+            .put("hdfs", HDFS)
+            .put("s3a", S3)
+            .build();
+
+    /**
+     * Provides a mapping between filesystem schemes and filesystems types. This can be
+     * useful as there are often multiple filesystem connectors for a give fs, each
+     * with its own scheme (e.g. abfs, abfss, adl are all ADLS connectors).
+     * Returns the {@link FsType} associated with a given filesystem scheme (e.g. local,
+     * hdfs, s3a, etc.)
+     */
+    public static FsType getFsType(String scheme) {
+      return SCHEME_TO_FS_MAPPING.get(scheme);
+    }
+  }
+
   public static FileSystem getDefaultFileSystem() throws IOException {
     Path path = new Path(FileSystem.getDefaultUri(CONF));
     FileSystem fs = path.getFileSystem(CONF);
     return fs;
+  }
+
+  /**
+   * Returns the FileSystem object for a given path using the cached config.
+   */
+  public static FileSystem getFileSystemForPath(Path p) throws IOException {
+    return p.getFileSystem(CONF);
   }
 
   public static DistributedFileSystem getDistributedFileSystem() throws IOException {
@@ -458,6 +530,7 @@ public class FileSystemUtil {
     return (FileSystemUtil.isDistributedFileSystem(path) ||
         FileSystemUtil.isLocalFileSystem(path) ||
         FileSystemUtil.isS3AFileSystem(path) ||
+        FileSystemUtil.isABFSFileSystem(path) ||
         FileSystemUtil.isADLFileSystem(path));
   }
 
@@ -466,10 +539,38 @@ public class FileSystemUtil {
    * the path does not exist. This helps simplify the caller code in cases where
    * the file does not exist and also saves an RPC as the caller need not do a separate
    * exists check for the path. Returns null if the path does not exist.
+   *
+   * If 'recursive' is true, all underlying files and directories will be yielded.
+   * Note that the order (breadth-first vs depth-first, sorted vs not) is undefined.
    */
-  public static FileStatus[] listStatus(FileSystem fs, Path p) throws IOException {
+  public static RemoteIterator<? extends FileStatus> listStatus(FileSystem fs, Path p,
+      boolean recursive) throws IOException {
     try {
-      return fs.listStatus(p);
+      if (recursive) {
+        // The Hadoop FileSystem API doesn't provide a recursive listStatus call that
+        // doesn't also fetch block locations, and fetching block locations is expensive.
+        // Here, our caller specifically doesn't need block locations, so we don't want to
+        // call the expensive 'listFiles' call on HDFS. Instead, we need to "manually"
+        // recursively call FileSystem.listStatusIterator().
+        //
+        // Note that this "manual" recursion is not actually any slower than the recursion
+        // provided by the HDFS 'listFiles(recursive=true)' API, since the HDFS wire
+        // protocol doesn't provide any such recursive support anyway. In other words,
+        // the API that looks like a single recursive call is just as bad as what we're
+        // doing here.
+        //
+        // However, S3 actually implements 'listFiles(recursive=true)' with a faster path
+        // which natively recurses. In that case, it's quite preferable to use 'listFiles'
+        // even though it returns LocatedFileStatus objects with "fake" blocks which we
+        // will ignore.
+        if (isS3AFileSystem(fs)) {
+          return listFiles(fs, p, true);
+        }
+
+        return new FilterIterator(p, new RecursingIterator(fs, p));
+      }
+
+      return new FilterIterator(p, fs.listStatusIterator(p));
     } catch (FileNotFoundException e) {
       if (LOG.isWarnEnabled()) LOG.warn("Path does not exist: " + p.toString(), e);
       return null;
@@ -479,13 +580,199 @@ public class FileSystemUtil {
   /**
    * Wrapper around FileSystem.listFiles(), similar to the listStatus() wrapper above.
    */
-  public static RemoteIterator<LocatedFileStatus> listFiles(FileSystem fs, Path p,
+  public static RemoteIterator<? extends FileStatus> listFiles(FileSystem fs, Path p,
       boolean recursive) throws IOException {
     try {
-      return fs.listFiles(p, recursive);
+      return new FilterIterator(p, fs.listFiles(p, recursive));
     } catch (FileNotFoundException e) {
       if (LOG.isWarnEnabled()) LOG.warn("Path does not exist: " + p.toString(), e);
       return null;
+    }
+  }
+
+  /**
+   * Returns true if the path 'p' is a directory, false otherwise.
+   */
+  public static boolean isDir(Path p) throws IOException {
+    FileSystem fs = getFileSystemForPath(p);
+    return fs.isDirectory(p);
+  }
+
+  /**
+   * Return the path of 'path' relative to the startPath. This may
+   * differ from simply the file name in the case of recursive listings.
+   */
+  public static String relativizePath(Path path, Path startPath) {
+    URI relUri = startPath.toUri().relativize(path.toUri());
+    if (relUri.isAbsolute() || relUri.getPath().startsWith("/")) {
+      throw new RuntimeException("FileSystem returned an unexpected path " +
+          path + " for a file within " + startPath);
+    }
+    return relUri.getPath();
+  }
+
+  /**
+   * Util method to check if the given file status relative to its parent is contained
+   * in a ignored directory. This is useful to ignore the files which seemingly are valid
+   * just by themselves but should still be ignored if they are contained in a
+   * directory which needs to be ignored
+   *
+   * @return true if the fileStatus should be ignored, false otherwise
+   */
+  @VisibleForTesting
+  static boolean isInIgnoredDirectory(Path parent, FileStatus fileStatus) {
+    Preconditions.checkNotNull(fileStatus);
+    Path currentPath = fileStatus.isDirectory() ? fileStatus.getPath() :
+        fileStatus.getPath().getParent();
+    while (currentPath != null && !currentPath.equals(parent)) {
+      if (isIgnoredDir(currentPath)) {
+        LOG.debug("Ignoring {} since it is either in a hidden directory or a temporary "
+                + "staging directory {}", fileStatus.getPath(), currentPath);
+        return true;
+      }
+      currentPath = currentPath.getParent();
+    }
+    return false;
+  }
+
+  /**
+   * Prefix string used by hive to write certain temporary or "non-data" files in the
+   * table location
+   */
+  public static final String HIVE_TEMP_FILE_PREFIX = "_tmp.";
+
+  public static final String DOT = ".";
+
+  /**
+   * Util method used to filter out hidden and temporary staging directories
+   * which tools like Hive create in the table/partition directories when a query is
+   * inserting data into them.
+   */
+  @VisibleForTesting
+  static boolean isIgnoredDir(Path path) {
+    String filename = path.getName();
+    return filename.startsWith(DOT) || filename.startsWith(HIVE_TEMP_FILE_PREFIX);
+  }
+
+  /**
+   * A remote iterator which takes in another Remote Iterator and a start path and filters
+   * all the ignored directories
+   * (See {@link org.apache.impala.common.FileSystemUtil#isInIgnoredDirectory}) from the
+   * listing of the remote iterator
+   */
+  static class FilterIterator implements RemoteIterator<FileStatus> {
+    private final RemoteIterator<? extends FileStatus> baseIterator_;
+    private FileStatus curFile_ = null;
+    private final Path startPath_;
+
+    FilterIterator(Path startPath, RemoteIterator<? extends FileStatus> baseIterator) {
+      startPath_ = Preconditions.checkNotNull(startPath);
+      baseIterator_ = Preconditions.checkNotNull(baseIterator);
+    }
+
+    @Override
+    public boolean hasNext() throws IOException {
+      // Pull the next file to be returned into 'curFile'. If we've already got one,
+      // we don't need to do anything (extra calls to hasNext() must not affect
+      // state)
+      while (curFile_ == null) {
+        FileStatus next;
+        try {
+          if (!baseIterator_.hasNext()) return false;
+          // if the next fileStatus is in ignored directory skip it
+           next = baseIterator_.next();
+        } catch (FileNotFoundException ex) {
+          // in case of concurrent operations by multiple engines it is possible that
+          // some temporary files are deleted while Impala is loading the table. For
+          // instance, hive deletes the temporary files in the .hive-staging directory
+          // after an insert query from Hive completes. If we are loading the table at
+          // the same time, we may get a FileNotFoundException which is safe to ignore.
+          LOG.warn(ex.getMessage());
+          continue;
+        }
+        if (!isInIgnoredDirectory(startPath_, next)) {
+          curFile_ = next;
+          return true;
+        }
+      }
+      return true;
+    }
+
+    @Override
+    public FileStatus next() throws IOException {
+      if (hasNext()) {
+        FileStatus next = curFile_;
+        curFile_ = null;
+        return next;
+      }
+      throw new NoSuchElementException("No more entries");
+    }
+  }
+
+  /**
+   * Iterator which recursively visits directories on a FileSystem, yielding
+   * files in an unspecified order.
+   */
+  private static class RecursingIterator implements RemoteIterator<FileStatus> {
+    private final FileSystem fs_;
+    private final Stack<RemoteIterator<FileStatus>> iters_ = new Stack<>();
+    private RemoteIterator<FileStatus> curIter_;
+    private FileStatus curFile_;
+
+    private RecursingIterator(FileSystem fs, Path startPath) throws IOException {
+      this.fs_ = Preconditions.checkNotNull(fs);
+      curIter_ = fs.listStatusIterator(Preconditions.checkNotNull(startPath));
+    }
+
+    @Override
+    public boolean hasNext() throws IOException {
+      // Pull the next file to be returned into 'curFile'. If we've already got one,
+      // we don't need to do anything (extra calls to hasNext() must not affect
+      // state)
+      while (curFile_ == null) {
+        if (curIter_.hasNext()) {
+          // Consume the next file or directory from the current iterator.
+          handleFileStat(curIter_.next());
+        } else if (!iters_.empty()) {
+          // We ran out of entries in the current one, but we might still have
+          // entries at a higher level of recursion.
+          curIter_ = iters_.pop();
+        } else {
+          // No iterators left to process, so we are entirely done.
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * Process the input stat.
+     * If it is a file, return the file stat.
+     * If it is a directory, traverse the directory if recursive is true;
+     * ignore it if recursive is false.
+     * @param fileStatus input status
+     * @throws IOException if any IO error occurs
+     */
+    private void handleFileStat(FileStatus fileStatus) throws IOException {
+      if (fileStatus.isFile()) {
+        curFile_ = fileStatus;
+        return;
+      }
+      iters_.push(curIter_);
+      curIter_ = fs_.listStatusIterator(fileStatus.getPath());
+      curFile_ = fileStatus;
+    }
+
+    @Override
+    public FileStatus next() throws IOException {
+      if (hasNext()) {
+        FileStatus result = curFile_;
+        // Reset back to 'null' so that hasNext() will pull a new entry on the next
+        // call.
+        curFile_ = null;
+        return result;
+      }
+      throw new NoSuchElementException("No more entries");
     }
   }
 }

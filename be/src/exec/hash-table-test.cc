@@ -81,14 +81,14 @@ class HashTableTest : public testing::Test {
     // simplest.  The purpose of these tests is to exercise the hash map
     // internals so a simple build/probe expr is fine.
     ScalarExpr* build_expr = pool_.Add(new SlotRef(TYPE_INT, 1, true /* nullable */));
-    ASSERT_OK(build_expr->Init(desc, nullptr));
+    ASSERT_OK(build_expr->Init(desc, true, nullptr));
     build_exprs_.push_back(build_expr);
     ASSERT_OK(ScalarExprEvaluator::Create(build_exprs_, nullptr, &pool_, &mem_pool_,
         &mem_pool_, &build_expr_evals_));
     ASSERT_OK(ScalarExprEvaluator::Open(build_expr_evals_, nullptr));
 
     ScalarExpr* probe_expr = pool_.Add(new SlotRef(TYPE_INT, 1, true /* nullable */));
-    ASSERT_OK(probe_expr->Init(desc, nullptr));
+    ASSERT_OK(probe_expr->Init(desc, true, nullptr));
     probe_exprs_.push_back(probe_expr);
     ASSERT_OK(ScalarExprEvaluator::Create(probe_exprs_, nullptr, &pool_, &mem_pool_,
         &mem_pool_, &probe_expr_evals_));
@@ -170,7 +170,9 @@ class HashTableTest : public testing::Test {
       int32_t val = *reinterpret_cast<int32_t*>(build_expr_evals_[0]->GetValue(row));
       EXPECT_GE(val, min);
       EXPECT_LT(val, max);
-      if (all_unique) EXPECT_TRUE(results[val] == nullptr);
+      if (all_unique) {
+        EXPECT_TRUE(results[val] == nullptr);
+      }
       EXPECT_EQ(row->GetTuple(0), expected[val]->GetTuple(0));
       results[val] = row;
       iter.Next();
@@ -738,11 +740,4 @@ TEST_F(HashTableTest, VeryLowMemTest) {
   VeryLowMemTest(false);
 }
 
-}
-
-int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-  impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
-  impala::InitFeSupport();
-  return RUN_ALL_TESTS();
 }

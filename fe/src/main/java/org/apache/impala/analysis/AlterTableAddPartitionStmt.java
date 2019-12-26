@@ -19,20 +19,17 @@ package org.apache.impala.analysis;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Joiner;
-import com.google.common.collect.Sets;
 
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
-import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.TAlterTableAddPartitionParams;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableType;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-
-import com.google.common.base.Preconditions;
 
 /**
  * Represents an ALTER TABLE ADD PARTITION statement.
@@ -60,12 +57,12 @@ public class AlterTableAddPartitionStmt extends AlterTableStmt {
   public boolean getIfNotExists() { return ifNotExists_; }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("ALTER TABLE ");
     if (getDb() != null) sb.append(getDb() + ".");
     sb.append(getTbl()).append(" ADD");
     if (ifNotExists_) sb.append(" IF NOT EXISTS");
-    for (PartitionDef p: partitions_) sb.append(" " + p.toSql());
+    for (PartitionDef p : partitions_) sb.append(" " + p.toSql(options));
     return sb.toString();
   }
 
@@ -83,12 +80,12 @@ public class AlterTableAddPartitionStmt extends AlterTableStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    Table table = getTargetTable();
-    if (table instanceof KuduTable) {
+    FeTable table = getTargetTable();
+    if (table instanceof FeKuduTable) {
       throw new AnalysisException("ALTER TABLE ADD PARTITION is not supported for " +
           "Kudu tables: " + table.getTableName());
     }
-    Set<String> partitionSpecs = Sets.newHashSet();
+    Set<String> partitionSpecs = new HashSet<>();
     for (PartitionDef p: partitions_) {
       p.analyze(analyzer);
 

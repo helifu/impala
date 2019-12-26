@@ -1231,7 +1231,7 @@ order by 1, 2;
 2010,11,1350
 2010,12,1395
 ---- TYPES
-INT,INT,BIGINT
+BIGINT,BIGINT,BIGINT
 ====
 ---- QUERY
 # IMPALA-2089: Tests correct elimination of redundant predicates.
@@ -1369,4 +1369,61 @@ from x
 -Infinity,0,-Infinity,-Infinity
 ---- TYPES
 DOUBLE,DOUBLE,DOUBLE,DOUBLE
+====
+---- QUERY
+# IMPALA-7397: conjunct that makes allocations in Prepare (extract) assigned to agg node
+select timestamp_col, count(int_col) from alltypesagg group by timestamp_col, int_col
+having extract(hour from timestamp_col) = int_col
+---- TYPES
+TIMESTAMP,BIGINT
+---- RESULTS
+====
+---- QUERY
+# GROUP BY of NaN values aggregates NaN's as one grouping
+select count(*), sqrt(0.5-x) as Z
+from (VALUES((1.6 x, 2 y), (3.2, 4), (5.4,6))) T
+group by Z
+---- RESULTS
+3, NaN
+---- TYPES
+bigint, double
+====
+---- QUERY
+# GROUP BY of NaN values aggregates NaN's as one grouping
+select count(*), cast(sqrt(0.4-x) as FLOAT) as P, cast(sqrt(1.5-y) as FLOAT) as Q
+from (VALUES((1.6 x, 1.6 y, 0 z), (0.5, 0.5, 0), (5.4, 6, 0),
+              (0.5, 0.5, 0), (0.5, 0.5, 0), (-0.6, 0.5, 0))) T
+group by P, Q order by P, Q
+---- RESULTS
+2, NaN, NaN
+3, NaN, 1
+1, 1, 1
+---- TYPES
+bigint, float, float
+====
+---- QUERY
+# IMPALA-6660: GROUP BY of -0/+0 values aggregates zeros as one grouping
+select x, count(*)
+from (values(cast("-0" as float) x), (cast("0" as float))) v
+group by x
+---- RESULTS
+0,2
+---- TYPES
+float, bigint
+====
+---- QUERY
+# IMPALA-6660: -0/+0 values are not distinct
+select distinct *
+from (values(cast("-0" as float)), (cast("0" as float))) v;
+---- RESULTS
+0
+---- TYPES
+float
+====
+---- QUERY
+# IMPALA-8140: Test that group by with limit does not crash on Asan
+select count(*) from tpch_parquet.orders o group by o.o_clerk limit 10
+# We don't validate the results since the order is not deterministic.
+---- TYPES
+bigint
 ====

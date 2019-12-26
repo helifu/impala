@@ -20,12 +20,38 @@
 #include <boost/unordered_set.hpp>
 
 #include "common/names.h"
+#include "flatbuffers/flatbuffers.h"
+#include "gen-cpp/CatalogObjects_generated.h"
+#include "scheduling/cluster-membership-mgr.h"
+#include "scheduling/cluster-membership-test-util.h"
 #include "scheduling/scheduler.h"
+#include "util/hash-util.h"
+#include "service/impala-server.h"
 
 using namespace impala;
 using namespace impala::test;
+using namespace org::apache::impala::fb;
 
 DECLARE_int32(krpc_port);
+
+/// Make the BlockNamingPolicy enum easy to print. Must be declared in impala::test
+namespace impala {
+namespace test {
+std::ostream& operator<<(std::ostream& os, const BlockNamingPolicy& naming_policy)
+{
+  switch(naming_policy) {
+  case BlockNamingPolicy::UNPARTITIONED:
+    os << "UNPARTITIONED"; break;
+  case BlockNamingPolicy::PARTITIONED_SINGLE_FILENAME:
+    os << "PARTITIONED_SINGLE_FILENAME"; break;
+  case BlockNamingPolicy::PARTITIONED_UNIQUE_FILENAMES:
+    os << "PARTITIONED_UNIQUE_FILENAMES"; break;
+  default: os.setstate(std::ios_base::failbit);
+  }
+  return os;
+}
+}
+}
 
 /// Sample 'n' elements without replacement from the set [0..N-1].
 /// This is an implementation of "Algorithm R" by J. Vitter.
@@ -61,6 +87,24 @@ const string Cluster::IP_PREFIX = "10";
 
 /// Default size for new blocks is 1MB.
 const int64_t Block::DEFAULT_BLOCK_SIZE = 1 << 20;
+/// Default size for files is 4MB.
+const int64_t FileSplitGeneratorSpec::DEFAULT_FILE_SIZE = 1 << 22;
+/// Default size for file splits is 1 MB.
+const int64_t FileSplitGeneratorSpec::DEFAULT_BLOCK_SIZE = 1 << 20;
+
+ClusterMembershipMgr::BeDescSharedPtr BuildBackendDescriptor(const Host& host) {
+  auto be_desc = make_shared<TBackendDescriptor>();
+  be_desc->address.hostname = host.ip;
+  be_desc->address.port = host.be_port;
+  be_desc->ip_address = host.ip;
+  be_desc->__set_is_coordinator(host.is_coordinator);
+  be_desc->__set_is_executor(host.is_executor);
+  be_desc->is_quiescing = false;
+  be_desc->executor_groups.push_back(TExecutorGroupDesc());
+  be_desc->executor_groups.back().name = ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME;
+  be_desc->executor_groups.back().min_size = 1;
+  return be_desc;
+}
 
 int Cluster::AddHost(bool has_backend, bool has_datanode, bool is_executor) {
   int host_idx = hosts_.size();
@@ -69,7 +113,8 @@ int Cluster::AddHost(bool has_backend, bool has_datanode, bool is_executor) {
   IpAddr ip = HostIdxToIpAddr(host_idx);
   DCHECK(ip_to_idx_.find(ip) == ip_to_idx_.end());
   ip_to_idx_[ip] = host_idx;
-  hosts_.push_back(Host(HostIdxToHostname(host_idx), ip, be_port, dn_port, is_executor));
+  hosts_.push_back(Host(HostIdxToHostname(host_idx),
+      ip, be_port, dn_port, has_backend && is_executor));
   // Add host to lists of backend indexes per type.
   if (has_backend) backend_host_idxs_.push_back(host_idx);
   if (has_datanode) {
@@ -88,14 +133,19 @@ void Cluster::AddHosts(int num_hosts, bool has_backend, bool has_datanode,
   for (int i = 0; i < num_hosts; ++i) AddHost(has_backend, has_datanode, is_executor);
 }
 
-Hostname Cluster::HostIdxToHostname(int host_idx) {
-  return HOSTNAME_PREFIX + std::to_string(host_idx);
-}
-
 void Cluster::GetBackendAddress(int host_idx, TNetworkAddress* addr) const {
   DCHECK_LT(host_idx, hosts_.size());
   addr->hostname = hosts_[host_idx].ip;
   addr->port = hosts_[host_idx].be_port;
+}
+
+Cluster Cluster::CreateRemoteCluster(int num_impala_nodes, int num_data_nodes) {
+  Cluster cluster;
+  // Set of Impala hosts
+  cluster.AddHosts(num_impala_nodes, true, false);
+  // Set of datanodes
+  cluster.AddHosts(num_data_nodes, false, true);
+  return cluster;
 }
 
 const vector<int>& Cluster::datanode_with_backend_host_idxs() const {
@@ -106,15 +156,14 @@ const vector<int>& Cluster::datanode_only_host_idxs() const {
   return datanode_only_host_idxs_;
 }
 
-IpAddr Cluster::HostIdxToIpAddr(int host_idx) {
-  DCHECK_LT(host_idx, (1 << 24));
-  string suffix;
-  for (int i = 0; i < 3; ++i) {
-    suffix = "." + std::to_string(host_idx % 256) + suffix; // prepend
-    host_idx /= 256;
-  }
-  DCHECK_EQ(0, host_idx);
-  return IP_PREFIX + suffix;
+void Schema::AddEmptyTable(
+    const TableName& table_name, BlockNamingPolicy naming_policy) {
+  DCHECK(tables_.find(table_name) == tables_.end());
+  // Create table
+  Table table;
+  table.naming_policy = naming_policy;
+  // Insert table
+  tables_.emplace(table_name, table);
 }
 
 void Schema::AddSingleBlockTable(
@@ -148,14 +197,17 @@ void Schema::AddSingleBlockTable(const TableName& table_name,
 
 void Schema::AddMultiBlockTable(const TableName& table_name, int num_blocks,
     ReplicaPlacement replica_placement, int num_replicas) {
-  AddMultiBlockTable(table_name, num_blocks, replica_placement, num_replicas, 0);
+  AddMultiBlockTable(table_name, num_blocks, replica_placement, num_replicas, 0,
+      BlockNamingPolicy::UNPARTITIONED);
 }
 
 void Schema::AddMultiBlockTable(const TableName& table_name, int num_blocks,
-    ReplicaPlacement replica_placement, int num_replicas, int num_cached_replicas) {
+    ReplicaPlacement replica_placement, int num_replicas, int num_cached_replicas,
+    BlockNamingPolicy naming_policy) {
   DCHECK_GT(num_replicas, 0);
   DCHECK(num_cached_replicas <= num_replicas);
   Table table;
+  table.naming_policy = naming_policy;
   for (int i = 0; i < num_blocks; ++i) {
     Block block;
     vector<int>& replica_idxs = block.replica_host_idxs;
@@ -193,6 +245,17 @@ void Schema::AddMultiBlockTable(const TableName& table_name, int num_blocks,
   tables_[table_name] = table;
 }
 
+void Schema::AddFileSplitGeneratorSpecs(
+    const TableName& table_name, const std::vector<FileSplitGeneratorSpec>& specs) {
+  Table* table = &tables_[table_name];
+  table->specs.insert(table->specs.end(), specs.begin(), specs.end());
+}
+
+void Schema::AddFileSplitGeneratorDefaultSpecs(const TableName& table_name, int num) {
+  Table* table = &tables_[table_name];
+  for (int i = 0; i < num; ++i) table->specs.push_back(FileSplitGeneratorSpec());
+}
+
 const Table& Schema::GetTable(const TableName& table_name) const {
   auto it = tables_.find(table_name);
   DCHECK(it != tables_.end());
@@ -203,12 +266,16 @@ void Plan::SetReplicaPreference(TReplicaPreference::type p) {
   query_options_.replica_preference = p;
 }
 
+void Plan::SetNumRemoteExecutorCandidates(int32_t num) {
+  query_options_.num_remote_executor_candidates = num;
+}
+
 const vector<TNetworkAddress>& Plan::referenced_datanodes() const {
   return referenced_datanodes_;
 }
 
-const vector<TScanRangeLocationList>& Plan::scan_range_locations() const {
-  return scan_range_locations_;
+const TScanRangeSpec& Plan::scan_range_specs() const {
+  return scan_range_specs_;
 }
 
 void Plan::AddTableScan(const TableName& table_name) {
@@ -217,18 +284,28 @@ void Plan::AddTableScan(const TableName& table_name) {
   for (int i = 0; i < blocks.size(); ++i) {
     const Block& block = blocks[i];
     TScanRangeLocationList scan_range_locations;
-    BuildTScanRangeLocationList(table_name, block, i, &scan_range_locations);
-    scan_range_locations_.push_back(scan_range_locations);
+    BuildTScanRangeLocationList(table_name, block, i, table.naming_policy,
+        &scan_range_locations);
+    scan_range_specs_.concrete_ranges.push_back(scan_range_locations);
+  }
+  const vector<FileSplitGeneratorSpec>& specs = table.specs;
+  for (int i = 0; i < specs.size(); ++i) {
+    const FileSplitGeneratorSpec& file_spec = specs[i];
+    TFileSplitGeneratorSpec spec;
+    BuildScanRangeSpec(table_name, file_spec, i, table.naming_policy, &spec);
+    scan_range_specs_.split_specs.push_back(spec);
   }
 }
 
 void Plan::BuildTScanRangeLocationList(const TableName& table_name, const Block& block,
-    int block_idx, TScanRangeLocationList* scan_range_locations) {
+    int block_idx, BlockNamingPolicy naming_policy,
+    TScanRangeLocationList* scan_range_locations) {
   const vector<int>& replica_idxs = block.replica_host_idxs;
   const vector<bool>& is_cached = block.replica_host_idx_is_cached;
   DCHECK_EQ(replica_idxs.size(), is_cached.size());
   int num_replicas = replica_idxs.size();
-  BuildScanRange(table_name, block, block_idx, &scan_range_locations->scan_range);
+  BuildScanRange(table_name, block, block_idx, naming_policy,
+      &scan_range_locations->scan_range);
   scan_range_locations->locations.resize(num_replicas);
   for (int i = 0; i < num_replicas; ++i) {
     TScanRangeLocation& location = scan_range_locations->locations[i];
@@ -237,21 +314,103 @@ void Plan::BuildTScanRangeLocationList(const TableName& table_name, const Block&
   }
 }
 
+void Plan::GetBlockPaths(const TableName& table_name, bool is_spec, int index,
+    BlockNamingPolicy naming_policy, string* relative_path, int64_t* partition_id,
+    string* partition_path) {
+  // For debugging, it is useful to differentiate between Blocks and
+  // FileSplitGeneratorSpecs.
+  string spec_or_block = is_spec ? "_spec_" : "_block_";
+
+  switch (naming_policy) {
+  case BlockNamingPolicy::UNPARTITIONED:
+    // For unpartitioned tables, use unique file names and set partition_id = 0
+    // Encoding the table name and index in the file helps debugging.
+    // For example, an unpartitioned table may contain two files with paths like:
+    // /warehouse/{table_name}/file1.csv
+    // /warehouse/{table_name}/file2.csv
+    *relative_path = table_name + spec_or_block + std::to_string(index);
+    *partition_id = 0;
+    *partition_path = "/warehouse/" + table_name;
+    break;
+  case BlockNamingPolicy::PARTITIONED_SINGLE_FILENAME:
+    // For partitioned tables with simple names, use a simple file name, but vary the
+    // partition id and partition_path by using the index as the partition_id and as
+    // part of the partition_path.
+    // For example, a partitioned table with two partitions might have paths like:
+    // /warehouse/{table_name}/year=2010/000001_0
+    // /warehouse/{table_name}/year=2009/000001_0
+    *relative_path = "000001_0";
+    *partition_id = index;
+    *partition_path = "/warehouse/" + table_name + "/part=" + std::to_string(index);
+    break;
+  case BlockNamingPolicy::PARTITIONED_UNIQUE_FILENAMES:
+    // For partitioned tables with unique names, the file name, partition_id, and
+    // partition_path all incorporate the index.
+    // For example, a partitioned table with two partitions might have paths like:
+    // /warehouse/{table_name}/year=2010/6541856e3fb0583d_654267678_data.0.parq
+    // /warehouse/{table_name}/year=2009/6541856e3fb0583d_627636719_data.0.parq
+    *relative_path = table_name + spec_or_block + std::to_string(index);
+    *partition_id = index;
+    *partition_path = "/warehouse/" + table_name + "/part=" + std::to_string(index);
+    break;
+  default:
+    DCHECK(false) << "Invalid naming_policy";
+  }
+}
+
 void Plan::BuildScanRange(const TableName& table_name, const Block& block, int block_idx,
-    TScanRange* scan_range) {
+    BlockNamingPolicy naming_policy, TScanRange* scan_range) {
   // Initialize locations.scan_range correctly.
   THdfsFileSplit file_split;
-  // 'length' is the only member considered by the scheduler.
+  // 'length' is the only member considered by the scheduler for scheduling non-remote
+  // blocks.
   file_split.length = block.length;
-  // Encoding the table name and block index in the file helps debugging.
-  file_split.file_name = table_name + "_block_" + std::to_string(block_idx);
+
+  // Consistent remote scheduling considers the partition_path_hash, relative_path,
+  // and offset when scheduling blocks.
+  string partition_path;
+  GetBlockPaths(table_name, false, block_idx, naming_policy, &file_split.relative_path,
+      &file_split.partition_id, &partition_path);
+  file_split.partition_path_hash =
+      static_cast<int32_t>(HashUtil::Hash(partition_path.data(),
+          partition_path.length(), 0));
   file_split.offset = 0;
-  file_split.partition_id = 0;
+
   // For now, we model each file by a single block.
   file_split.file_length = block.length;
   file_split.file_compression = THdfsCompression::NONE;
   file_split.mtime = 1;
   scan_range->__set_hdfs_file_split(file_split);
+}
+
+void Plan::BuildScanRangeSpec(const TableName& table_name,
+    const FileSplitGeneratorSpec& spec, int spec_idx, BlockNamingPolicy naming_policy,
+    TFileSplitGeneratorSpec* thrift_spec) {
+  THdfsFileDesc thrift_file;
+
+  string relative_path;
+  int64_t partition_id;
+  string partition_path;
+  GetBlockPaths(table_name, true, spec_idx, naming_policy, &relative_path,
+      &partition_id, &partition_path);
+
+  flatbuffers::FlatBufferBuilder fb_builder;
+  auto rel_path =
+      fb_builder.CreateString(relative_path);
+  auto fb_file_desc = CreateFbFileDesc(fb_builder, rel_path, spec.length);
+  fb_builder.Finish(fb_file_desc);
+
+  string buffer(
+      reinterpret_cast<const char*>(fb_builder.GetBufferPointer()), fb_builder.GetSize());
+  thrift_file.__set_file_desc_data(buffer);
+
+  thrift_spec->__set_partition_id(partition_id);
+  thrift_spec->__set_file_desc(thrift_file);
+  thrift_spec->__set_max_block_size(spec.block_size);
+  thrift_spec->__set_is_splittable(spec.is_splittable);
+  int32_t partition_path_hash = static_cast<int32_t>(HashUtil::Hash(partition_path.data(),
+      partition_path.length(), 0));
+  thrift_spec->__set_partition_path_hash(partition_path_hash);
 }
 
 int Plan::FindOrInsertDatanodeIndex(int cluster_datanode_idx) {
@@ -401,11 +560,11 @@ void Result::ProcessAssignments(const AssignmentCallback& cb) const {
           const TScanRange& scan_range = scan_range_params.scan_range;
           DCHECK(scan_range.__isset.hdfs_file_split);
           const THdfsFileSplit& hdfs_file_split = scan_range.hdfs_file_split;
-          bool is_cached =
-              scan_range_params.__isset.is_cached ? scan_range_params.is_cached : false;
+          bool try_hdfs_cache = scan_range_params.__isset.try_hdfs_cache ?
+              scan_range_params.try_hdfs_cache : false;
           bool is_remote =
               scan_range_params.__isset.is_remote ? scan_range_params.is_remote : false;
-          cb({addr, hdfs_file_split, is_cached, is_remote});
+          cb({addr, hdfs_file_split, try_hdfs_cache, is_remote});
         }
       }
     }
@@ -459,15 +618,42 @@ Status SchedulerWrapper::Compute(bool exec_at_coord, Result* result) {
 
   // Compute Assignment.
   FragmentScanRangeAssignment* assignment = result->AddAssignment();
-  return scheduler_->ComputeScanRangeAssignment(*scheduler_->GetExecutorsConfig(), 0,
-      nullptr, false, plan_.scan_range_locations(), plan_.referenced_datanodes(),
-      exec_at_coord, plan_.query_options(), nullptr, assignment);
+  const vector<TScanRangeLocationList>* locations = nullptr;
+  vector<TScanRangeLocationList> expanded_locations;
+  if (plan_.scan_range_specs().split_specs.empty()) {
+    // directly use the concrete ranges.
+    locations = &plan_.scan_range_specs().concrete_ranges;
+  } else {
+    // union concrete ranges and expanded specs.
+    for (const TScanRangeLocationList& range : plan_.scan_range_specs().concrete_ranges) {
+      expanded_locations.push_back(range);
+    }
+    RETURN_IF_ERROR(scheduler_->GenerateScanRanges(
+        plan_.scan_range_specs().split_specs, &expanded_locations));
+    locations = &expanded_locations;
+  }
+  DCHECK(locations != nullptr);
+
+  ClusterMembershipMgr::SnapshotPtr membership_snapshot =
+      cluster_membership_mgr_->GetSnapshot();
+  auto it = membership_snapshot->executor_groups.find(
+      ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME);
+  // If a group does not exist (e.g. no executors are registered), we pass an empty group
+  // to the scheduler to exercise its error handling logic.
+  bool no_executor_group = it == membership_snapshot->executor_groups.end();
+  ExecutorGroup empty_group("empty-group");
+  DCHECK(membership_snapshot->local_be_desc.get() != nullptr);
+  Scheduler::ExecutorConfig executor_config =
+      {no_executor_group ? empty_group : it->second, *membership_snapshot->local_be_desc};
+  return scheduler_->ComputeScanRangeAssignment(executor_config, 0,
+      nullptr, false, *locations, plan_.referenced_datanodes(), exec_at_coord,
+      plan_.query_options(), nullptr, assignment);
 }
 
 void SchedulerWrapper::AddBackend(const Host& host) {
   // Add to topic delta
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = true;
   AddHostToTopicDelta(host, &delta);
   SendTopicDelta(delta);
@@ -476,7 +662,7 @@ void SchedulerWrapper::AddBackend(const Host& host) {
 void SchedulerWrapper::RemoveBackend(const Host& host) {
   // Add deletion to topic delta
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = true;
   TTopicItem item;
   item.__set_deleted(true);
@@ -487,7 +673,7 @@ void SchedulerWrapper::RemoveBackend(const Host& host) {
 
 void SchedulerWrapper::SendFullMembershipMap() {
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = false;
   for (const Host& host : plan_.cluster().hosts()) {
     if (host.be_port >= 0) AddHostToTopicDelta(host, &delta);
@@ -497,7 +683,7 @@ void SchedulerWrapper::SendFullMembershipMap() {
 
 void SchedulerWrapper::SendEmptyUpdate() {
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = true;
   SendTopicDelta(delta);
 }
@@ -508,35 +694,27 @@ void SchedulerWrapper::InitializeScheduler() {
                                            << "hosts.";
   const Host& scheduler_host = plan_.cluster().hosts()[0];
   string scheduler_backend_id = scheduler_host.ip;
-  TNetworkAddress scheduler_backend_address =
-      MakeNetworkAddress(scheduler_host.ip, scheduler_host.be_port);
-  TNetworkAddress scheduler_krpc_address =
-      MakeNetworkAddress(scheduler_host.ip, FLAGS_krpc_port);
-  scheduler_.reset(new Scheduler(nullptr, scheduler_backend_id,
-      &metrics_, nullptr, nullptr));
-  const Status status = scheduler_->Init(scheduler_backend_address,
-      scheduler_krpc_address, scheduler_host.ip);
-  DCHECK(status.ok()) << "Scheduler init failed in test";
-  // Initialize the scheduler backend maps.
+  cluster_membership_mgr_.reset(
+      new ClusterMembershipMgr(scheduler_backend_id, nullptr, &metrics_));
+  cluster_membership_mgr_->SetLocalBeDescFn(
+      [scheduler_host]() { return BuildBackendDescriptor(scheduler_host); });
+  Status status = cluster_membership_mgr_->Init();
+  DCHECK(status.ok()) << "Cluster membership manager init failed in test";
+  scheduler_.reset(new Scheduler(&metrics_, nullptr));
+  // Initialize the cluster membership manager
   SendFullMembershipMap();
 }
 
 void SchedulerWrapper::AddHostToTopicDelta(const Host& host, TTopicDelta* delta) const {
   DCHECK_GT(host.be_port, 0) << "Host cannot be added to scheduler without a running "
                              << "backend";
-  // Build backend descriptor.
-  TBackendDescriptor be_desc;
-  be_desc.address.hostname = host.ip;
-  be_desc.address.port = host.be_port;
-  be_desc.ip_address = host.ip;
-  be_desc.__set_is_coordinator(host.is_coordinator);
-  be_desc.__set_is_executor(host.is_executor);
+  ClusterMembershipMgr::BeDescSharedPtr be_desc = BuildBackendDescriptor(host);
 
   // Build topic item.
   TTopicItem item;
   item.key = host.ip;
   ThriftSerializer serializer(false);
-  Status status = serializer.Serialize(&be_desc, &item.value);
+  Status status = serializer.SerializeToString(be_desc.get(), &item.value);
   DCHECK(status.ok());
 
   // Add to topic delta.
@@ -547,9 +725,9 @@ void SchedulerWrapper::SendTopicDelta(const TTopicDelta& delta) {
   DCHECK(scheduler_ != nullptr);
   // Wrap in topic delta map.
   StatestoreSubscriber::TopicDeltaMap delta_map;
-  delta_map.emplace(Scheduler::IMPALA_MEMBERSHIP_TOPIC, delta);
+  delta_map.emplace(Statestore::IMPALA_MEMBERSHIP_TOPIC, delta);
 
   // Send to the scheduler.
   vector<TTopicDelta> dummy_result;
-  scheduler_->UpdateMembership(delta_map, &dummy_result);
+  cluster_membership_mgr_->UpdateMembership(delta_map, &dummy_result);
 }

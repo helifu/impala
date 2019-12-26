@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <ostream>
+#include <utility>
+
 #include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
@@ -27,8 +30,9 @@ namespace rpc {
 using strings::Substitute;
 
 RemoteMethod::RemoteMethod(std::string service_name,
-                           const std::string method_name)
-    : service_name_(std::move(service_name)), method_name_(method_name) {}
+                           std::string method_name)
+    : service_name_(std::move(service_name)),
+      method_name_(std::move(method_name)) {}
 
 void RemoteMethod::FromPB(const RemoteMethodPB& pb) {
   DCHECK(pb.IsInitialized()) << "PB is uninitialized: " << pb.InitializationErrorString();
@@ -41,7 +45,7 @@ void RemoteMethod::ToPB(RemoteMethodPB* pb) const {
   pb->set_method_name(method_name_);
 }
 
-string RemoteMethod::ToString() const {
+std::string RemoteMethod::ToString() const {
   return Substitute("$0.$1", service_name_, method_name_);
 }
 

@@ -25,18 +25,18 @@
 #include "common/status.h"
 #include "rpc/authentication.h"
 #include "rpc/rpc-trace.h"
-#include "rpc/thrift-util.h"
 #include "rpc/thrift-server.h"
-#include "runtime/mem-tracker.h"
 #include "service/fe-support.h"
-#include "util/debug-util.h"
-#include "util/jni-util.h"
-#include "util/metrics.h"
 #include "util/common-metrics.h"
-#include "util/network-util.h"
-#include "util/memory-metrics.h"
-#include "util/webserver.h"
+#include "util/debug-util.h"
 #include "util/default-path-handlers.h"
+#include "util/event-metrics.h"
+#include "util/jni-util.h"
+#include "util/memory-metrics.h"
+#include "util/metrics.h"
+#include "util/network-util.h"
+#include "util/openssl-util.h"
+#include "util/webserver.h"
 
 DECLARE_string(classpath);
 DECLARE_string(principal);
@@ -62,12 +62,11 @@ int CatalogdMain(int argc, char** argv) {
   InitCommonRuntime(argc, argv, true);
   InitFeSupport();
 
-  MemTracker process_mem_tracker;
-  scoped_ptr<Webserver> webserver(new Webserver());
   scoped_ptr<MetricGroup> metrics(new MetricGroup("catalog"));
+  scoped_ptr<Webserver> webserver(new Webserver(metrics.get()));
 
   if (FLAGS_enable_webserver) {
-    AddDefaultUrlCallbacks(webserver.get(), &process_mem_tracker, metrics.get());
+    AddDefaultUrlCallbacks(webserver.get(), metrics.get());
     ABORT_IF_ERROR(webserver->Start());
   } else {
     LOG(INFO) << "Not starting webserver";
@@ -82,6 +81,7 @@ int CatalogdMain(int argc, char** argv) {
   metrics->AddProperty<string>("catalog.version", GetVersionString(true));
 
   CommonMetrics::InitCommonMetrics(metrics.get());
+  MetastoreEventMetrics::InitMetastoreEventMetrics(metrics.get());
 
   CatalogServer catalog_server(metrics.get());
   ABORT_IF_ERROR(catalog_server.Start());
@@ -95,7 +95,7 @@ int CatalogdMain(int argc, char** argv) {
   ThriftServer* server;
   ThriftServerBuilder builder("CatalogService", processor, FLAGS_catalog_service_port);
 
-  if (EnableInternalSslConnections()) {
+  if (IsInternalTlsConfigured()) {
     SSLProtocol ssl_version;
     ABORT_IF_ERROR(
         SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));

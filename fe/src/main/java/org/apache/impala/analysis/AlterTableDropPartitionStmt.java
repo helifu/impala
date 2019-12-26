@@ -18,8 +18,8 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableDropPartitionParams;
 import org.apache.impala.thrift.TAlterTableParams;
@@ -50,11 +50,11 @@ public class AlterTableDropPartitionStmt extends AlterTableStmt {
   public boolean getIfNotExists() { return ifExists_; }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("ALTER TABLE " + getTbl());
     sb.append(" DROP ");
     if (ifExists_) sb.append("IF EXISTS ");
-    sb.append(partitionSet_.toSql());
+    sb.append(partitionSet_.toSql(options));
     if (purgePartition_) sb.append(" PURGE");
     return sb.toString();
   }
@@ -74,8 +74,8 @@ public class AlterTableDropPartitionStmt extends AlterTableStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    Table table = getTargetTable();
-    if (table instanceof KuduTable) {
+    FeTable table = getTargetTable();
+    if (table instanceof FeKuduTable) {
       throw new AnalysisException("ALTER TABLE DROP PARTITION is not supported for " +
           "Kudu tables: " + partitionSet_.toSql());
     }

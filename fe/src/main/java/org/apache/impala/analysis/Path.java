@@ -22,11 +22,12 @@ import java.util.List;
 
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -128,15 +129,15 @@ public class Path {
   // Catalog table that this resolved path is rooted at, if any.
   // Null if the path is rooted at a registered tuple that does not
   // belong to a catalog table/view.
-  private final Table rootTable_;
+  private final FeTable rootTable_;
 
   // Root path that a relative path was created from.
   private final Path rootPath_;
 
   // List of matched types and field positions set during resolution. The matched
   // types/positions describe the physical path through the schema tree.
-  private final List<Type> matchedTypes_ = Lists.newArrayList();
-  private final List<Integer> matchedPositions_ = Lists.newArrayList();
+  private final List<Type> matchedTypes_ = new ArrayList<>();
+  private final List<Integer> matchedPositions_ = new ArrayList<>();
 
   // Remembers the indices into rawPath_ and matchedTypes_ of the first collection
   // matched during resolution.
@@ -164,7 +165,7 @@ public class Path {
   /**
    * Constructs a Path rooted at the given rootTable.
    */
-  public Path(Table rootTable, List<String> rawPath) {
+  public Path(FeTable rootTable, List<String> rawPath) {
     Preconditions.checkNotNull(rootTable);
     Preconditions.checkNotNull(rawPath);
     rootTable_ = rootTable;
@@ -270,7 +271,29 @@ public class Path {
     }
   }
 
-  public Table getRootTable() { return rootTable_; }
+  /**
+   * Returns a list of table names that might be referenced by the given path.
+   * The path must be non-empty.
+   *
+   * Examples: path -> result
+   * a -> [<sessionDb>.a]
+   * a.b -> [<sessionDb>.a, a.b]
+   * a.b.c -> [<sessionDb>.a, a.b]
+   * a.b.c... -> [<sessionDb>.a, a.b]
+   */
+  public static List<TableName> getCandidateTables(List<String> path, String sessionDb) {
+    Preconditions.checkArgument(path != null && !path.isEmpty());
+    List<TableName> result = new ArrayList<>();
+    int end = Math.min(2, path.size());
+    for (int tblNameIdx = 0; tblNameIdx < end; ++tblNameIdx) {
+      String dbName = (tblNameIdx == 0) ? sessionDb : path.get(0);
+      String tblName = path.get(tblNameIdx);
+      result.add(new TableName(dbName, tblName));
+    }
+    return result;
+  }
+
+  public FeTable getRootTable() { return rootTable_; }
   public TupleDescriptor getRootDesc() { return rootDesc_; }
   public boolean isRootedAtTable() { return rootTable_ != null; }
   public boolean isRootedAtTuple() { return rootDesc_ != null; }
@@ -313,7 +336,7 @@ public class Path {
     return null;
   }
 
-  public Table destTable() {
+  public FeTable destTable() {
     Preconditions.checkState(isResolved_);
     if (rootTable_ != null && rootDesc_ == null && matchedTypes_.isEmpty()) {
       return rootTable_;
@@ -369,7 +392,7 @@ public class Path {
    * mydb.test.a.item.f1
    */
   public List<String> getCanonicalPath() {
-    List<String> result = Lists.newArrayList();
+    List<String> result = new ArrayList<>();
     getCanonicalPath(result);
     return result;
   }
@@ -383,7 +406,7 @@ public class Path {
       rootDesc_.getPath().getCanonicalPath(result);
       currentType = rootDesc_.getType();
     } else {
-      Preconditions.checkNotNull(isRootedAtTable());
+      Preconditions.checkState(isRootedAtTable());
       result.add(rootTable_.getTableName().getDb());
       result.add(rootTable_.getTableName().getTbl());
       currentType = rootTable_.getType().getItemType();
@@ -407,7 +430,7 @@ public class Path {
   public List<Integer> getAbsolutePath() {
     if (absolutePath_ != null) return absolutePath_;
     Preconditions.checkState(isResolved_);
-    absolutePath_ = Lists.newArrayList();
+    absolutePath_ = new ArrayList<>();
     if (rootDesc_ != null) absolutePath_.addAll(rootDesc_.getPath().getAbsolutePath());
     absolutePath_.addAll(matchedPositions_);
     return absolutePath_;
@@ -429,8 +452,8 @@ public class Path {
   /**
    * Returns a raw path from a known root alias and field name.
    */
-  public static ArrayList<String> createRawPath(String rootAlias, String fieldName) {
-    ArrayList<String> result = Lists.newArrayList(rootAlias.split("\\."));
+  public static List<String> createRawPath(String rootAlias, String fieldName) {
+    List<String> result = Lists.newArrayList(rootAlias.split("\\."));
     result.add(fieldName);
     return result;
   }

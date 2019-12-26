@@ -19,7 +19,11 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 
+#include "exprs/timestamp-functions.h"
+#include "exprs/timezone_db.h"
 #include "runtime/timestamp-parse-util.h"
+#include "runtime/timestamp-value.h"
+#include "runtime/timestamp-value.inline.h"
 
 #include "common/names.h"
 
@@ -38,73 +42,141 @@ DEFINE_bool(use_local_tz_for_unix_timestamp_conversions, false,
     "and from Unix times. When false, TIMESTAMPs are interpreted in the UTC time zone. "
     "Set to true for Hive compatibility.");
 
-// Constants for use with Unix times. Leap-seconds do not apply.
-const int32_t SECONDS_IN_MINUTE = 60;
-const int32_t SECONDS_IN_HOUR = 60 * SECONDS_IN_MINUTE;
-const int32_t SECONDS_IN_DAY = 24 * SECONDS_IN_HOUR;
-
-// struct tm stores month/year data as an offset
-const unsigned short TM_YEAR_OFFSET = 1900;
-const unsigned short TM_MONTH_OFFSET = 1;
-
 // Boost stores dates as an uint32_t. Since subtraction is needed, convert to signed.
 const int64_t EPOCH_DAY_NUMBER =
     static_cast<int64_t>(date(1970, boost::gregorian::Jan, 1).day_number());
 
 namespace impala {
 
+using datetime_parse_util::DateTimeFormatContext;
+
 const char* TimestampValue::LLVM_CLASS_NAME = "class.impala::TimestampValue";
 const double TimestampValue::ONE_BILLIONTH = 0.000000001;
 
-TimestampValue TimestampValue::Parse(const char* str, int len) {
+TimestampValue TimestampValue::ParseSimpleDateFormat(const char* str, int len) {
   TimestampValue tv;
-  TimestampParser::Parse(str, len, &tv.date_, &tv.time_);
+  discard_result(TimestampParser::ParseSimpleDateFormat(str, len, &tv.date_, &tv.time_));
   return tv;
 }
 
-TimestampValue TimestampValue::Parse(const string& str) {
-  return Parse(str.c_str(), str.size());
+TimestampValue TimestampValue::ParseSimpleDateFormat(const string& str) {
+  return ParseSimpleDateFormat(str.c_str(), str.size());
 }
 
-TimestampValue TimestampValue::Parse(const char* str, int len,
+TimestampValue TimestampValue::ParseSimpleDateFormat(const char* str, int len,
     const DateTimeFormatContext& dt_ctx) {
   TimestampValue tv;
-  TimestampParser::Parse(str, len, dt_ctx, &tv.date_, &tv.time_);
+  discard_result(TimestampParser::ParseSimpleDateFormat(str, len, dt_ctx, &tv.date_,
+      &tv.time_));
   return tv;
 }
 
-int TimestampValue::Format(const DateTimeFormatContext& dt_ctx, int len, char* buff)
-    const {
-  return TimestampParser::Format(dt_ctx, date_, time_, len, buff);
+TimestampValue TimestampValue::ParseIsoSqlFormat(const char* str, int len,
+    const datetime_parse_util::DateTimeFormatContext& dt_ctx) {
+  TimestampValue tv;
+  discard_result(TimestampParser::ParseIsoSqlFormat(str, len, dt_ctx, &tv.date_,
+      &tv.time_));
+  return tv;
 }
 
-void TimestampValue::UtcToLocal() {
+string TimestampValue::Format(const DateTimeFormatContext& dt_ctx) const {
+  return TimestampParser::Format(dt_ctx, date_, time_);
+}
+
+namespace {
+inline cctz::time_point<cctz::sys_seconds> UnixTimeToTimePoint(time_t t) {
+  static const cctz::time_point<cctz::sys_seconds> epoch =
+      std::chrono::time_point_cast<cctz::sys_seconds>(
+          std::chrono::system_clock::from_time_t(0));
+  return epoch + cctz::sys_seconds(t);
+}
+
+inline time_t TimePointToUnixTime(const cctz::time_point<cctz::sys_seconds>& tp) {
+  static const cctz::time_point<cctz::sys_seconds> epoch =
+      std::chrono::time_point_cast<cctz::sys_seconds>(
+          std::chrono::system_clock::from_time_t(0));
+  return (tp - epoch).count();
+}
+
+// Returns 'true' iff 'cs' is out of valid range (years 1400..9999 are considered valid).
+inline bool IsDateOutOfRange(const cctz::civil_second& cs) {
+  // Smallest valid year.
+  const static int MIN_YEAR =
+      boost::gregorian::date(boost::date_time::min_date_time).year();
+  // Largest valid year.
+  const static int MAX_YEAR =
+      boost::gregorian::date(boost::date_time::max_date_time).year();
+  return cs.year() < MIN_YEAR || cs.year() > MAX_YEAR;
+}
+
+TimestampValue CivilSecondsToTimestampValue(const cctz::civil_second& cs, int64_t nanos) {
+  // boost::gregorian::date() throws boost::gregorian::bad_year if year is not in the
+  // 1400..9999 range. Need to check validity before creating the date object.
+  if (UNLIKELY(IsDateOutOfRange(cs))) {
+    return TimestampValue();
+  } else {
+    return TimestampValue(
+        date(cs.year(), cs.month(), cs.day()),
+        time_duration(cs.hour(), cs.minute(), cs.second(), nanos));
+  }
+}
+
+}
+
+void TimestampValue::UtcToLocal(const Timezone& local_tz,
+    TimestampValue* start_of_repeated_period, TimestampValue* end_of_repeated_period) {
   DCHECK(HasDateAndTime());
-  // Previously, conversion was done using boost functions but it was found to be
-  // too slow. Doing the conversion without function calls (which also avoids some
-  // unnecessary validations) the conversion only take half as long. Original:
-  // http://www.boost.org/doc/libs/1_55_0/boost/date_time/c_local_time_adjustor.hpp
-  try {
-    time_t utc =
-        (static_cast<int64_t>(date_.day_number()) - EPOCH_DAY_NUMBER) * SECONDS_IN_DAY +
-        time_.hours() * SECONDS_IN_HOUR +
-        time_.minutes() * SECONDS_IN_MINUTE +
-        time_.seconds();
-    tm temp;
-    if (UNLIKELY(localtime_r(&utc, &temp) == nullptr)) {
-      *this = ptime(not_a_date_time);
-      return;
+  time_t unix_time;
+  if (UNLIKELY(!UtcToUnixTime(&unix_time))) {
+    SetToInvalidDateTime();
+    return;
+  }
+
+  cctz::time_point<cctz::sys_seconds> from_tp = UnixTimeToTimePoint(unix_time);
+  cctz::civil_second to_cs = cctz::convert(from_tp, local_tz);
+
+  *this = CivilSecondsToTimestampValue(to_cs, time_.fractional_seconds());
+
+  if (start_of_repeated_period == nullptr && end_of_repeated_period == nullptr) return;
+  // Do the reverse conversion if repeated period boundaries are needed.
+  const cctz::time_zone::civil_lookup from_cl = local_tz.lookup(to_cs);
+  if (UNLIKELY(from_cl.kind == cctz::time_zone::civil_lookup::REPEATED)) {
+    if (start_of_repeated_period != nullptr) {
+      // Start of the period is simply the transition time converted to local time.
+      to_cs = cctz::convert(from_cl.trans, local_tz);
+      *start_of_repeated_period = CivilSecondsToTimestampValue(to_cs, 0);
     }
-    // Unlikely but a time zone conversion may push the value over the min/max
-    // boundary resulting in an exception.
-    date_ = boost::gregorian::date(
-        static_cast<unsigned short>(temp.tm_year + TM_YEAR_OFFSET),
-        static_cast<unsigned short>(temp.tm_mon + TM_MONTH_OFFSET),
-        static_cast<unsigned short>(temp.tm_mday));
-    time_ = time_duration(temp.tm_hour, temp.tm_min, temp.tm_sec,
-        time().fractional_seconds());
-  } catch (std::exception& /* from Boost */) {
-    *this = ptime(not_a_date_time);
+    if (end_of_repeated_period != nullptr) {
+      // End of the period is last nanosecond before transition time converted to
+      // local time.
+      to_cs = cctz::convert(from_cl.trans - std::chrono::seconds(1), local_tz);
+      *end_of_repeated_period =
+          CivilSecondsToTimestampValue(to_cs, NANOS_PER_SEC - 1);
+    }
+  }
+}
+
+void TimestampValue::LocalToUtc(const Timezone& local_tz) {
+  DCHECK(HasDateAndTime());
+  const cctz::civil_second from_cs(date_.year(), date_.month(), date_.day(),
+      time_.hours(), time_.minutes(), time_.seconds());
+
+  // 'from_cl' represents the 'time_point' that corresponds to 'from_cs' civil time within
+  // 'local_tz' time-zone.
+  const cctz::time_zone::civil_lookup from_cl = local_tz.lookup(from_cs);
+
+  // In case the resulting 'time_point' is ambiguous, we have to invalidate
+  // TimestampValue.
+  // 'civil_lookup' members and the details of handling ambiguity are described at:
+  // https://github.com/google/cctz/blob/a2dd3d0fbc811fe0a1d4d2dbb0341f1a3d28cb2a/
+  // include/cctz/time_zone.h#L106
+  if (UNLIKELY(from_cl.kind != cctz::time_zone::civil_lookup::UNIQUE)) {
+    SetToInvalidDateTime();
+  } else {
+    int64_t nanos = time_.fractional_seconds();
+    *this = UtcFromUnixTimeTicks<1>(TimePointToUnixTime(from_cl.pre));
+    // Time-zone conversion rules don't affect fractional seconds, leave them intact.
+    time_ += nanoseconds(nanos);
   }
 }
 
@@ -112,70 +184,26 @@ ostream& operator<<(ostream& os, const TimestampValue& timestamp_value) {
   return os << timestamp_value.ToString();
 }
 
-void TimestampValue::Validate() {
-    if (HasDate() && UNLIKELY(!IsValidDate(date_))) {
-      time_ = boost::posix_time::time_duration(boost::posix_time::not_a_date_time);
-      date_ = boost::gregorian::date(boost::gregorian::not_a_date_time);
-    }
-}
-
-/// Return a ptime representation of the given Unix time (seconds since the Unix epoch).
-/// The time zone of the resulting ptime is local time. This is called by
-/// UnixTimeToPtime.
-ptime TimestampValue::UnixTimeToLocalPtime(time_t unix_time) {
-  tm temp_tm;
-  // TODO: avoid localtime*, which takes a global timezone db lock
-  if (UNLIKELY(localtime_r(&unix_time, &temp_tm) == nullptr)) {
+TimestampValue TimestampValue::UnixTimeToLocal(
+    time_t unix_time, const Timezone& local_tz) {
+  cctz::time_point<cctz::sys_seconds> from_tp = UnixTimeToTimePoint(unix_time);
+  cctz::civil_second to_cs = cctz::convert(from_tp, local_tz);
+  // boost::gregorian::date() throws boost::gregorian::bad_year if year is not in the
+  // 1400..9999 range. Need to check validity before creating the date object.
+  if (UNLIKELY(IsDateOutOfRange(to_cs))) {
     return ptime(not_a_date_time);
-  }
-  try {
-    return ptime_from_tm(temp_tm);
-  } catch (std::exception&) {
-    return ptime(not_a_date_time);
-  }
-}
-
-/// Return a ptime representation of the given Unix time (seconds since the Unix epoch).
-/// The time zone of the resulting ptime is UTC.
-/// In order to avoid a serious performance degredation using libc (IMPALA-5357), this
-/// function uses boost to convert the time_t to a ptime. Unfortunately, because the boost
-/// conversion relies on time_duration to represent the time_t and internally
-/// time_duration stores nanosecond precision ticks, the 'fast path' conversion using
-/// boost can only handle a limited range of dates (appx years 1677-2622, while Impala
-/// supports years 1600-9999). For dates outside this range, the conversion will instead
-/// use the libc function gmtime_r which supports those dates but takes the global lock
-/// for the timezone db (even though technically it is not needed for the conversion,
-/// again see IMPALA-5357). This is called by UnixTimeToPtime.
-ptime TimestampValue::UnixTimeToUtcPtime(time_t unix_time) {
-  // Minimum Unix time that can be converted with from_time_t: 1677-Sep-21 00:12:44
-  const int64_t MIN_BOOST_CONVERT_UNIX_TIME = -9223372036;
-  // Maximum Unix time that can be converted with from_time_t: 2262-Apr-11 23:47:16
-  const int64_t MAX_BOOST_CONVERT_UNIX_TIME = 9223372036;
-  if (LIKELY(unix_time >= MIN_BOOST_CONVERT_UNIX_TIME &&
-             unix_time <= MAX_BOOST_CONVERT_UNIX_TIME)) {
-    try {
-      return from_time_t(unix_time);
-    } catch (std::exception&) {
-      return ptime(not_a_date_time);
-    }
-  }
-
-  tm temp_tm;
-  if (UNLIKELY(gmtime_r(&unix_time, &temp_tm) == nullptr)) {
-    return ptime(not_a_date_time);
-  }
-  try {
-    return ptime_from_tm(temp_tm);
-  } catch (std::exception&) {
-    return ptime(not_a_date_time);
-  }
-}
-
-ptime TimestampValue::UnixTimeToPtime(time_t unix_time) {
-  if (FLAGS_use_local_tz_for_unix_timestamp_conversions) {
-    return UnixTimeToLocalPtime(unix_time);
   } else {
-    return UnixTimeToUtcPtime(unix_time);
+    return TimestampValue(
+        boost::gregorian::date(to_cs.year(), to_cs.month(), to_cs.day()),
+        boost::posix_time::time_duration(to_cs.hour(), to_cs.minute(), to_cs.second()));
+  }
+}
+
+TimestampValue TimestampValue::FromUnixTime(time_t unix_time, const Timezone& local_tz) {
+  if (FLAGS_use_local_tz_for_unix_timestamp_conversions) {
+    return UnixTimeToLocal(unix_time, local_tz);
+  } else {
+    return UtcFromUnixTimeTicks<1>(unix_time);
   }
 }
 

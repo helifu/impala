@@ -21,52 +21,62 @@
 #include <map>
 #include <string>
 
+#include <boost/algorithm/string.hpp>
 #include <boost/date_time/c_local_time_adjustor.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/regex.hpp>
+#include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 
-#include "testutil/gtest-util.h"
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/object-pool.h"
+#include "exprs/anyval-util.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
 #include "exprs/literal.h"
 #include "exprs/null-literal.h"
-#include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
 #include "exprs/string-functions.h"
 #include "exprs/timestamp-functions.h"
 #include "exprs/timezone_db.h"
 #include "gen-cpp/Exprs_types.h"
+#include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/hive_metastore_types.h"
 #include "rpc/thrift-client.h"
 #include "rpc/thrift-server.h"
-#include "runtime/runtime-state.h"
+#include "runtime/date-value.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
+#include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
 #include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "service/fe-support.h"
 #include "service/impala-server.h"
+#include "statestore/statestore.h"
+#include "testutil/gtest-util.h"
 #include "testutil/impalad-query-executor.h"
 #include "testutil/in-process-servers.h"
 #include "udf/udf-test-harness.h"
+#include "util/asan.h"
 #include "util/debug-util.h"
+#include "util/metrics.h"
 #include "util/string-parser.h"
+#include "util/string-util.h"
 #include "util/test-info.h"
-#include "gen-cpp/ImpalaInternalService_types.h"
+#include "utility-functions.h"
 
 #include "common/names.h"
 
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disable_optimization_passes);
 DECLARE_bool(use_utc_for_unix_timestamp_conversions);
+DECLARE_string(hdfs_zone_info_zip);
 
 namespace posix_time = boost::posix_time;
 using boost::bad_lexical_cast;
@@ -79,9 +89,13 @@ using namespace Apache::Hadoop::Hive;
 using namespace impala;
 
 namespace impala {
+// America/Anguilla timezone does not observe DST.
+// Use this timezone in tests where DST changes may cause problems.
+const char* TEST_TZ_WITHOUT_DST = "America/Anguilla";
+
 ImpaladQueryExecutor* executor_;
-bool disable_codegen_;
-bool enable_expr_rewrites_;
+scoped_ptr<MetricGroup> statestore_metrics(new MetricGroup("statestore_metrics"));
+Statestore* statestore;
 
 template <typename ORIGINAL_TYPE, typename VAL_TYPE>
 string LiteralToString(VAL_TYPE val) {
@@ -135,39 +149,94 @@ string StringToOctalLiteral(const string& s) {
 // and no special permissions are needed. This is not thread-safe.
 class ScopedTimeZoneOverride {
  public:
-  ScopedTimeZoneOverride(string time_zone) {
-    original_time_zone_ = getenv("TZ");
-    setenv("TZ", time_zone.c_str(), /*overwrite*/ true);
+  ScopedTimeZoneOverride(const char* tz_name)
+      : original_tz_name_(getenv("TZ")),
+        new_tz_name_(tz_name),
+        new_tz_(TimezoneDatabase::FindTimezone(new_tz_name_)) {
+    EXPECT_NE(nullptr, new_tz_) << "Could not find " << new_tz_name_ << " time zone.";
+    setenv("TZ", new_tz_name_, true);
     tzset();
   }
 
   ~ScopedTimeZoneOverride() {
-    if (original_time_zone_ == NULL) {
+    if (original_tz_name_ == nullptr) {
       unsetenv("TZ");
     } else {
-      setenv("TZ", original_time_zone_, /*overwrite*/ true);
+      setenv("TZ", original_tz_name_, true);
     }
     tzset();
   }
 
+  const Timezone& GetTimezone() const { return *new_tz_; }
+
  private:
-  char* original_time_zone_;
+  const char* const original_tz_name_;
+  const char* const new_tz_name_;
+  const Timezone* new_tz_;
 };
 
 // Enable FLAGS_use_local_tz_for_unix_timestamp_conversions for the duration of the scope.
 class ScopedLocalUnixTimestampConversionOverride {
+ bool original_;
  public:
   ScopedLocalUnixTimestampConversionOverride() {
+    original_ = FLAGS_use_local_tz_for_unix_timestamp_conversions;
     FLAGS_use_local_tz_for_unix_timestamp_conversions = true;
   }
 
   ~ScopedLocalUnixTimestampConversionOverride() {
-    FLAGS_use_local_tz_for_unix_timestamp_conversions = false;
+    FLAGS_use_local_tz_for_unix_timestamp_conversions = original_;
   }
 };
 
-class ExprTest : public testing::Test {
+class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
+ public:
+  // Run once (independent of parameter values).
+  static void SetUpTestCase() {
+    InitFeSupport(false);
+    ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
+
+    // The host running this test might have an out-of-date tzdata package installed.
+    // To avoid tzdata related issues, we will load time-zone db from the testdata
+    // directory.
+    FLAGS_hdfs_zone_info_zip = Substitute("file://$0/testdata/tzdb/2017c.zip",
+        getenv("IMPALA_HOME"));
+    ABORT_IF_ERROR(TimezoneDatabase::Initialize());
+
+    // Disable llvm optimization passes if the env var is no set to true. Running without
+    // the optimizations makes the tests run much faster.
+    char* optimizations = getenv("EXPR_TEST_ENABLE_OPTIMIZATIONS");
+    if (optimizations != NULL && strcmp(optimizations, "true") == 0) {
+      cout << "Running with optimization passes." << endl;
+      FLAGS_disable_optimization_passes = false;
+    } else {
+      cout << "Running without optimization passes." << endl;
+      FLAGS_disable_optimization_passes = true;
+    }
+
+    // Create an in-process Impala server and in-process backends for test environment
+    // without any startup validation check
+    FLAGS_abort_on_config_error = false;
+    VLOG_CONNECTION << "creating test env";
+    VLOG_CONNECTION << "starting backends";
+    statestore = new Statestore(statestore_metrics.get());
+    IGNORE_LEAKING_OBJECT(statestore);
+
+    // Pass in 0 to have the statestore use an ephemeral port for the service.
+    ABORT_IF_ERROR(statestore->Init(0));
+    InProcessImpalaServer* impala_server;
+    ABORT_IF_ERROR(InProcessImpalaServer::StartWithEphemeralPorts(
+        FLAGS_hostname, statestore->port(), &impala_server));
+    IGNORE_LEAKING_OBJECT(impala_server);
+
+    executor_ = new ImpaladQueryExecutor(FLAGS_hostname, impala_server->GetBeeswaxPort());
+    ABORT_IF_ERROR(executor_->Setup());
+  }
+
  protected:
+  // Pool for objects to be destroyed during test teardown.
+  ObjectPool pool_;
+
   // Maps from enum value of primitive integer type to the minimum value that is
   // outside of the next smaller-resolution type. For example the value for type
   // TYPE_SMALLINT is numeric_limits<int8_t>::max()+1. There is a GREATEST test in
@@ -189,12 +258,39 @@ class ExprTest : public testing::Test {
   string default_string_str_;
   string default_timestamp_str_;
   string default_decimal_str_;
+  string default_date_str_;
   // Corresponding default values.
   bool default_bool_val_;
   string default_string_val_;
   TimestampValue default_timestamp_val_;
+  DateValue default_date_val_;
+
+  bool disable_codegen_;
+  bool enable_expr_rewrites_;
 
   virtual void SetUp() {
+    disable_codegen_ = std::get<0>(GetParam());
+    enable_expr_rewrites_ = std::get<1>(GetParam());
+    LOG(INFO) << Substitute(
+      "Test case: disable_codegen=$0  enable_expr_rewrites=$1",
+      disable_codegen_, enable_expr_rewrites_);
+    executor_->ClearExecOptions();
+    executor_->PushExecOption(Substitute("DISABLE_CODEGEN=$0",
+        disable_codegen_ ? 1 : 0));
+    executor_->PushExecOption(Substitute("ENABLE_EXPR_REWRITES=$0",
+        enable_expr_rewrites_ ? 1 : 0));
+
+    // The following have no effect when codegen is disabled, but don't
+    // harm anything either. They generally prevent the planner from doing
+    // anything clever here.
+    executor_->PushExecOption("EXEC_SINGLE_NODE_ROWS_THRESHOLD=0");
+    executor_->PushExecOption("DISABLE_CODEGEN_ROWS_THRESHOLD=0");
+
+    // Some tests select rows that take a long time to materialize (e.g.
+    // "select length(unhex(repeat('a', 1024 * 1024 * 1024)))") so set the client fetch
+    // timeout to a high value.
+    executor_->PushExecOption("FETCH_ROWS_TIMEOUT_MS=100000");
+
     min_int_values_[TYPE_TINYINT] = 1;
     min_int_values_[TYPE_SMALLINT] =
         static_cast<int64_t>(numeric_limits<int8_t>::max()) + 1;
@@ -211,9 +307,12 @@ class ExprTest : public testing::Test {
     default_string_str_ = "'abc'";
     default_timestamp_str_ = "cast('2011-01-01 09:01:01' as timestamp)";
     default_decimal_str_ = "1.23";
+    default_date_str_ = "cast('2011-01-01' as date)";
     default_bool_val_ = false;
     default_string_val_ = "abc";
-    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461);
+    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461,
+        TimezoneDatabase::GetUtcTimezone());
+    default_date_val_ = DateValue(2011, 1, 1);
     default_type_strs_[TYPE_TINYINT] =
         lexical_cast<string>(min_int_values_[TYPE_TINYINT]);
     default_type_strs_[TYPE_SMALLINT] =
@@ -236,7 +335,10 @@ class ExprTest : public testing::Test {
     default_type_strs_[TYPE_STRING] = default_string_str_;
     default_type_strs_[TYPE_TIMESTAMP] = default_timestamp_str_;
     default_type_strs_[TYPE_DECIMAL] = default_decimal_str_;
+    default_type_strs_[TYPE_DATE] = default_date_str_;
   }
+
+  virtual void TearDown() { pool_.Clear(); }
 
   string GetValue(const string& expr, const ColumnType& expr_type,
       bool expect_error = false) {
@@ -265,6 +367,10 @@ class ExprTest : public testing::Test {
     EXPECT_EQ(expected_result, GetValue(expr, TYPE_STRING)) << expr;
   }
 
+  // Tests that DST of the given timezone ends at 3am
+  void TestAusDSTEndingForEastTimeZone(const string& time_zone);
+  void TestAusDSTEndingForCentralTimeZone(const string& time_zone);
+
   void TestCharValue(const string& expr, const string& expected_result,
                      const ColumnType& type) {
     EXPECT_EQ(expected_result, GetValue(expr, type)) << expr;
@@ -281,47 +387,47 @@ class ExprTest : public testing::Test {
   void TestLastDayFunction() {
     // Test common months (with and without time component).
     TestTimestampValue("last_day('2003-01-02 04:24:04.1579')",
-      TimestampValue::Parse("2003-01-31 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2003-01-31 00:00:00", 19));
     TestTimestampValue("last_day('2003-02-02')",
-      TimestampValue::Parse("2003-02-28 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-02-28 00:00:00"));
     TestTimestampValue("last_day('2003-03-02 03:21:12.0058')",
-      TimestampValue::Parse("2003-03-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-03-31 00:00:00"));
     TestTimestampValue("last_day('2003-04-02')",
-      TimestampValue::Parse("2003-04-30 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-04-30 00:00:00"));
     TestTimestampValue("last_day('2003-05-02')",
-      TimestampValue::Parse("2003-05-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-05-31 00:00:00"));
     TestTimestampValue("last_day('2003-06-02')",
-      TimestampValue::Parse("2003-06-30 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-06-30 00:00:00"));
     TestTimestampValue("last_day('2003-07-02 00:01:01.125')",
-      TimestampValue::Parse("2003-07-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-07-31 00:00:00"));
     TestTimestampValue("last_day('2003-08-02')",
-      TimestampValue::Parse("2003-08-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-08-31 00:00:00"));
     TestTimestampValue("last_day('2003-09-02')",
-      TimestampValue::Parse("2003-09-30 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-09-30 00:00:00"));
     TestTimestampValue("last_day('2003-10-02')",
-      TimestampValue::Parse("2003-10-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-10-31 00:00:00"));
     TestTimestampValue("last_day('2003-11-02 12:30:16')",
-      TimestampValue::Parse("2003-11-30 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-11-30 00:00:00"));
     TestTimestampValue("last_day('2003-12-02')",
-      TimestampValue::Parse("2003-12-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2003-12-31 00:00:00"));
 
     // Test leap years and special cases.
     TestTimestampValue("last_day('2004-02-13')",
-      TimestampValue::Parse("2004-02-29 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2004-02-29 00:00:00"));
     TestTimestampValue("last_day('2008-02-13')",
-      TimestampValue::Parse("2008-02-29 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2008-02-29 00:00:00"));
     TestTimestampValue("last_day('2000-02-13')",
-      TimestampValue::Parse("2000-02-29 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2000-02-29 00:00:00"));
     TestTimestampValue("last_day('1900-02-13')",
-      TimestampValue::Parse("1900-02-28 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1900-02-28 00:00:00"));
     TestTimestampValue("last_day('2100-02-13')",
-      TimestampValue::Parse("2100-02-28 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2100-02-28 00:00:00"));
 
     // Test corner cases.
     TestTimestampValue("last_day('1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-31 00:00:00"));
     TestTimestampValue("last_day('9999-12-31 23:59:59')",
-      TimestampValue::Parse("9999-12-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 00:00:00"));
 
     // Test invalid input.
     TestIsNull("last_day('12202010')", TYPE_TIMESTAMP);
@@ -334,67 +440,68 @@ class ExprTest : public testing::Test {
   void TestNextDayFunction() {
     // Sequential test cases
     TestTimestampValue("next_day('2016-05-01','Sunday')",
-      TimestampValue::Parse("2016-05-08 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-08 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Monday')",
-      TimestampValue::Parse("2016-05-02 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-02 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Tuesday')",
-      TimestampValue::Parse("2016-05-03 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-03 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Wednesday')",
-      TimestampValue::Parse("2016-05-04 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-04 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Thursday')",
-      TimestampValue::Parse("2016-05-05 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-05 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Friday')",
-      TimestampValue::Parse("2016-05-06 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-06 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Saturday')",
-      TimestampValue::Parse("2016-05-07 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2016-05-07 00:00:00", 19));
 
     // Random test cases
     TestTimestampValue("next_day('1910-01-18','SunDay')",
-      TimestampValue::Parse("1910-01-23 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1910-01-23 00:00:00", 19));
     TestTimestampValue("next_day('1916-06-05', 'SUN')",
-      TimestampValue::Parse("1916-06-11 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1916-06-11 00:00:00", 19));
     TestTimestampValue("next_day('1932-11-08','monday')",
-      TimestampValue::Parse("1932-11-14 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1932-11-14 00:00:00", 19));
     TestTimestampValue("next_day('1933-09-11','Mon')",
-      TimestampValue::Parse("1933-09-18 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1933-09-18 00:00:00", 19));
     TestTimestampValue("next_day('1934-03-21','TUeSday')",
-      TimestampValue::Parse("1934-03-27 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1934-03-27 00:00:00", 19));
     TestTimestampValue("next_day('1954-02-25','tuE')",
-      TimestampValue::Parse("1954-03-02 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1954-03-02 00:00:00", 19));
     TestTimestampValue("next_day('1965-04-18','WeDneSdaY')",
-      TimestampValue::Parse("1965-04-21 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1965-04-21 00:00:00", 19));
     TestTimestampValue("next_day('1966-08-29','wed')",
-      TimestampValue::Parse("1966-08-31 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1966-08-31 00:00:00", 19));
     TestTimestampValue("next_day('1968-07-23','tHurSday')",
-      TimestampValue::Parse("1968-07-25 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1968-07-25 00:00:00", 19));
     TestTimestampValue("next_day('1969-05-28','thu')",
-      TimestampValue::Parse("1969-05-29 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1969-05-29 00:00:00", 19));
     TestTimestampValue("next_day('1989-10-12','fRIDay')",
-      TimestampValue::Parse("1989-10-13 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1989-10-13 00:00:00", 19));
     TestTimestampValue("next_day('1973-10-02','frI')",
-      TimestampValue::Parse("1973-10-05 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1973-10-05 00:00:00", 19));
     TestTimestampValue("next_day('2000-02-29','saTUrDaY')",
-      TimestampValue::Parse("2000-03-04 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2000-03-04 00:00:00", 19));
     TestTimestampValue("next_day('2013-04-12','sat')",
-      TimestampValue::Parse("2013-04-13 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2013-04-13 00:00:00", 19));
     TestTimestampValue("next_day('2013-12-25','Saturday')",
-      TimestampValue::Parse("2013-12-28 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2013-12-28 00:00:00", 19));
 
     // Explicit timestamp conversion tests
     TestTimestampValue("next_day(to_timestamp('12-27-2008', 'MM-dd-yyyy'), 'moN')",
-      TimestampValue::Parse("2008-12-29 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2008-12-29 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('2007-20-10 11:22', 'yyyy-dd-MM HH:mm'),\
-      'TUeSdaY')", TimestampValue::Parse("2007-10-23 11:22:00", 19));
+      'TUeSdaY')", TimestampValue::ParseSimpleDateFormat("2007-10-23 11:22:00", 19));
     TestTimestampValue("next_day(to_timestamp('18-11-2070 09:12', 'dd-MM-yyyy HH:mm'),\
-      'WeDneSdaY')", TimestampValue::Parse("2070-11-19 09:12:00", 19));
+      'WeDneSdaY')", TimestampValue::ParseSimpleDateFormat("2070-11-19 09:12:00", 19));
     TestTimestampValue("next_day(to_timestamp('12-1900-05', 'dd-yyyy-MM'), 'tHurSday')",
-      TimestampValue::Parse("1900-05-17 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1900-05-17 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('08-1987-21', 'MM-yyyy-dd'), 'FRIDAY')",
-      TimestampValue::Parse("1987-08-28 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1987-08-28 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('02-04-2001', 'dd-MM-yyyy'), 'SAT')",
-      TimestampValue::Parse("2001-04-07 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("2001-04-07 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('1970-01-31 00:00:00',\
-      'yyyy-MM-dd HH:mm:ss'), 'SunDay')", TimestampValue::Parse("1970-02-01 00:00:00", 19));
+      'yyyy-MM-dd HH:mm:ss'), 'SunDay')",
+      TimestampValue::ParseSimpleDateFormat("1970-02-01 00:00:00", 19));
 
     // Invalid input: unacceptable date parameter
     TestIsNull("next_day('12202010','Saturday')", TYPE_TIMESTAMP);
@@ -403,6 +510,15 @@ class ExprTest : public testing::Test {
     TestIsNull("next_day('000000000000000','wed')", TYPE_TIMESTAMP);
     TestIsNull("next_day('hell world!','fRiDaY')", TYPE_TIMESTAMP);
     TestIsNull("next_day('t1c7t0c9','sunDAY')", TYPE_TIMESTAMP);
+    TestIsNull("next_day(NULL ,'sunDAY')", TYPE_TIMESTAMP);
+
+    // Invalid input: wrong weekday parameter
+    for (const string& day: { "s", "SA", "satu", "not-a-day" }) {
+      const string expr = "next_day('2013-12-25','" + day + "')";
+      TestError(expr);
+    }
+    TestError("next_day('2013-12-25', NULL)");
+    TestError("next_day(NULL, NULL)");
   }
 
 // This macro adds a scoped trace to provide the line number of the caller upon failure.
@@ -575,6 +691,18 @@ class ExprTest : public testing::Test {
     ASSERT_FALSE(status.ok()) << "stmt: " << stmt << "\nunexpected Status::OK.";
   }
 
+  // "Execute 'expr' and check that the returned error ends with 'error_string'"
+  void TestErrorString(const string& expr, const string& error_string) {
+    string stmt = "select " + expr;
+    vector<FieldSchema> result_types;
+    string result_row;
+    Status status = executor_->Exec(stmt, &result_types);
+    status = executor_->FetchResult(&result_row);
+    ASSERT_FALSE(status.ok());
+    ASSERT_TRUE(EndsWith(status.msg().msg(), error_string)) << "Actual: '"
+        << status.msg().msg() << "'" << endl << "Expected: '" << error_string << "'";
+  }
+
   template <typename T> void TestFixedPointComparisons(bool test_boundaries) {
     int64_t t_min = numeric_limits<T>::min();
     int64_t t_max = numeric_limits<T>::max();
@@ -716,6 +844,8 @@ class ExprTest : public testing::Test {
 
   void TestTimestampValue(const string& expr, const TimestampValue& expected_result);
   void TestValidTimestampValue(const string& expr);
+
+  void TestDateValue(const string& expr, const DateValue& expected_result);
 
   // Test IS DISTINCT FROM operator and its variants
   void TestDistinctFrom() {
@@ -903,11 +1033,11 @@ class ExprTest : public testing::Test {
     string a_str = LiteralToString<Result>(cast_a);
     string b_str = LiteralToString<Result>(cast_b);
     TestValue(a_str + " + " + b_str, expected_type,
-        static_cast<Result>(cast_a + cast_b));
+        ArithmeticUtil::Compute<std::plus>(cast_a, cast_b));
     TestValue(a_str + " - " + b_str, expected_type,
-        static_cast<Result>(cast_a - cast_b));
+         ArithmeticUtil::Compute<std::minus>(cast_a, cast_b));
     TestValue(a_str + " * " + b_str, expected_type,
-        static_cast<Result>(cast_a * cast_b));
+        ArithmeticUtil::Compute<std::multiplies>(cast_a, cast_b));
     TestValue(a_str + " / " + b_str, TYPE_DOUBLE,
         static_cast<double>(a) / static_cast<double>(b));
   }
@@ -1019,7 +1149,7 @@ class ExprTest : public testing::Test {
   template<class T>
   bool ParseString(const string& str, T* val);
 
-  // Create a Literal expression out of 'str'.
+  // Create a Literal expression out of 'str'. Adds the returned literal to pool_.
   Literal* CreateLiteral(const ColumnType& type, const string& str);
 
   // Helper function for LiteralConstruction test. Creates a Literal expression
@@ -1047,38 +1177,47 @@ class ExprTest : public testing::Test {
       TestIsNull("cast(" + stmt + " as timestamp)", TYPE_TIMESTAMP);
     }
   }
+
+  // Wrapper around UdfTestHarness::CreateTestContext() that stores the context in
+  // 'pool_' to be automatically cleaned up.
+  FunctionContext* CreateUdfTestContext(const FunctionContext::TypeDesc& return_type,
+      const std::vector<FunctionContext::TypeDesc>& arg_types,
+      RuntimeState* state = nullptr, MemPool* pool = nullptr) {
+    return pool_.Add(
+        UdfTestHarness::CreateTestContext(return_type, arg_types, state, pool));
+  }
 };
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(const string& val) {
-  return TimestampValue::Parse(val);
+  return TimestampValue::ParseSimpleDateFormat(val);
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(float val) {
-  return TimestampValue::FromSubsecondUnixTime(val);
+  return TimestampValue::FromSubsecondUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(double val) {
-  return TimestampValue::FromSubsecondUnixTime(val);
+  return TimestampValue::FromSubsecondUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(int val) {
-  return TimestampValue::FromUnixTime(val);
+  return TimestampValue::FromUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 template<>
 TimestampValue ExprTest::CreateTestTimestamp(int64_t val) {
-  return TimestampValue::FromUnixTime(val);
+  return TimestampValue::FromUnixTime(val, TimezoneDatabase::GetUtcTimezone());
 }
 
 // Test casting 'stmt' to each of the native types.  The result should be 'val'
 // 'stmt' is a partial stmt that could be of any valid type.
 template<>
 void ExprTest::TestCast(const string& stmt, const char* val,
-                        bool timestamp_out_of_range) {
+    bool timestamp_out_of_range) {
   try {
     int8_t val8 = static_cast<int8_t>(lexical_cast<int16_t>(val));
 #if 0
@@ -1139,7 +1278,12 @@ double ExprTest::ConvertValue<double>(const string& value) {
 
 template <>
 TimestampValue ExprTest::ConvertValue<TimestampValue>(const string& value) {
-  return TimestampValue::Parse(value.data(), value.size());
+  return TimestampValue::ParseSimpleDateFormat(value.data(), value.size());
+}
+
+template <>
+DateValue ExprTest::ConvertValue<DateValue>(const string& value) {
+  return DateValue::ParseSimpleDateFormat(value.data(), value.size());
 }
 
 // We can't put this into TestValue() because GTest can't resolve
@@ -1156,6 +1300,12 @@ void ExprTest::TestValidTimestampValue(const string& expr) {
       ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP)).HasDateOrTime());
 }
 
+// We can't put this into TestValue() because GTest can't resolve
+// the ambiguity in DateValue::operator==, even with the appropriate casts.
+void ExprTest::TestDateValue(const string& expr, const DateValue& expected_result) {
+  EXPECT_EQ(expected_result, ConvertValue<DateValue>(GetValue(expr, TYPE_DATE)));
+}
+
 template<class T>
 bool ExprTest::ParseString(const string& str, T* val) {
   istringstream stream(str);
@@ -1167,10 +1317,16 @@ template<>
 bool ExprTest::ParseString(const string& str, TimestampValue* val) {
   boost::gregorian::date date;
   boost::posix_time::time_duration time;
-  bool success = TimestampParser::Parse(str.data(), str.length(), &date, &time);
+  bool success = TimestampParser::ParseSimpleDateFormat(str.data(), str.length(), &date,
+      &time);
   val->set_date(date);
   val->set_time(time);
   return success;
+}
+
+template<>
+bool ExprTest::ParseString(const string& str, DateValue* val) {
+  return DateParser::ParseSimpleDateFormat(str.c_str(), str.length(), false, val);
 }
 
 Literal* ExprTest::CreateLiteral(const ColumnType& type, const string& str) {
@@ -1178,51 +1334,56 @@ Literal* ExprTest::CreateLiteral(const ColumnType& type, const string& str) {
     case TYPE_BOOLEAN: {
       bool v = false;
       EXPECT_TRUE(ParseString<bool>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_TINYINT: {
       int8_t v = 0;
       EXPECT_TRUE(ParseString<int8_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_SMALLINT: {
       int16_t v = 0;
       EXPECT_TRUE(ParseString<int16_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_INT: {
       int32_t v = 0;
       EXPECT_TRUE(ParseString<int32_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_BIGINT: {
       int64_t v = 0;
       EXPECT_TRUE(ParseString<int64_t>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_FLOAT: {
       float v = 0;
       EXPECT_TRUE(ParseString<float>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_DOUBLE: {
       double v = 0;
       EXPECT_TRUE(ParseString<double>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_STRING:
     case TYPE_VARCHAR:
     case TYPE_CHAR:
-      return new Literal(type, str);
+      return pool_.Add(new Literal(type, str));
     case TYPE_TIMESTAMP: {
       TimestampValue v;
       EXPECT_TRUE(ParseString<TimestampValue>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
+    }
+    case TYPE_DATE: {
+      DateValue v;
+      EXPECT_TRUE(ParseString<DateValue>(str, &v));
+      return pool_.Add(new Literal(type, v));
     }
     case TYPE_DECIMAL: {
       double v = 0;
       EXPECT_TRUE(ParseString<double>(str, &v));
-      return new Literal(type, v);
+      return pool_.Add(new Literal(type, v));
     }
     default:
       DCHECK(false) << "Invalid type: " << type.DebugString();
@@ -1234,6 +1395,7 @@ template <typename T>
 void ExprTest::TestSingleLiteralConstruction(
     const ColumnType& type, const T& value, const string& string_val) {
   ObjectPool pool;
+
   RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
   MemTracker tracker;
   MemPool mem_pool(&tracker);
@@ -1250,7 +1412,7 @@ void ExprTest::TestSingleLiteralConstruction(
   state.ReleaseResources();
 }
 
-TEST_F(ExprTest, NullLiteral) {
+TEST_P(ExprTest, NullLiteral) {
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
     RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
     ObjectPool pool;
@@ -1268,7 +1430,7 @@ TEST_F(ExprTest, NullLiteral) {
   }
 }
 
-TEST_F(ExprTest, LiteralConstruction) {
+TEST_P(ExprTest, LiteralConstruction) {
   bool b_val = true;
   int8_t c_val = 'f';
   int16_t s_val = 123;
@@ -1297,8 +1459,9 @@ TEST_F(ExprTest, LiteralConstruction) {
   TestSingleLiteralConstruction(TYPE_DOUBLE, d_val_3, "5.9e-3");
   TestSingleLiteralConstruction(TYPE_DOUBLE, d_val_3, "+5.9e-3");
   TestSingleLiteralConstruction(TYPE_STRING, str_val, "Hello");
+  TestSingleLiteralConstruction(TYPE_DATE, DateValue(2001, 11, 30), "2001-11-30");
 
-  // Min/Max Boundary value test for tiny/small/int/long
+  // Min/Max Boundary value test for tiny/small/int/long/date
   c_val = 127;
   const char c_array_max[] = {(const char)127}; // avoid implicit casting
   string c_input_max(c_array_max, 1);
@@ -1309,6 +1472,7 @@ TEST_F(ExprTest, LiteralConstruction) {
   TestSingleLiteralConstruction(TYPE_SMALLINT, s_val, "32767");
   TestSingleLiteralConstruction(TYPE_INT, i_val, "2147483647");
   TestSingleLiteralConstruction(TYPE_BIGINT, l_val, "9223372036854775807");
+  TestSingleLiteralConstruction(TYPE_DATE, DateValue(9999, 12, 31), "9999-12-31");
 
   const char c_array_min[] = {(const char)(-128)}; // avoid implicit casting
   string c_input_min(c_array_min, 1);
@@ -1320,10 +1484,11 @@ TEST_F(ExprTest, LiteralConstruction) {
   TestSingleLiteralConstruction(TYPE_SMALLINT, s_val, "-32768");
   TestSingleLiteralConstruction(TYPE_INT, i_val, "-2147483648");
   TestSingleLiteralConstruction(TYPE_BIGINT, l_val, "-9223372036854775808");
+  TestSingleLiteralConstruction(TYPE_DATE, DateValue(1, 1, 1), "0001-01-01");
 }
 
 
-TEST_F(ExprTest, LiteralExprs) {
+TEST_P(ExprTest, LiteralExprs) {
   TestFixedPointLimits<int8_t>(TYPE_TINYINT);
   TestFixedPointLimits<int16_t>(TYPE_SMALLINT);
   TestFixedPointLimits<int32_t>(TYPE_INT);
@@ -1340,7 +1505,7 @@ TEST_F(ExprTest, LiteralExprs) {
 }
 
 // IMPALA-3942: Test escaping string literal for single/double quotes
-TEST_F(ExprTest, EscapeStringLiteral) {
+TEST_P(ExprTest, EscapeStringLiteral) {
   TestStringValue(R"('"')", R"(")");
   TestStringValue(R"("'")", R"(')");
   TestStringValue(R"("\"")", R"(")");
@@ -1375,7 +1540,7 @@ TEST_F(ExprTest, EscapeStringLiteral) {
   TestStringValue(R"(concat('a\\\'b', "c\\\"d"))", R"(a\'bc\"d)");
 }
 
-TEST_F(ExprTest, ArithmeticExprs) {
+TEST_P(ExprTest, ArithmeticExprs) {
   // Test float ops.
   TestFixedResultTypeOps<float, float, double>(min_float_values_[TYPE_FLOAT],
       min_float_values_[TYPE_FLOAT], TYPE_DOUBLE);
@@ -2419,6 +2584,25 @@ DecimalTestCase decimal_cases[] = {
   { "18014118346046923173168730371588410/-340282366920938463463374607431768200",
     {{ false, false, 0, 38, 0 },
      { false, false, -52939, 38, 6 }}},
+  // IMPALA-6429: Test overflow detection when scaling up the dividend by more than 38.
+  // The bug can be trigerred only by these specific values. These values were generated
+  // by the fuzz test.
+  { "cast(70685438201098443655665080810945040.194 as decimal(38,3)) / "
+    "cast(0.85070591730234615865843651857942052863 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(9269574547799442144750864826042582 as decimal(38,2)) / "
+    "cast(0.2475880078570760549798248447 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(19770219132749848273961352693131418.9 as decimal(36,1)) / "
+    "cast(0.973940341920032002 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(100000000000000000000000000000000 as decimal(36,3)) / "
+    "cast(1 as decimal(1,0))",
+    {{ false, false, StringToInt128("10000000000000000000000000000000000000"), 38, 5 },
+     { true, false, 0, 38, 6 }}},
   // Test modulo operator
   { "cast(1.23 as decimal(8,2)) % cast(1 as decimal(10,3))",
     {{ false, false, 230, 9, 3 }}},
@@ -2821,7 +3005,49 @@ DecimalTestCase decimal_cases[] = {
      { true, false, 0, 38, 0 }}},
 };
 
-TEST_F(ExprTest, DecimalArithmeticExprs) {
+void TestScaleBy() {
+  // IMPALA-6429: There is a shortcut in the decimal division. If we estimate that the
+  // dividend requires more than 255 bits after scaling up, we overflow right away. This
+  // test proves that it is correct to do this and no other checks are needed.
+  for (int scale_by = 0; scale_by < 38 * 2 + 1; ++scale_by) {
+    for (int num_bits = 1; num_bits < 128; ++num_bits) {
+      // We set the dividend to be the smallest number that requires a certain number of
+      // bits.
+      int128_t dividend = 1;
+      dividend <<= num_bits - 1;
+      int256_t scaled_up_dividend = DecimalUtil::MultiplyByScale<int256_t>(
+          ConvertToInt256(dividend), scale_by, true);
+      int256_t scale_multiplier = DecimalUtil::GetScaleMultiplier<int256_t>(scale_by);
+      if (detail::MaxBitsRequiredAfterScaling(dividend, scale_by) <= 255) {
+        // If we estimate that the scaled up dividend requires 255 bits or less, verify
+        // that we do not overflow when scaling up.
+        EXPECT_TRUE(scaled_up_dividend / scale_multiplier == ConvertToInt256(dividend));
+        EXPECT_TRUE(
+            (-scaled_up_dividend) / scale_multiplier == ConvertToInt256(-dividend));
+      } else {
+        // If we estimate that scaled up dividend requres more than 255 bits, we want to
+        // verify that it is safe to set the result of the division to overflow.
+        if (scaled_up_dividend / scale_multiplier == ConvertToInt256(dividend)) {
+          // In this case, scaling up did not overflow. Verify that the scaled up
+          // dividend is too large. Even if we divide it by the largest possible divisor
+          // the result is larger than MAX_UNSCALED_DECIMAL16, which means the division
+          // overflows in all cases.
+          EXPECT_TRUE((-scaled_up_dividend) / scale_multiplier ==
+              ConvertToInt256(-dividend));
+          int256_t max_divisor = ConvertToInt256(DecimalUtil::MAX_UNSCALED_DECIMAL16);
+          EXPECT_TRUE(scaled_up_dividend / max_divisor > max_divisor);
+          EXPECT_TRUE((-scaled_up_dividend) / max_divisor < -max_divisor);
+        } else {
+          // There was an overflow when scaling up.
+          EXPECT_TRUE((-scaled_up_dividend) / scale_multiplier !=
+              ConvertToInt256(-dividend));
+        }
+      }
+    }
+  }
+}
+
+TEST_P(ExprTest, DecimalArithmeticExprs) {
   // Test with both decimal_v2={false, true}
   for (int v2: { 0, 1 }) {
     string opt = "DECIMAL_V2=" + lexical_cast<string>(v2);
@@ -2853,10 +3079,11 @@ TEST_F(ExprTest, DecimalArithmeticExprs) {
     }
     executor_->PopExecOption();
   }
+  TestScaleBy();
 }
 
 // Tests for expressions that mix decimal and non-decimal arguments with DECIMAL_V2=false.
-TEST_F(ExprTest, DecimalV1MixedArithmeticExprs) {
+TEST_P(ExprTest, DecimalV1MixedArithmeticExprs) {
   executor_->PushExecOption("DECIMAL_V2=false");
   // IMPALA-3437: decimal constants are implicitly converted to double.
   TestValue("10.0 + 3", TYPE_DOUBLE, 13.0);
@@ -2874,7 +3101,7 @@ TEST_F(ExprTest, DecimalV1MixedArithmeticExprs) {
 }
 
 // Tests the same expressions as above with DECIMAL_V2=true.
-TEST_F(ExprTest, DecimalV2MixedArithmeticExprs) {
+TEST_P(ExprTest, DecimalV2MixedArithmeticExprs) {
   executor_->PushExecOption("DECIMAL_V2=true");
   // IMPALA-3437: decimal constants remain decimal.
   TestDecimalValue(
@@ -2898,7 +3125,7 @@ TEST_F(ExprTest, DecimalV2MixedArithmeticExprs) {
 
 // There are two tests of ranges, the second of which requires a cast
 // of the second operand to a higher-resolution type.
-TEST_F(ExprTest, BinaryPredicates) {
+TEST_P(ExprTest, BinaryPredicates) {
   TestComparison("false", "true", false);
   TestBinaryPredicates("false", false);
   TestBinaryPredicates("true", false);
@@ -2915,7 +3142,7 @@ TEST_F(ExprTest, BinaryPredicates) {
 }
 
 // Test casting from all types to all other types
-TEST_F(ExprTest, CastExprs) {
+TEST_P(ExprTest, CastExprs) {
   // From tinyint
   TestCast("cast(0 as tinyint)", 0);
   TestCast("cast(5 as tinyint)", 5);
@@ -2989,36 +3216,181 @@ TEST_F(ExprTest, CastExprs) {
   TestStringValue("cast(cast(cast('2012-01-01 09:10:11.123456789' as timestamp) as"
       " timestamp) as string)", "2012-01-01 09:10:11.123456789");
 
+  // Test casting of lazy date and/or time format string to timestamp
+  TestTimestampValue(
+      "cast('2001-1-2' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-02 00:00:00"));
+  TestTimestampValue(
+      "cast('2001-01-3' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-03 00:00:00"));
+  TestTimestampValue(
+      "cast('2001-1-21' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-21 00:00:00"));
+  TestTimestampValue("cast('2001-1-21 12:5:30' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-21 12:05:30"));
+  TestTimestampValue("cast('2001-1-21 13:5:05' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-21 13:05:05"));
+  TestTimestampValue("cast('2001-1-21 1:2:3' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-21 01:02:03"));
+  TestTimestampValue("cast('2001-1-21 1:5:31.12345' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-21 01:05:31.123450000"));
+  TestTimestampValue("cast('2001-1-21 1:5:31.12345678910111213' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-21 01:05:31.123456789"));
+  TestTimestampValue("cast('1:05:1.12' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("01:05:01.120000000"));
+  TestTimestampValue("cast('1:05:1' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("01:05:01"));
+  TestTimestampValue("cast('        2001-01-9 1:05:1        ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestIsNull("cast('2001-6' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('01-1-21' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-1-21 12:5:3 AM' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1:05:31.123456foo' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('10/feb/10' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-foo1-2bar' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909/1-/2' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-1-2 12:32:1.111bar' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32:1.111.111.2' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test various ways of truncating a "lazy" format to produce an invalid timestamp.
+  TestIsNull("cast('1909-10-2 12:32:1.' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32:11.' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32:11. ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32:' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32: ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 1:32:' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 1:2:' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 1:2' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 1:2 ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12 ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 2' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10- ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test missing number from format.
+  TestIsNull("cast('1909-10-2 12:32:.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12::1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 :32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10- 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909--2 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('-10-2 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test duplicate separators - should return NULL because not a valid format.
+  TestIsNull("cast('1909--10-2 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10--2 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12::32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32::1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32:1..9999' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test numbers with too many digits in date/time - should return NULL because not a
+  // valid timestamp.
+  TestIsNull("cast('19097-10-2 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-107-2 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-277 12:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 127:32:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:327:1.9999' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('1909-10-2 12:32:177.9999' as timestamp)", TYPE_TIMESTAMP);
+
+  // IMPALA-6630: Test whitespace trimming mechanism when cast from string to timestamp
+  TestTimestampValue("cast(' \t\r\n 2001-01-09 01:05:01.123456789 \t\r\n' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01.123456789"));
+  TestTimestampValue("cast(' \t\r\n 2001-01-09T01:05:02.123456789 \t\r\n' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:02.123456789"));
+  TestTimestampValue("cast('  \t\r\n      2001-01-09 01:05:01   \t\r\n  ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('  \t\r\n      2001-01-09T01:05:01   \t\r\n  ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('  \t\r\n      2001-01-09   \t\r\n     ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09"));
+  TestTimestampValue("cast('  \t\r\n      01:05:01   \t\r\n     ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("01:05:01"));
+  TestTimestampValue("cast(' \t\r\n 01:05:01.123456789   \t\r\n     ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("01:05:01.123456789"));
+  TestTimestampValue("cast('  \t\r\n      2001-1-9 1:5:1    \t\r\n    ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('  \t\r\n  2001-1-9 1:5:1.12345678  \t\r\n ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01.123456780"));
+  TestTimestampValue("cast('  \t\r\n      1:5:1    \t\r\n    ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("01:05:01"));
+  TestTimestampValue("cast('  \t\r\n      1:5:1.12345678    \t\r\n    ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("01:05:01.123456780"));
+  TestTimestampValue("cast('  \t\r\n      2001-1-9    \t\r\n    ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09"));
+
+  // IMPALA-6995: whitespace-only strings should return NULL.
+  TestIsNull("cast(' ' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('\n' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('\t' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('  \t\r\n' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test valid multi-space and 'T' separators between date and time
+  // components
+  TestTimestampValue("cast('2001-01-09   01:05:01' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('2001-01-09T01:05:10' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:10"));
+  TestTimestampValue("cast('2001-01-09   01:05:02.321456789101112' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:02.321456789"));
+  TestTimestampValue("cast('2001-01-09T01:05:03.123456789101112' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:03.123456789"));
+  TestTimestampValue("cast('  \t\r\n 2001-01-09   01:05:01   \t\r\n ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestTimestampValue("cast('  \t\r\n 2001-01-09T01:05:01   \t\r\n ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:01"));
+  TestTimestampValue(
+      "cast('  \t\r\n 2001-01-09   01:05:04.12345678910   \t\r\n ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-01-09 01:05:04.123456789"));
+  TestTimestampValue(
+      "cast('  \t\r\n 2001-02-09T01:05:01.12345678910   \t\r\n ' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2001-02-09 01:05:01.123456789"));
+
+  // Test invalid variations of the 'T' separator
+  TestIsNull("cast('2001-01-09TTTTT01:05:01' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-01-09t01:05:01' as timestamp)", TYPE_TIMESTAMP);
+
+  // Test invalid whitespace locations in strings to be casted to timestamp
+  TestIsNull("cast('2001-01-09\t01:05:01' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-01-09\r01:05:01' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-01-09\n01:05:01' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-1-9\t1:5:1' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-1-9\r1:5:1' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('2001-1-9\n1:5:1' as timestamp)", TYPE_TIMESTAMP);
+
   // IMPALA-3163: Test precise conversion from Decimal to Timestamp.
   TestTimestampValue("cast(cast(1457473016.1230 as decimal(17,4)) as timestamp)",
-      TimestampValue::Parse("2016-03-08 21:36:56.123000000", 29));
+      TimestampValue::ParseSimpleDateFormat("2016-03-08 21:36:56.123000000", 29));
   // 32 bit Decimal.
   TestTimestampValue("cast(cast(123.45 as decimal(9,2)) as timestamp)",
-      TimestampValue::Parse("1970-01-01 00:02:03.450000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1970-01-01 00:02:03.450000000", 29));
   TestTimestampValue("cast(cast(-123.45 as decimal(9,2)) as timestamp)",
-      TimestampValue::Parse("1969-12-31 23:57:56.550000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1969-12-31 23:57:56.550000000", 29));
   // 64 bit Decimal.
   TestTimestampValue("cast(cast(123.45 as decimal(18,2)) as timestamp)",
-      TimestampValue::Parse("1970-01-01 00:02:03.450000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1970-01-01 00:02:03.450000000", 29));
   TestTimestampValue("cast(cast(-123.45 as decimal(18,2)) as timestamp)",
-      TimestampValue::Parse("1969-12-31 23:57:56.550000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1969-12-31 23:57:56.550000000", 29));
   TestTimestampValue("cast(cast(-0.1 as decimal(18,10)) as timestamp)",
-      TimestampValue::Parse("1969-12-31 23:59:59.900000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1969-12-31 23:59:59.900000000", 29));
   TestTimestampValue("cast(cast(253402300799.99 as decimal(18, 2)) as timestamp)",
-      TimestampValue::Parse("9999-12-31 23:59:59.990000000", 29));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59.990000000", 29));
   TestIsNull("cast(cast(260000000000.00 as decimal(18, 2)) as timestamp)",
       TYPE_TIMESTAMP);
   // 128 bit Decimal.
   TestTimestampValue("cast(cast(123.45 as decimal(38,2)) as timestamp)",
-      TimestampValue::Parse("1970-01-01 00:02:03.450000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1970-01-01 00:02:03.450000000", 29));
   TestTimestampValue("cast(cast(-123.45 as decimal(38,2)) as timestamp)",
-      TimestampValue::Parse("1969-12-31 23:57:56.550000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1969-12-31 23:57:56.550000000", 29));
   TestTimestampValue("cast(cast(-0.1 as decimal(38,20)) as timestamp)",
-      TimestampValue::Parse("1969-12-31 23:59:59.900000000", 29));
+      TimestampValue::ParseSimpleDateFormat("1969-12-31 23:59:59.900000000", 29));
   TestTimestampValue("cast(cast(253402300799.99 as decimal(38, 2)) as timestamp)",
-      TimestampValue::Parse("9999-12-31 23:59:59.990000000", 29));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59.990000000", 29));
   TestTimestampValue("cast(cast(253402300799.99 as decimal(38, 26)) as timestamp)",
-      TimestampValue::Parse("9999-12-31 23:59:59.990000000", 29));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59.990000000", 29));
   TestIsNull("cast(cast(260000000000.00 as decimal(38, 2)) as timestamp)",
       TYPE_TIMESTAMP);
   // numeric_limits<int64_t>::max()
@@ -3051,18 +3423,18 @@ TEST_F(ExprTest, CastExprs) {
   TestValue("cast(cast('2000-01-01 09:10:11.000000' as timestamp) as int)", TYPE_INT,
       946717811);
   TestTimestampValue("cast(946717811 as timestamp)",
-      TimestampValue::Parse("2000-01-01 09:10:11", 19));
+      TimestampValue::ParseSimpleDateFormat("2000-01-01 09:10:11", 19));
 
   // Timestamp <--> Int conversions boundary cases
   TestValue("cast(cast('1400-01-01 00:00:00' as timestamp) as bigint)",
       TYPE_BIGINT, -17987443200);
   TestTimestampValue("cast(-17987443200 as timestamp)",
-      TimestampValue::Parse("1400-01-01 00:00:00", 19));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00", 19));
   TestIsNull("cast(-17987443201 as timestamp)", TYPE_TIMESTAMP);
   TestValue("cast(cast('9999-12-31 23:59:59' as timestamp) as bigint)",
       TYPE_BIGINT, 253402300799);
   TestTimestampValue("cast(253402300799 as timestamp)",
-      TimestampValue::Parse("9999-12-31 23:59:59", 19));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59", 19));
   TestIsNull("cast(253402300800 as timestamp)", TYPE_TIMESTAMP);
 
   // Timestamp <--> Float
@@ -3072,12 +3444,12 @@ TEST_F(ExprTest, CastExprs) {
   TestValue("cast(cast('2000-01-01 09:10:11.720000' as timestamp) as double)",
       TYPE_DOUBLE, 946717811.72);
   TestTimestampValue("cast(cast(946717811.033 as double) as timestamp)",
-      TimestampValue::Parse("2000-01-01 09:10:11.032999992", 29));
+      TimestampValue::ParseSimpleDateFormat("2000-01-01 09:10:11.032999992", 29));
   TestValue("cast(cast('1400-01-01' as timestamp) as double)", TYPE_DOUBLE,
       -17987443200);
   TestIsNull("cast(cast(-17987443201.03 as double) as timestamp)", TYPE_TIMESTAMP);
   TestTimestampValue("cast(253402300799 as timestamp)",
-      TimestampValue::Parse("9999-12-31 23:59:59", 19));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59", 19));
   TestIsNull("cast(253433923200 as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast(cast(null as bigint) as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast(cast(null as timestamp) as bigint)", TYPE_BIGINT);
@@ -3094,7 +3466,134 @@ TEST_F(ExprTest, CastExprs) {
 #endif
 }
 
-TEST_F(ExprTest, CompoundPredicates) {
+// Test casting from/to Date.
+TEST_P(ExprTest, CastDateExprs) {
+  // From Date to Date
+  TestStringValue("cast(cast(cast('2012-01-01' as date) as date) as string)",
+      "2012-01-01");
+  TestStringValue("cast(cast(date '2012-01-01' as date) as string)",
+      "2012-01-01");
+
+  // Test casting of lazy date and/or time format string to Date.
+  TestDateValue("cast('2001-1-2' as date)", DateValue(2001, 1, 2));
+  TestDateValue("cast('2001-01-3' as date)", DateValue(2001, 1, 3));
+  TestDateValue("cast('2001-1-21' as date)", DateValue(2001, 1, 21));
+  TestDateValue("cast('        2001-01-9         ' as date)",
+      DateValue(2001, 1, 9));
+
+  TestError("cast('2001-6' as date)");
+  TestError("cast('01-1-21' as date)");
+  TestError("cast('10/feb/10' as date)");
+  TestError("cast('1909-foo1-2bar' as date)");
+  TestError("cast('1909/1-/2' as date)");
+
+  // Test various ways of truncating a "lazy" format to produce an invalid date.
+  TestError("cast('1909-10- ' as date)");
+  TestError("cast('1909-10-' as date)");
+  TestError("cast('1909-10' as date)");
+  TestError("cast('1909-' as date)");
+  TestError("cast('1909' as date)");
+
+  // Test missing number from format.
+  TestError("cast('1909--2' as date)");
+  TestError("cast('-10-2' as date)");
+
+  // Test duplicate separators - should fail with an error because not a valid format.
+  TestError("cast('1909--10-2' as date)");
+  TestError("cast('1909-10--2' as date)");
+
+  // Test numbers with too many digits in date - should fail with an error because not a
+  // valid date.
+  TestError("cast('19097-10-2' as date)");
+  TestError("cast('1909-107-2' as date)");
+  TestError("cast('1909-10-277' as date)");
+
+  // Test correctly formatted invalid dates
+  // Invalid month of year
+  TestError("cast('2000-13-29' as date)");
+  // Invalid day of month
+  TestError("cast('2000-04-31' as date)");
+  // 1900 is not a leap year: 1900-02-28 is valid but 1900-02-29 isn't
+  TestDateValue("cast('1900-02-28' as date)", DateValue(1900, 2, 28));
+  TestError("cast('1900-02-29' as date)");
+  // 2000 is a leap year: 2000-02-29 is valid but 2000-02-30 isn't
+  TestDateValue("cast('2000-02-29' as date)", DateValue(2000, 2, 29));
+  TestError("cast('2000-02-30' as date)");
+
+  // Test whitespace trimming mechanism when cast from string to date.
+  TestDateValue("cast('  \t\r\n      2001-01-09   \t\r\n     ' as date)",
+      DateValue(2001, 1, 9));
+  TestDateValue("cast('  \t\r\n      2001-1-9    \t\r\n    ' as date)",
+      DateValue(2001, 1, 9));
+
+  // whitespace-only strings should fail with an error.
+  TestError("cast(' ' as date)");
+  TestError("cast('\n' as date)");
+  TestError("cast('\t' as date)");
+  TestError("cast('  \t\r\n' as date)");
+
+  // Test String <-> Date boundary cases.
+  TestDateValue("cast('0001-01-01' as date)", DateValue(1, 1, 1));
+  TestStringValue("cast(date '0001-01-01' as string)", "0001-01-01");
+  TestDateValue("cast('9999-12-31' as date)", DateValue(9999, 12, 31));
+  TestStringValue("cast(date '9999-12-31' as string)", "9999-12-31");
+  TestError("cast('10000-01-01' as date)");
+  TestError("cast(date '10000-01-01' as string)");
+
+  // Decimal <-> Date conversions are not allowed.
+  TestError("cast(cast('2000-01-01' as date) as decimal(12, 4))");
+  TestError("cast(cast(16868.1230 as decimal(12,4)) as date)");
+  TestError("cast(cast(null as date) as decimal(12, 4))");
+  TestError("cast(cast(null as decimal(12, 4)) as date)");
+
+  // Date <-> Int conversions are not allowed.
+  TestError("cast(cast('2000-01-01' as date) as int)");
+  TestError("cast(10957 as date)");
+  TestError("cast(cast(null as date) as int)");
+  TestError("cast(cast(null as int) as date)");
+
+  // Date <-> Double conversions are not allowed.
+  TestError("cast(cast('2000-01-01' as date) as double)");
+  TestError("cast(123.0 as date)");
+  TestError("cast(cast(null as date) as double)");
+  TestError("cast(cast(null as double) as date)");
+
+  // Bigint <-> date conversions are not allowed.
+  TestError("cast(cast(1234567890 as bigint) as date)");
+  TestError("cast(cast('2000-01-01' as date) as bigint)");
+  TestError("cast(cast(null as bigint) as date)");
+  TestError("cast(cast(null as date) as bigint)");
+
+  // Date <-> Timestamp
+  TestDateValue("cast(cast('2000-09-27 01:12:32.546' as timestamp) as date)",
+      DateValue(2000, 9, 27));
+  TestDateValue("cast(cast('1960-01-01 23:59:59' as timestamp) as date)",
+      DateValue(1960, 1, 1));
+  TestDateValue("cast(cast('1400-01-01 00:00:00' as timestamp) as date)",
+      DateValue(1400, 1, 1));
+  TestDateValue("cast(cast('9999-12-31 23:59:59.999999999' as timestamp) as date)",
+      DateValue(9999, 12, 31));
+
+  TestTimestampValue("cast(cast('2000-09-27' as date) as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2000-09-27", 10));
+  TestTimestampValue("cast(date '2000-09-27' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("2000-09-27", 10));
+  TestTimestampValue("cast(cast('9999-12-31' as date) as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("9999-12-31", 10));
+  TestTimestampValue("cast(date '9999-12-31' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("9999-12-31", 10));
+  TestTimestampValue("cast(cast('1400-01-01' as date) as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("1400-01-01", 10));
+  TestTimestampValue("cast(DATE '1400-01-01' as timestamp)",
+      TimestampValue::ParseSimpleDateFormat("1400-01-01", 10));
+  TestError("cast(cast('1399-12-31' as date) as timestamp)");
+  TestError("cast(date '1399-12-31' as timestamp)");
+
+  TestIsNull("cast(cast(null as timestamp) as date)", TYPE_DATE);
+  TestIsNull("cast(cast(null as date) as timestamp)", TYPE_TIMESTAMP);
+}
+
+TEST_P(ExprTest, CompoundPredicates) {
   TestValue("TRUE AND TRUE", TYPE_BOOLEAN, true);
   TestValue("TRUE AND FALSE", TYPE_BOOLEAN, false);
   TestValue("FALSE AND TRUE", TYPE_BOOLEAN, false);
@@ -3145,14 +3644,14 @@ TEST_F(ExprTest, CompoundPredicates) {
   TestIsNull("!NULL", TYPE_BOOLEAN);
 }
 
-TEST_F(ExprTest, IsNullPredicate) {
+TEST_P(ExprTest, IsNullPredicate) {
   TestValue("5 IS NULL", TYPE_BOOLEAN, false);
   TestValue("5 IS NOT NULL", TYPE_BOOLEAN, true);
   TestValue("NULL IS NULL", TYPE_BOOLEAN, true);
   TestValue("NULL IS NOT NULL", TYPE_BOOLEAN, false);
 }
 
-TEST_F(ExprTest, BoolTestExpr) {
+TEST_P(ExprTest, BoolTestExpr) {
   // Tests against constants.
   TestValue("TRUE IS TRUE", TYPE_BOOLEAN, true);
   TestValue("TRUE IS FALSE", TYPE_BOOLEAN, false);
@@ -3194,7 +3693,7 @@ TEST_F(ExprTest, BoolTestExpr) {
   TestValue("(NULL = 1) IS NOT UNKNOWN", TYPE_BOOLEAN, false);
 }
 
-TEST_F(ExprTest, LikePredicate) {
+TEST_P(ExprTest, LikePredicate) {
   TestValue("'a' LIKE '%a%'", TYPE_BOOLEAN, true);
   TestValue("'a' LIKE '%abcde'", TYPE_BOOLEAN, false);
   TestValue("'a' LIKE 'abcde%'", TYPE_BOOLEAN, false);
@@ -3343,7 +3842,7 @@ TEST_F(ExprTest, LikePredicate) {
   TestValue("'engLish' IREGEXP 'lIsh$'", TYPE_BOOLEAN, true);
 }
 
-TEST_F(ExprTest, BetweenPredicate) {
+TEST_P(ExprTest, BetweenPredicate) {
   // Between is rewritten into a conjunctive compound predicate.
   // Compound predicates are also tested elsewere, so we just do basic testing here.
   TestValue("5 between 0 and 10", TYPE_BOOLEAN, true);
@@ -3382,7 +3881,7 @@ TEST_F(ExprTest, BetweenPredicate) {
 }
 
 // Tests with NULLs are in the FE QueryTest.
-TEST_F(ExprTest, InPredicate) {
+TEST_P(ExprTest, InPredicate) {
   // Test integers.
   IntValMap::iterator int_iter;
   for(int_iter = min_int_values_.begin(); int_iter != min_int_values_.end();
@@ -3427,9 +3926,9 @@ TEST_F(ExprTest, InPredicate) {
       "cast('2011-11-24 09:11:12' as timestamp), " +
       default_timestamp_str_ + ")", TYPE_BOOLEAN, true);
   TestValue(default_timestamp_str_ + " "
-        "in (cast('2011-11-22 09:10:11' as timestamp), "
-        "cast('2011-11-23 09:11:12' as timestamp), "
-        "cast('2011-11-24 09:12:13' as timestamp))", TYPE_BOOLEAN, false);
+      "in (cast('2011-11-22 09:10:11' as timestamp), "
+      "cast('2011-11-23 09:11:12' as timestamp), "
+      "cast('2011-11-24 09:12:13' as timestamp))", TYPE_BOOLEAN, false);
   TestValue(default_timestamp_str_ + " "
       "not in (cast('2011-11-22 09:10:11' as timestamp), "
       "cast('2011-11-23 09:11:12' as timestamp), " +
@@ -3438,6 +3937,16 @@ TEST_F(ExprTest, InPredicate) {
       "not in (cast('2011-11-22 09:10:11' as timestamp), "
       "cast('2011-11-23 09:11:12' as timestamp), "
       "cast('2011-11-24 09:12:13' as timestamp))", TYPE_BOOLEAN, true);
+
+  // Test dates
+  TestValue(default_date_str_ + " in (cast('2011-01-02' as date), "
+      "cast('2011-01-03' as date), " + default_date_str_ + ")", TYPE_BOOLEAN, true);
+  TestValue(default_date_str_ + " in (cast('2011-01-02' as date), "
+      "cast('2011-01-03' as date), cast('2011-01-04' as date))", TYPE_BOOLEAN, false);
+  TestValue(default_date_str_ + " not in (cast('2011-01-02' as date), "
+      "cast('2011-01-03' as date), " + default_date_str_ + ")", TYPE_BOOLEAN, false);
+  TestValue(default_date_str_ + " not in (cast('2011-01-02' as date), "
+      "cast('2011-01-03' as date), cast('2011-01-04' as date))", TYPE_BOOLEAN, true);
 
   // Test decimals
   vector<string> dec_strs; // Decimal of every physical type
@@ -3482,7 +3991,163 @@ TEST_F(ExprTest, InPredicate) {
   TestIsNull("NULL in (NULL, NULL)", TYPE_BOOLEAN);
 }
 
-TEST_F(ExprTest, StringFunctions) {
+TEST_P(ExprTest, StringFunctions) {
+
+  for (const string fn_name: { "levenshtein", "le_dst" }) {
+    TestValue(fn_name + "('levenshtein', 'frankenstein')", TYPE_INT, 6);
+    TestValue(fn_name + "('example', 'samples')", TYPE_INT, 3);
+    TestValue(fn_name + "('sturgeon', 'urgently')", TYPE_INT, 6);
+    TestValue(fn_name + "('distance', 'difference')", TYPE_INT, 5);
+    TestValue(fn_name + "('kitten', 'sitting')", TYPE_INT, 3);
+    TestValue(fn_name + "('levenshtein', 'levenshtein')", TYPE_INT, 0);
+    TestValue(fn_name + "('', 'levenshtein')", TYPE_INT, 11);
+    TestValue(fn_name + "('levenshtein', '')", TYPE_INT, 11);
+    TestIsNull(fn_name + "('foo', NULL)", TYPE_INT);
+    TestIsNull(fn_name + "(NULL, 'foo')", TYPE_INT);
+    TestIsNull(fn_name + "(NULL, NULL)", TYPE_INT);
+    TestErrorString(fn_name + "('z', repeat('x', 256))",
+        "levenshtein argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "(repeat('x', 256), 'z')",
+        "levenshtein argument exceeds maximum length of 255 characters\n");
+  }
+
+  for (const string fn_name: { "damerau_levenshtein", "dle_dst" }) {
+    TestValue(fn_name + "('', '')", TYPE_INT, 0);
+    TestValue(fn_name + "('abc', 'abc')", TYPE_INT, 0);
+    TestValue(fn_name + "('a', 'b')", TYPE_INT, 1);
+    TestValue(fn_name + "('a', '')", TYPE_INT, 1);
+    TestValue(fn_name + "('aabc', 'abc')", TYPE_INT, 1);
+    TestValue(fn_name + "('abcc', 'abc')", TYPE_INT, 1);
+    TestValue(fn_name + "('', 'a')", TYPE_INT, 1);
+    TestValue(fn_name + "('abc', 'abcc')", TYPE_INT, 1);
+    TestValue(fn_name + "('abc', 'aabc')", TYPE_INT, 1);
+    TestValue(fn_name + "('teh', 'the')", TYPE_INT, 1);
+    TestValue(fn_name + "('tets', 'test')", TYPE_INT, 1);
+    TestValue(fn_name + "('fuor', 'four')", TYPE_INT, 1);
+    TestValue(fn_name + "('kitten', 'sitting')", TYPE_INT, 3);
+    TestValue(fn_name + "('Saturday', 'Sunday')", TYPE_INT, 3);
+    TestValue(fn_name + "('rosettacode', 'raisethysword')", TYPE_INT, 8);
+    TestValue(fn_name + "('CA', 'ABC')", TYPE_INT, 3);
+    TestValue(fn_name + "(repeat('z', 255), repeat('x', 255))", TYPE_INT, 255);
+    TestIsNull(fn_name + "('foo', NULL)", TYPE_INT);
+    TestIsNull(fn_name + "(NULL, 'foo')", TYPE_INT);
+    TestIsNull(fn_name + "(NULL, NULL)", TYPE_INT);
+    TestErrorString(fn_name + "('z', repeat('x', 256))",
+        "damerau-levenshtein argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "(repeat('x', 256), 'z')",
+        "damerau-levenshtein argument exceeds maximum length of 255 characters\n");
+  }
+
+  for (const string fn_name: { "jaro_dst", "jaro_distance" }) {
+    TestIsNull(fn_name + "('foo', NULL)", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, 'foo')", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, NULL)", TYPE_DOUBLE);
+    TestValue(fn_name + "('foo', 'foo')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('foo', 'bar')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('', '')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('', 'jaro')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('jaro', '')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('crate', 'trace')", TYPE_DOUBLE, 0.2666666666666666);
+    TestValue(fn_name + "('dwayne', 'duane')", TYPE_DOUBLE, 0.1777777777777778);
+    TestValue(fn_name + "('martha', 'marhta')", TYPE_DOUBLE, 0.05555555555555558);
+    TestValue(fn_name + "('frog', 'fog')", TYPE_DOUBLE, 0.08333333333333337);
+    TestValue(fn_name + "('hello', 'haloa')", TYPE_DOUBLE, 0.2666666666666666);
+    TestValue(fn_name + "('atcg', 'tagc')", TYPE_DOUBLE, 0.1666666666666667);
+    TestValue(fn_name + "(repeat('z', 255), repeat('x', 255))", TYPE_DOUBLE, 1.0);
+    TestErrorString(fn_name + "('z', repeat('x', 256))",
+        "jaro argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "(repeat('x', 256), 'z')",
+        "jaro argument exceeds maximum length of 255 characters\n");
+  }
+
+  for (const string fn_name: { "jaro_sim", "jaro_similarity" }) {
+    TestIsNull(fn_name + "('foo', NULL)", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, 'foo')", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, NULL)", TYPE_DOUBLE);
+    TestValue(fn_name + "('foo', 'foo')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('foo', 'bar')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('', '')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('', 'jaro')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('jaro', '')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('crate', 'trace')", TYPE_DOUBLE, 0.7333333333333334);
+    TestValue(fn_name + "('dwayne', 'duane')", TYPE_DOUBLE, 0.82222222222222222);
+    TestValue(fn_name + "('martha', 'marhta')", TYPE_DOUBLE, 0.944444444444444444);
+    TestValue(fn_name + "('frog', 'fog')", TYPE_DOUBLE, 0.9166666666666666);
+    TestValue(fn_name + "('hello', 'haloa')", TYPE_DOUBLE, 0.73333333333333334);
+    TestValue(fn_name + "('atcg', 'tagc')", TYPE_DOUBLE, 0.8333333333333333);
+    TestValue(fn_name + "(repeat('z', 255), repeat('x', 255))", TYPE_DOUBLE, 0.0);
+    TestErrorString(fn_name + "('z', repeat('x', 256))",
+        "jaro argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "(repeat('x', 256), 'z')",
+        "jaro argument exceeds maximum length of 255 characters\n");
+  }
+
+  for (const string fn_name: { "jaro_winkler_distance", "jw_dst" }) {
+    TestIsNull(fn_name + "('foo', NULL)", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, 'foo')", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, NULL)", TYPE_DOUBLE);
+    TestValue(fn_name + "('foo', 'foo')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('foo', 'bar')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('', '')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('', 'jaro')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('jaro', '')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('crate', 'trace')", TYPE_DOUBLE, 0.2666666666666666);
+    TestValue(fn_name + "('crate', 'trace', 0.2)", TYPE_DOUBLE, 0.2666666666666666);
+    TestValue(fn_name + "('dwayne', 'duane')", TYPE_DOUBLE, 0.16);
+    TestValue(fn_name + "('martha', 'marhta', 0.0)", TYPE_DOUBLE, 0.05555555555555558);
+    TestValue(fn_name + "('martha', 'marhta')", TYPE_DOUBLE, 0.03888888888888886);
+    TestValue(fn_name + "('martha', 'marhta', 0.2)", TYPE_DOUBLE, 0.02222222222222225);
+    TestValue(fn_name + "('atcg', 'tagc')", TYPE_DOUBLE, 0.1666666666666667);
+    TestValue(fn_name + "('martha', 'marhta', 0.1, 0.99)", TYPE_DOUBLE,
+        0.05555555555555558);
+    TestValue(fn_name + "('dwayne', 'duane', 0.1, 0.9)", TYPE_DOUBLE, 0.1777777777777778);
+    TestErrorString(fn_name + "('z', repeat('x', 256))",
+        "jaro-winkler argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "(repeat('x', 256), 'z')",
+        "jaro-winkler argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "('foo', 'bar', 0.26)",
+        "jaro-winkler scaling factor values can range between 0.0 and 0.25\n");
+    TestErrorString(fn_name + "('foo', 'bar', -0.01)",
+        "jaro-winkler scaling factor values can range between 0.0 and 0.25\n");
+    TestErrorString(fn_name + "('foo', 'bar', 0.1, -0.01)",
+        "jaro-winkler boost threshold values can range between 0.0 and 1.0\n");
+    TestErrorString(fn_name + "('foo', 'bar', 0.1, 1.01)",
+        "jaro-winkler boost threshold values can range between 0.0 and 1.0\n");
+  }
+  for (const string fn_name: { "jaro_winkler_similarity", "jw_sim"}) {
+    TestIsNull(fn_name + "('foo', NULL)", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, 'foo')", TYPE_DOUBLE);
+    TestIsNull(fn_name + "(NULL, NULL)", TYPE_DOUBLE);
+    TestValue(fn_name + "('foo', 'foo')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('foo', 'bar')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('', '')", TYPE_DOUBLE, 1.0);
+    TestValue(fn_name + "('', 'jaro')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('jaro', '')", TYPE_DOUBLE, 0.0);
+    TestValue(fn_name + "('crate', 'trace')", TYPE_DOUBLE, 0.7333333333333334);
+    TestValue(fn_name + "('crate', 'trace', 0.2)", TYPE_DOUBLE, 0.7333333333333334);
+    TestValue(fn_name + "('dwayne', 'duane')", TYPE_DOUBLE, 0.84);
+    TestValue(fn_name + "('martha', 'marhta', 0.0)", TYPE_DOUBLE, 0.94444444444444442);
+    TestValue(fn_name + "('martha', 'marhta', 0.1)", TYPE_DOUBLE, 0.96111111111111111);
+    TestValue(fn_name + "('martha', 'marhta', 0.2)", TYPE_DOUBLE, 0.97777777777777777);
+    TestValue(fn_name + "('atcg', 'tagc')", TYPE_DOUBLE, 0.8333333333333333);;
+    TestValue(fn_name + "('martha', 'marhta', 0.1, 0.99)", TYPE_DOUBLE,
+        0.94444444444444442);
+    TestValue(fn_name + "('dwayne', 'duane', 0.1, 0.9)", TYPE_DOUBLE,
+        0.82222222222222222);
+    TestErrorString(fn_name + "('z', repeat('x', 256))",
+        "jaro-winkler argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "(repeat('x', 256), 'z')",
+        "jaro-winkler argument exceeds maximum length of 255 characters\n");
+    TestErrorString(fn_name + "('foo', 'bar', 0.26)",
+        "jaro-winkler scaling factor values can range between 0.0 and 0.25\n");
+    TestErrorString(fn_name + "('foo', 'bar', -0.01)",
+        "jaro-winkler scaling factor values can range between 0.0 and 0.25\n");
+    TestErrorString(fn_name + "('foo', 'bar', 0.1, -0.01)",
+        "jaro-winkler boost threshold values can range between 0.0 and 1.0\n");
+    TestErrorString(fn_name + "('foo', 'bar', 0.1, 1.01)",
+        "jaro-winkler boost threshold values can range between 0.0 and 1.0\n");
+  }
+
   TestStringValue("substring('Hello', 1)", "Hello");
   TestStringValue("substring('Hello', -2)", "lo");
   TestStringValue("substring('Hello', cast(0 as bigint))", "");
@@ -3514,18 +4179,25 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("chr(NULL)", TYPE_STRING);
 
   TestStringValue("split_part('abc~!def~!ghi', '~!', 1)", "abc");
+  TestStringValue("split_part('abc~!def~!ghi', '~!', -1)", "ghi");
   TestStringValue("split_part('abc~!~def~!~ghi', '~!', 2)", "~def");
+  TestStringValue("split_part('abc~!~def~!~ghi', '~!', -2)", "~def");
   TestStringValue("split_part('abc@@def@@ghi', '@@', 3)", "ghi");
+  TestStringValue("split_part('abc@@def@@ghi', '@@', -3)", "abc");
   TestStringValue("split_part('abc@@def@@@@ghi', '@@', 4)", "ghi");
+  TestStringValue("split_part('abc@@def@@@@ghi', '@@', -4)", "abc");
   TestStringValue("split_part('abc@@def@@ghi', '@@', 4)", "");
+  TestStringValue("split_part('abc@@def@@ghi', '@@', -4)", "");
   TestStringValue("split_part('', '@@', 1)", "");
+  TestStringValue("split_part('', '@@', -1)", "");
   TestStringValue("split_part('abcdef', '', 1)", "abcdef");
+  TestStringValue("split_part('abcdef', '', -1)", "abcdef");
   TestStringValue("split_part('', '', 1)", "");
+  TestStringValue("split_part('', '', -1)", "");
   TestIsNull("split_part(NULL, NULL, 1)", TYPE_STRING);
   TestIsNull("split_part('abcdefabc', NULL, 1)", TYPE_STRING);
   TestIsNull("split_part(NULL, 'xyz', 1)", TYPE_STRING);
   TestError("split_part('abc@@def@@ghi', '@@', 0)");
-  TestError("split_part('abc@@def@@ghi', '@@', -1)");
 
   TestStringValue("lower('')", "");
   TestStringValue("lower('HELLO')", "hello");
@@ -3619,7 +4291,7 @@ TEST_F(ExprTest, StringFunctions) {
   FunctionContext::TypeDesc str_desc;
   str_desc.type = FunctionContext::Type::TYPE_STRING;
   std::vector<FunctionContext::TypeDesc> v(3, str_desc);
-  auto context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+  FunctionContext* context = CreateUdfTestContext(str_desc, v, nullptr, &pool);
 
   StringVal giga(static_cast<uint8_t*>(giga_buf->data()), StringVal::MAX_LENGTH);
   StringVal a("A");
@@ -3656,7 +4328,7 @@ TEST_F(ExprTest, StringFunctions) {
   EXPECT_TRUE(r4.is_null);
   // Re-create context to clear the error from failed allocation.
   UdfTestHarness::CloseContext(context);
-  context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+  context = CreateUdfTestContext(str_desc, v, nullptr, &pool);
 
   // Similar test for second overflow.  This tests overflowing on re-allocation.
   (*short_buf)[4095] = 'Z';
@@ -3665,7 +4337,7 @@ TEST_F(ExprTest, StringFunctions) {
   EXPECT_TRUE(r5.is_null);
   // Re-create context to clear the error from failed allocation.
   UdfTestHarness::CloseContext(context);
-  context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+  context = CreateUdfTestContext(str_desc, v, nullptr, &pool);
 
   // Finally, test expanding to exactly MAX_LENGTH
   // There are 4 Zs in giga4 (not including the trailing one, as we truncate that)
@@ -3697,6 +4369,7 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("strleft(NULL, 3)", TYPE_STRING);
   TestIsNull("strleft('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strleft(NULL, NULL)", TYPE_STRING);
+  TestStringValue("left('foobar', 3)", "foo");
   TestStringValue("strright('abcdefg', 0)", "");
   TestStringValue("strright('abcdefg', 3)", "efg");
   TestStringValue("strright('abcdefg', cast(10 as bigint))", "abcdefg");
@@ -3705,6 +4378,7 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("strright(NULL, 3)", TYPE_STRING);
   TestIsNull("strright('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strright(NULL, NULL)", TYPE_STRING);
+  TestStringValue("right('foobar', 3)", "bar");
 
   TestStringValue("translate('', '', '')", "");
   TestStringValue("translate('abcd', '', '')", "abcd");
@@ -3827,6 +4501,10 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("repeat(NULL, 6)", TYPE_STRING);
   TestIsNull("repeat('ab', NULL)", TYPE_STRING);
   TestIsNull("repeat(NULL, NULL)", TYPE_STRING);
+  TestErrorString("repeat('x', 1024 * 1024 * 1024 * 10)", "Number of repeats in "
+      "repeat() call is larger than allowed limit of 1 GB character data.\n");
+  TestErrorString("repeat('xx', 1024 * 1024 * 1024)", "repeat() result is larger than "
+      "allowed limit of 1 GB character data.\n");
 
   TestValue("ascii('')", TYPE_INT, 0);
   TestValue("ascii('abcde')", TYPE_INT, 'a');
@@ -3974,6 +4652,7 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("concat(NULL)", TYPE_STRING);
   TestIsNull("concat('a', NULL, 'b')", TYPE_STRING);
   TestIsNull("concat('a', 'b', NULL)", TYPE_STRING);
+  TestStringValue("concat('', '', '')", "");
 
   TestStringValue("concat_ws(',', 'a')", "a");
   TestStringValue("concat_ws(',', 'a', 'b')", "a,b");
@@ -3983,8 +4662,17 @@ TEST_F(ExprTest, StringFunctions) {
   TestStringValue("concat_ws('|','a', 'b', 'cde', '', 'fg', '')", "a|b|cde||fg|");
   TestStringValue("concat_ws('', '', '', '')", "");
   TestIsNull("concat_ws(NULL, NULL)", TYPE_STRING);
-  TestIsNull("concat_ws(',', NULL, 'b')", TYPE_STRING);
-  TestIsNull("concat_ws(',', 'b', NULL)", TYPE_STRING);
+  TestStringValue("concat_ws(',', NULL, 'b')", "b");
+  TestStringValue("concat_ws(',', 'b', NULL)", "b");
+  TestStringValue("concat_ws(',', NULL, 'b', 'a')", "b,a");
+  TestStringValue("concat_ws(',', 'b', NULL, 'a')", "b,a");
+  TestStringValue("concat_ws(',', 'b', 'a', NULL)", "b,a");
+  TestStringValue("concat_ws('', NULL, 'b', 'a')", "ba");
+  TestStringValue("concat_ws('', 'b', NULL, 'a')", "ba");
+  TestStringValue("concat_ws('', 'b', 'a', NULL)", "ba");
+  TestStringValue("concat_ws(',', NULL, NULL)", "");
+  TestStringValue("concat_ws(',', '', '')", ",");
+  TestStringValue("concat_ws(',', '')", "");
 
   TestValue("find_in_set('ab', 'ab,ab,ab,ade,cde')", TYPE_INT, 1);
   TestValue("find_in_set('ab', 'abc,xyz,abc,ade,ab')", TYPE_INT, 5);
@@ -4069,7 +4757,7 @@ TEST_F(ExprTest, StringFunctions) {
   TestStringValue(query, big_str);
 }
 
-TEST_F(ExprTest, StringBase64Coding) {
+TEST_P(ExprTest, StringBase64Coding) {
   // Test some known values of base64{en,de}code
   TestIsNull("base64encode(NULL)", TYPE_STRING);
   TestIsNull("base64decode(NULL)", TYPE_STRING);
@@ -4099,7 +4787,7 @@ TEST_F(ExprTest, StringBase64Coding) {
   }
 }
 
-TEST_F(ExprTest, LongReverse) {
+TEST_P(ExprTest, LongReverse) {
   static const int MAX_LEN = 2048;
   string to_reverse(MAX_LEN, ' '), reversed(MAX_LEN, ' ');
   // Pick some 'interesting' (i.e. random, but include some powers of two, some primes,
@@ -4111,7 +4799,7 @@ TEST_F(ExprTest, LongReverse) {
   }
 }
 
-TEST_F(ExprTest, StringRegexpFunctions) {
+TEST_P(ExprTest, StringRegexpFunctions) {
   // Single group.
   TestStringValue("regexp_extract('abxcy1234a', 'a.x', 0)", "abx");
   TestStringValue("regexp_extract('abxcy1234a', 'a.x.*a', 0)", "abxcy1234a");
@@ -4244,9 +4932,46 @@ TEST_F(ExprTest, StringRegexpFunctions) {
   TestIsNull("regexp_match_count(NULL, '.*')", TYPE_INT);
   TestIsNull("regexp_match_count('a123', NULL)", TYPE_INT);
   TestIsNull("regexp_match_count(NULL, NULL)", TYPE_INT);
+
+  TestIsNull("regexp_escape(NULL)", TYPE_STRING);
+  TestStringValue("regexp_escape('')", "");
+  // Test special character escape
+  // .\+*?[^]$(){}=!<>|:-
+  TestStringValue("regexp_escape('Hello.world')", R"(Hello\.world)");
+  TestStringValue(R"(regexp_escape('Hello\\world'))", R"(Hello\\world)");
+  TestStringValue("regexp_escape('Hello+world')", R"(Hello\+world)");
+  TestStringValue("regexp_escape('Hello*world')", R"(Hello\*world)");
+  TestStringValue("regexp_escape('Hello?world')", R"(Hello\?world)");
+  TestStringValue("regexp_escape('Hello[world')", R"(Hello\[world)");
+  TestStringValue("regexp_escape('Hello^world')", R"(Hello\^world)");
+  TestStringValue("regexp_escape('Hello]world')", R"(Hello\]world)");
+  TestStringValue("regexp_escape('Hello$world')", R"(Hello\$world)");
+  TestStringValue("regexp_escape('Hello(world')", R"(Hello\(world)");
+  TestStringValue("regexp_escape('Hello)world')", R"(Hello\)world)");
+  TestStringValue("regexp_escape('Hello{world')", R"(Hello\{world)");
+  TestStringValue("regexp_escape('Hello}world')", R"(Hello\}world)");
+  TestStringValue("regexp_escape('Hello=world')", R"(Hello\=world)");
+  TestStringValue("regexp_escape('Hello!world')", R"(Hello\!world)");
+  TestStringValue("regexp_escape('Hello<world')", R"(Hello\<world)");
+  TestStringValue("regexp_escape('Hello>world')", R"(Hello\>world)");
+  TestStringValue("regexp_escape('Hello|world')", R"(Hello\|world)");
+  TestStringValue("regexp_escape('Hello:world')", R"(Hello\:world)");
+  TestStringValue("regexp_escape('Hello-world')", R"(Hello\-world)");
+  // Mixed case
+  TestStringValue(R"(regexp_escape('a.b\\c+d*e?f[g]h$i(j)k{l}m=n!o<p>q|r:s-t'))",
+      R"(a\.b\\c\+d\*e\?f\[g\]h\$i\(j\)k\{l\}m\=n\!o\<p\>q\|r\:s\-t)");
+  // Mixed case with other regexp_* functions
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 0))", R"(Hello\\world)");
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 1))", "Hello");
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 2))", R"(\\)");
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 3))", "world");
 }
 
-TEST_F(ExprTest, StringParseUrlFunction) {
+TEST_P(ExprTest, StringParseUrlFunction) {
   // TODO: For now, our parse_url my not behave exactly like Hive
   // when given malformed URLs.
   // If necessary, we can closely follow Java's URL implementation
@@ -4575,16 +5300,20 @@ TEST_F(ExprTest, StringParseUrlFunction) {
       "index.html?test=true&name=networking&op=true', 'XYZ', 'name')");
 }
 
-TEST_F(ExprTest, UtilityFunctions) {
+TEST_P(ExprTest, UtilityFunctions) {
   TestStringValue("current_database()", "default");
   TestStringValue("current_catalog()", "default");
   TestStringValue("user()", "impala_test_user");
   TestStringValue("current_user()", "impala_test_user");
   TestStringValue("effective_user()",  "impala_test_user");
+  TestStringValue("logged_in_user()", "impala_test_user");
   TestStringValue("session_user()",  "impala_test_user");
   TestStringValue("version()", GetVersionString());
   TestValue("sleep(100)", TYPE_BOOLEAN, true);
   TestIsNull("sleep(NULL)", TYPE_BOOLEAN);
+  string hostname;
+  ASSERT_OK(GetHostname(&hostname));
+  TestStringValue("coordinator()", hostname);
 
   // Test typeOf
   TestStringValue("typeOf(!true)", "BOOLEAN");
@@ -4601,8 +5330,13 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestStringValue("typeOf(cast(10 as FLOAT))", "FLOAT");
   TestStringValue("typeOf(cast(10 as DOUBLE))", "DOUBLE");
   TestStringValue("typeOf(current_database())", "STRING");
+  TestStringValue("typeOf(version())", "STRING");
+  TestStringValue("typeOf(coordinator())", "STRING");
   TestStringValue("typeOf(now())", "TIMESTAMP");
   TestStringValue("typeOf(utc_timestamp())", "TIMESTAMP");
+  TestStringValue("typeOf(DATE '2011-01-01')", "DATE");
+  TestStringValue("typeOf(cast(now() as DATE))", "DATE");
+  TestStringValue("typeOf(current_date())", "DATE");
   TestStringValue("typeOf(cast(10 as DECIMAL))", "DECIMAL(9,0)");
   TestStringValue("typeOf(0.0)", "DECIMAL(1,1)");
   TestStringValue("typeOf(3.14)", "DECIMAL(3,2)");
@@ -4649,6 +5383,10 @@ TEST_F(ExprTest, UtilityFunctions) {
   expected = HashUtil::FnvHash64(&default_timestamp_val_, 12, HashUtil::FNV_SEED);
   TestValue("fnv_hash(" + default_timestamp_str_ + ")", TYPE_BIGINT, expected);
 
+  expected = HashUtil::FnvHash64(&default_date_val_, sizeof(DateValue),
+      HashUtil::FNV_SEED);
+  TestValue("fnv_hash(" + default_date_str_ + ")", TYPE_BIGINT, expected);
+
   bool bool_val = false;
   expected = HashUtil::FnvHash64(&bool_val, 1, HashUtil::FNV_SEED);
   TestValue("fnv_hash(FALSE)", TYPE_BIGINT, expected);
@@ -4657,7 +5395,27 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestIsNull("fnv_hash(NULL)", TYPE_BIGINT);
 }
 
-TEST_F(ExprTest, MurmurHashFunction) {
+// Test that UtilityFunctions::Coordinator() will return null if coord_address is unset
+TEST_P(ExprTest, CoordinatorFunction) {
+  // Make a RuntimeState where the query context does not have coord_address set.
+  // Note that this should never happen in a real impalad.
+  RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
+  MemTracker tracker;
+  MemPool mem_pool(&tracker);
+  FunctionContext::TypeDesc return_type;
+  return_type.type = FunctionContext::Type::TYPE_STRING;
+  std::vector<FunctionContext::TypeDesc> no_arguments;
+  FunctionContext* context =
+      CreateUdfTestContext(return_type, no_arguments, &state, &mem_pool);
+
+  StringVal coordinator = UtilityFunctions::Coordinator(context);
+  ASSERT_TRUE(coordinator.is_null) << "Coordinator() did not return expected null value";
+
+  UdfTestHarness::CloseContext(context);
+  state.ReleaseResources();
+}
+
+TEST_P(ExprTest, MurmurHashFunction) {
   string s("hello world");
   int64_t expected = HashUtil::MurmurHash2_64(s.data(), s.size(),
       HashUtil::MURMUR_DEFAULT_SEED);
@@ -4695,6 +5453,10 @@ TEST_F(ExprTest, MurmurHashFunction) {
       HashUtil::MURMUR_DEFAULT_SEED);
   TestValue("murmur_hash(" + default_timestamp_str_ + ")", TYPE_BIGINT, expected);
 
+  expected = HashUtil::MurmurHash2_64(&default_date_val_, sizeof(DateValue),
+      HashUtil::MURMUR_DEFAULT_SEED);
+  TestValue("murmur_hash(" + default_date_str_ + ")", TYPE_BIGINT, expected);
+
   bool bool_val = false;
   expected = HashUtil::MurmurHash2_64(&bool_val, 1, HashUtil::MURMUR_DEFAULT_SEED);
   TestValue("murmur_hash(FALSE)", TYPE_BIGINT, expected);
@@ -4703,7 +5465,7 @@ TEST_F(ExprTest, MurmurHashFunction) {
   TestIsNull("murmur_hash(NULL)", TYPE_BIGINT);
 }
 
-TEST_F(ExprTest, SessionFunctions) {
+TEST_P(ExprTest, SessionFunctions) {
   enum Session {S1, S2};
   enum Query {Q1, Q2};
 
@@ -4721,7 +5483,7 @@ TEST_F(ExprTest, SessionFunctions) {
   EXPECT_NE(results[S1][Q1], results[S2][Q1]);
 }
 
-TEST_F(ExprTest, NonFiniteFloats) {
+TEST_P(ExprTest, NonFiniteFloats) {
   TestValue("is_inf(0.0)", TYPE_BOOLEAN, false);
   TestValue("is_inf(-1/0)", TYPE_BOOLEAN, true);
   TestValue("is_inf(1/0)", TYPE_BOOLEAN, true);
@@ -4794,7 +5556,7 @@ TEST_F(ExprTest, NonFiniteFloats) {
   TestStringValue("CAST(0/0 AS STRING)", string("nan"));
 }
 
-TEST_F(ExprTest, InvalidFloats) {
+TEST_P(ExprTest, InvalidFloats) {
   // IMPALA-1731: Test that leading/trailing garbage is not allowed when parsing inf.
   TestIsNull("CAST('1.23inf' AS FLOAT)", TYPE_FLOAT);
   TestIsNull("CAST('1.23inf' AS DOUBLE)", TYPE_DOUBLE);
@@ -4838,7 +5600,7 @@ TEST_F(ExprTest, InvalidFloats) {
   TestIsNull("CAST('' AS FLOAT)", TYPE_FLOAT);
 }
 
-TEST_F(ExprTest, MathTrigonometricFunctions) {
+TEST_P(ExprTest, MathTrigonometricFunctions) {
   // It is important to calculate the expected values
   // using math functions, and not simply use constants.
   // Otherwise, floating point imprecisions may lead to failed tests.
@@ -4886,7 +5648,7 @@ TEST_F(ExprTest, MathTrigonometricFunctions) {
   TestIsNull("degrees(NULL)", TYPE_DOUBLE);
 }
 
-TEST_F(ExprTest, MathConversionFunctions) {
+TEST_P(ExprTest, MathConversionFunctions) {
   TestStringValue("bin(0)", "0");
   TestStringValue("bin(1)", "1");
   TestStringValue("bin(12)", "1100");
@@ -4921,6 +5683,9 @@ TEST_F(ExprTest, MathConversionFunctions) {
   TestStringValue("unhex('30GA')", "");
   // Uneven number of chars results in empty string.
   TestStringValue("unhex('30A')", "");
+  // IMPALA-8713: stack overflow in unhex().
+  TestValue("length(unhex(repeat('a', 1024 * 1024 * 1024)))",
+      TYPE_INT, 512 * 1024 * 1024);
 
   // Run the test suite twice, once with a bigint parameter, and once with
   // string parameters.
@@ -4989,7 +5754,7 @@ TEST_F(ExprTest, MathConversionFunctions) {
   TestIsNull("conv(NULL, NULL, NULL)", TYPE_STRING);
 }
 
-TEST_F(ExprTest, MathFunctions) {
+TEST_P(ExprTest, MathFunctions) {
   TestValue("pi()", TYPE_DOUBLE, M_PI);
   TestValue("e()", TYPE_DOUBLE, M_E);
   TestValue("abs(cast(-1.0 as double))", TYPE_DOUBLE, 1.0);
@@ -5009,12 +5774,12 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("abs(-9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
   TestValue("abs(9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
   TestIsNull("abs(-9223372036854775808)", TYPE_BIGINT);
-  TestValue("sign(0.0)", TYPE_FLOAT, 0.0f);
-  TestValue("sign(-0.0)", TYPE_FLOAT, 0.0f);
-  TestValue("sign(+0.0)", TYPE_FLOAT, 0.0f);
-  TestValue("sign(10.0)", TYPE_FLOAT, 1.0f);
-  TestValue("sign(-10.0)", TYPE_FLOAT, -1.0f);
-  TestIsNull("sign(NULL)", TYPE_FLOAT);
+  TestValue("sign(0.0)", TYPE_DOUBLE, 0.0f);
+  TestValue("sign(-0.0)", TYPE_DOUBLE, 0.0f);
+  TestValue("sign(+0.0)", TYPE_DOUBLE, 0.0f);
+  TestValue("sign(10.0)", TYPE_DOUBLE, 1.0f);
+  TestValue("sign(-10.0)", TYPE_DOUBLE, -1.0f);
+  TestIsNull("sign(NULL)", TYPE_DOUBLE);
 
   // It is important to calculate the expected values
   // using math functions, and not simply use constants.
@@ -5040,6 +5805,81 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("sqrt(121.0)", TYPE_DOUBLE, 11.0);
   TestValue("sqrt(2.0)", TYPE_DOUBLE, sqrt(2.0));
   TestValue("dsqrt(81.0)", TYPE_DOUBLE, 9);
+
+  TestValue("width_bucket(6.3, 2, 17, 2)", TYPE_BIGINT, 1);
+  TestValue("width_bucket(11, 6, 14, 3)", TYPE_BIGINT, 2);
+  TestValue("width_bucket(-1, -5, 5, 3)", TYPE_BIGINT, 2);
+  TestValue("width_bucket(1, -5, 5, 3)", TYPE_BIGINT, 2);
+  TestValue("width_bucket(3, 5, 20.1, 4)", TYPE_BIGINT, 0);
+  TestIsNull("width_bucket(NULL, 5, 20.1, 4)", TYPE_BIGINT);
+  TestIsNull("width_bucket(22, NULL, 20.1, 4)", TYPE_BIGINT);
+  TestIsNull("width_bucket(22, 5, NULL, 4)", TYPE_BIGINT);
+  TestIsNull("width_bucket(22, 5, 20.1, NULL)", TYPE_BIGINT);
+
+  TestValue("width_bucket(22, 5, 20.1, 4)", TYPE_BIGINT, 5);
+  // Test when the result (bucket number) is greater than the max value that can be
+  // stored in a IntVal
+  TestValue("width_bucket(22, 5, 20.1, 2147483647)", TYPE_BIGINT, 2147483648);
+  // Test when min and max of the bucket width range are equal.
+  TestErrorString("width_bucket(22, 5, 5, 4)",
+      "UDF ERROR: Lower bound cannot be greater than or equal to the upper bound\n");
+  // Test when min > max
+  TestErrorString("width_bucket(22, 50, 5, 4)",
+      "UDF ERROR: Lower bound cannot be greater than or equal to the upper bound\n");
+  // IMPALA-7412: Test max - min should not overflow anymore
+  TestValue("width_bucket(11, -9, 99999999999999999999999999999999999999, 4000)",
+      TYPE_BIGINT, 1);
+  TestValue("width_bucket(1, -99999999999999999999999999999999999999, 9, 40)",
+      TYPE_BIGINT, 40);
+  // Test when dist_from_min * buckets cannot be stored in a int128_t (overflows)
+  // and needs to be stored in a int256_t
+  TestValue("width_bucket(8000000000000000000000000000000000000,"
+      "100000000000000000000000000000000000, 9000000000000000000000000000000000000,"
+      "900000)", TYPE_BIGINT, 798877);
+  // Test when range_size * GetScaleMultiplier(input_scale) cannot be stored in a
+  // int128_t (overflows) and needs to be stored in a int256_t
+  TestValue("width_bucket(100000000, 199999.77777777777777777777777777, 99999999999.99999"
+    ", 40)", TYPE_BIGINT, 1);
+  // Test with max values for expr and num_bucket when the width_bucket can be
+  // evaluated with int128_t. Incrementing one of them will require using int256_t for
+  // width_bucket evaluation
+  TestValue("width_bucket(9999999999999999999999999999999999999, 1,"
+            "99999999999999999999999999999999999999, 15)", TYPE_BIGINT, 2);
+  // Test with the smallest value of num_bucket for the given combination of expr,
+  // max and min value that would require int256_t for evalation
+  TestValue("width_bucket(9999999999999999999999999999999999999, 1,"
+            "99999999999999999999999999999999999999, 16)", TYPE_BIGINT, 2);
+  // Test with the smallest value of expr for the given combination of num_buckets,
+  // max and min value that would require int256_t for evalation
+  TestValue("width_bucket(10000000000000000000000000000000000000, 1,"
+            "99999999999999999999999999999999999999, 15)", TYPE_BIGINT, 2);
+  // IMPALA-7412: These should not overflow anymore
+  TestValue("width_bucket(cast(-0.10 as decimal(37,30)), cast(-0.36028797018963968 "
+      "as decimal(25,25)), cast(9151517.4969773200562764155787276999832"
+      "as decimal(38,31)), 1328180220)", TYPE_BIGINT, 38);
+  TestValue("width_bucket(cast(9 as decimal(10,7)), cast(-60000 as decimal(11,6)), "
+      "cast(10 as decimal(7,5)), 249895273);", TYPE_BIGINT, 249891109);
+  // max - min and expr - min needs bigger type than the underlying type of
+  // the deduced decimal. The calculation must succeed by using a bigger type.
+  TestValue("width_bucket(cast(0.9999 as decimal(35,35)), cast(-0.705408425140 as "
+      "decimal(23,23)), cast(0.999999999999999999999 as decimal(38,38)), 699997927)",
+      TYPE_BIGINT, 699956882ll);
+  // max - min needs bigger type, but expr - min and (expr - min) * num_buckets fits
+  // into deduced decimal
+  TestValue("width_bucket(cast(-0.7054084251 as decimal(23,23)), cast(-0.705408425140 "
+      "as decimal(23,23)), cast(0.999999999999999999999 as decimal(38,38)), 10)",
+      TYPE_BIGINT, 1);
+  // max - min fits into deduced decimal, (max - min) * num_buckets needs bigger type,
+  // but expr == min
+  TestValue("width_bucket(cast(1 as decimal(9,0)), cast(1 as decimal(9,0)), "
+      "cast(100000000 as decimal(9,0)), 100)", TYPE_BIGINT, 1);
+  // max - min fits into deduced decimal, (max - min) * num_buckets needs bigger type,
+  // but (expr - min) * num_buckets fits
+  TestValue("width_bucket(cast(2 as decimal(9,0)), cast(1 as decimal(9,0)), "
+      "cast(100000000 as decimal(9,0)), 100)", TYPE_BIGINT, 1);
+  // max - min fits into deduced decimal, but (expr - min) * num_buckets needs bigger type
+  TestValue("width_bucket(cast(100000000 as decimal(9,0)), cast(1 as decimal(9,0)), "
+      "cast(100000001 as decimal(9,0)), 100)", TYPE_BIGINT, 100);
 
   // Run twice to test deterministic behavior.
   for (uint32_t seed : {0, 1234}) {
@@ -5093,7 +5933,8 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("cast(-12345.345 as float) % cast(-7 as float)",
       TYPE_FLOAT, fmodf(-12345.345f, -7.0f));
   TestValue("cast(12345.345 as double) % 7", TYPE_DOUBLE, fmod(12345.345, 7.0));
-  TestValue("-12345.345 % cast(7 as double)", TYPE_DOUBLE, fmod(-12345.345, 7.0));
+  TestValue("cast(-12345.345 as double) % cast(7 as double)",
+      TYPE_DOUBLE, fmod(-12345.345, 7.0));
   TestValue("cast(-12345.345 as double) % -7", TYPE_DOUBLE, fmod(-12345.345, -7.0));
   // Test floating-point modulo by zero.
   TestIsNull("fmod(cast(-12345.345 as float), cast(0 as float))", TYPE_FLOAT);
@@ -5196,6 +6037,9 @@ TEST_F(ExprTest, MathFunctions) {
   // Test timestamp param
   TestStringValue("cast(least(cast('2014-09-26 12:00:00' as timestamp), "
       "cast('2013-09-26 12:00:00' as timestamp)) as string)", "2013-09-26 12:00:00");
+  // Test date param
+  TestStringValue("cast(least(cast('2014-09-26' as date), "
+      "cast('2013-09-26' as date)) as string)", "2013-09-26");
   // Test string param.
   TestStringValue("least('2', '5', '12', '3')", "12");
   TestStringValue("least('apples', 'oranges', 'bananas')", "apples");
@@ -5253,6 +6097,9 @@ TEST_F(ExprTest, MathFunctions) {
   // Test timestamp param
   TestStringValue("cast(greatest(cast('2014-09-26 12:00:00' as timestamp), "
       "cast('2013-09-26 12:00:00' as timestamp)) as string)", "2014-09-26 12:00:00");
+  // Test date param
+  TestStringValue("cast(greatest(cast('2014-09-26' as date), "
+      "cast('2013-09-26' as date)) as string)", "2014-09-26");
   // Test string param
   TestStringValue("greatest('2', '5', '12', '3')", "5");
   TestStringValue("greatest('apples', 'oranges', 'bananas')", "oranges");
@@ -5277,7 +6124,7 @@ TEST_F(ExprTest, MathFunctions) {
   // NULL arguments. In some cases the NULL can match multiple overloads so the result
   // type depends on the order in which function overloads are considered.
   TestIsNull("abs(NULL)", TYPE_SMALLINT);
-  TestIsNull("sign(NULL)", TYPE_FLOAT);
+  TestIsNull("sign(NULL)", TYPE_DOUBLE);
   TestIsNull("exp(NULL)", TYPE_DOUBLE);
   TestIsNull("ln(NULL)", TYPE_DOUBLE);
   TestIsNull("log10(NULL)", TYPE_DOUBLE);
@@ -5319,6 +6166,7 @@ TEST_F(ExprTest, MathFunctions) {
   TestIsNull("least(cast(NULL as float))", TYPE_FLOAT);
   TestIsNull("least(cast(NULL as double))", TYPE_DOUBLE);
   TestIsNull("least(cast(NULL as timestamp))", TYPE_TIMESTAMP);
+  TestIsNull("least(cast(NULL as date))", TYPE_DATE);
   TestIsNull("greatest(NULL)", TYPE_TINYINT);
   TestIsNull("greatest(cast(NULL as tinyint))", TYPE_TINYINT);
   TestIsNull("greatest(cast(NULL as smallint))", TYPE_SMALLINT);
@@ -5327,28 +6175,29 @@ TEST_F(ExprTest, MathFunctions) {
   TestIsNull("greatest(cast(NULL as float))", TYPE_FLOAT);
   TestIsNull("greatest(cast(NULL as double))", TYPE_DOUBLE);
   TestIsNull("greatest(cast(NULL as timestamp))", TYPE_TIMESTAMP);
+  TestIsNull("greatest(cast(NULL as date))", TYPE_DATE);
 }
 
-TEST_F(ExprTest, MathRoundingFunctions) {
-  TestValue("ceil(cast(0.1 as double))", TYPE_BIGINT, 1);
-  TestValue("ceil(cast(-10.05 as double))", TYPE_BIGINT, -10);
-  TestValue("ceil(cast(23.6 as double))", TYPE_BIGINT, 24);
-  TestValue("ceiling(cast(0.1 as double))", TYPE_BIGINT, 1);
-  TestValue("ceiling(cast(-10.05 as double))", TYPE_BIGINT, -10);
-  TestValue("floor(cast(0.1 as double))", TYPE_BIGINT, 0);
-  TestValue("floor(cast(-10.007 as double))", TYPE_BIGINT, -11);
-  TestValue("dfloor(cast(123.456 as double))", TYPE_BIGINT, 123);
-  TestValue("truncate(cast(0.1 as double))", TYPE_BIGINT, 0);
-  TestValue("truncate(cast(-10.007 as double))", TYPE_BIGINT, -10);
-  TestValue("dtrunc(cast(10.99 as double))", TYPE_BIGINT, 10);
+TEST_P(ExprTest, MathRoundingFunctions) {
+  TestValue("ceil(cast(0.1 as double))", TYPE_DOUBLE, 1);
+  TestValue("ceil(cast(-10.05 as double))", TYPE_DOUBLE, -10);
+  TestValue("ceil(cast(23.6 as double))", TYPE_DOUBLE, 24);
+  TestValue("ceiling(cast(0.1 as double))", TYPE_DOUBLE, 1);
+  TestValue("ceiling(cast(-10.05 as double))", TYPE_DOUBLE, -10);
+  TestValue("floor(cast(0.1 as double))", TYPE_DOUBLE, 0);
+  TestValue("floor(cast(-10.007 as double))", TYPE_DOUBLE, -11);
+  TestValue("dfloor(cast(123.456 as double))", TYPE_DOUBLE, 123);
+  TestValue("truncate(cast(0.1 as double))", TYPE_DOUBLE, 0);
+  TestValue("truncate(cast(-10.007 as double))", TYPE_DOUBLE, -10);
+  TestValue("dtrunc(cast(10.99 as double))", TYPE_DOUBLE, 10);
 
-  TestValue("round(cast(1.499999 as double))", TYPE_BIGINT, 1);
-  TestValue("round(cast(1.5 as double))", TYPE_BIGINT, 2);
-  TestValue("round(cast(1.500001 as double))", TYPE_BIGINT, 2);
-  TestValue("round(cast(-1.499999 as double))", TYPE_BIGINT, -1);
-  TestValue("round(cast(-1.5 as double))", TYPE_BIGINT, -2);
-  TestValue("round(cast(-1.500001 as double))", TYPE_BIGINT, -2);
-  TestValue("dround(cast(2.500001 as double))", TYPE_BIGINT, 3);
+  TestValue("round(cast(1.499999 as double))", TYPE_DOUBLE, 1);
+  TestValue("round(cast(1.5 as double))", TYPE_DOUBLE, 2);
+  TestValue("round(cast(1.500001 as double))", TYPE_DOUBLE, 2);
+  TestValue("round(cast(-1.499999 as double))", TYPE_DOUBLE, -1);
+  TestValue("round(cast(-1.5 as double))", TYPE_DOUBLE, -2);
+  TestValue("round(cast(-1.500001 as double))", TYPE_DOUBLE, -2);
+  TestValue("dround(cast(2.500001 as double))", TYPE_DOUBLE, 3);
 
   TestValue("round(cast(3.14159265 as double), 0)", TYPE_DOUBLE, 3.0);
   TestValue("round(cast(3.14159265 as double), 1)", TYPE_DOUBLE, 3.1);
@@ -5362,20 +6211,30 @@ TEST_F(ExprTest, MathRoundingFunctions) {
   TestValue("round(cast(-3.14159265 as double), 3)", TYPE_DOUBLE, -3.142);
   TestValue("round(cast(-3.14159265 as double), 4)", TYPE_DOUBLE, -3.1416);
   TestValue("round(cast(-3.14159265 as double), 5)", TYPE_DOUBLE, -3.14159);
+  TestValue("round(cast(3.1415926535897932384626433 as double), 19)",
+      TYPE_DOUBLE, 3.141592653589793);
+  TestValue("round(cast(3.1415926535897932384626433 as double), 20)",
+      TYPE_DOUBLE, 3.141592653589794);
   TestValue("dround(cast(3.14159265 as double), 5)", TYPE_DOUBLE, 3.14159);
+  TestValue("round(cast(5.55 as double), 1)", TYPE_DOUBLE, 5.6);
+  TestValue("round(cast(-5.55 as double), 1)", TYPE_DOUBLE, -5.6);
+  TestValue("round(cast(555.555 as double), -1)", TYPE_DOUBLE, 560);
+  TestValue("round(cast(-555.555 as double), -1)", TYPE_DOUBLE, -560);
+  TestValue("round(cast(555.555 as double), -2)", TYPE_DOUBLE, 600);
+  TestValue("round(cast(-555.555 as double), -2)", TYPE_DOUBLE, -600);
 
   // NULL arguments.
-  TestIsNull("ceil(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("ceiling(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("floor(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("truncate(cast(NULL as double))", TYPE_BIGINT);
-  TestIsNull("round(cast(NULL as double))", TYPE_BIGINT);
+  TestIsNull("ceil(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("ceiling(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("floor(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("truncate(cast(NULL as double))", TYPE_DOUBLE);
+  TestIsNull("round(cast(NULL as double))", TYPE_DOUBLE);
   TestIsNull("round(cast(NULL as double), 1)", TYPE_DOUBLE);
   TestIsNull("round(cast(3.14159265 as double), NULL)", TYPE_DOUBLE);
   TestIsNull("round(cast(NULL as double), NULL)", TYPE_DOUBLE);
 }
 
-TEST_F(ExprTest, UnaryOperators) {
+TEST_P(ExprTest, UnaryOperators) {
   TestValue("+1", TYPE_TINYINT, 1);
   TestValue("-1", TYPE_TINYINT, -1);
   TestValue("- -1", TYPE_TINYINT, 1);
@@ -5394,7 +6253,7 @@ TEST_F(ExprTest, UnaryOperators) {
   TestValue("-1 & 8", TYPE_TINYINT, 8);
 }
 
-TEST_F(ExprTest, MoscowTimezoneConversion) {
+TEST_P(ExprTest, MoscowTimezoneConversion) {
 #pragma push_macro("UTC_TO_MSC")
 #pragma push_macro("MSC_TO_UTC")
 #define UTC_TO_MSC(X) ("cast(from_utc_timestamp('" X "', 'Europe/Moscow') as string)")
@@ -5458,7 +6317,50 @@ TEST_F(ExprTest, MoscowTimezoneConversion) {
 #pragma pop_macro("UTC_TO_MSC")
 }
 
-TEST_F(ExprTest, TimestampFunctions) {
+void ExprTest::TestAusDSTEndingForEastTimeZone(const string& time_zone) {
+  // Timestamps between 02:00:00 and 02:59:59 inclusive on the ending day of DST are
+  // ambiguous, hence excpecting NULL for timestamps in that range. Expect a UTC adjusted
+  // timestamp otherwise.
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 01:59:59', '" + time_zone + "') "
+      "as string)", "2018-03-31 14:59:59");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:00:00', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:59:59', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 03:00:00', '" + time_zone + "') "
+      "as string)", "2018-03-31 17:00:00");
+}
+
+void ExprTest::TestAusDSTEndingForCentralTimeZone(const string& time_zone) {
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 01:59:59', '" + time_zone + "') "
+      "as string)", "2018-03-31 15:29:59");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:00:00', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 02:59:59', '" + time_zone + "') "
+      "as string)", "NULL");
+  TestStringValue("cast(to_utc_timestamp('2018-04-01 03:00:00', '" + time_zone + "') "
+      "as string)", "2018-03-31 17:30:00");
+}
+
+// IMPALA-6699: Fix DST end time for Australian time-zones
+TEST_P(ExprTest, AusDSTEndingTests) {
+  TestAusDSTEndingForEastTimeZone("AET");
+  TestAusDSTEndingForEastTimeZone("Australia/ACT");
+  TestAusDSTEndingForCentralTimeZone("Australia/Adelaide");
+  TestAusDSTEndingForCentralTimeZone("Australia/Broken_Hill");
+  TestAusDSTEndingForEastTimeZone("Australia/Canberra");
+  TestAusDSTEndingForEastTimeZone("Australia/Currie");
+  TestAusDSTEndingForEastTimeZone("Australia/Hobart");
+  TestAusDSTEndingForEastTimeZone("Australia/Melbourne");
+  TestAusDSTEndingForEastTimeZone("Australia/NSW");
+  TestAusDSTEndingForCentralTimeZone("Australia/South");
+  TestAusDSTEndingForEastTimeZone("Australia/Sydney");
+  TestAusDSTEndingForEastTimeZone("Australia/Tasmania");
+  TestAusDSTEndingForEastTimeZone("Australia/Victoria");
+  TestAusDSTEndingForCentralTimeZone("Australia/Yancowinna");
+}
+
+TEST_P(ExprTest, TimestampFunctions) {
   // Regression for IMPALA-1105
   TestIsNull("cast(cast('NOTATIMESTAMP' as timestamp) as string)", TYPE_STRING);
 
@@ -5634,6 +6536,8 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue("cast(date_sub(cast('2012-01-02 01:00:00.033000001' "
       "as timestamp), interval cast(90000033 as bigint) milliseconds) as string)",
       "2012-01-01 00:00:00.000000001");
+  TestStringValue("cast(cast(0 as timestamp) + interval -10000000000000 milliseconds "
+      "as string)", "1653-02-10 06:13:20");
   // Add/sub microseconds.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
       "as timestamp), interval 1033 microseconds) as string)",
@@ -5782,6 +6686,7 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // Test Unix epoch conversions again but now converting into local timestamp values.
   {
+    ScopedTimeZoneOverride time_zone("PST8PDT");
     ScopedLocalUnixTimestampConversionOverride use_local;
     // Determine what the local time would have been when it was 1970-01-01 GMT
     ptime local_time_at_epoch = c_local_adjustor<ptime>::utc_to_local(from_time_t(0));
@@ -5834,11 +6739,13 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("cast('2011-12-22 09:10:11.000000' as timestamp) = \
       cast('2011-12-22 09:10:11' as timestamp)", TYPE_BOOLEAN, true);
   TestValue("year(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 2011);
+  TestValue("quarter(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 4);
   TestValue("month(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 12);
   TestValue("dayofmonth(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 22);
   TestValue("day(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 22);
   TestValue("dayofyear(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 356);
   TestValue("weekofyear(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 51);
+  TestValue("week(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 51);
   TestValue("dayofweek(cast('2011-12-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
   TestValue("dayofweek(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 5);
   TestValue("dayofweek(cast('2011-12-24 09:10:11.000000' as timestamp))", TYPE_INT, 7);
@@ -5850,11 +6757,13 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("millisecond(cast('2011-12-22 09:10:11' as timestamp))", TYPE_INT, 0);
   TestValue("millisecond(cast('2011-12-22' as timestamp))", TYPE_INT, 0);
   TestValue("year(cast('2011-12-22' as timestamp))", TYPE_INT, 2011);
+  TestValue("quarter(cast('2011-12-22' as timestamp))", TYPE_INT, 4);
   TestValue("month(cast('2011-12-22' as timestamp))", TYPE_INT, 12);
   TestValue("dayofmonth(cast('2011-12-22' as timestamp))", TYPE_INT, 22);
   TestValue("day(cast('2011-12-22' as timestamp))", TYPE_INT, 22);
   TestValue("dayofyear(cast('2011-12-22' as timestamp))", TYPE_INT, 356);
   TestValue("weekofyear(cast('2011-12-22' as timestamp))", TYPE_INT, 51);
+  TestValue("week(cast('2011-12-22' as timestamp))", TYPE_INT, 51);
   TestValue("dayofweek(cast('2011-12-18' as timestamp))", TYPE_INT, 1);
   TestValue("dayofweek(cast('2011-12-22' as timestamp))", TYPE_INT, 5);
   TestValue("dayofweek(cast('2011-12-24' as timestamp))", TYPE_INT, 7);
@@ -5879,7 +6788,7 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("timestamp_cmp('','1966-05-04 15:33:45')", TYPE_INT);
   TestIsNull("timestamp_cmp(NULL,'1966-05-04 15:33:45')", TYPE_INT);
   // Invalid timestamp test case
-  TestIsNull("timestamp_cmp('1966-5-4 5:33:45','1966-5-4 15:33:45')", TYPE_INT);
+  TestIsNull("timestamp_cmp('1966-5-4 50:33:45','1966-5-4 15:33:45')", TYPE_INT);
 
   TestValue("int_months_between('1967-07-19','1966-06-04')", TYPE_INT, 13);
   TestValue("int_months_between('1966-06-04 16:34:45','1967-07-19 15:33:46')",
@@ -5912,22 +6821,26 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("cast('2000-12-31 24:59:59' as timestamp)", TYPE_TIMESTAMP);
 
   TestIsNull("year(cast('09:10:11.000000' as timestamp))", TYPE_INT);
+  TestIsNull("quarter(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("month(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofmonth(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("day(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofweek(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("weekofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
+  TestIsNull("week(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("datediff(cast('09:10:11.12345678' as timestamp), "
       "cast('2012-12-22' as timestamp))", TYPE_INT);
 
   TestIsNull("year(NULL)", TYPE_INT);
+  TestIsNull("quarter(NULL)", TYPE_INT);
   TestIsNull("month(NULL)", TYPE_INT);
   TestIsNull("dayofmonth(NULL)", TYPE_INT);
   TestIsNull("day(NULL)", TYPE_INT);
   TestIsNull("dayofweek(NULL)", TYPE_INT);
   TestIsNull("dayofyear(NULL)", TYPE_INT);
   TestIsNull("weekofyear(NULL)", TYPE_INT);
+  TestIsNull("week(NULL)", TYPE_INT);
   TestIsNull("datediff(NULL, cast('2011-12-22 09:10:11.12345678' as timestamp))",
       TYPE_INT);
   TestIsNull("datediff(cast('2012-12-22' as timestamp), NULL)", TYPE_INT);
@@ -5946,6 +6859,34 @@ TEST_F(ExprTest, TimestampFunctions) {
       "Saturday");
   TestStringValue("dayname(cast('2011-12-25 09:10:11.000000' as timestamp))", "Sunday");
   TestIsNull("dayname(NULL)", TYPE_STRING);
+
+  TestStringValue("monthname(cast('2011-01-18 09:10:11.000000' as timestamp))", "January");
+  TestStringValue("monthname(cast('2011-02-18 09:10:11.000000' as timestamp))", "February");
+  TestStringValue("monthname(cast('2011-03-18 09:10:11.000000' as timestamp))", "March");
+  TestStringValue("monthname(cast('2011-04-18 09:10:11.000000' as timestamp))", "April");
+  TestStringValue("monthname(cast('2011-05-18 09:10:11.000000' as timestamp))", "May");
+  TestStringValue("monthname(cast('2011-06-18 09:10:11.000000' as timestamp))", "June");
+  TestStringValue("monthname(cast('2011-07-18 09:10:11.000000' as timestamp))", "July");
+  TestStringValue("monthname(cast('2011-08-18 09:10:11.000000' as timestamp))", "August");
+  TestStringValue("monthname(cast('2011-09-18 09:10:11.000000' as timestamp))", "September");
+  TestStringValue("monthname(cast('2011-10-18 09:10:11.000000' as timestamp))", "October");
+  TestStringValue("monthname(cast('2011-11-18 09:10:11.000000' as timestamp))", "November");
+  TestStringValue("monthname(cast('2011-12-18 09:10:11.000000' as timestamp))", "December");
+  TestIsNull("monthname(NULL)", TYPE_STRING);
+
+  TestValue("quarter(cast('2011-01-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("quarter(cast('2011-02-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("quarter(cast('2011-03-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("quarter(cast('2011-04-18 09:10:11.000000' as timestamp))", TYPE_INT, 2);
+  TestValue("quarter(cast('2011-05-18 09:10:11.000000' as timestamp))", TYPE_INT, 2);
+  TestValue("quarter(cast('2011-06-18 09:10:11.000000' as timestamp))", TYPE_INT, 2);
+  TestValue("quarter(cast('2011-07-18 09:10:11.000000' as timestamp))", TYPE_INT, 3);
+  TestValue("quarter(cast('2011-08-18 09:10:11.000000' as timestamp))", TYPE_INT, 3);
+  TestValue("quarter(cast('2011-09-18 09:10:11.000000' as timestamp))", TYPE_INT, 3);
+  TestValue("quarter(cast('2011-10-18 09:10:11.000000' as timestamp))", TYPE_INT, 4);
+  TestValue("quarter(cast('2011-11-18 09:10:11.000000' as timestamp))", TYPE_INT, 4);
+  TestValue("quarter(cast('2011-12-18 09:10:11.000000' as timestamp))", TYPE_INT, 4);
+  TestIsNull("quarter(NULL)", TYPE_INT);
 
   // Tests from Hive
   // The hive documentation states that timestamps are timezoneless, but the tests
@@ -6020,7 +6961,7 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // These return NULL because timezone conversion makes the value out
   // of range.
-  TestIsNull("to_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"AEST\")",
+  TestIsNull("to_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"AET\")",
       TYPE_TIMESTAMP);
   TestIsNull("from_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"PST\")",
       TYPE_TIMESTAMP);
@@ -6030,8 +6971,8 @@ TEST_F(ExprTest, TimestampFunctions) {
       TYPE_TIMESTAMP);
 
   // With support of date strings this generates a date and 0 time.
-  TestStringValue(
-      "cast(cast('1999-01-10' as timestamp) as string)", "1999-01-10 00:00:00");
+  TestStringValue("cast(cast('1999-01-10' as timestamp) as string)",
+      "1999-01-10 00:00:00");
 
   // Test functions with unknown expected value.
   TestValidTimestampValue("now()");
@@ -6039,57 +6980,80 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValidTimestampValue("current_timestamp()");
   TestValidTimestampValue("cast(unix_timestamp() as timestamp)");
 
-  // Test that the epoch is reasonable. The default behavior of UNIX_TIMESTAMP()
-  // is incorrect but wasn't changed for compatibility reasons. The function returns
-  // a value as though the current timezone is UTC. Or in other words, 1970-01-01
-  // in the current timezone is the effective epoch. A flag was introduced to enable
-  // the correct behavior. The first test below checks the default/incorrect behavior.
-  time_t unix_start_time =
-      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
-  int64_t unix_timestamp_result = ConvertValue<int64_t>(GetValue("unix_timestamp()",
-      TYPE_BIGINT));
-  EXPECT_BETWEEN(unix_start_time, unix_timestamp_result, static_cast<int64_t>(
-      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds()));
-
-  // Check again with the flag enabled.
   {
-    ScopedLocalUnixTimestampConversionOverride use_local;
-    tm before = to_tm(posix_time::microsec_clock::local_time());
-    unix_start_time = mktime(&before);
-    unix_timestamp_result = ConvertValue<int64_t>(GetValue("unix_timestamp()",
+    // Test that the epoch is reasonable. The default behavior of UNIX_TIMESTAMP()
+    // is incorrect but wasn't changed for compatibility reasons. The function returns
+    // a value as though the current timezone is UTC. Or in other words, 1970-01-01
+    // in the current timezone is the effective epoch. A flag was introduced to enable
+    // the correct behavior. The first test below checks the default/incorrect behavior.
+    ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
+    time_t unix_start_time =
+        (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
+    int64_t unix_timestamp_result = ConvertValue<int64_t>(GetValue("unix_timestamp()",
         TYPE_BIGINT));
-    tm after = to_tm(posix_time::microsec_clock::local_time());
-    EXPECT_BETWEEN(unix_start_time, unix_timestamp_result,
-        static_cast<int64_t>(mktime(&after)));
+    EXPECT_BETWEEN(unix_start_time, unix_timestamp_result, static_cast<int64_t>(
+        (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds()));
+
+    // Check again with the flag enabled.
+    {
+      ScopedLocalUnixTimestampConversionOverride use_local;
+      tm before = to_tm(posix_time::microsec_clock::local_time());
+      unix_start_time = mktime(&before);
+      unix_timestamp_result = ConvertValue<int64_t>(GetValue("unix_timestamp()",
+          TYPE_BIGINT));
+      tm after = to_tm(posix_time::microsec_clock::local_time());
+      EXPECT_BETWEEN(unix_start_time, unix_timestamp_result,
+          static_cast<int64_t>(mktime(&after)));
+    }
   }
 
-  // Test that the other current time functions are also reasonable.
-  TimestampValue timestamp_result;
-  TimestampValue start_time = TimestampValue::FromUnixTimeMicros(UnixMicros());
-  timestamp_result = ConvertValue<TimestampValue>(GetValue("now()", TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(start_time, timestamp_result,
-      TimestampValue::FromUnixTimeMicros(UnixMicros()));
-  timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
-      TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(start_time, timestamp_result,
-      TimestampValue::FromUnixTimeMicros(UnixMicros()));
+  // Test that now() and current_timestamp() are reasonable.
+  {
+    ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
+    ScopedLocalUnixTimestampConversionOverride use_local;
+    const Timezone& local_tz = time_zone.GetTimezone();
+
+    const TimestampValue start_time =
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz);
+    TimestampValue timestamp_result =
+        ConvertValue<TimestampValue>(GetValue("now()", TYPE_TIMESTAMP));
+    EXPECT_BETWEEN(start_time, timestamp_result,
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+    timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
+        TYPE_TIMESTAMP));
+    EXPECT_BETWEEN(start_time, timestamp_result,
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+  }
+
+  // Test that utc_timestamp() is reasonable.
   const TimestampValue utc_start_time =
       TimestampValue::UtcFromUnixTimeMicros(UnixMicros());
-  timestamp_result = ConvertValue<TimestampValue>(GetValue("utc_timestamp()",
-      TYPE_TIMESTAMP));
+  TimestampValue timestamp_result =
+      ConvertValue<TimestampValue>(GetValue("utc_timestamp()", TYPE_TIMESTAMP));
   EXPECT_BETWEEN(utc_start_time, timestamp_result,
       TimestampValue::UtcFromUnixTimeMicros(UnixMicros()));
-  // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
-  // a second to ensure an earlier value.
-  unix_start_time =
-      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
-  timestamp_result = ConvertValue<TimestampValue>(GetValue(
-      "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1), timestamp_result,
-      TimestampValue::FromUnixTimeMicros(UnixMicros()));
+
+  // Test cast(unix_timestamp() as timestamp).
+  {
+    ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
+    ScopedLocalUnixTimestampConversionOverride use_local;
+    const Timezone& local_tz = time_zone.GetTimezone();
+
+    // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
+    // a second to ensure an earlier value.
+    time_t unix_start_time =
+        (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
+    TimestampValue timestamp_result = ConvertValue<TimestampValue>(GetValue(
+        "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
+    EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1, local_tz),
+        timestamp_result,
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz));
+  }
 
   // Test that UTC and local time represent the same point in time
   {
+    ScopedTimeZoneOverride time_zone_override("PST8PDT");
+
     const string stmt = "select now(), utc_timestamp()";
     vector<FieldSchema> result_types;
     Status status = executor_->Exec(stmt, &result_types);
@@ -6108,8 +7072,9 @@ TEST_F(ExprTest, TimestampFunctions) {
     DCHECK(result_cols.size() == 2);
     const TimestampValue local_time = ConvertValue<TimestampValue>(result_cols[0]);
     const TimestampValue utc_timestamp = ConvertValue<TimestampValue>(result_cols[1]);
+
     TimestampValue utc_converted_to_local(utc_timestamp);
-    utc_converted_to_local.UtcToLocal();
+    utc_converted_to_local.UtcToLocal(time_zone_override.GetTimezone());
     EXPECT_EQ(utc_converted_to_local, local_time);
   }
 
@@ -6402,69 +7367,73 @@ TEST_F(ExprTest, TimestampFunctions) {
       "cast(trunc(cast('2012-09-10 07:59:59' as timestamp), 'XXYYZZ') as string)");
 
   // Extract as a regular function
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'YEAR')",
-            TYPE_INT, 2006);
-  TestValue("extract('2006-05-12 18:27:28.12345', 'YEAR')", TYPE_INT, 2006);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'MoNTH')",
-            TYPE_INT, 5);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'DaY')",
-            TYPE_INT, 12);
-  TestValue("extract(cast('2006-05-12 06:27:28.12345' as timestamp), 'hour')",
-            TYPE_INT, 6);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'MINUTE')",
-            TYPE_INT, 27);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'SECOND')",
-            TYPE_INT, 28);
-  TestValue("extract(cast('2006-05-12 18:27:28.12345' as timestamp), 'MILLISECOND')",
-            TYPE_INT, 123);
-  TestValue("extract(cast('2006-05-13 01:27:28.12345' as timestamp), 'EPOCH')",
-            TYPE_INT, 1147483648);
-  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.12345' as timestamp), 'foo')");
-  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.12345' as timestamp), NULL)");
-  TestIsNull("extract(NULL, 'EPOCH')", TYPE_INT);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'YEAR')",
+            TYPE_BIGINT, 2006);
+  TestValue("extract('2006-05-12 18:27:28.123456789', 'YEAR')", TYPE_BIGINT, 2006);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'MoNTH')",
+            TYPE_BIGINT, 5);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'DaY')",
+            TYPE_BIGINT, 12);
+  TestValue("extract(cast('2006-05-12 06:27:28.123456789' as timestamp), 'hour')",
+            TYPE_BIGINT, 6);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'MINUTE')",
+            TYPE_BIGINT, 27);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'SECOND')",
+            TYPE_BIGINT, 28);
+  TestValue("extract(cast('2006-05-12 18:27:28.123456789' as timestamp), 'MILLISECOND')",
+            TYPE_BIGINT, 28123);
+  TestValue("extract(cast('2006-05-13 01:27:28.123456789' as timestamp), 'EPOCH')",
+            TYPE_BIGINT, 1147483648);
+  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.123456789' as timestamp), 'foo')");
+  TestNonOkStatus("extract(cast('2006-05-13 01:27:28.123456789' as timestamp), NULL)");
+  TestIsNull("extract(NULL, 'EPOCH')", TYPE_BIGINT);
   TestNonOkStatus("extract(NULL, NULL)");
 
   // Extract using FROM keyword
-  TestValue("extract(YEAR from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 2006);
-  TestValue("extract(MoNTH from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 5);
-  TestValue("extract(DaY from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 12);
-  TestValue("extract(hour from cast('2006-05-12 06:27:28.12345' as timestamp))",
-            TYPE_INT, 6);
-  TestValue("extract(MINUTE from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 27);
-  TestValue("extract(SECOND from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 28);
-  TestValue("extract(MILLISECOND from cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 123);
-  TestValue("extract(EPOCH from cast('2006-05-13 01:27:28.12345' as timestamp))",
-            TYPE_INT, 1147483648);
-  TestNonOkStatus("extract(foo from cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestNonOkStatus("extract(NULL from cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestIsNull("extract(EPOCH from NULL)", TYPE_INT);
+  TestValue("extract(YEAR from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2006);
+  TestValue("extract(QUARTER from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2);
+  TestValue("extract(MoNTH from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 5);
+  TestValue("extract(DaY from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 12);
+  TestValue("extract(hour from cast('2006-05-12 06:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 6);
+  TestValue("extract(MINUTE from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 27);
+  TestValue("extract(SECOND from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28);
+  TestValue("extract(MILLISECOND from cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28123);
+  TestValue("extract(EPOCH from cast('2006-05-13 01:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 1147483648);
+  TestNonOkStatus("extract(foo from cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestNonOkStatus("extract(NULL from cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestIsNull("extract(EPOCH from NULL)", TYPE_BIGINT);
 
   // Date_part, same as extract function but with arguments swapped
-  TestValue("date_part('YEAR', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 2006);
-  TestValue("date_part('MoNTH', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 5);
-  TestValue("date_part('DaY', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 12);
-  TestValue("date_part('hour', cast('2006-05-12 06:27:28.12345' as timestamp))",
-            TYPE_INT, 6);
-  TestValue("date_part('MINUTE', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 27);
-  TestValue("date_part('SECOND', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 28);
-  TestValue("date_part('MILLISECOND', cast('2006-05-12 18:27:28.12345' as timestamp))",
-            TYPE_INT, 123);
-  TestValue("date_part('EPOCH', cast('2006-05-13 01:27:28.12345' as timestamp))",
-            TYPE_INT, 1147483648);
-  TestNonOkStatus("date_part('foo', cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestNonOkStatus("date_part(NULL, cast('2006-05-13 01:27:28.12345' as timestamp))");
-  TestIsNull("date_part('EPOCH', NULL)", TYPE_INT);
+  TestValue("date_part('YEAR', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2006);
+  TestValue("date_part('QUARTER', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 2);
+  TestValue("date_part('MoNTH', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 5);
+  TestValue("date_part('DaY', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 12);
+  TestValue("date_part('hour', cast('2006-05-12 06:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 6);
+  TestValue("date_part('MINUTE', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 27);
+  TestValue("date_part('SECOND', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28);
+  TestValue("date_part('MILLISECOND', cast('2006-05-12 18:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 28123);
+  TestValue("date_part('EPOCH', cast('2006-05-13 01:27:28.123456789' as timestamp))",
+            TYPE_BIGINT, 1147483648);
+  TestNonOkStatus("date_part('foo', cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestNonOkStatus("date_part(NULL, cast('2006-05-13 01:27:28.123456789' as timestamp))");
+  TestIsNull("date_part('EPOCH', NULL)", TYPE_BIGINT);
   TestNonOkStatus("date_part(NULL, NULL)");
 
   // Test with timezone offset
@@ -6617,7 +7586,631 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("unix_micros_to_utc_timestamp(253402300800000000)", TYPE_TIMESTAMP);
 }
 
-TEST_F(ExprTest, ConditionalFunctions) {
+TEST_P(ExprTest, TruncForDateTest) {
+  // trunc(date, string unit)
+  // Truncate date to year
+  for (const string& unit: { "SYYYY", "YYYY", "YEAR", "SYEAR", "YYY", "YY", "Y" }) {
+    const string expr = "trunc(date'2014-04-01', '" + unit + "')";
+    TestDateValue(expr, DateValue(2014, 1, 1));
+  }
+  TestDateValue("trunc(date'2000-01-01', 'Y')", DateValue(2000, 1, 1));
+
+  // Truncate date to quarter
+  TestDateValue("trunc(date'2000-01-01', 'Q')", DateValue(2000, 1, 1));
+  TestDateValue("trunc(date'2000-02-01', 'Q')", DateValue(2000, 1, 1));
+  TestDateValue("trunc(date'2000-03-01', 'Q')", DateValue(2000, 1, 1));
+  TestDateValue("trunc(date'2000-04-01', 'Q')", DateValue(2000, 4, 1));
+  TestDateValue("trunc(date'2000-05-01', 'Q')", DateValue(2000, 4, 1));
+  TestDateValue("trunc(date'2000-06-01', 'Q')", DateValue(2000, 4, 1));
+  TestDateValue("trunc(date'2000-07-01', 'Q')", DateValue(2000, 7, 1));
+  TestDateValue("trunc(date'2000-08-01', 'Q')", DateValue(2000, 7, 1));
+  TestDateValue("trunc(date'2000-09-01', 'Q')", DateValue(2000, 7, 1));
+  TestDateValue("trunc(date'2000-10-01', 'Q')", DateValue(2000, 10, 1));
+  TestDateValue("trunc(date'2000-11-01', 'Q')", DateValue(2000, 10, 1));
+  TestDateValue("trunc(date'2000-12-01', 'Q')", DateValue(2000, 10, 1));
+
+  // Truncate date to month
+  for (const string& unit: { "MONTH", "MON", "MM", "RM" }) {
+    const string expr = "trunc(date'2001-02-05', '" + unit + "')";
+    TestDateValue(expr, DateValue(2001, 2, 1));
+  }
+  TestDateValue("trunc(date'2001-01-01', 'MM')", DateValue(2001, 1, 1));
+  TestDateValue("trunc(date'2001-12-29', 'MM')", DateValue(2001, 12, 1));
+
+  // Same day of the week as the first day of the year
+  TestDateValue("trunc(date'2014-01-07', 'WW')", DateValue(2014, 1, 1));
+  TestDateValue("trunc(date'2014-01-08', 'WW')", DateValue(2014, 1, 8));
+  TestDateValue("trunc(date'2014-01-09', 'WW')", DateValue(2014, 1, 8));
+  TestDateValue("trunc(date'2014-01-14', 'WW')", DateValue(2014, 1, 8));
+
+  // Same day of the week as the first day of the month
+  TestDateValue("trunc(date'2014-01-07', 'W')", DateValue(2014, 1, 1));
+  TestDateValue("trunc(date'2014-01-08', 'W')", DateValue(2014, 1, 8));
+  TestDateValue("trunc(date'2014-01-09', 'W')", DateValue(2014, 1, 8));
+  TestDateValue("trunc(date'2014-01-14', 'W')", DateValue(2014, 1, 8));
+  TestDateValue("trunc(date'2014-02-01', 'W')", DateValue(2014, 2, 1));
+  TestDateValue("trunc(date'2014-02-02', 'W')", DateValue(2014, 2, 1));
+  TestDateValue("trunc(date'2014-02-03', 'W')", DateValue(2014, 2, 1));
+  TestDateValue("trunc(date'2014-02-07', 'W')", DateValue(2014, 2, 1));
+  TestDateValue("trunc(date'2014-02-08', 'W')", DateValue(2014, 2, 8));
+  TestDateValue("trunc(date'2014-02-24', 'W')", DateValue(2014, 2, 22));
+
+  // Truncate to day, i.e. leave the date intact
+  for (const string& unit: { "DDD", "DD", "J" }) {
+    const string expr = "trunc(date'2014-01-08', '" + unit + "')";
+    TestDateValue(expr, DateValue(2014, 1, 8));
+  }
+
+  // Truncate date to starting day of the week
+  for (const string& unit: { "DAY", "DY", "D" }) {
+    const string expr = "trunc(date'2012-09-10', '" + unit + "')";
+    TestDateValue(expr, DateValue(2012, 9, 10));
+  }
+  TestDateValue("trunc(date'2012-09-11', 'D')", DateValue(2012, 9, 10));
+  TestDateValue("trunc(date'2012-09-12', 'D')", DateValue(2012, 9, 10));
+  TestDateValue("trunc(date'2012-09-16', 'D')", DateValue(2012, 9, 10));
+
+  // Test upper limit
+  TestDateValue("trunc(date'9999-12-31', 'YYYY')", DateValue(9999, 1, 1));
+  TestDateValue("trunc(date'9999-12-31', 'Q')", DateValue(9999, 10, 1));
+  TestDateValue("trunc(date'9999-12-31', 'MONTH')", DateValue(9999, 12, 1));
+  TestDateValue("trunc(date'9999-12-31', 'W')", DateValue(9999, 12, 29));
+  TestDateValue("trunc(date'9999-12-31', 'WW')", DateValue(9999, 12, 31));
+  TestDateValue("trunc(date'9999-12-31', 'DDD')", DateValue(9999, 12, 31));
+  TestDateValue("trunc(date'9999-12-31', 'DAY')", DateValue(9999, 12, 27));
+
+  // Test lower limit
+  TestDateValue("trunc(date'0001-01-01', 'YYYY')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-01', 'Q')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-03-31', 'Q')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-01', 'MONTH')", DateValue(1, 1, 1));
+  // 0001-01-01 is Monday
+  TestDateValue("trunc(date'0001-01-01', 'W')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-07', 'W')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-08', 'W')", DateValue(1, 1, 8));
+  TestDateValue("trunc(date'0001-01-01', 'WW')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-07', 'WW')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-08', 'WW')", DateValue(1, 1, 8));
+  TestDateValue("trunc(date'0001-01-01', 'DAY')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-07', 'DAY')", DateValue(1, 1, 1));
+  TestDateValue("trunc(date'0001-01-08', 'DAY')", DateValue(1, 1, 8));
+
+  // Truncating date to hour or minute returns an error
+  for (const string& unit: { "HH", "HH12", "HH24", "MI" }) {
+    const string expr = "trunc(date'2012-09-10', '" + unit + "')";
+    TestNonOkStatus(expr);  // Unsupported Truncate Unit
+  }
+
+  // Invalid trunc unit
+  for (const string& unit: { "MIN", "XXYYZZ", "" }) {
+    const string expr = "trunc(date'2012-09-10', '" + unit + "')";
+    TestNonOkStatus(expr);  // Invalid Truncate Unit
+  }
+  TestNonOkStatus("trunc(date'2012-09-10', NULL)");  // Invalid Truncate Unit
+  TestNonOkStatus("trunc(cast(NULL as date), NULL)");  // Invalid Truncate Unit
+
+  // Truncating NULL date returns NULL.
+  TestIsNull("trunc(cast(NULL as date), 'DDD')", TYPE_DATE);
+}
+
+TEST_P(ExprTest, DateTruncForDateTest) {
+  TestDateValue("date_trunc('MILLENNIUM', date '2016-05-08')", DateValue(2001, 1, 1));
+  TestDateValue("date_trunc('MILLENNIUM', date '3000-12-31')", DateValue(2001, 1, 1));
+  TestDateValue("date_trunc('MILLENNIUM', date '3001-01-01')", DateValue(3001, 1, 1));
+  TestDateValue("date_trunc('CENTURY', date '2016-05-08')", DateValue(2001, 1, 1));
+  TestDateValue("date_trunc('CENTURY', date '2116-05-08')", DateValue(2101, 1, 1));
+  TestDateValue("date_trunc('DECADE', date '2116-05-08')", DateValue(2110, 1, 1));
+  TestDateValue("date_trunc('YEAR', date '2016-05-08')", DateValue(2016, 1, 1));
+  TestDateValue("date_trunc('MONTH', date '2016-05-08')", DateValue(2016, 5, 1));
+  TestDateValue("date_trunc('WEEK', date '2116-05-08')", DateValue(2116, 5, 4));
+  TestDateValue("date_trunc('WEEK', date '2017-01-01')", DateValue(2016,12,26));
+  TestDateValue("date_trunc('WEEK', date '2017-01-02')", DateValue(2017, 1, 2));
+  TestDateValue("date_trunc('WEEK', date '2017-01-07')", DateValue(2017, 1, 2));
+  TestDateValue("date_trunc('WEEK', date '2017-01-08')", DateValue(2017, 1, 2));
+  TestDateValue("date_trunc('WEEK', date '2017-01-09')", DateValue(2017, 1, 9));
+  TestDateValue("date_trunc('DAY', date '1416-05-08')", DateValue(1416, 5, 8));
+
+  // Test upper limit
+  TestDateValue("date_trunc('MILLENNIUM', date '9999-12-31')", DateValue(9001, 1, 1));
+  TestDateValue("date_trunc('CENTURY', date '9999-12-31')", DateValue(9901, 1, 1));
+  TestDateValue("date_trunc('DECADE', date '9999-12-31')", DateValue(9990, 1, 1));
+  TestDateValue("date_trunc('YEAR', date '9999-12-31')", DateValue(9999, 1, 1));
+  TestDateValue("date_trunc('MONTH', date '9999-12-31')", DateValue(9999, 12, 1));
+  TestDateValue("date_trunc('WEEK', date '9999-12-31')", DateValue(9999, 12, 27));
+  TestDateValue("date_trunc('DAY', date '9999-12-31')", DateValue(9999, 12, 31));
+
+  // Test lower limit for millennium
+  TestDateValue("date_trunc('MILLENNIUM', date '1001-01-01')", DateValue(1001, 1, 1));
+  TestDateValue("date_trunc('MILLENNIUM', date '1000-01-01')", DateValue(1, 1, 1));
+  TestDateValue("date_trunc('MILLENNIUM', date '0001-01-01')", DateValue(1, 1, 1));
+
+  // Test lower limit for century
+  TestDateValue("date_trunc('CENTURY', date '0101-01-01')", DateValue(101, 1, 1));
+  TestDateValue("date_trunc('CENTURY', date '0100-01-01')", DateValue(1, 1, 1));
+  TestDateValue("date_trunc('CENTURY', date '0001-01-01')", DateValue(1, 1, 1));
+
+  // Test lower limit for decade
+  TestDateValue("date_trunc('DECADE', date '0011-01-01')", DateValue(10, 1, 1));
+  TestDateValue("date_trunc('DECADE', date '0010-01-01')", DateValue(10, 1, 1));
+  TestIsNull("date_trunc('DECADE', date '0001-01-01')", TYPE_DATE);
+
+  // Test lower limit for year, month, day
+  TestDateValue("date_trunc('YEAR', date '0001-01-01')", DateValue(1, 1, 1));
+  TestDateValue("date_trunc('MONTH', date '0001-01-01')", DateValue(1, 1, 1));
+  TestDateValue("date_trunc('DAY', date '0001-01-01')", DateValue(1, 1, 1));
+
+  // Test lower limit for week
+  TestDateValue("date_trunc('WEEK', date '0001-01-08')", DateValue(1, 1, 8));
+  TestDateValue("date_trunc('WEEK', date '0001-01-07')", DateValue(1, 1, 1));
+  TestDateValue("date_trunc('WEEK', date '0001-01-01')", DateValue(1, 1, 1));
+
+  // Test invalid input.
+  // Truncating date to hour or minute returns an error
+  for (const string& unit: { "HOUR", "MINUTE", "SECOND", "MILLISECONDS",
+      "MICROSECONDS" }) {
+    const string expr = "date_trunc('" + unit + "', date '2012-09-10')";
+    TestNonOkStatus(expr);  // Unsupported Date Truncate Unit
+  }
+
+  // Invalid trunc unit
+  for (const string& unit: { "YEARR", "XXYYZZ", "" }) {
+    const string expr = "date_trunc('" + unit + "', date '2012-09-10')";
+    TestNonOkStatus(expr);  // Invalid Date Truncate Unit
+  }
+  TestNonOkStatus("date_trunc(NULL, date '2012-09-10'");  // Invalid Date Truncate Unit
+  TestNonOkStatus("date_trunc(NULL, cast(NULL as date))");  // Invalid Date Truncate Unit
+
+  // Truncating NULL date returns NULL.
+  TestIsNull("date_trunc('DAY', cast(NULL as date))", TYPE_DATE);
+}
+
+TEST_P(ExprTest, ExtractAndDatePartForDateTest) {
+  // extract as a regular function
+  TestValue("extract(date '2006-05-12', 'YEAR')", TYPE_BIGINT, 2006);
+  TestValue("extract(date '2006-05-12', 'quarter')", TYPE_BIGINT, 2);
+  TestValue("extract(date '2006-05-12', 'MoNTH')", TYPE_BIGINT, 5);
+  TestValue("extract(date '2006-05-12', 'DaY')", TYPE_BIGINT, 12);
+
+  // extract using FROM keyword
+  TestValue("extract(year from date '2006-05-12')", TYPE_BIGINT, 2006);
+  TestValue("extract(QUARTER from date '2006-05-12')", TYPE_BIGINT, 2);
+  TestValue("extract(mOnTh from date '2006-05-12')", TYPE_BIGINT, 5);
+  TestValue("extract(dAy from date '2006-05-12')", TYPE_BIGINT, 12);
+
+  // Test upper limit
+  TestValue("extract(date '9999-12-31', 'YEAR')", TYPE_BIGINT, 9999);
+  TestValue("extract(quarter from date '9999-12-31')", TYPE_BIGINT, 4);
+  TestValue("extract(date '9999-12-31', 'month')", TYPE_BIGINT, 12);
+  TestValue("extract(DAY from date '9999-12-31')", TYPE_BIGINT, 31);
+
+  // Test lower limit
+  TestValue("extract(date '0001-01-01', 'YEAR')", TYPE_BIGINT, 1);
+  TestValue("extract(quarter from date '0001-01-01')", TYPE_BIGINT, 1);
+  TestValue("extract(date '0001-01-01', 'month')", TYPE_BIGINT, 1);
+  TestValue("extract(DAY from date '0001-01-01')", TYPE_BIGINT, 1);
+
+  // Time of day extract fields are not supported
+  for (const string& field: { "MINUTE", "SECOND", "MILLISECOND", "EPOCH" }) {
+    const string expr = "extract(date '2012-09-10', '" + field + "')";
+    TestNonOkStatus(expr);  // Unsupported Extract Field
+  }
+
+  // Invalid extract fields
+  for (const string& field: { "foo", "SSECOND", "" }) {
+    const string expr = "extract(date '2012-09-10', '" + field + "')";
+    TestNonOkStatus(expr);  // Invalid Extract Field
+  }
+  TestNonOkStatus("extract(date '2012-09-10', NULL)");  // Invalid Extract Field
+  TestNonOkStatus("extract(cast(NULL as date), NULL)");  // Invalid Extract Field
+
+  TestIsNull("extract(cast(NULL as date), 'YEAR')", TYPE_BIGINT);
+  TestIsNull("extract(YEAR from cast(NULL as date))", TYPE_BIGINT);
+
+  // date_part, same as extract function but with arguments swapped
+  TestValue("date_part('YEAR', date '2006-05-12')", TYPE_BIGINT, 2006);
+  TestValue("date_part('QuarTer', date '2006-05-12')", TYPE_BIGINT, 2);
+  TestValue("date_part('Month', date '2006-05-12')", TYPE_BIGINT, 5);
+  TestValue("date_part('Day', date '2006-05-12')", TYPE_BIGINT, 12);
+
+  // Test upper limit
+  TestValue("date_part('YEAR', date '9999-12-31')", TYPE_BIGINT, 9999);
+  TestValue("date_part('QUARTER', '9999-12-31')", TYPE_BIGINT, 4);
+  TestValue("date_part('month', date '9999-12-31')", TYPE_BIGINT, 12);
+  TestValue("date_part('DAY', date '9999-12-31')", TYPE_BIGINT, 31);
+
+  // Test lower limit
+  TestValue("date_part('year', date '0001-01-01')", TYPE_BIGINT, 1);
+  TestValue("date_part('quarter', date '0001-01-01')", TYPE_BIGINT, 1);
+  TestValue("date_part('MONTH', date '0001-01-01')", TYPE_BIGINT, 1);
+  TestValue("date_part('DAY', date '0001-01-01')", TYPE_BIGINT, 1);
+
+  // Time of day extract fields are not supported
+  for (const string& field: { "MINUTE", "SECOND", "MILLISECOND", "EPOCH" }) {
+    const string expr = "date_part('" + field + "', date '2012-09-10')";
+    // Unsupported Date Part Field
+    TestNonOkStatus(expr);
+  }
+
+  // Invalid extract fields
+  for (const string& field: { "foo", "SSECOND", "" }) {
+    const string expr = "date_part('" + field + "', date '2012-09-10')";
+    TestNonOkStatus(expr);  // Invalid Date Part Field
+  }
+  TestNonOkStatus("date_part(MULL, date '2012-09-10')");  // Invalid Date Part Field
+  TestNonOkStatus("date_part(MULL, cast(NULL as date))");  // Invalid Date Part Field
+
+  TestIsNull("date_part('YEAR', cast(NULL as date))", TYPE_BIGINT);
+}
+
+TEST_P(ExprTest, DateFunctions) {
+  // year:
+  TestValue("year(date '2019-06-05')", TYPE_INT, 2019);
+  TestValue("year(date '9999-12-31')", TYPE_INT, 9999);
+  TestValue("year(date '0001-01-01')", TYPE_INT, 1);
+  TestIsNull("year(cast(NULL as date))", TYPE_INT);
+
+  // Test that the name-resolution algorithm picks up the TIMESTAMP-version of year() if
+  // year() is called with a STRING.
+  TestValue("year('2019-06-05')", TYPE_INT, 2019);
+  // 1399-12-31 is out of the valid TIMESTAMP range, year(TIMESTAMP) returns NULL.
+  TestIsNull("year('1399-12-31')", TYPE_INT);
+  // year(DATE) returns the correct result.
+  TestValue("year(DATE '1399-12-31')", TYPE_INT, 1399);
+  // Test that calling year(TIMESTAMP) with an invalid argument returns NULL.
+  TestIsNull("year('2019-02-29')", TYPE_INT);
+  // Test that calling year(DATE) with an invalid argument returns an error.
+  TestError("year(DATE '2019-02-29')");
+
+  // month:
+  TestValue("month(date '2019-06-05')", TYPE_INT, 6);
+  TestValue("month(date '9999-12-31')", TYPE_INT, 12);
+  TestValue("month(date '0001-01-01')", TYPE_INT, 1);
+  TestIsNull("month(cast(NULL as date))", TYPE_INT);
+
+  // monthname:
+  TestStringValue("monthname(date '2019-06-05')", "June");
+  TestStringValue("monthname(date '9999-12-31')", "December");
+  TestStringValue("monthname(date '0001-01-01')", "January");
+  TestIsNull("monthname(cast(NULL as date))", TYPE_STRING);
+
+  // day, dayofmonth:
+  TestValue("day(date '2019-06-05')", TYPE_INT, 5);
+  TestValue("day(date '9999-12-31')", TYPE_INT, 31);
+  TestValue("day(date '0001-01-01')", TYPE_INT, 1);
+  TestIsNull("day(cast(NULL as date))", TYPE_INT);
+  TestValue("dayofmonth(date '2019-06-07')", TYPE_INT, 7);
+  TestValue("dayofmonth(date '9999-12-31')", TYPE_INT, 31);
+  TestValue("dayofmonth(date '0001-01-01')", TYPE_INT, 1);
+  TestIsNull("dayofmonth(cast(NULL as date))", TYPE_INT);
+
+  // quarter:
+  TestValue("quarter(date '2019-01-01')", TYPE_INT, 1);
+  TestValue("quarter(date '2019-03-31')", TYPE_INT, 1);
+  TestValue("quarter(date '2019-04-01')", TYPE_INT, 2);
+  TestValue("quarter(date '2019-06-30')", TYPE_INT, 2);
+  TestValue("quarter(date '2019-07-01')", TYPE_INT, 3);
+  TestValue("quarter(date '2019-09-30')", TYPE_INT, 3);
+  TestValue("quarter(date '2019-10-01')", TYPE_INT, 4);
+  TestValue("quarter(date '2019-12-31')", TYPE_INT, 4);
+  TestValue("quarter(date '9999-12-31')", TYPE_INT, 4);
+  TestValue("quarter(date '0001-01-01')", TYPE_INT, 1);
+  TestIsNull("quarter(cast(NULL as date))", TYPE_INT);
+
+  // dayofweek:
+  TestValue("dayofweek(date '2019-06-05')", TYPE_INT, 4);
+  // 9999-12-31 is Friday.
+  TestValue("dayofweek(date '9999-12-31')", TYPE_INT, 6);
+  // 0001-01-01 is Monday.
+  TestValue("dayofweek(date '0001-01-01')", TYPE_INT, 2);
+  TestIsNull("dayofweek(cast(NULL as date))", TYPE_INT);
+
+  // dayname:
+  TestStringValue("dayname(date '2019-06-03')", "Monday");
+  TestStringValue("dayname(date '2019-06-04')", "Tuesday");
+  TestStringValue("dayname(date '2019-06-05')", "Wednesday");
+  TestStringValue("dayname(date '2019-06-06')", "Thursday");
+  TestStringValue("dayname(date '2019-06-07')", "Friday");
+  TestStringValue("dayname(date '2019-06-08')", "Saturday");
+  TestStringValue("dayname(date '2019-06-09')", "Sunday");
+  TestStringValue("dayname(date '9999-12-31')", "Friday");
+  TestStringValue("dayname(date '0001-01-01')", "Monday");
+  TestIsNull("dayname(cast(NULL as date))", TYPE_STRING);
+
+  // dayofyear:
+  TestValue("dayofyear(date '2019-01-01')", TYPE_INT, 1);
+  TestValue("dayofyear(date '2019-12-31')", TYPE_INT, 365);
+  TestValue("dayofyear(date '2019-06-05')", TYPE_INT, 31 + 28 + 31 + 30 + 31 + 5);
+  TestValue("dayofyear(date '2016-12-31')", TYPE_INT, 366);
+  TestValue("dayofyear(date '2016-06-05')", TYPE_INT, 31 + 29 + 31 + 30 + 31 + 5);
+  TestValue("dayofyear(date '9999-12-31')", TYPE_INT, 365);
+  TestValue("dayofyear(date '0001-01-01')", TYPE_INT, 1);
+  TestIsNull("dayofyear(cast(NULL as date))", TYPE_INT);
+
+  // week, weekofyear
+  // 2019-01-01 is Tuesday, it belongs to the first week of the year.
+  TestValue("weekofyear(date '2018-12-31')", TYPE_INT, 1);
+  TestValue("weekofyear(date '2019-01-01')", TYPE_INT, 1);
+  TestValue("weekofyear(date '2019-01-06')", TYPE_INT, 1);
+  TestValue("weekofyear(date '2019-01-07')", TYPE_INT, 2);
+  TestValue("weekofyear(date '2019-06-05')", TYPE_INT, 23);
+  TestValue("weekofyear(date '2019-12-23')", TYPE_INT, 52);
+  TestValue("weekofyear(date '2019-12-29')", TYPE_INT, 52);
+  TestValue("weekofyear(date '2019-12-30')", TYPE_INT, 1);
+  // Year 2015 has 53 weeks. 2015-12-31 is Thursday.
+  TestValue("weekofyear(date '2015-12-31')", TYPE_INT, 53);
+  TestValue("week(date '2018-12-31')", TYPE_INT, 1);
+  TestValue("week(date '2019-01-01')", TYPE_INT, 1);
+  TestValue("week(date '2019-01-06')", TYPE_INT, 1);
+  TestValue("week(date '2019-01-07')", TYPE_INT, 2);
+  TestValue("week(date '2019-06-05')", TYPE_INT, 23);
+  TestValue("week(date '2019-12-23')", TYPE_INT, 52);
+  TestValue("week(date '2019-12-29')", TYPE_INT, 52);
+  TestValue("week(date '2019-12-30')", TYPE_INT, 1);
+  TestValue("week(date '2015-12-31')", TYPE_INT, 53);
+  // 0001-01-01 is Monday. It belongs to the first week of the year.
+  TestValue("weekofyear(date '0001-01-01')", TYPE_INT, 1);
+  TestValue("week(date '0001-01-01')", TYPE_INT, 1);
+  // 9999-12-31 is Friday. It belongs to the last week of the year.
+  TestValue("weekofyear(date '9999-12-31')", TYPE_INT, 52);
+  TestValue("week(date '9999-12-31')", TYPE_INT, 52);
+  TestIsNull("weekofyear(cast(NULL as date))", TYPE_INT);
+  TestIsNull("week(cast(NULL as date))", TYPE_INT);
+
+  // next_day:
+  // 2019-06-05 is Wednesday.
+  TestDateValue("next_day(date '2019-06-05', 'monday')", DateValue(2019, 6, 10));
+  TestDateValue("next_day(date '2019-06-05', 'TUE')", DateValue(2019, 6, 11));
+  TestDateValue("next_day(date '2019-06-05', 'Wed')", DateValue(2019, 6, 12));
+  TestDateValue("next_day(date '2019-06-05', 'THursdaY')", DateValue(2019, 6, 6));
+  TestDateValue("next_day(date '2019-06-05', 'fRI')", DateValue(2019, 6, 7));
+  TestDateValue("next_day(date '2019-06-05', 'saturDAY')", DateValue(2019, 6, 8));
+  TestDateValue("next_day(date '2019-06-05', 'suN')", DateValue(2019, 6, 9));
+  // 0001-01-01 is Monday
+  TestDateValue("next_day(date '0001-01-01', 'MON')", DateValue(1, 1, 8));
+  TestDateValue("next_day(date '0001-01-01', 'sunday')", DateValue(1, 1, 7));
+  // 9999-12-31 is Friday
+  TestDateValue("next_day(date'9999-12-30', 'FRI')", DateValue(9999, 12, 31));
+  TestIsNull("next_day(date'9999-12-30', 'THU')", TYPE_DATE);
+  // Date is null
+  TestIsNull("next_day(cast(NULL as date), 'THU')", TYPE_DATE);
+  // Invalid day
+  for (const string day: { "", "S", "sa", "satu", "saturdayy" }) {
+    const string expr = "next_day(date '2019-06-05', '" + day + "')";
+    TestError(expr);
+  }
+  TestError("next_day(date '2019-06-05', NULL)");
+  TestError("next_day(cast(NULL as date), NULL)");
+
+  // last_day:
+  TestDateValue("last_day(date'2019-01-11')", DateValue(2019, 1, 31));
+  TestDateValue("last_day(date'2019-02-05')", DateValue(2019, 2, 28));
+  TestDateValue("last_day(date'2019-04-25')", DateValue(2019, 4, 30));
+  TestDateValue("last_day(date'2019-05-31')", DateValue(2019, 5, 31));
+  // 2016 is leap year
+  TestDateValue("last_day(date'2016-02-05')", DateValue(2016, 2, 29));
+  TestDateValue("last_day(date'0001-01-01')", DateValue(1, 1, 31));
+  TestDateValue("last_day(date'9999-12-31')", DateValue(9999, 12, 31));
+  TestIsNull("last_day(cast(NULL as date))", TYPE_DATE);
+
+  // years_add, years_sub:
+  TestDateValue("years_add(date '0125-05-24', 0)", DateValue(125, 5, 24));
+  TestDateValue("years_sub(date '0125-05-24', 0)", DateValue(125, 5, 24));
+  TestDateValue("years_add(date '0125-05-24', 125)", DateValue(250, 5, 24));
+  TestDateValue("years_add(date '0125-05-24', -124)", DateValue(1, 5, 24));
+  TestDateValue("years_sub(date '0125-05-24', 124)", DateValue(1, 5, 24));
+  // Test leap years.
+  TestDateValue("years_add(date '2000-02-29', 1)", DateValue(2001, 2, 28));
+  TestDateValue("years_add(date '2000-02-29', 4)", DateValue(2004, 2, 29));
+  TestDateValue("years_sub(date '2000-02-29', 1)", DateValue(1999, 2, 28));
+  TestDateValue("years_sub(date '2000-02-29', 4)", DateValue(1996, 2, 29));
+  // Test upper and lower limit
+  TestDateValue("years_add(date'0001-12-31', 9998)", DateValue(9999, 12, 31));
+  TestIsNull("years_add(date'0001-12-31', 9999)", TYPE_DATE);
+  TestDateValue("years_sub(date'9999-01-01', 9998)", DateValue(1, 1, 1));
+  TestIsNull("years_sub(date'9999-01-01', 9999)", TYPE_DATE);
+  // Test max int64
+  TestIsNull("years_add(date'0001-01-01', 2147483647)", TYPE_DATE);
+  TestIsNull("years_sub(date'9999-12-31', 2147483647)", TYPE_DATE);
+  // Test NULL values
+  TestIsNull("years_add(cast(NULL as date), 1)", TYPE_DATE);
+  TestIsNull("years_add(date '2019-01-01', NULL)", TYPE_DATE);
+  TestIsNull("years_add(cast(NULL as date), NULL)", TYPE_DATE);
+
+  // months_add, add_months, months_sub:
+  TestDateValue("months_add(date '0005-01-29', 0)", DateValue(5, 1, 29));
+  TestDateValue("months_sub(date '0005-01-29', 0)", DateValue(5, 1, 29));
+  TestDateValue("add_months(date '0005-01-29', -48)", DateValue(1, 1, 29));
+  TestDateValue("months_add(date '0005-01-29', -48)", DateValue(1, 1, 29));
+  TestDateValue("months_sub(date '0005-01-29', 48)", DateValue(1, 1, 29));
+  TestDateValue("add_months(date '9995-01-29', 59)", DateValue(9999, 12, 29));
+  TestDateValue("months_add(date '9995-01-29', 59)", DateValue(9999, 12, 29));
+  TestDateValue("months_sub(date '9995-01-29', -59)", DateValue(9999, 12, 29));
+  // If the input date falls on the last day of the month, the result will also always be
+  // the last day of the month.
+  TestDateValue("add_months(date '2000-02-29', 1)", DateValue(2000, 3, 31));
+  TestDateValue("add_months(date '1999-02-28', 12)", DateValue(2000, 2, 29));
+  TestDateValue("months_sub(date '2000-03-31', 1)", DateValue(2000, 2, 29));
+  TestDateValue("months_add(date '2000-03-31', -2)", DateValue(2000, 1, 31));
+  // Test upper and lower limit.
+  // 12 * 9998 == 119976
+  TestDateValue("months_add(date '0001-12-31', 119976)", DateValue(9999, 12, 31));
+  TestIsNull("months_add(date'0001-12-31', 119977)", TYPE_DATE);
+  TestDateValue("months_sub(date '9999-01-01', 119976)", DateValue(1, 1, 1));
+  TestIsNull("months_sub(date'9999-01-01', 119977)", TYPE_DATE);
+  // Test max int64
+  TestIsNull("months_add(date'0001-01-01', 2147483647)", TYPE_DATE);
+  TestIsNull("months_sub(date'9999-12-31', 2147483647)", TYPE_DATE);
+  // Test NULL values
+  TestIsNull("months_add(cast(NULL as date), 1)", TYPE_DATE);
+  TestIsNull("months_add(date '2019-01-01', NULL)", TYPE_DATE);
+  TestIsNull("months_add(cast(NULL as date), NULL)", TYPE_DATE);
+
+  // weeks_add, weeks_sub:
+  TestDateValue("weeks_add(date'2019-06-12', 0)", DateValue(2019, 6, 12));
+  TestDateValue("weeks_sub(date'2019-06-12', 0)", DateValue(2019, 6, 12));
+  TestDateValue("weeks_add(date'2019-06-12', 29)", DateValue(2020, 1, 1));
+  TestDateValue("weeks_add(date'2019-06-12', -24)", DateValue(2018, 12, 26));
+  TestDateValue("weeks_sub(date'2019-06-12', 24)", DateValue(2018, 12, 26));
+  // Test leap year
+  TestDateValue("weeks_add(date '2016-01-04', 8)", DateValue(2016, 2, 29));
+  // Test upper and ower limit. There are 3652058 days between 0001-01-01 and 9999-12-31.
+  // 3652058 days is 521722 weeks + 4 days.
+  TestDateValue("weeks_add(date'0001-01-01', 521722)", DateValue(9999, 12, 27));
+  TestIsNull("weeks_add(date'0001-01-01', 521723)", TYPE_DATE);
+  TestDateValue("weeks_sub(date'9999-12-31', 521722)", DateValue(1, 1, 5));
+  TestIsNull("weeks_sub(date'9999-12-31', 521723)", TYPE_DATE);
+  // Test max int64
+  TestIsNull("weeks_add(date'0001-01-01', 2147483647)", TYPE_DATE);
+  TestIsNull("weeks_sub(date'9999-12-31', 2147483647)", TYPE_DATE);
+  // Test NULL values
+  TestIsNull("weeks_sub(cast(NULL as date), 1)", TYPE_DATE);
+  TestIsNull("weeks_sub(date '2019-01-01', NULL)", TYPE_DATE);
+  TestIsNull("weeks_sub(cast(NULL as date), NULL)", TYPE_DATE);
+
+  // days_add, date_add, days_sub, date_sub, subdate:
+  TestDateValue("days_add(date'2019-06-12', 0)", DateValue(2019, 6, 12));
+  TestDateValue("days_sub(date'2019-06-12', 0)", DateValue(2019, 6, 12));
+  TestDateValue("date_add(date'2019-01-01', 365)", DateValue(2020, 1, 1));
+  TestDateValue("date_sub(date'2019-12-31', 365)", DateValue(2018, 12, 31));
+  // Test leap year
+  TestDateValue("date_add(date'2016-01-01', 366)", DateValue(2017, 1, 1));
+  TestDateValue("subdate(date'2016-12-31', 366)", DateValue(2015, 12, 31));
+  // Test upper and lower limit. There are 3652058 days between 0001-01-01 and 9999-12-31.
+  TestDateValue("days_add(date '0001-01-01', 3652058)", DateValue(9999, 12, 31));
+  TestIsNull("date_add(date '0001-01-01', 3652059)", TYPE_DATE);
+  TestDateValue("days_sub(date '9999-12-31', 3652058)", DateValue(1, 1, 1));
+  TestIsNull("date_sub(date '9999-12-31', 3652059)", TYPE_DATE);
+  // Test max int64
+  TestIsNull("days_add(date'0001-01-01', 2147483647)", TYPE_DATE);
+  TestIsNull("days_sub(date'9999-12-31', 2147483647)", TYPE_DATE);
+  // Test NULL values
+  TestIsNull("days_add(cast(NULL as date), 1)", TYPE_DATE);
+  TestIsNull("days_add(date '2019-01-01', NULL)", TYPE_DATE);
+  TestIsNull("days_add(cast(NULL as date), NULL)", TYPE_DATE);
+
+  // Interval expressions:
+  // Test year interval expressions.
+  TestDateValue("date_add(date '2000-02-29', interval 1 year)", DateValue(2001, 2, 28));
+  TestDateValue("date_add(date '2000-02-29', interval 4 year)", DateValue(2004, 2, 29));
+  TestDateValue("date_sub(date '2000-02-29', interval 1 year)", DateValue(1999, 2, 28));
+  TestDateValue("date_sub(date '2000-02-29', interval 4 year)", DateValue(1996, 2, 29));
+  TestDateValue("date '2000-02-29' + interval 1 year", DateValue(2001, 2, 28));
+  TestDateValue("date '2000-02-29' + interval 4 years", DateValue(2004, 2, 29));
+  TestDateValue("date '0001-12-31' + interval 9998 years", DateValue(9999, 12, 31));
+  TestIsNull("date '0001-12-31' + interval 9999 years", TYPE_DATE);
+  TestIsNull("date '0001-01-01' + interval 2147483647 years", TYPE_DATE);
+  // Test month interval expressions. Keep-last-day-of-month behavior is not enforced.
+  TestDateValue("date_add(date '2000-02-29', interval 1 month)", DateValue(2000, 3, 29));
+  TestDateValue("date_add(date '1999-02-28', interval 12 months)",
+      DateValue(2000, 2, 28));
+  TestDateValue("date_sub(date '2000-03-31', interval 1 month)", DateValue(2000, 2, 29));
+  TestDateValue("date_add(date '2000-03-31', interval -2 months)",
+      DateValue(2000, 1, 31));
+  TestDateValue("date '2000-02-29' + interval 1 month", DateValue(2000, 3, 29));
+  TestDateValue("date '2000-03-31' - interval 2 months", DateValue(2000, 1, 31));
+  TestDateValue("date '9999-01-01' - interval 119976 months", DateValue(1, 1, 1));
+  TestIsNull("date'9999-01-01' - interval 119977 months", TYPE_DATE);
+  TestIsNull("date'9999-12-31' - interval 2147483647 months", TYPE_DATE);
+  // Test week interval expressions.
+  TestDateValue("date_add(date'2019-06-12', interval -24 weeks)",
+      DateValue(2018, 12, 26));
+  TestDateValue("date_sub(date'2019-06-12', interval 24 weeks)", DateValue(2018, 12, 26));
+  TestDateValue("date_add(date '2016-01-04', interval 8 weeks)", DateValue(2016, 2, 29));
+  TestDateValue("date '2019-06-12' - interval 24 weeks", DateValue(2018, 12, 26));
+  TestDateValue("date '2018-12-26' + interval 24 weeks", DateValue(2019, 6, 12));
+  TestDateValue("date '9999-12-31' - interval 521722 weeks", DateValue(1, 1, 5));
+  TestIsNull("date '9999-12-31' - interval 521723 weeks", TYPE_DATE);
+  TestIsNull("date'9999-12-31' - interval 2147483647 weeks", TYPE_DATE);
+  // Test day interval expressions.
+  TestDateValue("date_add(date '2019-01-01', interval 365 days)", DateValue(2020, 1, 1));
+  TestDateValue("date_sub(date '2016-12-31', interval 366 days)",
+      DateValue(2015, 12, 31));
+  TestDateValue("date '0001-01-01' + interval 3652058 days", DateValue(9999, 12, 31));
+  TestIsNull("date '0001-01-01' + interval 3652059 days", TYPE_DATE);
+  TestIsNull("date '9999-12-31' - interval 2147483647 days", TYPE_DATE);
+  // Test NULL values.
+  TestIsNull("date_add(date '2019-01-01', interval cast(NULL as BIGINT) days)",
+      TYPE_DATE);
+  TestIsNull("date_add(cast(NULL as date), interval 1 days)", TYPE_DATE);
+  TestIsNull("date_add(cast(NULL as date), interval cast(NULL as BIGINT) days)",
+      TYPE_DATE);
+  TestIsNull("date '2019-01-01' - interval cast(NULL as BIGINT) days", TYPE_DATE);
+  TestIsNull("cast(NULL as date) - interval 1 days", TYPE_DATE);
+  TestIsNull("cast(NULL as date) - interval cast(NULL as BIGINT) days", TYPE_DATE);
+
+  // datediff:
+  TestValue("datediff(date'2019-05-12', date '2019-05-12')", TYPE_INT, 0);
+  TestValue("datediff(date'2020-01-01', '2019-01-01')", TYPE_INT, 365);
+  TestValue("datediff('2019-01-01', date '2020-01-01')", TYPE_INT, -365);
+  // Test leap year
+  TestValue("datediff(date'2021-01-01', date '2020-01-01')", TYPE_INT, 366);
+  TestValue("datediff('2020-01-01', date '2021-01-01')", TYPE_INT, -366);
+  // Test difference between min and max date
+  TestValue("datediff(date'9999-12-31', date '0001-01-01')", TYPE_INT, 3652058);
+  TestValue("datediff(date'0001-01-01', '9999-12-31')", TYPE_INT, -3652058);
+  // Test NULL values
+  TestIsNull("datediff(cast(NULL as DATE), date '0001-01-01')", TYPE_INT);
+  TestIsNull("datediff(date'9999-12-31', cast(NULL as date))", TYPE_INT);
+  TestIsNull("datediff(cast(NULL as DATE), cast(NULL as date))", TYPE_INT);
+
+  // date_cmp:
+  TestValue("date_cmp(date '2019-06-11', date '2019-06-11')", TYPE_INT, 0);
+  TestValue("date_cmp(date '2019-06-11', '2019-06-12')", TYPE_INT, -1);
+  TestValue("date_cmp('2019-06-12', date '2019-06-11')", TYPE_INT, 1);
+  // Test NULL values
+  TestIsNull("date_cmp(date '2019-06-12', cast(NULL as date))", TYPE_INT);
+  TestIsNull("date_cmp(cast(NULL as date), date '2019-06-11')", TYPE_INT);
+  TestIsNull("date_cmp(cast(NULL as DATE), cast(NULL as date))", TYPE_INT);
+  // Test upper and lower limit
+  TestValue("date_cmp(date '9999-12-31', '0001-01-01')", TYPE_INT, 1);
+
+  // int_months_between:
+  TestValue("int_months_between(date '1967-07-19','1966-06-04')", TYPE_INT, 13);
+  TestValue("int_months_between('1966-06-04', date'1967-07-19')", TYPE_INT, -13);
+  TestValue("int_months_between(date '1967-07-19','1967-07-19')", TYPE_INT, 0);
+  TestValue("int_months_between('2015-07-19', date '2015-08-18')", TYPE_INT, 0);
+  // Test lower and upper limit
+  TestValue("int_months_between(date '9999-12-31','0001-01-01')", TYPE_INT,
+      9998 * 12 + 11);
+  // Test NULL values
+  TestIsNull("int_months_between(date '1999-11-25', cast(NULL as date))", TYPE_INT);
+  TestIsNull("int_months_between(cast(NULL as DATE), date '1999-11-25')", TYPE_INT);
+  TestIsNull("int_months_between(cast(NULL as DATE), cast(NULL as date))", TYPE_INT);
+
+  // months_between:
+  TestValue("months_between(DATE '1967-07-19','1966-06-04')", TYPE_DOUBLE,
+      13.48387096774194);
+  TestValue("months_between('1966-06-04', date'1967-07-19')",
+      TYPE_DOUBLE, -13.48387096774194);
+  TestValue("months_between(date'1967-07-19','1967-07-19')", TYPE_DOUBLE, 0);
+  TestValue("months_between(date'2015-02-28','2015-05-31')", TYPE_DOUBLE, -3);
+  TestValue("months_between(date'2012-02-29','2012-01-31')", TYPE_DOUBLE, 1);
+  // Test NULL values
+  TestIsNull("months_between(date '1999-11-25', cast(NULL as date))", TYPE_DOUBLE);
+  TestIsNull("months_between(cast(NULL as DATE), date '1999-11-25')", TYPE_DOUBLE);
+  TestIsNull("months_between(cast(NULL as DATE), cast(NULL as date))", TYPE_DOUBLE);
+
+  // current_date:
+  // Test that current_date() is reasonable.
+  {
+    ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
+    ScopedLocalUnixTimestampConversionOverride use_local;
+    const Timezone& local_tz = time_zone.GetTimezone();
+
+    const boost::gregorian::date start_date =
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz).date();
+    DateValue current_dv = ConvertValue<DateValue>(GetValue("current_date()", TYPE_DATE));
+    const boost::gregorian::date end_date =
+        TimestampValue::FromUnixTimeMicros(UnixMicros(), local_tz).date();
+
+    int year, month, day;
+    EXPECT_TRUE(current_dv.ToYearMonthDay(&year, &month, &day));
+    const boost::gregorian::date current_date(year, month, day);
+    EXPECT_BETWEEN(start_date, current_date, end_date);
+  }
+}
+
+TEST_P(ExprTest, ConditionalFunctions) {
   // If first param evaluates to true, should return second parameter,
   // false or NULL should return the third.
   TestValue("if(TRUE, FALSE, TRUE)", TYPE_BOOLEAN, false);
@@ -6628,12 +8221,18 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestValue("if(FALSE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("if(TRUE, 'abc', 'defgh')", "abc");
   TestStringValue("if(FALSE, 'abc', 'defgh')", "defgh");
-  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461);
-  TimestampValue else_val = TimestampValue::FromUnixTime(929387245);
+  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue else_val = TimestampValue::FromUnixTime(929387245,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("if(TRUE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", else_val);
+  TestDateValue("if(TRUE, cast('2011-01-01' as date), cast('1999-06-14' as date))",
+      DateValue(2011, 1, 1));
+  TestDateValue("if(FALSE, cast('2011-01-01' as date), cast('1999-06-14' as date))",
+      DateValue(1999, 6, 14));
 
   // Test nvl2(), which is rewritten to if() before analysis.
   // Returns 2nd arg if 1st arg is not NULL, otherwise it returns 3rd arg.
@@ -6646,12 +8245,18 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestValue("nvl2(NULL, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("nvl2('some string', 'abc', 'defgh')", "abc");
   TestStringValue("nvl2(NULL, 'abc', 'defgh')", "defgh");
-  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461);
-  TimestampValue second_val = TimestampValue::FromUnixTime(929387245);
+  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue second_val = TimestampValue::FromUnixTime(929387245,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("nvl2(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", first_val);
   TestTimestampValue("nvl2(NULL, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", second_val);
+  TestDateValue("nvl2(FALSE, cast('2011-01-01' as date), cast('1999-06-14' as date))",
+      DateValue(2011, 1, 1));
+  TestDateValue("nvl2(NULL, cast('2011-01-01' as date), cast('1999-06-14' as date))",
+      DateValue(1999, 6, 14));
 
   // Test nullif(). Return NULL if lhs equals rhs, lhs otherwise.
   TestIsNull("nullif(NULL, NULL)", TYPE_BOOLEAN);
@@ -6673,13 +8278,16 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestStringValue("nullif('abc', NULL)", "abc");
   TestIsNull("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
-  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461);
+  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", testlhs);
   TestIsNull("nullif(NULL, "
       "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
   TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "NULL)", testlhs);
+  TestIsNull("nullif(NULL, cast('2011-01-01' as date))", TYPE_DATE);
+  TestDateValue("nullif(cast('2011-01-01' as date), NULL)", DateValue(2011, 1, 1));
 
   // Test IsNull() function and its aliases on all applicable types and NULL.
   string isnull_aliases[] = {"IsNull", "IfNull", "Nvl"};
@@ -6695,6 +8303,7 @@ TEST_F(ExprTest, ConditionalFunctions) {
     TestStringValue(f + "('abc', NULL)", "abc");
     TestTimestampValue(f + "(" + default_timestamp_str_ + ", NULL)",
         default_timestamp_val_);
+    TestDateValue(f + "(" + default_date_str_ + ", NULL)", default_date_val_);
     // Test first argument is NULL.
     TestValue(f + "(NULL, true)", TYPE_BOOLEAN, true);
     TestValue(f + "(NULL, 1)", TYPE_TINYINT, 1);
@@ -6706,6 +8315,7 @@ TEST_F(ExprTest, ConditionalFunctions) {
     TestStringValue(f + "(NULL, 'abc')", "abc");
     TestTimestampValue(f + "(NULL, " + default_timestamp_str_ + ")",
         default_timestamp_val_);
+    TestDateValue(f + "(NULL, " + default_date_str_ + ")", default_date_val_);
     // Test NULL. The return type is boolean to avoid a special NULL function signature.
     TestIsNull(f + "(NULL, NULL)", TYPE_BOOLEAN);
   }
@@ -6736,8 +8346,10 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestStringValue("coalesce(NULL, 'abc', NULL)", "abc");
   TestStringValue("coalesce('defgh', NULL, 'abc', NULL)", "defgh");
   TestStringValue("coalesce(NULL, NULL, NULL, 'abc', NULL, NULL)", "abc");
-  TimestampValue ats = TimestampValue::FromUnixTime(1293872461);
-  TimestampValue bts = TimestampValue::FromUnixTime(929387245);
+  TimestampValue ats = TimestampValue::FromUnixTime(1293872461,
+      TimezoneDatabase::GetUtcTimezone());
+  TimestampValue bts = TimestampValue::FromUnixTime(929387245,
+      TimezoneDatabase::GetUtcTimezone());
   TestTimestampValue("coalesce(cast('2011-01-01 09:01:01' as timestamp))", ats);
   TestTimestampValue("coalesce(NULL, cast('2011-01-01 09:01:01' as timestamp),"
       "NULL)", ats);
@@ -6745,6 +8357,11 @@ TEST_F(ExprTest, ConditionalFunctions) {
       "cast('2011-01-01 09:01:01' as timestamp), NULL)", bts);
   TestTimestampValue("coalesce(NULL, NULL, NULL,"
       "cast('2011-01-01 09:01:01' as timestamp), NULL, NULL)", ats);
+  TestDateValue("coalesce(cast('2011-01-01' as date))", DateValue(2011, 1, 1));
+  TestDateValue("coalesce(NULL, cast('2011-01-01' as date))", DateValue(2011, 1, 1));
+  TestDateValue("coalesce(cast('1999-06-14' as date), NULL)", DateValue(1999, 6, 14));
+  TestDateValue("coalesce(NULL, NULL, NULL, cast('2011-01-01' as date))",
+      DateValue(2011, 1, 1));
 
   // Test logic of case expr using int types.
   // The different types and casting are tested below.
@@ -6874,6 +8491,10 @@ TEST_F(ExprTest, ConditionalFunctions) {
       default_timestamp_val_);
   TestTimestampValue("case when false then cast('1999-06-14 19:07:25' as timestamp) "
       "else " + default_timestamp_str_ + " end", default_timestamp_val_);
+  // Date type.
+  TestDateValue("case when true then " + default_date_str_ + " end", default_date_val_);
+  TestDateValue("case when false then cast('1999-06-14' as date) else " +
+      default_date_str_ + " end", default_date_val_);
 
   // Test Decode. This function is internalized as a CaseExpr so no
   // extra testing should be needed. To be safe, a sanity test will be done.
@@ -6885,7 +8506,7 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestIsNull("decode(NULL, 1, 2)", TYPE_TINYINT);
 }
 
-TEST_F(ExprTest, ConditionalFunctionIsTrue) {
+TEST_P(ExprTest, ConditionalFunctionIsTrue) {
   TestValue("istrue(cast(false as boolean))", TYPE_BOOLEAN, false);
   TestValue("istrue(cast(true as boolean))", TYPE_BOOLEAN, true);
   TestValue("istrue(cast(NULL as boolean))", TYPE_BOOLEAN, false);
@@ -6912,7 +8533,7 @@ TEST_F(ExprTest, ConditionalFunctionIsTrue) {
   TestError("istrue(-9999999999999999999999999999999999999.9)");
 }
 
-TEST_F(ExprTest, ConditionalFunctionIsFalse) {
+TEST_P(ExprTest, ConditionalFunctionIsFalse) {
   TestValue("isfalse(cast(false as boolean))", TYPE_BOOLEAN, true);
   TestValue("isfalse(cast(true as boolean))", TYPE_BOOLEAN, false);
   TestValue("isfalse(cast(NULL as boolean))", TYPE_BOOLEAN, false);
@@ -6941,7 +8562,7 @@ TEST_F(ExprTest, ConditionalFunctionIsFalse) {
   TestError("isfalse(-9999999999999999999999999999999999999.9)");
 }
 
-TEST_F(ExprTest, ConditionalFunctionIsNotTrue) {
+TEST_P(ExprTest, ConditionalFunctionIsNotTrue) {
   TestValue("isnottrue(cast(false as boolean))", TYPE_BOOLEAN, true);
   TestValue("isnottrue(cast(true as boolean))", TYPE_BOOLEAN, false);
   TestValue("isnottrue(cast(NULL as boolean))", TYPE_BOOLEAN, true);
@@ -6970,7 +8591,7 @@ TEST_F(ExprTest, ConditionalFunctionIsNotTrue) {
   TestError("isnottrue(-9999999999999999999999999999999999999.9)");
 }
 
-TEST_F(ExprTest, ConditionalFunctionIsNotFalse) {
+TEST_P(ExprTest, ConditionalFunctionIsNotFalse) {
   TestValue("isnotfalse(cast(false as boolean))", TYPE_BOOLEAN, false);
   TestValue("isnotfalse(cast(true as boolean))", TYPE_BOOLEAN, true);
   TestValue("isnotfalse(cast(NULL as boolean))", TYPE_BOOLEAN, true);
@@ -7030,9 +8651,7 @@ void ValidateLayout(const vector<ScalarExpr*>& exprs, int expected_byte_size,
   }
 }
 
-TEST_F(ExprTest, ResultsLayoutTest) {
-  ObjectPool pool;
-
+TEST_P(ExprTest, ResultsLayoutTest) {
   vector<ScalarExpr*> exprs;
   map<int, set<int>> expected_offsets;
 
@@ -7049,6 +8668,7 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   types.push_back(TYPE_FLOAT);
   types.push_back(TYPE_DOUBLE);
   types.push_back(TYPE_TIMESTAMP);
+  types.push_back(TYPE_DATE);
   types.push_back(TYPE_STRING);
 
   types.push_back(ColumnType::CreateDecimalType(1,0));
@@ -7072,13 +8692,13 @@ TEST_F(ExprTest, ResultsLayoutTest) {
     expected_offsets.clear();
     // With one expr, all offsets should be 0.
     expected_offsets[t.GetByteSize()] = set<int>({0});
-    if (t.type != TYPE_TIMESTAMP) {
-      exprs.push_back(pool.Add(CreateLiteral(t, "0")));
+    if (t.type != TYPE_TIMESTAMP && t.type != TYPE_DATE) {
+      exprs.push_back(CreateLiteral(t, "0"));
     } else {
-      exprs.push_back(pool.Add(CreateLiteral(t, "2016-11-09")));
+      exprs.push_back(CreateLiteral(t, "2016-11-09"));
     }
     if (t.IsVarLenStringType()) {
-      ValidateLayout(exprs, 16, 0, expected_offsets);
+      ValidateLayout(exprs, 12, 0, expected_offsets);
     } else {
       ValidateLayout(exprs, t.GetByteSize(), -1, expected_offsets);
     }
@@ -7089,71 +8709,66 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_offsets.clear();
   exprs.clear();
 
-  // Test layout adding a bunch of exprs.  This is designed to trigger padding.
+  // Test layout adding a bunch of exprs.  Previously, this triggered padding.
+  // IMPALA-7367 removed the alignment requirement, hence the values are not padded.
   // The expected result is computed along the way
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BOOLEAN, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_TINYINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(1), "0")));
+  exprs.push_back(CreateLiteral(TYPE_BOOLEAN, "0"));
+  exprs.push_back(CreateLiteral(TYPE_TINYINT, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateCharType(1), "0"));
   expected_offsets[1].insert(expected_byte_size);
   expected_offsets[1].insert(expected_byte_size + 1);
   expected_offsets[1].insert(expected_byte_size + 2);
-  expected_byte_size += 3 * 1 + 1;  // 1 byte of padding
+  expected_byte_size += 3 * 1;
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_SMALLINT, "0")));
+  exprs.push_back(CreateLiteral(TYPE_SMALLINT, "0"));
   expected_offsets[2].insert(expected_byte_size);
   expected_byte_size += 2; // No padding before CHAR
 
-  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(3), "0")));
+  exprs.push_back(CreateLiteral(ColumnType::CreateCharType(3), "0"));
   expected_offsets[3].insert(expected_byte_size);
-  expected_byte_size += 3 + 3; // 3 byte of padding
-  ASSERT_EQ(expected_byte_size % 4, 0);
-
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_INT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0")));
+  expected_byte_size += 3;
+  exprs.push_back(CreateLiteral(TYPE_INT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_FLOAT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_FLOAT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_DATE, "2018-11-10"));
+  exprs.push_back(CreateLiteral(TYPE_DATE, "2018-11-10"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0"));
   expected_offsets[4].insert(expected_byte_size);
   expected_offsets[4].insert(expected_byte_size + 4);
   expected_offsets[4].insert(expected_byte_size + 8);
   expected_offsets[4].insert(expected_byte_size + 12);
-  expected_byte_size += 4 * 4 + 4;  // 4 bytes of padding
-  ASSERT_EQ(expected_byte_size % 8, 0);
+  expected_offsets[4].insert(expected_byte_size + 16);
+  expected_offsets[4].insert(expected_byte_size + 20);
+  expected_byte_size += 6 * 4;
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_DOUBLE, "0")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0")));
+  exprs.push_back(CreateLiteral(TYPE_BIGINT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_BIGINT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_BIGINT, "0"));
+  exprs.push_back(CreateLiteral(TYPE_DOUBLE, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0"));
   expected_offsets[8].insert(expected_byte_size);
   expected_offsets[8].insert(expected_byte_size + 8);
   expected_offsets[8].insert(expected_byte_size + 16);
   expected_offsets[8].insert(expected_byte_size + 24);
   expected_offsets[8].insert(expected_byte_size + 32);
-  expected_byte_size += 5 * 8;      // No more padding
-  ASSERT_EQ(expected_byte_size % 8, 0);
+  expected_byte_size += 5 * 8;
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0")));
+  exprs.push_back(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09"));
+  exprs.push_back(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0"));
   expected_offsets[16].insert(expected_byte_size);
   expected_offsets[16].insert(expected_byte_size + 16);
   expected_offsets[16].insert(expected_byte_size + 32);
   expected_byte_size += 3 * 16;
-  ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
-  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
-  exprs.push_back(pool.Add(
-      CreateLiteral(ColumnType::CreateVarcharType(1), "0")));
+  exprs.push_back(CreateLiteral(TYPE_STRING, "0"));
+  exprs.push_back(CreateLiteral(TYPE_STRING, "0"));
+  exprs.push_back(CreateLiteral(ColumnType::CreateVarcharType(1), "0"));
   expected_offsets[0].insert(expected_byte_size);
-  expected_offsets[0].insert(expected_byte_size + 16);
-  expected_offsets[0].insert(expected_byte_size + 32);
+  expected_offsets[0].insert(expected_byte_size + 12);
+  expected_offsets[0].insert(expected_byte_size + 24);
   expected_var_begin = expected_byte_size;
-  expected_byte_size += 3 * 16;
-  ASSERT_EQ(expected_byte_size % 8, 0);
+  expected_byte_size += 3 * 12;
 
   // Validate computed layout
   ValidateLayout(exprs, expected_byte_size, expected_var_begin, expected_offsets);
@@ -7170,7 +8785,7 @@ TEST_F(ExprTest, ResultsLayoutTest) {
 }
 
 // TODO: is there an easy way to templatize/parametrize these tests?
-TEST_F(ExprTest, DecimalFunctions) {
+TEST_P(ExprTest, DecimalFunctions) {
   TestValue("precision(cast (1 as decimal(10,2)))", TYPE_INT, 10);
   TestValue("scale(cast(1 as decimal(10,2)))", TYPE_INT, 2);
 
@@ -7195,8 +8810,8 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestValue("scale(round(cast(\"123.456\" as decimal(6, 3)), -2))", TYPE_INT, 0);
   TestValue("precision(round(123.456, -2))", TYPE_INT, 4);
 
-  TestValue("scale(truncate(123.456, 10))", TYPE_INT, 10);
-  TestValue("precision(truncate(cast(\"123.456\" as decimal(6, 3)), 10))", TYPE_INT, 13);
+  TestValue("scale(truncate(123.456, 10))", TYPE_INT, 3);
+  TestValue("precision(truncate(cast(\"123.456\" as decimal(6, 3)), 10))", TYPE_INT, 6);
 
   TestValue("scale(round(123.456, -10))", TYPE_INT, 0);
   TestValue("precision(round(cast(\"123.456\" as decimal(6, 3)), -10))", TYPE_INT, 4);
@@ -7527,8 +9142,8 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(6, 3));
   TestDecimalValue("round(cast('3.1615' as decimal(6,4)), 4)", Decimal4Value(31615),
       ColumnType::CreateDecimalType(6, 4));
-  TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 5)", Decimal4Value(-316150),
-      ColumnType::CreateDecimalType(7, 5));
+  TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 5)", Decimal4Value(-31615),
+      ColumnType::CreateDecimalType(6, 4));
   TestDecimalValue("round(cast('175.0' as decimal(6,1)), 0)", Decimal4Value(175),
       ColumnType::CreateDecimalType(6, 0));
   TestDecimalValue("round(cast('-175.0' as decimal(6,1)), -1)", Decimal4Value(-180),
@@ -7554,8 +9169,8 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(16, 3));
   TestDecimalValue("round(cast('-3.1615' as decimal(16,4)), 4)", Decimal8Value(-31615),
       ColumnType::CreateDecimalType(16, 4));
-  TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 5)", Decimal8Value(316150),
-      ColumnType::CreateDecimalType(17, 5));
+  TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 5)", Decimal8Value(31615),
+      ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("round(cast('-999.951' as decimal(16,3)), 1)", Decimal8Value(-10000),
       ColumnType::CreateDecimalType(15, 1));
 
@@ -7617,8 +9232,8 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(5, 3));
   TestDecimalValue("truncate(cast('-3.1615' as decimal(6,4)), 4)", Decimal4Value(-31615),
       ColumnType::CreateDecimalType(6, 4));
-  TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 5)", Decimal4Value(316150),
-      ColumnType::CreateDecimalType(7, 5));
+  TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 5)", Decimal4Value(31615),
+      ColumnType::CreateDecimalType(6, 4));
   TestDecimalValue("truncate(cast('175.0' as decimal(6,1)), 0)", Decimal4Value(175),
       ColumnType::CreateDecimalType(5, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(6,1)), -1)", Decimal4Value(-170),
@@ -7641,7 +9256,7 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("truncate(cast('3.1615' as decimal(16,4)), 4)",
       Decimal8Value(31615), ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("truncate(cast('-3.1615' as decimal(16,4)), 5)",
-      Decimal8Value(-316150), ColumnType::CreateDecimalType(17, 5));
+      Decimal8Value(-31615), ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("truncate(cast('-175.0' as decimal(15,1)), 0)", Decimal8Value(-175),
       ColumnType::CreateDecimalType(14, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(15,1)), -1)", Decimal8Value(170),
@@ -7664,7 +9279,7 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("truncate(cast('-3.1615' as decimal(32,4)), 4)",
       Decimal16Value(-31615), ColumnType::CreateDecimalType(32, 4));
   TestDecimalValue("truncate(cast('3.1615' as decimal(32,4)), 5)",
-      Decimal16Value(316150), ColumnType::CreateDecimalType(33, 5));
+      Decimal16Value(31615), ColumnType::CreateDecimalType(32, 4));
   TestDecimalValue("truncate(cast('-175.0' as decimal(35,1)), 0)",
       Decimal16Value(-175), ColumnType::CreateDecimalType(34, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(35,1)), -1)",
@@ -7693,7 +9308,9 @@ TEST_F(ExprTest, DecimalFunctions) {
 
 // Sanity check some overflow casting. We have a random test framework that covers
 // this more thoroughly.
-TEST_F(ExprTest, DecimalOverflowCasts) {
+TEST_P(ExprTest, DecimalOverflowCastsDecimalV1) {
+  executor_->PushExecOption("DECIMAL_V2=0");
+
   TestDecimalValue("cast(123.456 as decimal(6,3))",
       Decimal4Value(123456), ColumnType::CreateDecimalType(6, 3));
   TestDecimalValue("cast(-123.456 as decimal(6,1))",
@@ -7762,9 +9379,80 @@ TEST_F(ExprTest, DecimalOverflowCasts) {
   // Tests converting a non-trivial empty string to a decimal (IMPALA-1566).
   TestIsNull("cast(regexp_replace('','a','b') as decimal(15,2))",
       ColumnType::CreateDecimalType(15,2));
+
+  executor_->PopExecOption();
 }
 
-TEST_F(ExprTest, NullValueFunction) {
+TEST_P(ExprTest, DecimalOverflowCastsDecimalV2) {
+  executor_->PushExecOption("DECIMAL_V2=1");
+
+  TestDecimalValue("cast(123.456 as decimal(6,3))",
+      Decimal4Value(123456), ColumnType::CreateDecimalType(6, 3));
+  TestDecimalValue("cast(-123.456 as decimal(6,1))",
+      Decimal4Value(-1235), ColumnType::CreateDecimalType(6, 1));
+  TestDecimalValue("cast(123.456 as decimal(6,0))",
+      Decimal4Value(123), ColumnType::CreateDecimalType(6, 0));
+  TestDecimalValue("cast(-123.456 as decimal(3,0))",
+      Decimal4Value(-123), ColumnType::CreateDecimalType(3, 0));
+
+  TestDecimalValue("cast(123.4567890 as decimal(10,7))",
+      Decimal8Value(1234567890L), ColumnType::CreateDecimalType(10, 7));
+
+  TestDecimalValue("cast(cast(\"123.01234567890123456789\" as decimal(23,20))\
+      as decimal(12,9))", Decimal8Value(123012345679L),
+      ColumnType::CreateDecimalType(12, 9));
+  TestDecimalValue("cast(cast(\"123.01234567890123456789\" as decimal(23,20))\
+      as decimal(4,1))", Decimal4Value(1230), ColumnType::CreateDecimalType(4, 1));
+
+  TestDecimalValue("cast(cast(\"123.0123456789\" as decimal(13,10))\
+      as decimal(5,2))", Decimal4Value(12301), ColumnType::CreateDecimalType(5, 2));
+
+  // Overflow
+  TestError("cast(123.456 as decimal(2,0))");
+  TestError("cast(123.456 as decimal(2,1))");
+  TestError("cast(123.456 as decimal(2,2))");
+  TestError("cast(99.99 as decimal(2,2))");
+  TestError("cast(99.99 as decimal(2,0))");
+  TestError("cast(-99.99 as decimal(2,2))");
+  TestError("cast(-99.99 as decimal(3,1))");
+
+  TestDecimalValue("cast(999.99 as decimal(6,3))",
+      Decimal4Value(999990), ColumnType::CreateDecimalType(6, 3));
+  TestDecimalValue("cast(-999.99 as decimal(7,4))",
+      Decimal4Value(-9999900), ColumnType::CreateDecimalType(7, 4));
+  TestError("cast(9990.99 as decimal(6,3))");
+  TestError("cast(-9990.99 as decimal(7,4))");
+
+  TestDecimalValue("cast(123.4567890 as decimal(4, 1))",
+      Decimal4Value(1235), ColumnType::CreateDecimalType(4, 1));
+  TestDecimalValue("cast(-123.4567890 as decimal(5, 2))",
+      Decimal4Value(-12346), ColumnType::CreateDecimalType(5, 2));
+  TestError("cast(123.4567890 as decimal(2, 1))");
+  TestError("cast(123.4567890 as decimal(6, 5))");
+
+  TestDecimalValue("cast(pi() as decimal(1, 0))",
+      Decimal4Value(3), ColumnType::CreateDecimalType(1,0));
+  TestDecimalValue("cast(pi() as decimal(4, 1))",
+      Decimal4Value(31), ColumnType::CreateDecimalType(4,1));
+  TestDecimalValue("cast(pi() as decimal(30, 1))",
+      Decimal8Value(31), ColumnType::CreateDecimalType(30,1));
+  TestError("cast(pi() as decimal(4, 4))");
+  TestError("cast(pi() as decimal(11, 11))");
+  TestError("cast(pi() as decimal(31, 31))");
+
+  TestError("cast(140573315541874605.4665184383287 as decimal(17, 13))");
+  TestError("cast(140573315541874605.4665184383287 as decimal(9, 3))");
+
+  // value has 30 digits before the decimal, casting to 29 is an overflow.
+  TestError("cast(99999999999999999999999999999.9 as decimal(29, 1))");
+
+  // Tests converting a non-trivial empty string to a decimal (IMPALA-1566).
+  TestError("cast(regexp_replace('','a','b') as decimal(15,2))");
+
+  executor_->PopExecOption();
+}
+
+TEST_P(ExprTest, NullValueFunction) {
   TestValue("nullvalue(cast(NULL as boolean))", TYPE_BOOLEAN, true);
   TestValue("nullvalue(cast(0 as boolean))", TYPE_BOOLEAN, false);
   TestValue("nullvalue(cast(5 as boolean))", TYPE_BOOLEAN, false);
@@ -7834,7 +9522,7 @@ TEST_F(ExprTest, NullValueFunction) {
   TestValue("nullvalue(-99999999999999999999999999999999999.9)", TYPE_BOOLEAN, false);
 }
 
-TEST_F(ExprTest, NonNullValueFunction) {
+TEST_P(ExprTest, NonNullValueFunction) {
   TestValue("nonnullvalue(cast(NULL as boolean))", TYPE_BOOLEAN, false);
   TestValue("nonnullvalue(cast(0 as boolean))", TYPE_BOOLEAN, true);
   TestValue("nonnullvalue(cast(5 as boolean))", TYPE_BOOLEAN, true);
@@ -7904,7 +9592,7 @@ TEST_F(ExprTest, NonNullValueFunction) {
   TestValue("nonnullvalue(-99999999999999999999999999999999999.9)", TYPE_BOOLEAN, true);
 }
 
-TEST_F(ExprTest, UdfInterfaceBuiltins) {
+TEST_P(ExprTest, UdfInterfaceBuiltins) {
   TestValue("udf_pi()", TYPE_DOUBLE, M_PI);
   TestValue("udf_abs(-1)", TYPE_DOUBLE, 1.0);
   TestStringValue("udf_lower('Hello_WORLD')", "hello_world");
@@ -7920,7 +9608,7 @@ TEST_F(ExprTest, UdfInterfaceBuiltins) {
   TestValue("min_bigint()", TYPE_BIGINT, numeric_limits<int64_t>::min());
 }
 
-TEST_F(ExprTest, MADlib) {
+TEST_P(ExprTest, MADlib) {
   TestStringValue("madlib_encode_vector(madlib_vector(1.0, 2.0, 3.0))",
                   "aaaaaipdaaaaaaaeaaaaaeae");
   TestStringValue("madlib_print_vector(madlib_vector(1, 2, 3))", "<1, 2, 3>");
@@ -7939,7 +9627,7 @@ TEST_F(ExprTest, MADlib) {
     TYPE_DOUBLE, 3.0);
 }
 
-TEST_F(ExprTest, BitByteBuiltins) {
+TEST_P(ExprTest, BitByteBuiltins) {
   TestIsNull("bitand(1,NULL)", TYPE_TINYINT);
   TestIsNull("bitand(NULL,3)", TYPE_TINYINT);
   // And of numbers differing in 2nd bit position gives min of two numbers
@@ -8110,7 +9798,7 @@ TEST_F(ExprTest, BitByteBuiltins) {
   TestValue("rotateright(256, -2)", TYPE_SMALLINT, 1024);
 }
 
-TEST_F(ExprTest, UuidTest) {
+TEST_P(ExprTest, UuidTest) {
   boost::unordered_set<string> string_set;
   const unsigned int NUM_UUIDS = 10;
   const string regex(
@@ -8122,105 +9810,115 @@ TEST_F(ExprTest, UuidTest) {
   EXPECT_TRUE(string_set.size() == NUM_UUIDS);
 }
 
-TEST_F(ExprTest, DateTruncTest) {
+TEST_P(ExprTest, DateTruncTest) {
   TestTimestampValue("date_trunc('MILLENNIUM', '2016-05-08 10:30:00')",
-      TimestampValue::Parse("2000-01-01 00:00:00"));
-  TestTimestampValue("date_trunc('MILLENNIUM', '2000-01-01 00:00:00')",
-      TimestampValue::Parse("2000-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2001-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MILLENNIUM', '3000-12-31 23:59:59.999999999')",
+      TimestampValue::ParseSimpleDateFormat("2001-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MILLENNIUM', '3001-01-01 00:00:00')",
+      TimestampValue::ParseSimpleDateFormat("3001-01-01 00:00:00"));
   TestTimestampValue("date_trunc('CENTURY', '2016-05-08 10:30:00')",
-      TimestampValue::Parse("2000-01-01 00:00:00  "));
+      TimestampValue::ParseSimpleDateFormat("2001-01-01 00:00:00  "));
   TestTimestampValue("date_trunc('CENTURY', '2116-05-08 10:30:00')",
-      TimestampValue::Parse("2100-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2101-01-01 00:00:00"));
   TestTimestampValue("date_trunc('DECADE', '2116-05-08 10:30:00')",
-      TimestampValue::Parse("2110-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2110-01-01 00:00:00"));
   TestTimestampValue("date_trunc('YEAR', '2016-05-08 10:30:00')",
-      TimestampValue::Parse("2016-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2016-01-01 00:00:00"));
   TestTimestampValue("date_trunc('MONTH', '2016-05-08 00:00:00')",
-      TimestampValue::Parse("2016-05-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2016-05-01 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '2116-05-08 10:30:00')",
-      TimestampValue::Parse("2116-05-04 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2116-05-04 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '2017-01-01 10:37:03.455722111')",
-      TimestampValue::Parse("2016-12-26 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2016-12-26 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '2017-01-02 10:37:03.455722111')",
-      TimestampValue::Parse("2017-01-02 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2017-01-02 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '2017-01-07 10:37:03.455722111')",
-      TimestampValue::Parse("2017-01-02 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2017-01-02 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '2017-01-08 10:37:03.455722111')",
-      TimestampValue::Parse("2017-01-02 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2017-01-02 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '2017-01-09 10:37:03.455722111')",
-      TimestampValue::Parse("2017-01-09 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("2017-01-09 00:00:00"));
   TestTimestampValue("date_trunc('DAY', '1416-05-08 10:37:03.455722111')",
-      TimestampValue::Parse("1416-05-08 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 00:00:00"));
 
   TestTimestampValue("date_trunc('HOUR', '1416-05-08 10:30:03.455722111')",
-      TimestampValue::Parse("1416-05-08 10:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 10:00:00"));
   TestTimestampValue("date_trunc('HOUR', '1416-05-08 23:30:03.455722111')",
-      TimestampValue::Parse("1416-05-08 23:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 23:00:00"));
   TestTimestampValue("date_trunc('MINUTE', '1416-05-08 10:37:03.455722111')",
-      TimestampValue::Parse("1416-05-08 10:37:00"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 10:37:00"));
   TestTimestampValue("date_trunc('SECOND', '1416-05-08 10:37:03.455722111')",
-      TimestampValue::Parse("1416-05-08 10:37:03"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 10:37:03"));
   TestTimestampValue("date_trunc('MILLISECONDS', '1416-05-08 10:37:03.455722111')",
-      TimestampValue::Parse("1416-05-08 10:37:03.455000000"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 10:37:03.455000000"));
   TestTimestampValue("date_trunc('MICROSECONDS', '1416-05-08 10:37:03.455722111')",
-      TimestampValue::Parse("1416-05-08 10:37:03.455722000"));
+      TimestampValue::ParseSimpleDateFormat("1416-05-08 10:37:03.455722000"));
 
   // Test corner cases.
   TestTimestampValue("date_trunc('MILLENNIUM', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9000-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9001-01-01 00:00:00"));
   TestTimestampValue("date_trunc('CENTURY', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9900-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9901-01-01 00:00:00"));
   TestTimestampValue("date_trunc('DECADE', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9990-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9990-01-01 00:00:00"));
   TestTimestampValue("date_trunc('YEAR', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-01-01 00:00:00"));
   TestTimestampValue("date_trunc('MONTH', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-01 00:00:00"));
   TestTimestampValue("date_trunc('WEEK', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-27 00:00:00"));
-  TestTimestampValue("date_trunc('WEEK', '1400-01-06 23:59:59.999999999')",
-      TimestampValue::Parse("1400-01-06 00:00:00"));
-  TestTimestampValue("date_trunc('WEEK', '1400-01-07 23:59:59.999999999')",
-      TimestampValue::Parse("1400-01-06 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-27 00:00:00"));
   TestTimestampValue("date_trunc('DAY', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-31 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 00:00:00"));
   TestTimestampValue("date_trunc('HOUR', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-31 23:00:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:00:00"));
   TestTimestampValue("date_trunc('MINUTE', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-31 23:59:00"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:00"));
   TestTimestampValue("date_trunc('SECOND', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-31 23:59:59"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59"));
   TestTimestampValue("date_trunc('MILLISECONDS', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-31 23:59:59.999"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59.999"));
   TestTimestampValue("date_trunc('MICROSECONDS', '9999-12-31 23:59:59.999999999')",
-      TimestampValue::Parse("9999-12-31 23:59:59.999999"));
+      TimestampValue::ParseSimpleDateFormat("9999-12-31 23:59:59.999999"));
 
-  TestTimestampValue("date_trunc('CENTURY', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('DECADE', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('YEAR', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('MONTH', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('DAY', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('HOUR', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('MINUTE', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('SECOND', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('MILLISECONDS', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
   TestTimestampValue("date_trunc('MICROSECONDS', '1400-01-01 00:00:00')",
-      TimestampValue::Parse("1400-01-01 00:00:00"));
+      TimestampValue::ParseSimpleDateFormat("1400-01-01 00:00:00"));
 
-  // valid input with invalid output
-  TestIsNull("date_trunc('MILLENNIUM', '1416-05-08 10:30:00')", TYPE_TIMESTAMP);
-  TestIsNull("date_trunc('MILLENNIUM', '1999-12-31 11:59:59.999999')", TYPE_TIMESTAMP);
+  // Test lower limit for century
+  TestIsNull("date_trunc('CENTURY', '1400-01-01 00:00:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('CENTURY', '1400-12-31 23:59:59.999999999')", TYPE_TIMESTAMP);
+  TestTimestampValue("date_trunc('CENTURY', '1401-01-01 00:00:00')",
+      TimestampValue::ParseSimpleDateFormat("1401-01-01 00:00:00"));
+
+  // Test lower limit for millennium
+  TestIsNull("date_trunc('MILLENNIUM', '1400-01-01 00:00:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('MILLENNIUM', '2000-12-31 23:59:59.999999999')", TYPE_TIMESTAMP);
+  TestTimestampValue("date_trunc('MILLENNIUM', '2001-01-01 00:00:00')",
+      TimestampValue::ParseSimpleDateFormat("2001-01-01 00:00:00"));
+
+  // Test lower limit for week
   TestIsNull("date_trunc('WEEK', '1400-01-01 00:00:00')", TYPE_TIMESTAMP);
-  TestIsNull("date_trunc('WEEK', '1400-01-05 00:00:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('WEEK', '1400-01-05 23:59:59.999999999')", TYPE_TIMESTAMP);
+  TestTimestampValue("date_trunc('WEEK', '1400-01-06 00:00:00')",
+      TimestampValue::ParseSimpleDateFormat("1400-01-06 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '1400-01-07 23:59:59.999999999')",
+      TimestampValue::ParseSimpleDateFormat("1400-01-06 00:00:00"));
 
   // Test invalid input.
   TestIsNull("date_trunc('HOUR', '12202010')", TYPE_TIMESTAMP);
@@ -8235,67 +9933,164 @@ TEST_F(ExprTest, DateTruncTest) {
   TestError("date_trunc('2017-01-09', '2017-01-09 10:37:03.455722111' )");
   TestError("date_trunc('2017-01-09 10:00:00', 'HOUR')");
 }
+
+TEST_P(ExprTest, JsonTest) {
+  TestStringValue("get_json_object('{\"a\":1, \"b\":2, \"c\":3}', '$.b')", "2");
+  TestStringValue(
+      "get_json_object('{\"a\":true, \"b\":false, \"c\":true}', '$.b')", "false");
+  TestStringValue(
+      "get_json_object('{\"a\":-1, \"b\":-2, \"c\":-3}', '$.b')", "-2");
+  TestStringValue(
+      "get_json_object('{\"a\":\"A\", \"b\":\"B\", \"c\":\"C\"}', '$.b')", "B");
+  TestStringValue(
+      "get_json_object('{\"a\":[], \"b\":[2,3,4], \"c\":[3]}', '$.b')", "[2,3,4]");
+
+  TestStringValue("get_json_object('[\"abc\", \"ddd\", \"fff\"]', '$[1]')", "ddd");
+  TestStringValue("get_json_object('[1, 2, 3]', '$[*]')", "[1,2,3]");
+  TestStringValue(
+      "get_json_object('{\"key\": {\"a\": {\"b\": true}}}', '$.key.a.b')", "true");
+  TestStringValue(
+      "get_json_object('[{\"key\": \"v1\"}, {\"key\": \"v2\"}]', '$[*].key')",
+      "[\"v1\",\"v2\"]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].key')",
+      "[[1,2,3],[4,5]]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].key[*]')",
+      "[1,2,3,4,5]");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[1][0]')", "3");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[*][0]')", "[0,3,6]");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[*][2]')", "[2,5]");
+  TestStringValue("get_json_object('[[0,1,2], [3,4,5], [6,7]]', '$[1][*]')", "[3,4,5]");
+
+  TestStringValue("get_json_object('{\"a\":1, \"b\":2, \"c\":3}', '$.*')", "[1,2,3]");
+  TestStringValue(
+      "get_json_object('{\"a\":true, \"b\":false, \"c\":true}', '$.*')",
+      "[true,false,true]");
+  TestStringValue(
+      "get_json_object('{\"a\":[], \"b\":[2,3,4], \"c\":[3]}', '$.*')",
+      "[[],[2,3,4],[3]]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].*')",
+      "[[1,2,3],[4,5]]");
+  TestStringValue(
+      "get_json_object('[{\"key\": [1,2,3]}, {\"key\": [4,5]}]', '$[*].*[*]')",
+      "[1,2,3,4,5]");
+  TestStringValue("get_json_object('[{\"key\": 1}, 123]', '$[*].*')", "1");
+  TestStringValue(
+      "get_json_object('{\"a\": {\"aa\": 1}, \"b\": {\"bb\": 2}}', '$.*')",
+      "[{\"aa\":1},{\"bb\":2}]");
+  TestStringValue(
+      "get_json_object('{\"a\": {\"aa\": 1}, \"b\": {\"bb\": 2}}', '$.*.*')",
+      "[1,2]");
+
+  // Tests about NULL
+  TestIsNull("get_json_object('{\"a\": 1}', '$.b')", TYPE_STRING);
+  TestIsNull("get_json_object('{\"a\": 1}', '$[0]')", TYPE_STRING);
+  TestIsNull("get_json_object('[1,2]', '$[2]')", TYPE_STRING);
+  TestIsNull("get_json_object('[1,2,3]', '$.*')", TYPE_STRING);
+  TestIsNull("get_json_object('{illegal_json}', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('\"abc\"', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('\"abc\"', '$[0]')", TYPE_STRING);
+  TestIsNull("get_json_object('123', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('123', '$[0]')", TYPE_STRING);
+  TestIsNull("get_json_object('{}', '$.a')", TYPE_STRING);
+  TestIsNull("get_json_object('[]', '$[0]')", TYPE_STRING);
+  TestStringValue("get_json_object('[0, 1, null, 2, 3]', '$[*]')", "[0,1,null,2,3]");
+  TestStringValue("get_json_object('[{\"a\": null}, {\"a\": \"NULL\"}]', '$[*].a')",
+      "[null,\"NULL\"]");
+  TestIsNull(
+      "get_json_object('[{\"key\": \"v1\"}, {\"key\": \"v2\"}]', '$[*].key.abc')",
+      TYPE_STRING);
+  TestValue("get_json_object('{\"a\":\"NULL\", \"b\":null}', '$.a') IS NULL",
+      TYPE_BOOLEAN, false);
+  TestValue("get_json_object('{\"a\":\"NULL\", \"b\":null}', '$.b') IS NULL",
+      TYPE_BOOLEAN, true);
+
+  // Test whitespaces
+  TestStringValue("get_json_object('[1,2,3]', '  $[1]')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '$[1]  ')", "2");
+  TestStringValue("get_json_object('[1,2,3]', ' $[ 1]')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '$[  1  ]')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '   $   [  1  ]  ')", "2");
+  TestStringValue("get_json_object('[1,2,3]', '   $   [  *  ]  ')", "[1,2,3]");
+  TestStringValue("get_json_object('{\"abc\":1}', ' $.abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', '$ .abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', '$. abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', '$.abc ')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', ' $ .abc')", "1");
+  TestStringValue("get_json_object('{\"abc\":1}', ' $ . abc ')", "1");
+  TestStringValue(
+      "get_json_object('{\"key\": 1, \" key\": 2, \" key \": 3}', ' $. key ')", "1");
+  TestStringValue("get_json_object('{\"abc\":[1,2,3]}', ' $ . abc  [  2 ] ')", "3");
+  TestStringValue("get_json_object('{\"a\":1}', '$.*  ')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', '$.  *')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', '$  .*')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', '  $.*')", "1");
+  TestStringValue("get_json_object('{\"a\":1}', ' $ . * ')", "1");
+
+  // Test errors
+  TestErrorString("get_json_object('[1,2]', '$[-2]')",
+      "Failed to parse json path '$[-2]': Negative index at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[999999999999999]')",
+      "Failed to parse json path '$[999999999999999]': Index too large at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[0.1]')",
+      "Failed to parse json path '$[0.1]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[]')",
+      "Failed to parse json path '$[]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[  ]')",
+      "Failed to parse json path '$[  ]': Expected number at position 4\n");
+  TestErrorString("get_json_object('[1,2]', '$[a]')",
+      "Failed to parse json path '$[a]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[1a]')",
+      "Failed to parse json path '$[1a]': Expected number at position 2\n");
+  TestErrorString("get_json_object('[1,2]', '$[0][a]')",
+      "Failed to parse json path '$[0][a]': Expected number at position 5\n");
+  TestErrorString("get_json_object('[1,2]', '$[*')",
+      "Unclosed brackets in json path '$[*'\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$.')",
+      "Failed to parse json path '$.': Found a trailing '.'\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$*')",
+      "Failed to parse json path '$*': Unexpected char '*' at position 1\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$.*a')",
+      "Failed to parse json path '$.*a': Encountered 'a' in position 3, "
+      "expects ' ', '[' or '.'\n");
+  TestErrorString("get_json_object('{\"key\": 1}', '$.a*')",
+      "Failed to parse json path '$.a*': Unexpected char '*' at position 3\n");
+  TestErrorString("get_json_object('[1,2]', '$[0')",
+      "Unclosed brackets in json path '$[0'\n");
+  TestErrorString("get_json_object('{\"key\": {\"a\": 1}}', '$..a')",
+      "Failed to parse json path '$..a': Expected key at position 2\n");
+  TestErrorString("get_json_object('{\"key\": \"value\"}', '$$')",
+      "Failed to parse json path '$$': $ should only be placed at start\n");
+  TestErrorString("get_json_object('{\"a\": 1}', '$a')",
+      "Failed to parse json path '$a': Unexpected char 'a' at position 1\n");
+  TestErrorString("get_json_object('[{\"a\": 1}]', '$[0]a')",
+      "Failed to parse json path '$[0]a': Unexpected char 'a' at position 4\n");
+  TestErrorString("get_json_object('{\"a\": 1}', 'a')",
+      "Failed to parse json path 'a': Should start with '$'\n");
+  TestErrorString("get_json_object('[1,2,3]', '$[**]')",
+      "Failed to parse json path '$[**]': "
+      "Encountered '*' in position 3, expects ' ' or ']'\n");
+  TestErrorString("get_json_object('[1,2,3]', '')", "Empty json path\n");
+  TestErrorString("get_json_object('[1,2,3]', '   ')",
+      "Failed to parse json path '   ': Should start with '$'\n");
+}
 } // namespace impala
 
-int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-  InitCommonRuntime(argc, argv, true, TestInfo::BE_TEST);
-  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
-  InitFeSupport(false);
-  ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
-
-  // Disable llvm optimization passes if the env var is no set to true. Running without
-  // the optimizations makes the tests run much faster.
-  char* optimizations = getenv("EXPR_TEST_ENABLE_OPTIMIZATIONS");
-  if (optimizations != NULL && strcmp(optimizations, "true") == 0) {
-    cout << "Running with optimization passes." << endl;
-    FLAGS_disable_optimization_passes = false;
-  } else {
-    cout << "Running without optimization passes." << endl;
-    FLAGS_disable_optimization_passes = true;
-  }
-
-  // Create an in-process Impala server and in-process backends for test environment
-  // without any startup validation check
-  FLAGS_abort_on_config_error = false;
-  VLOG_CONNECTION << "creating test env";
-  VLOG_CONNECTION << "starting backends";
-  InProcessStatestore* ips = InProcessStatestore::StartWithEphemeralPorts();
-  InProcessImpalaServer* impala_server =
-      InProcessImpalaServer::StartWithEphemeralPorts(FLAGS_hostname, ips->port());
-  executor_ = new ImpaladQueryExecutor(impala_server->hostname(),
-      impala_server->beeswax_port());
-  ABORT_IF_ERROR(executor_->Setup());
-
-  // Disable FE expr rewrites to make sure the Exprs get executed exactly as specified
-  // in the tests here.
-  int ret;
-  disable_codegen_ = true;
-  enable_expr_rewrites_ = false;
-  executor_->ClearExecOptions();
-  executor_->PushExecOption("ENABLE_EXPR_REWRITES=0");
-  executor_->PushExecOption("DISABLE_CODEGEN=1");
-  cout << "Running without codegen" << endl;
-  ret = RUN_ALL_TESTS();
-  if (ret != 0) return ret;
-
-  disable_codegen_ = false;
-  enable_expr_rewrites_ = false;
-  executor_->ClearExecOptions();
-  executor_->PushExecOption("ENABLE_EXPR_REWRITES=0");
-  executor_->PushExecOption("DISABLE_CODEGEN=0");
-  executor_->PushExecOption("EXEC_SINGLE_NODE_ROWS_THRESHOLD=0");
-  executor_->PushExecOption("DISABLE_CODEGEN_ROWS_THRESHOLD=0");
-  cout << endl << "Running with codegen" << endl;
-  ret = RUN_ALL_TESTS();
-  if (ret != 0) return ret;
-
-  // Enable FE expr rewrites to get test for constant folding over all exprs.
-  disable_codegen_ = true;
-  enable_expr_rewrites_ = true;
-  executor_->ClearExecOptions();
-  executor_->PushExecOption("ENABLE_EXPR_REWRITES=1");
-  executor_->PushExecOption("DISABLE_CODEGEN=1");
-  cout << endl << "Running without codegen and expr rewrites" << endl;
-  return RUN_ALL_TESTS();
-}
+INSTANTIATE_TEST_CASE_P(Instantiations, ExprTest, ::testing::Values(
+  //              disable_codegen  enable_expr_rewrites
+  std::make_tuple(true,            false),
+  std::make_tuple(false,           false),
+  std::make_tuple(true,            true)));
+  // Note: the false/true case is not tested because it provides very little
+  // incremental coverage but adds a lot to test runtime (this test is quite
+  // slow when codegen is enabled).
+  //
+  // Mostly we get the best backend codegened/interpreted coverage from running
+  // the unmodified (i.e. more complex) expr trees enabled. Running the trees
+  // in interpreted mode should be enough to validate correctness of the
+  // rewrites. So enabling the remaining combination might provide some
+  // additional incidental coverage from codegening some additional expr tree
+  // shapes but mostly it isn't that interesting since the majority of
+  // expressions get folded to a constant anyway.

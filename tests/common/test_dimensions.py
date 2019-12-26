@@ -17,10 +17,11 @@
 
 # Common test dimensions and associated utility functions.
 
+import copy
 import os
 from itertools import product
 
-from tests.common.test_vector import ImpalaTestDimension
+from tests.common.test_vector import ImpalaTestDimension, ImpalaTestVector
 
 WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 
@@ -28,10 +29,10 @@ WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 # of what specific table format to target along with the exec options (num_nodes, etc)
 # to use when running the query.
 class TableFormatInfo(object):
-  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'avro', 'hbase']
+  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'orc', 'avro', 'hbase']
   if os.environ['KUDU_IS_SUPPORTED'] == 'true':
     KNOWN_FILE_FORMATS.append('kudu')
-  KNOWN_COMPRESSION_CODECS = ['none', 'snap', 'gzip', 'bzip', 'def', 'lzo']
+  KNOWN_COMPRESSION_CODECS = ['none', 'snap', 'gzip', 'bzip', 'def', 'lzo', 'zstd', 'lz4']
   KNOWN_COMPRESSION_TYPES = ['none', 'block', 'record']
 
   def __init__(self, **kwargs):
@@ -96,29 +97,48 @@ class TableFormatInfo(object):
       return '_%s_%s' % (self.file_format, self.compression_codec)
 
 
-
 def create_uncompressed_text_dimension(workload):
   dataset = get_dataset_from_workload(workload)
   return ImpalaTestDimension('table_format',
       TableFormatInfo.create_from_string(dataset, 'text/none'))
+
 
 def create_parquet_dimension(workload):
   dataset = get_dataset_from_workload(workload)
   return ImpalaTestDimension('table_format',
       TableFormatInfo.create_from_string(dataset, 'parquet/none'))
 
-# Available Exec Options:
-#01: abort_on_error (bool)
-#02 max_errors (i32)
-#03: disable_codegen (bool)
-#04: batch_size (i32)
-#05: return_as_ascii (bool)
-#06: num_nodes (i32)
-#07: max_scan_range_length (i64)
-#08: num_scanner_threads (i32)
-#09: max_io_buffers (i32)
-#10: allow_unsupported_formats (bool)
-#11: partition_agg (bool)
+
+def create_avro_snappy_dimension(workload):
+  dataset = get_dataset_from_workload(workload)
+  return ImpalaTestDimension('table_format',
+      TableFormatInfo.create_from_string(dataset, 'avro/snap/block'))
+
+
+def create_client_protocol_dimension():
+  # IMPALA-8864: Older python versions do not support SSLContext object that the thrift
+  # http client implementation depends on. Falls back to a dimension without http
+  # transport.
+  import ssl
+  if not hasattr(ssl, "create_default_context"):
+    return ImpalaTestDimension('protocol', 'beeswax', 'hs2')
+  return ImpalaTestDimension('protocol', 'beeswax', 'hs2', 'hs2-http')
+
+
+def hs2_parquet_constraint(v):
+  """Constraint function, used to only run HS2 against Parquet format, because file format
+  and the client protocol are orthogonal."""
+  return (v.get_value('protocol') == 'beeswax' or
+          v.get_value('table_format').file_format == 'parquet' and
+          v.get_value('table_format').compression_codec == 'none')
+
+
+def hs2_text_constraint(v):
+  """Constraint function, used to only run HS2 against uncompressed text, because file
+  format and the client protocol are orthogonal."""
+  return (v.get_value('protocol') == 'beeswax' or
+          v.get_value('table_format').file_format == 'text' and
+          v.get_value('table_format').compression_codec == 'none')
 
 # Common sets of values for the exec option vectors
 ALL_BATCH_SIZES = [0]
@@ -131,13 +151,13 @@ SINGLE_NODE_ONLY = [1]
 ALL_NODES_ONLY = [0]
 ALL_DISABLE_CODEGEN_OPTIONS = [True, False]
 
-def create_single_exec_option_dimension():
+def create_single_exec_option_dimension(num_nodes=0, disable_codegen_rows_threshold=5000):
   """Creates an exec_option dimension that will produce a single test vector"""
-  return create_exec_option_dimension(cluster_sizes=ALL_NODES_ONLY,
-                                      disable_codegen_options=[False],
-                                      # Make sure codegen kicks in for functional.alltypes.
-                                      disable_codegen_rows_threshold_options=[5000],
-                                      batch_sizes=[0])
+  return create_exec_option_dimension(cluster_sizes=[num_nodes],
+      disable_codegen_options=[False],
+      # Make sure codegen kicks in for functional.alltypes.
+      disable_codegen_rows_threshold_options=[disable_codegen_rows_threshold],
+      batch_sizes=[0])
 
 def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
                                  disable_codegen_options=ALL_DISABLE_CODEGEN_OPTIONS,
@@ -145,7 +165,8 @@ def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
                                  sync_ddl=None, exec_single_node_option=[0],
                                  # We already run with codegen on and off explicitly -
                                  # don't need automatic toggling.
-                                 disable_codegen_rows_threshold_options=[0]):
+                                 disable_codegen_rows_threshold_options=[0],
+                                 debug_action_options=None):
   exec_option_dimensions = {
       'abort_on_error': [1],
       'exec_single_node_rows_threshold': exec_single_node_option,
@@ -156,6 +177,8 @@ def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
 
   if sync_ddl is not None:
     exec_option_dimensions['sync_ddl'] = sync_ddl
+  if debug_action_options is not None:
+    exec_option_dimensions['debug_action'] = debug_action_options
   return create_exec_option_dimension_from_dict(exec_option_dimensions)
 
 def create_exec_option_dimension_from_dict(exec_option_dimensions):
@@ -178,6 +201,28 @@ def create_exec_option_dimension_from_dict(exec_option_dimensions):
 
   # Build a test vector out of it
   return ImpalaTestDimension('exec_option', *exec_option_dimension_values)
+
+def add_exec_option_dimension(test_suite, key, value):
+  """
+  Takes an ImpalaTestSuite object 'test_suite' and adds 'key=value' to every exec option
+  test dimension, leaving the number of tests that will be run unchanged.
+  """
+  for v in test_suite.ImpalaTestMatrix.dimensions["exec_option"]:
+    v.value[key] = value
+
+def extend_exec_option_dimension(test_suite, key, value):
+  """
+  Takes an ImpalaTestSuite object 'test_suite' and extends the exec option test dimension
+  by creating a copy of each existing exec option value that has 'key' set to 'value',
+  doubling the number of tests that will be run.
+  """
+  dim = test_suite.ImpalaTestMatrix.dimensions["exec_option"]
+  new_value = []
+  for v in dim:
+    new_value.append(ImpalaTestVector.Value(v.name, copy.copy(v.value)))
+    new_value[-1].value[key] = value
+  dim.extend(new_value)
+  test_suite.ImpalaTestMatrix.add_dimension(dim)
 
 def get_dataset_from_workload(workload):
   # TODO: We need a better way to define the workload -> dataset mapping so we can

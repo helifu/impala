@@ -21,8 +21,10 @@
 #include <zlib.h>
 #include <bzlib.h>
 #undef DISALLOW_COPY_AND_ASSIGN // Snappy redefines this.
-#include <snappy.h>
 #include <lz4.h>
+#include <snappy.h>
+#include <zstd.h>
+#include <zstd_errors.h>
 
 #include "common/logging.h"
 #include "exec/read-write-util.h"
@@ -449,6 +451,12 @@ static Status SnappyBlockDecompress(int64_t input_len, const uint8_t* input,
     }
 
     while (uncompressed_block_len > 0) {
+      // Check that input length should not be negative.
+      if (input_len < 0) {
+        stringstream ss;
+        ss << " Corruption snappy decomp input_len " << input_len;
+        return Status(ss.str());
+      }
       // Read the length of the next snappy compressed block.
       size_t compressed_len = ReadWriteUtil::GetInt<uint32_t>(input);
       input += sizeof(uint32_t);
@@ -462,6 +470,10 @@ static Status SnappyBlockDecompress(int64_t input_len, const uint8_t* input,
       size_t uncompressed_len;
       if (!snappy::GetUncompressedLength(reinterpret_cast<const char*>(input),
               compressed_len, &uncompressed_len)) {
+        return Status(TErrorCode::SNAPPY_DECOMPRESS_UNCOMPRESSED_LENGTH_FAILED);
+      }
+      // Check that uncompressed length should be greater than 0.
+      if (uncompressed_len <= 0) {
         return Status(TErrorCode::SNAPPY_DECOMPRESS_UNCOMPRESSED_LENGTH_FAILED);
       }
       DCHECK_GT(uncompressed_len, 0);
@@ -591,5 +603,90 @@ Status Lz4Decompressor::ProcessBlock(bool output_preallocated, int64_t input_len
     return Status("Lz4: uncompress failed");
   }
   *output_length = ret;
+  return Status::OK();
+}
+
+ZstandardDecompressor::ZstandardDecompressor(MemPool* mem_pool, bool reuse_buffer)
+  : Codec(mem_pool, reuse_buffer) {}
+
+int64_t ZstandardDecompressor::MaxOutputLen(int64_t input_len, const uint8_t* input) {
+  return -1;
+}
+
+Status ZstandardDecompressor::ProcessBlock(bool output_preallocated, int64_t input_length,
+    const uint8_t* input, int64_t* output_length, uint8_t** output) {
+  DCHECK(output_preallocated) << "Output was not allocated for Zstd Codec";
+  if (*output_length == 0) return Status::OK();
+  size_t ret = ZSTD_decompress(*output, *output_length, input, input_length);
+  if (ZSTD_isError(ret)) {
+    *output_length = 0;
+    return Status(TErrorCode::ZSTD_ERROR, "ZSTD_decompress",
+        ZSTD_getErrorString(ZSTD_getErrorCode(ret)));
+  }
+  *output_length = ret;
+  return Status::OK();
+}
+
+Lz4BlockDecompressor::Lz4BlockDecompressor(MemPool* mem_pool, bool reuse_buffer)
+  : Codec(mem_pool, reuse_buffer) {
+}
+
+int64_t Lz4BlockDecompressor::MaxOutputLen(int64_t input_len, const uint8_t* input) {
+  DCHECK(input != nullptr) << "Passed null input to Lz4 Decompressor";
+  return -1;
+}
+
+// Decompresses a block compressed using Hadoop's lz4 block compression scheme. The
+// compressed block layout is similar to Hadoop's snappy block compression scheme, with
+// the only difference being the compression codec used. For more details please refer
+// to the comment section for the SnappyBlockDecompress above.
+Status Lz4BlockDecompressor::ProcessBlock(bool output_preallocated, int64_t input_len,
+    const uint8_t* input, int64_t* output_len, uint8_t** output) {
+  DCHECK(output_preallocated) << "Lz4 Codec implementation must have allocated output";
+  if(*output_len == 0) return Status::OK();
+  uint8_t* out_ptr = *output;
+  int64_t uncompressed_total_len = 0;
+  const int64_t buffer_size = *output_len;
+  *output_len = 0;
+
+  while (input_len > 0) {
+    uint32_t uncompressed_block_len = ReadWriteUtil::GetInt<uint32_t>(input);
+    input += sizeof(uint32_t);
+    input_len -= sizeof(uint32_t);
+    int64_t remaining_output_size = buffer_size - uncompressed_total_len;
+    if (remaining_output_size < uncompressed_block_len) {
+      return Status(TErrorCode::LZ4_BLOCK_DECOMPRESS_DECOMPRESS_SIZE_INCORRECT);
+    }
+
+    while (uncompressed_block_len > 0) {
+      // Check that input length should not be negative.
+      if (input_len < 0) {
+        return Status(TErrorCode::LZ4_BLOCK_DECOMPRESS_INVALID_INPUT_LENGTH);
+      }
+      // Read the length of the next lz4 compressed block.
+      size_t compressed_len = ReadWriteUtil::GetInt<uint32_t>(input);
+      input += sizeof(uint32_t);
+      input_len -= sizeof(uint32_t);
+
+      if (compressed_len == 0 || compressed_len > input_len) {
+        return Status(TErrorCode::LZ4_BLOCK_DECOMPRESS_INVALID_COMPRESSED_LENGTH);
+      }
+
+      // Decompress this block.
+      int64_t remaining_output_size = buffer_size - uncompressed_total_len;
+      int uncompressed_len = LZ4_decompress_safe(reinterpret_cast<const char*>(input),
+          reinterpret_cast<char*>(out_ptr), compressed_len, remaining_output_size);
+      if (uncompressed_len < 0) {
+        return Status(TErrorCode::LZ4_DECOMPRESS_SAFE_FAILED);
+      }
+
+      out_ptr += uncompressed_len;
+      input += compressed_len;
+      input_len -= compressed_len;
+      uncompressed_block_len -= uncompressed_len;
+      uncompressed_total_len += uncompressed_len;
+    }
+  }
+  *output_len = uncompressed_total_len;
   return Status::OK();
 }

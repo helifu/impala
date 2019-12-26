@@ -17,50 +17,64 @@
 
 package org.apache.impala.catalog;
 
+import static org.apache.impala.catalog.HdfsPartition.comparePartitionKeyValues;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
-import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.lang.*;
 
-import org.apache.impala.analysis.*;
-import com.google.common.collect.Lists;
+import org.apache.hadoop.fs.Path;
+import org.apache.impala.analysis.BoolLiteral;
+import org.apache.impala.analysis.LiteralExpr;
+import org.apache.impala.analysis.NullLiteral;
+import org.apache.impala.analysis.NumericLiteral;
+import org.apache.impala.analysis.StringLiteral;
+import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.service.FeSupport;
+import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.util.ListMap;
 import org.junit.Test;
 
-import static org.apache.impala.catalog.HdfsPartition.comparePartitionKeyValues;
+import com.google.common.collect.Lists;
 
 public class HdfsPartitionTest {
 
-  private List<LiteralExpr> valuesNull_= Lists.newArrayList();
-  private List<LiteralExpr> valuesDecimal_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesDecimal1_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesDecimal2_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesMixed_= Lists.newArrayList();
-  private List<LiteralExpr> valuesMixed1_ = Lists.newArrayList();
-  private List<LiteralExpr> valuesMixed2_ = Lists.newArrayList();
+  static {
+    FeSupport.loadLibrary();
+  }
+
+  private List<LiteralExpr> valuesNull_= new ArrayList<>();
+  private List<LiteralExpr> valuesDecimal_ = new ArrayList<>();
+  private List<LiteralExpr> valuesDecimal1_ = new ArrayList<>();
+  private List<LiteralExpr> valuesDecimal2_ = new ArrayList<>();
+  private List<LiteralExpr> valuesMixed_= new ArrayList<>();
+  private List<LiteralExpr> valuesMixed1_ = new ArrayList<>();
+  private List<LiteralExpr> valuesMixed2_ = new ArrayList<>();
 
   public HdfsPartitionTest() {
     valuesNull_.add(NullLiteral.create(Type.BIGINT));
 
-    valuesDecimal_.add(new NumericLiteral(BigDecimal.valueOf(1)));
-    valuesDecimal1_.add(new NumericLiteral(BigDecimal.valueOf(3)));
-    valuesDecimal2_.add(new NumericLiteral(BigDecimal.valueOf(5)));
+    valuesDecimal_.add(NumericLiteral.create(1));
+    valuesDecimal1_.add(NumericLiteral.create(3));
+    valuesDecimal2_.add(NumericLiteral.create(5));
 
-    valuesMixed_.add(new NumericLiteral(BigDecimal.valueOf(3)));
+    valuesMixed_.add(NumericLiteral.create(3));
     valuesMixed_.add(NullLiteral.create(Type.BIGINT));
 
-    valuesMixed1_.add(new NumericLiteral(BigDecimal.valueOf(1)));
+    valuesMixed1_.add(NumericLiteral.create(1));
     valuesMixed1_.add(NullLiteral.create(Type.STRING));
     valuesMixed1_.add(new BoolLiteral(true));
 
-    valuesMixed2_.add(new NumericLiteral(BigDecimal.valueOf(1)));
+    valuesMixed2_.add(NumericLiteral.create(1));
     valuesMixed2_.add(new StringLiteral("Large"));
     valuesMixed2_.add(new BoolLiteral(false));
   }
 
   @Test
   public void testCompare() {
-    List<List<LiteralExpr>> allLists = Lists.newArrayList();
+    List<List<LiteralExpr>> allLists = new ArrayList<>();
     allLists.add(valuesNull_);
     allLists.add(valuesDecimal_);
     allLists.add(valuesDecimal1_);
@@ -79,8 +93,8 @@ public class HdfsPartitionTest {
       }
     }
 
-    List<LiteralExpr> valuesTest = Lists.newArrayList();
-    valuesTest.add(new NumericLiteral(BigDecimal.valueOf(3)));
+    List<LiteralExpr> valuesTest = new ArrayList<>();
+    valuesTest.add(NumericLiteral.create(3));
     verifyAntiSymmetric(valuesDecimal1_, valuesTest, valuesNull_);
     valuesTest.add(NullLiteral.create(Type.BIGINT));
     verifyAntiSymmetric(valuesMixed_, valuesTest, valuesDecimal_);
@@ -92,6 +106,7 @@ public class HdfsPartitionTest {
     assertTrue(Integer.signum(comparePartitionKeyValues(o1, o2)) ==
         -Integer.signum(comparePartitionKeyValues(o2, o1)));
   }
+
   private void verifyTransitive(List<LiteralExpr> o1, List<LiteralExpr> o2,
                                 List<LiteralExpr> o3) {
     // ((compare(x, y)>0) && (compare(y, z)>0)) implies compare(x, z)>0
@@ -100,10 +115,12 @@ public class HdfsPartitionTest {
       assertTrue(comparePartitionKeyValues(o1, o3) > 0);
     }
   }
+
   private void verifyReflexive(List<LiteralExpr> o1) {
     // (compare(x, x)==0) is always true
     assertTrue(comparePartitionKeyValues(o1, o1) == 0);
   }
+
   private void verifyAntiSymmetric(List<LiteralExpr> o1, List<LiteralExpr> o2,
                                    List<LiteralExpr> o3) {
     // compare(x, y)==0 implies that sgn(compare(x, z))==sgn(compare(y, z)) for all z.
@@ -111,5 +128,46 @@ public class HdfsPartitionTest {
       assertTrue(Integer.signum(comparePartitionKeyValues(o1, o3)) ==
           Integer.signum(comparePartitionKeyValues(o2, o3)));
     }
+  }
+
+  /**
+   * Get the list of all locations of blocks from the given file descriptor.
+   */
+  private static List<TNetworkAddress> getAllReplicaAddresses(FileDescriptor fd,
+      ListMap<TNetworkAddress> hostIndex) {
+    List<TNetworkAddress> ret = new ArrayList<>();
+    for (int i = 0; i < fd.getNumFileBlocks(); i++) {
+      for (int j = 0; j < fd.getFbFileBlock(i).replicaHostIdxsLength(); j++) {
+        int idx = fd.getFbFileBlock(i).replicaHostIdxs(j);
+        ret.add(hostIndex.getEntry(idx));
+      }
+    }
+    return ret;
+  }
+
+  @Test
+  public void testCloneWithNewHostIndex() throws Exception {
+    // Fetch some metadata from a directory in HDFS.
+    Path p = new Path("hdfs://localhost:20500/test-warehouse/schemas");
+    ListMap<TNetworkAddress> origIndex = new ListMap<>();
+    FileMetadataLoader fml = new FileMetadataLoader(p, /* recursive= */false,
+        Collections.emptyList(), origIndex, /*validTxnList=*/null, /*writeIds=*/null);
+    fml.load();
+    List<FileDescriptor> fileDescriptors = fml.getLoadedFds();
+    assertTrue(!fileDescriptors.isEmpty());
+
+    FileDescriptor fd = fileDescriptors.get(0);
+    // Get the list of locations, using the original host index.
+    List<TNetworkAddress> origAddresses = getAllReplicaAddresses(fd, origIndex);
+
+    // Make a new host index with the hosts in the opposite order.
+    ListMap<TNetworkAddress> newIndex = new ListMap<>();
+    newIndex.populate(Lists.reverse(origIndex.getList()));
+
+    // Clone the FD over to the reversed index. The actual addresses should be the same.
+    FileDescriptor cloned = fd.cloneWithNewHostIndex(origIndex.getList(), newIndex);
+    List<TNetworkAddress> newAddresses = getAllReplicaAddresses(cloned, newIndex);
+
+    assertEquals(origAddresses, newAddresses);
   }
 }

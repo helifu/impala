@@ -22,15 +22,23 @@
 
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
+#include "runtime/mem-tracker.h"
 #include "util/jni-util.h"
 #include "util/mem-info.h"
+#include "util/process-state-info.h"
 #include "util/time.h"
 
 using boost::algorithm::to_lower;
+using boost::lock_guard;
 using namespace impala;
 using namespace strings;
 
+DECLARE_bool(mem_limit_includes_jvm);
 DECLARE_bool(mmap_buffers);
+DEFINE_bool_hidden(enable_extended_memory_metrics, false,
+    "(Experimental) enable extended memory metrics, including those that can be "
+    "expensive to compute. This was introduced as a workaround for poor /proc/*/smaps "
+    "performance in certain Linux kernel versions - see IMPALA-7239.");
 
 SumGauge* AggregateMemoryMetrics::TOTAL_USED = nullptr;
 IntGauge* AggregateMemoryMetrics::NUM_MAPS = nullptr;
@@ -48,6 +56,10 @@ TcmallocMetric* TcmallocMetric::PAGEHEAP_UNMAPPED_BYTES = nullptr;
 TcmallocMetric::PhysicalBytesMetric* TcmallocMetric::PHYSICAL_BYTES_RESERVED = nullptr;
 
 SanitizerMallocMetric* SanitizerMallocMetric::BYTES_ALLOCATED = nullptr;
+
+bool JvmMemoryMetric::initialized_ = false;
+JvmMemoryMetric* JvmMemoryMetric::HEAP_MAX_USAGE = nullptr;
+JvmMemoryMetric* JvmMemoryMetric::NON_HEAP_COMMITTED = nullptr;
 
 BufferPoolMetric* BufferPoolMetric::LIMIT = nullptr;
 BufferPoolMetric* BufferPoolMetric::SYSTEM_ALLOCATED = nullptr;
@@ -80,7 +92,13 @@ Status impala::RegisterMemoryMetrics(MetricGroup* metrics, bool register_jvm_met
     // properly tracked.
     used_metrics.push_back(BufferPoolMetric::SYSTEM_ALLOCATED);
   }
-
+  if (register_jvm_metrics) {
+    JvmMemoryMetric::InitMetrics(metrics);
+    if (FLAGS_mem_limit_includes_jvm) {
+      used_metrics.push_back(JvmMemoryMetric::HEAP_MAX_USAGE);
+      used_metrics.push_back(JvmMemoryMetric::NON_HEAP_COMMITTED);
+    }
+  }
 #if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
   SanitizerMallocMetric::BYTES_ALLOCATED = metrics->RegisterMetric(
       new SanitizerMallocMetric(MetricDefs::Get("sanitizer-total-bytes-allocated")));
@@ -111,19 +129,15 @@ Status impala::RegisterMemoryMetrics(MetricGroup* metrics, bool register_jvm_met
   MetricGroup* aggregate_metrics = metrics->GetOrCreateChildGroup("memory");
   AggregateMemoryMetrics::TOTAL_USED = aggregate_metrics->RegisterMetric(
       new SumGauge(MetricDefs::Get("memory.total-used"), used_metrics));
-  if (register_jvm_metrics) {
-    RETURN_IF_ERROR(JvmMetric::InitMetrics(metrics->GetOrCreateChildGroup("jvm")));
-  }
 
-  if (MemInfo::HaveSmaps()) {
-    AggregateMemoryMetrics::NUM_MAPS =
-        aggregate_metrics->AddGauge("memory.num-maps", 0U);
-    AggregateMemoryMetrics::MAPPED_BYTES =
-        aggregate_metrics->AddGauge("memory.mapped-bytes", 0U);
-    AggregateMemoryMetrics::RSS = aggregate_metrics->AddGauge("memory.rss", 0U);
+  if (FLAGS_enable_extended_memory_metrics && MemInfo::HaveSmaps()) {
+    AggregateMemoryMetrics::NUM_MAPS = aggregate_metrics->AddGauge("memory.num-maps", 0U);
     AggregateMemoryMetrics::ANON_HUGE_PAGE_BYTES =
         aggregate_metrics->AddGauge("memory.anon-huge-page-bytes", 0U);
   }
+  AggregateMemoryMetrics::MAPPED_BYTES =
+      aggregate_metrics->AddGauge("memory.mapped-bytes", 0U);
+  AggregateMemoryMetrics::RSS = aggregate_metrics->AddGauge("memory.rss", 0U);
   ThpConfig thp_config = MemInfo::ParseThpConfig();
   AggregateMemoryMetrics::THP_ENABLED =
       aggregate_metrics->AddProperty("memory.thp.enabled", thp_config.enabled);
@@ -140,10 +154,11 @@ void AggregateMemoryMetrics::Refresh() {
     // Only call ParseSmaps() if the metrics were created.
     MappedMemInfo map_info = MemInfo::ParseSmaps();
     NUM_MAPS->SetValue(map_info.num_maps);
-    MAPPED_BYTES->SetValue(map_info.size_kb * 1024);
-    RSS->SetValue(map_info.rss_kb * 1024);
     ANON_HUGE_PAGE_BYTES->SetValue(map_info.anon_huge_pages_kb * 1024);
   }
+  ProcessStateInfo proc_state(false);
+  MAPPED_BYTES->SetValue(proc_state.GetVmSize());
+  RSS->SetValue(proc_state.GetRss());
 
   ThpConfig thp_config = MemInfo::ParseThpConfig();
   THP_ENABLED->SetValue(thp_config.enabled);
@@ -151,77 +166,150 @@ void AggregateMemoryMetrics::Refresh() {
   THP_KHUGEPAGED_DEFRAG->SetValue(thp_config.khugepaged_defrag);
 }
 
-JvmMetric* JvmMetric::CreateAndRegister(MetricGroup* metrics, const string& key,
-    const string& pool_name, JvmMetric::JvmMetricType type) {
+JvmMemoryMetric* JvmMemoryMetric::CreateAndRegister(
+    MetricGroup* metrics, const string& key, const string& pool_name,
+    JvmMemoryMetricType type) {
   string pool_name_for_key = pool_name;
   to_lower(pool_name_for_key);
   replace(pool_name_for_key.begin(), pool_name_for_key.end(), ' ', '-');
-  return metrics->RegisterMetric(new JvmMetric(MetricDefs::Get(key, pool_name_for_key),
-      pool_name, type));
+  return metrics->RegisterMetric(
+      new JvmMemoryMetric(MetricDefs::Get(key, pool_name_for_key), pool_name, type));
 }
 
-JvmMetric::JvmMetric(const TMetricDef& def, const string& mempool_name,
-    JvmMetricType type) : IntGauge(def, 0) {
+JvmMemoryMetric::JvmMemoryMetric(const TMetricDef& def, const string& mempool_name,
+    JvmMemoryMetricType type) : IntGauge(def, 0) {
   mempool_name_ = mempool_name;
   metric_type_ = type;
 }
 
-Status JvmMetric::InitMetrics(MetricGroup* metrics) {
-  DCHECK(metrics != nullptr);
-  TGetJvmMetricsRequest request;
-  request.get_all = true;
-  TGetJvmMetricsResponse response;
-  RETURN_IF_ERROR(JniUtil::GetJvmMetrics(request, &response));
-  for (const TJvmMemoryPool& usage: response.memory_pools) {
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.max-usage-bytes", usage.name, MAX);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.current-usage-bytes", usage.name,
-        CURRENT);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.committed-usage-bytes", usage.name,
-        COMMITTED);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.init-usage-bytes", usage.name, INIT);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.peak-max-usage-bytes", usage.name,
-        PEAK_MAX);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.peak-current-usage-bytes", usage.name,
-        PEAK_CURRENT);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.peak-committed-usage-bytes", usage.name,
-        PEAK_COMMITTED);
-    JvmMetric::CreateAndRegister(metrics, "jvm.$0.peak-init-usage-bytes", usage.name,
-        PEAK_INIT);
-  }
-
-  return Status::OK();
+int64_t JvmMemoryMetric::GetValue() {
+  return JvmMetricCache::GetInstance()->GetPoolMetric(mempool_name_, metric_type_);
 }
 
-int64_t JvmMetric::GetValue() {
-  TGetJvmMetricsRequest request;
-  request.get_all = false;
-  request.__set_memory_pool(mempool_name_);
-  TGetJvmMetricsResponse response;
-  if (!JniUtil::GetJvmMetrics(request, &response).ok()) return 0;
-  if (response.memory_pools.size() != 1) return 0;
-  TJvmMemoryPool& pool = response.memory_pools[0];
-  DCHECK(pool.name == mempool_name_);
-  switch (metric_type_) {
-    case MAX:
-      return pool.max;
-    case INIT:
-      return pool.init;
-    case CURRENT:
-      return pool.used;
-    case COMMITTED:
-      return pool.committed;
-    case PEAK_MAX:
-      return pool.peak_max;
-    case PEAK_INIT:
-      return pool.peak_init;
-    case PEAK_CURRENT:
-      return pool.peak_used;
-    case PEAK_COMMITTED:
-      return pool.peak_committed;
-    default:
-      DCHECK(false) << "Unknown JvmMetricType: " << metric_type_;
+void JvmMemoryMetric::InitMetrics(MetricGroup* parent) {
+  if (initialized_) return;
+  MetricGroup* metrics = parent->GetOrCreateChildGroup("jvm");
+  vector<string> names = JvmMetricCache::GetInstance()->GetPoolNames();
+  for (const string& name : names) {
+    JvmMemoryMetric* pool_max_usage =
+        JvmMemoryMetric::CreateAndRegister(metrics, "jvm.$0.max-usage-bytes", name, MAX);
+    if (name == "heap") HEAP_MAX_USAGE = pool_max_usage;
+    JvmMemoryMetric::CreateAndRegister(
+        metrics, "jvm.$0.current-usage-bytes", name, CURRENT);
+    JvmMemoryMetric* pool_committed = JvmMemoryMetric::CreateAndRegister(
+        metrics, "jvm.$0.committed-usage-bytes", name, COMMITTED);
+    if (name == "non-heap") NON_HEAP_COMMITTED = pool_committed;
+    JvmMemoryMetric::CreateAndRegister(metrics, "jvm.$0.init-usage-bytes", name, INIT);
+    JvmMemoryMetric::CreateAndRegister(
+        metrics, "jvm.$0.peak-max-usage-bytes", name, PEAK_MAX);
+    JvmMemoryMetric::CreateAndRegister(
+        metrics, "jvm.$0.peak-current-usage-bytes", name, PEAK_CURRENT);
+    JvmMemoryMetric::CreateAndRegister(
+        metrics, "jvm.$0.peak-committed-usage-bytes", name, PEAK_COMMITTED);
+    JvmMemoryMetric::CreateAndRegister(
+        metrics, "jvm.$0.peak-init-usage-bytes", name, PEAK_INIT);
   }
+  JvmMemoryCounterMetric::CreateAndRegister(metrics, "jvm.gc_time_millis",
+      [](const TGetJvmMemoryMetricsResponse& r) { return r.gc_time_millis; });
+  JvmMemoryCounterMetric::CreateAndRegister(metrics, "jvm.gc_num_info_threshold_exceeded",
+      [](const TGetJvmMemoryMetricsResponse& r) {
+      return r.gc_num_info_threshold_exceeded;
+  });
+  JvmMemoryCounterMetric::CreateAndRegister(metrics, "jvm.gc_num_warn_threshold_exceeded",
+      [](const TGetJvmMemoryMetricsResponse& r) {
+      return r.gc_num_warn_threshold_exceeded;
+  });
+  JvmMemoryCounterMetric::CreateAndRegister(metrics, "jvm.gc_count",
+      [](const TGetJvmMemoryMetricsResponse& r) { return r.gc_count; });
+  JvmMemoryCounterMetric::CreateAndRegister(metrics,
+      "jvm.gc_total_extra_sleep_time_millis", [](const TGetJvmMemoryMetricsResponse& r) {
+      return r.gc_total_extra_sleep_time_millis;
+  });
+  initialized_ = true;
+}
+
+JvmMemoryCounterMetric* JvmMemoryCounterMetric::CreateAndRegister(
+    MetricGroup* metrics, const string& key,
+    int64_t(*accessor)(const TGetJvmMemoryMetricsResponse&)) {
+  return metrics->RegisterMetric(
+      new JvmMemoryCounterMetric(MetricDefs::Get(key), accessor));
+}
+
+JvmMemoryCounterMetric::JvmMemoryCounterMetric(const TMetricDef& def,
+    int64_t(*accessor)(const TGetJvmMemoryMetricsResponse&))
+    : IntCounter(def, 0) {
+  accessor_ = accessor;
+}
+
+int64_t JvmMemoryCounterMetric::GetValue() {
+  return JvmMetricCache::GetInstance()->GetCounterMetric(accessor_);
+}
+
+JvmMetricCache* JvmMetricCache::GetInstance() {
+  static JvmMetricCache instance;
+  return &instance;
+}
+
+void JvmMetricCache::GrabMetricsIfNecessary() {
+  int64_t now = MonotonicMillis();
+  if (now - last_fetch_ < CACHE_PERIOD_MILLIS) return;
+  Status status = JniUtil::GetJvmMemoryMetrics(&last_response_);
+  if (!status.ok()) {
+    VLOG_QUERY << "Couldn't retrieve JVM Memory Metrics: " << status.GetDetail();
+    return;
+  }
+  last_fetch_ = now;
+  return;
+}
+
+int64_t JvmMetricCache::GetCounterMetric(
+    int64_t(*accessor)(const TGetJvmMemoryMetricsResponse&)) {
+  lock_guard<boost::mutex> lock_guard(lock_);
+  GrabMetricsIfNecessary();
+  return accessor(last_response_);
+}
+
+int64_t JvmMetricCache::GetPoolMetric(const std::string& mempool_name,
+    JvmMemoryMetricType type) {
+  lock_guard<boost::mutex> lock_guard(lock_);
+  GrabMetricsIfNecessary();
+
+  for (const TJvmMemoryPool& pool : last_response_.memory_pools) {
+    if (pool.name == mempool_name) {
+      switch (type) {
+        case MAX:
+          return pool.max;
+        case INIT:
+          return pool.init;
+        case CURRENT:
+          return pool.used;
+        case COMMITTED:
+          return pool.committed;
+        case PEAK_MAX:
+          return pool.peak_max;
+        case PEAK_INIT:
+          return pool.peak_init;
+        case PEAK_CURRENT:
+          return pool.peak_used;
+        case PEAK_COMMITTED:
+          return pool.peak_committed;
+        default:
+          DCHECK(false) << "Unknown JvmMemoryMetricType: " << type;
+      }
+    }
+  }
+  DCHECK(false) << "Could not find pool: " << mempool_name;
   return 0;
+}
+
+vector<string> JvmMetricCache::GetPoolNames() {
+  lock_guard<boost::mutex> lock_guard(lock_);
+  GrabMetricsIfNecessary();
+  vector<string> names;
+  for (const TJvmMemoryPool& usage: last_response_.memory_pools) {
+    names.push_back(usage.name);
+  }
+  return names;
 }
 
 Status BufferPoolMetric::InitMetrics(MetricGroup* metrics,
@@ -297,6 +385,34 @@ int64_t BufferPoolMetric::GetValue() {
       return buffer_pool_->GetCleanPageBytes();
     default:
       DCHECK(false) << "Unknown BufferPoolMetricType: " << static_cast<int>(type_);
+  }
+  return 0;
+}
+
+void MemTrackerMetric::CreateMetrics(MetricGroup* metrics, MemTracker* mem_tracker,
+    const string& name) {
+  metrics->RegisterMetric(
+      new MemTrackerMetric(MetricDefs::Get("mem-tracker.$0.current_usage_bytes", name),
+      MemTrackerMetricType::CURRENT, mem_tracker));
+  metrics->RegisterMetric(
+      new MemTrackerMetric(MetricDefs::Get("mem-tracker.$0.peak_usage_bytes", name),
+      MemTrackerMetricType::PEAK, mem_tracker));
+}
+
+MemTrackerMetric::MemTrackerMetric(const TMetricDef& def, MemTrackerMetricType type,
+    MemTracker* mem_tracker)
+  : IntGauge(def, 0),
+    type_(type),
+    mem_tracker_(mem_tracker) {}
+
+int64_t MemTrackerMetric::GetValue() {
+  switch (type_) {
+    case MemTrackerMetricType::CURRENT:
+      return mem_tracker_->consumption();
+    case MemTrackerMetricType::PEAK:
+      return mem_tracker_->peak_consumption();
+    default:
+      DCHECK(false) << "Unknown MemTrackerMetricType: " << static_cast<int>(type_);
   }
   return 0;
 }

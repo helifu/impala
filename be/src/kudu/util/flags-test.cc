@@ -15,27 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
 #include <string>
+#include <vector>
 
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/env.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 // Test gflags
-DEFINE_string_hidden(test_nondefault_ff, "default",
+DEFINE_string(test_nondefault_ff, "default",
              "Check if we track non defaults from flagfile");
-DEFINE_string_hidden(test_nondefault_explicit, "default",
+DEFINE_string(test_nondefault_explicit, "default",
              "Check if we track explicitly set non defaults");
-DEFINE_string_hidden(test_default_ff, "default",
+DEFINE_string(test_default_ff, "default",
              "Check if we track defaults from flagfile");
-DEFINE_string_hidden(test_default_explicit, "default",
+DEFINE_string(test_default_explicit, "default",
              "Check if we track explicitly set defaults");
-DEFINE_bool_hidden(test_sensitive_flag, false, "a sensitive flag");
+DEFINE_bool(test_sensitive_flag, false, "a sensitive flag");
 TAG_FLAG(test_sensitive_flag, sensitive);
 
 DECLARE_bool(never_fsync);
@@ -83,6 +91,7 @@ TEST_F(FlagsTest, TestNonDefaultFlags) {
   // Setting a sensitive flag with non-default value should return
   // a redacted value.
   FLAGS_test_sensitive_flag = true;
+  kudu::g_should_redact = kudu::RedactContext::LOG;
   std::string result = GetNonDefaultFlags(default_flags);
 
   for (const auto& expected : expected_flags) {

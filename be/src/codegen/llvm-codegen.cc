@@ -30,7 +30,7 @@
 #include <llvm/Analysis/InstructionSimplify.h>
 #include <llvm/Analysis/Passes.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
-#include <llvm/Bitcode/ReaderWriter.h>
+#include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/IR/Constants.h>
@@ -65,6 +65,7 @@
 #include "common/logging.h"
 #include "exprs/anyval-util.h"
 #include "impala-ir/impala-ir-names.h"
+#include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
@@ -119,12 +120,21 @@ namespace impala {
 
 bool LlvmCodeGen::llvm_initialized_ = false;
 string LlvmCodeGen::cpu_name_;
-vector<string> LlvmCodeGen::cpu_attrs_;
+std::unordered_set<string> LlvmCodeGen::cpu_attrs_;
 string LlvmCodeGen::target_features_attr_;
 CodegenCallGraph LlvmCodeGen::shared_call_graph_;
 
+const map<int64_t, std::string> LlvmCodeGen::cpu_flag_mappings_{
+    {CpuInfo::SSSE3, "+ssse3"}, {CpuInfo::SSE4_1, "+sse4.1"},
+    {CpuInfo::SSE4_2, "+sse4.2"}, {CpuInfo::POPCNT, "+popcnt"}, {CpuInfo::AVX, "+avx"},
+    {CpuInfo::AVX2, "+avx2"}, {CpuInfo::PCLMULQDQ, "+pclmul"},
+    {~(CpuInfo::SSSE3), "-ssse3"}, {~(CpuInfo::SSE4_1), "-sse4.1"},
+    {~(CpuInfo::SSE4_2), "-sse4.2"}, {~(CpuInfo::POPCNT), "-popcnt"},
+    {~(CpuInfo::AVX), "-avx"}, {~(CpuInfo::AVX2), "-avx2"},
+    {~(CpuInfo::PCLMULQDQ), "-pclmul"}};
+
 [[noreturn]] static void LlvmCodegenHandleError(
-    void* user_data, const std::string& reason, bool gen_crash_diag) {
+    void* user_data, const string& reason, bool gen_crash_diag) {
   LOG(FATAL) << "LLVM hit fatal error: " << reason.c_str();
 }
 
@@ -172,7 +182,9 @@ Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
     DCHECK_EQ(FN_MAPPINGS[i].fn, i);
     const string& fn_name = FN_MAPPINGS[i].fn_name;
     if (init_codegen->module_->getFunction(fn_name) == nullptr) {
-      return Status(Substitute("Failed to find function $0", fn_name));
+      const string& err_msg = Substitute("Failed to find function $0", fn_name);
+      LOG(ERROR) << err_msg;
+      return Status(err_msg);
     }
   }
 
@@ -201,11 +213,12 @@ LlvmCodeGen::LlvmCodeGen(RuntimeState* state, ObjectPool* pool,
   load_module_timer_ = ADD_TIMER(profile_, "LoadTime");
   prepare_module_timer_ = ADD_TIMER(profile_, "PrepareTime");
   module_bitcode_size_ = ADD_COUNTER(profile_, "ModuleBitcodeSize", TUnit::BYTES);
-  codegen_timer_ = ADD_TIMER(profile_, "CodegenTime");
+  ir_generation_timer_ = ADD_TIMER(profile_, "IrGenerationTime");
   optimization_timer_ = ADD_TIMER(profile_, "OptimizationTime");
   compile_timer_ = ADD_TIMER(profile_, "CompileTime");
   num_functions_ = ADD_COUNTER(profile_, "NumFunctions", TUnit::UNIT);
   num_instructions_ = ADD_COUNTER(profile_, "NumInstructions", TUnit::UNIT);
+  llvm_thread_counters_ = ADD_THREAD_COUNTERS(profile_, "Codegen");
 }
 
 Status LlvmCodeGen::CreateFromFile(RuntimeState* state, ObjectPool* pool,
@@ -213,23 +226,31 @@ Status LlvmCodeGen::CreateFromFile(RuntimeState* state, ObjectPool* pool,
     scoped_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
+  SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
 
   unique_ptr<llvm::Module> loaded_module;
-  RETURN_IF_ERROR((*codegen)->LoadModuleFromFile(file, &loaded_module));
-
-  return (*codegen)->Init(std::move(loaded_module));
+  Status status = (*codegen)->LoadModuleFromFile(file, &loaded_module);
+  if (!status.ok()) goto error;
+  status = (*codegen)->Init(move(loaded_module));
+  if (!status.ok()) goto error;
+  return Status::OK();
+error:
+  (*codegen)->Close();
+  return status;
 }
 
 Status LlvmCodeGen::CreateFromMemory(RuntimeState* state, ObjectPool* pool,
     MemTracker* parent_mem_tracker, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
+  SCOPED_TIMER((*codegen)->prepare_module_timer_);
+  SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
 
   // Select the appropriate IR version. We cannot use LLVM IR with SSE4.2 instructions on
   // a machine without SSE4.2 support.
   llvm::StringRef module_ir;
   string module_name;
-  if (CpuInfo::IsSupported(CpuInfo::SSE4_2)) {
+  if (IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
     module_ir = llvm::StringRef(
         reinterpret_cast<const char*>(impala_sse_llvm_ir), impala_sse_llvm_ir_len);
     module_name = "Impala IR with SSE 4.2 support";
@@ -242,9 +263,15 @@ Status LlvmCodeGen::CreateFromMemory(RuntimeState* state, ObjectPool* pool,
   unique_ptr<llvm::MemoryBuffer> module_ir_buf(
       llvm::MemoryBuffer::getMemBuffer(module_ir, "", false));
   unique_ptr<llvm::Module> loaded_module;
-  RETURN_IF_ERROR((*codegen)->LoadModuleFromMemory(std::move(module_ir_buf),
-      module_name, &loaded_module));
-  return (*codegen)->Init(std::move(loaded_module));
+  Status status = (*codegen)->LoadModuleFromMemory(move(module_ir_buf),
+      module_name, &loaded_module);
+  if (!status.ok()) goto error;
+  status = (*codegen)->Init(move(loaded_module));
+  if (!status.ok()) goto error;
+  return Status::OK();
+error:
+  (*codegen)->Close();
+  return status;
 }
 
 Status LlvmCodeGen::LoadModuleFromFile(
@@ -261,27 +288,27 @@ Status LlvmCodeGen::LoadModuleFromFile(
          << tmp_file_buffer.getError().message();
       return Status(ss.str());
     }
-    file_buffer = std::move(tmp_file_buffer.get());
+    file_buffer = move(tmp_file_buffer.get());
   }
 
   COUNTER_ADD(module_bitcode_size_, file_buffer->getBufferSize());
-  return LoadModuleFromMemory(std::move(file_buffer), file, module);
+  return LoadModuleFromMemory(move(file_buffer), file, module);
 }
 
 Status LlvmCodeGen::LoadModuleFromMemory(unique_ptr<llvm::MemoryBuffer> module_ir_buf,
     string module_name, unique_ptr<llvm::Module>* module) {
   DCHECK(!module_name.empty());
-  SCOPED_TIMER(prepare_module_timer_);
   COUNTER_ADD(module_bitcode_size_, module_ir_buf->getMemBufferRef().getBufferSize());
-  llvm::ErrorOr<unique_ptr<llvm::Module>> tmp_module =
-      getLazyBitcodeModule(std::move(module_ir_buf), context(), false);
-  if (!tmp_module) {
-    stringstream ss;
-    ss << "Could not parse module " << module_name << ": " << tmp_module.getError();
-    return Status(ss.str());
+  llvm::Expected<unique_ptr<llvm::Module>> tmp_module =
+      getOwningLazyBitcodeModule(move(module_ir_buf), context());
+  if (llvm::Error err = tmp_module.takeError()) {
+    string err_string;
+    llvm::handleAllErrors(
+        move(err), [&](llvm::ErrorInfoBase& eib) { err_string = eib.message(); });
+    return Status(err_string);
   }
 
-  *module = std::move(tmp_module.get());
+  *module = move(tmp_module.get());
 
   // We never run global constructors or destructors so let's strip them out for all
   // modules when we load them.
@@ -293,7 +320,6 @@ Status LlvmCodeGen::LoadModuleFromMemory(unique_ptr<llvm::MemoryBuffer> module_i
 
 // TODO: Create separate counters/timers (file size, load time) for each module linked
 Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
-  SCOPED_TIMER(profile_->total_time_counter());
   unique_ptr<llvm::Module> new_module;
   RETURN_IF_ERROR(LoadModuleFromFile(file, &new_module));
 
@@ -314,7 +340,7 @@ Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
     }
   }
 
-  bool error = llvm::Linker::linkModules(*module_, std::move(new_module));
+  bool error = llvm::Linker::linkModules(*module_, move(new_module));
   string diagnostic_err = diagnostic_handler_.GetErrorString();
   if (error) {
     stringstream ss;
@@ -325,11 +351,12 @@ Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
   return Status::OK();
 }
 
-Status LlvmCodeGen::LinkModuleFromHdfs(const string& hdfs_location) {
+Status LlvmCodeGen::LinkModuleFromHdfs(const string& hdfs_location, const time_t mtime) {
   if (linked_modules_.find(hdfs_location) != linked_modules_.end()) return Status::OK();
+  LibCacheEntryHandle handle;
   string local_path;
-  RETURN_IF_ERROR(LibCache::instance()->GetLocalLibPath(hdfs_location, LibCache::TYPE_IR,
-      &local_path));
+  RETURN_IF_ERROR(LibCache::instance()->GetLocalPath(
+      hdfs_location, LibCache::TYPE_IR, mtime, &handle, &local_path));
   RETURN_IF_ERROR(LinkModuleFromLocalFs(local_path));
   linked_modules_.insert(hdfs_location);
   return Status::OK();
@@ -353,12 +380,16 @@ Status LlvmCodeGen::CreateImpalaCodegen(RuntimeState* state,
   // Parse module for cross compiled functions and types
   SCOPED_TIMER(codegen->profile_->total_time_counter());
   SCOPED_TIMER(codegen->prepare_module_timer_);
+  SCOPED_THREAD_COUNTER_MEASUREMENT(codegen->llvm_thread_counters_);
 
   // Get type for StringValue
-  codegen->string_value_type_ = codegen->GetType(StringValue::LLVM_CLASS_NAME);
+  codegen->string_value_type_ = codegen->GetStructType<StringValue>();
 
   // Get type for TimestampValue
-  codegen->timestamp_value_type_ = codegen->GetType(TimestampValue::LLVM_CLASS_NAME);
+  codegen->timestamp_value_type_ = codegen->GetStructType<TimestampValue>();
+
+  // Get type for CollectionValue
+  codegen->collection_value_type_ = codegen->GetStructType<CollectionValue>();
 
   // Verify size is correct
   const llvm::DataLayout& data_layout = codegen->execution_engine()->getDataLayout();
@@ -389,7 +420,7 @@ Status LlvmCodeGen::Init(unique_ptr<llvm::Module> module) {
   opt_level = llvm::CodeGenOpt::None;
 #endif
   module_ = module.get();
-  llvm::EngineBuilder builder(std::move(module));
+  llvm::EngineBuilder builder(move(module));
   builder.setEngineKind(llvm::EngineKind::JIT);
   builder.setOptLevel(opt_level);
   unique_ptr<ImpalaMCJITMemoryManager> memory_manager(new ImpalaMCJITMemoryManager);
@@ -411,7 +442,7 @@ Status LlvmCodeGen::Init(unique_ptr<llvm::Module> module) {
   module_->setDataLayout(execution_engine_->getDataLayout());
 
   void_type_ = llvm::Type::getVoidTy(context());
-  ptr_type_ = llvm::PointerType::get(GetType(TYPE_TINYINT), 0);
+  ptr_type_ = llvm::PointerType::get(i8_type(), 0);
   true_value_ = llvm::ConstantInt::get(context(), llvm::APInt(1, true, true));
   false_value_ = llvm::ConstantInt::get(context(), llvm::APInt(1, false, true));
 
@@ -455,15 +486,22 @@ void LlvmCodeGen::EnableOptimizations(bool enable) {
   optimizations_enabled_ = enable;
 }
 
-void LlvmCodeGen::GetHostCPUAttrs(vector<string>* attrs) {
+void LlvmCodeGen::GetHostCPUAttrs(std::unordered_set<string>* attrs) {
   // LLVM's ExecutionEngine expects features to be enabled or disabled with a list
   // of strings like ["+feature1", "-feature2"].
   llvm::StringMap<bool> cpu_features;
   llvm::sys::getHostCPUFeatures(cpu_features);
   for (const llvm::StringMapEntry<bool>& entry : cpu_features) {
-    attrs->emplace_back(
-        Substitute("$0$1", entry.second ? "+" : "-", entry.first().data()));
+    attrs->emplace(Substitute("$0$1", entry.second ? "+" : "-", entry.first().data()));
   }
+}
+
+bool LlvmCodeGen::IsCPUFeatureEnabled(int64_t flag) {
+  DCHECK(llvm_initialized_);
+  auto enable_flag_it = cpu_flag_mappings_.find(flag);
+  DCHECK(enable_flag_it != cpu_flag_mappings_.end());
+  const std::string& enabled_feature = enable_flag_it->second;
+  return cpu_attrs_.find(enabled_feature) != cpu_attrs_.end();
 }
 
 string LlvmCodeGen::GetIR(bool full_module) const {
@@ -479,57 +517,58 @@ string LlvmCodeGen::GetIR(bool full_module) const {
   return str;
 }
 
-llvm::Type* LlvmCodeGen::GetType(const ColumnType& type) {
+llvm::Type* LlvmCodeGen::GetSlotType(const ColumnType& type) {
   switch (type.type) {
     case TYPE_NULL:
       return llvm::Type::getInt1Ty(context());
     case TYPE_BOOLEAN:
-      return llvm::Type::getInt1Ty(context());
+      return bool_type();
     case TYPE_TINYINT:
-      return llvm::Type::getInt8Ty(context());
+      return i8_type();
     case TYPE_SMALLINT:
-      return llvm::Type::getInt16Ty(context());
+      return i16_type();
     case TYPE_INT:
-      return llvm::Type::getInt32Ty(context());
+      return i32_type();
     case TYPE_BIGINT:
-      return llvm::Type::getInt64Ty(context());
+      return i64_type();
     case TYPE_FLOAT:
-      return llvm::Type::getFloatTy(context());
+      return float_type();
     case TYPE_DOUBLE:
-      return llvm::Type::getDoubleTy(context());
+      return double_type();
     case TYPE_STRING:
     case TYPE_VARCHAR:
       return string_value_type_;
+    case TYPE_CHAR:
     case TYPE_FIXED_UDA_INTERMEDIATE:
       // Represent this as an array of bytes.
-      return llvm::ArrayType::get(GetType(TYPE_TINYINT), type.len);
-    case TYPE_CHAR:
-      // IMPALA-3207: Codegen for CHAR is not yet implemented, this should not
-      // be called for TYPE_CHAR.
-      DCHECK(false) << "NYI";
-      return NULL;
+      return llvm::ArrayType::get(i8_type(), type.len);
     case TYPE_TIMESTAMP:
       return timestamp_value_type_;
     case TYPE_DECIMAL:
       return llvm::Type::getIntNTy(context(), type.GetByteSize() * 8);
+    case TYPE_DATE:
+      return i32_type();
+    case TYPE_ARRAY:
+    case TYPE_MAP:
+      return collection_value_type_;
     default:
       DCHECK(false) << "Invalid type: " << type;
       return NULL;
   }
 }
 
-llvm::PointerType* LlvmCodeGen::GetPtrType(const ColumnType& type) {
-  return llvm::PointerType::get(GetType(type), 0);
+llvm::PointerType* LlvmCodeGen::GetSlotPtrType(const ColumnType& type) {
+  return llvm::PointerType::get(GetSlotType(type), 0);
 }
 
-llvm::Type* LlvmCodeGen::GetType(const string& name) {
+llvm::Type* LlvmCodeGen::GetNamedType(const string& name) {
   llvm::Type* type = module_->getTypeByName(name);
   DCHECK(type != NULL) << name;
   return type;
 }
 
-llvm::PointerType* LlvmCodeGen::GetPtrType(const string& name) {
-  llvm::Type* type = GetType(name);
+llvm::PointerType* LlvmCodeGen::GetNamedPtrType(const string& name) {
+  llvm::Type* type = GetNamedType(name);
   DCHECK(type != NULL) << name;
   return llvm::PointerType::get(type, 0);
 }
@@ -542,32 +581,15 @@ llvm::PointerType* LlvmCodeGen::GetPtrPtrType(llvm::Type* type) {
   return llvm::PointerType::get(llvm::PointerType::get(type, 0), 0);
 }
 
-llvm::PointerType* LlvmCodeGen::GetPtrPtrType(const string& name) {
-  return llvm::PointerType::get(GetPtrType(name), 0);
+llvm::PointerType* LlvmCodeGen::GetNamedPtrPtrType(const string& name) {
+  return llvm::PointerType::get(GetNamedPtrType(name), 0);
 }
 
 // Llvm doesn't let you create a PointerValue from a c-side ptr.  Instead
 // cast it to an int and then to 'type'.
 llvm::Value* LlvmCodeGen::CastPtrToLlvmPtr(llvm::Type* type, const void* ptr) {
-  llvm::Constant* const_int =
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context()), (int64_t)ptr);
+  llvm::Constant* const_int = GetI64Constant((int64_t)ptr);
   return llvm::ConstantExpr::getIntToPtr(const_int, type);
-}
-
-llvm::Constant* LlvmCodeGen::GetIntConstant(PrimitiveType type, uint64_t val) {
-  switch (type) {
-    case TYPE_TINYINT:
-      return llvm::ConstantInt::get(context(), llvm::APInt(8, val));
-    case TYPE_SMALLINT:
-      return llvm::ConstantInt::get(context(), llvm::APInt(16, val));
-    case TYPE_INT:
-      return llvm::ConstantInt::get(context(), llvm::APInt(32, val));
-    case TYPE_BIGINT:
-      return llvm::ConstantInt::get(context(), llvm::APInt(64, val));
-    default:
-      DCHECK(false);
-      return NULL;
-  }
 }
 
 llvm::Constant* LlvmCodeGen::GetIntConstant(
@@ -593,7 +615,7 @@ llvm::AllocaInst* LlvmCodeGen::CreateEntryBlockAlloca(
     llvm::Function* f, const NamedVariable& var) {
   llvm::IRBuilder<> tmp(&f->getEntryBlock(), f->getEntryBlock().begin());
   llvm::AllocaInst* alloca = tmp.CreateAlloca(var.type, NULL, var.name.c_str());
-  if (var.type == GetType(CodegenAnyVal::LLVM_DECIMALVAL_NAME)) {
+  if (var.type == GetNamedType(CodegenAnyVal::LLVM_DECIMALVAL_NAME)) {
     // Generated functions may manipulate DecimalVal arguments via SIMD instructions such
     // as 'movaps' that require 16-byte memory alignment. LLVM uses 8-byte alignment by
     // default, so explicitly set the alignment for DecimalVals.
@@ -613,7 +635,7 @@ llvm::AllocaInst* LlvmCodeGen::CreateEntryBlockAlloca(const LlvmBuilder& builder
   llvm::Function* fn = builder.GetInsertBlock()->getParent();
   llvm::IRBuilder<> tmp(&fn->getEntryBlock(), fn->getEntryBlock().begin());
   llvm::AllocaInst* alloca =
-      tmp.CreateAlloca(type, GetIntConstant(TYPE_INT, num_entries), name);
+      tmp.CreateAlloca(type, GetI32Constant(num_entries), name);
   alloca->setAlignment(alignment);
   return alloca;
 }
@@ -625,14 +647,17 @@ void LlvmCodeGen::CreateIfElseBlocks(llvm::Function* fn, const string& if_name,
   *else_block = llvm::BasicBlock::Create(context(), else_name, fn, insert_before);
 }
 
-Status LlvmCodeGen::MaterializeFunctionHelper(llvm::Function* fn) {
+Status LlvmCodeGen::MaterializeFunction(llvm::Function* fn) {
   DCHECK(!is_compiled_);
   if (fn->isIntrinsic() || !fn->isMaterializable()) return Status::OK();
 
-  std::error_code err = module_->materialize(fn);
+  llvm::Error err = module_->materialize(fn);
   if (UNLIKELY(err)) {
+    string err_string;
+    llvm::handleAllErrors(
+        move(err), [&](llvm::ErrorInfoBase& eib) { err_string = eib.message(); });
     return Status(Substitute("Failed to materialize $0: $1",
-        fn->getName().str(), err.message()));
+        fn->getName().str(), err_string));
   }
 
   // Materialized functions are marked as not materializable by LLVM.
@@ -643,16 +668,10 @@ Status LlvmCodeGen::MaterializeFunctionHelper(llvm::Function* fn) {
     for (const string& callee : *callees) {
       llvm::Function* callee_fn = module_->getFunction(callee);
       DCHECK(callee_fn != nullptr);
-      RETURN_IF_ERROR(MaterializeFunctionHelper(callee_fn));
+      RETURN_IF_ERROR(MaterializeFunction(callee_fn));
     }
   }
   return Status::OK();
-}
-
-Status LlvmCodeGen::MaterializeFunction(llvm::Function* fn) {
-  SCOPED_TIMER(profile_->total_time_counter());
-  SCOPED_TIMER(prepare_module_timer_);
-  return MaterializeFunctionHelper(fn);
 }
 
 llvm::Function* LlvmCodeGen::GetFunction(const string& symbol, bool clone) {
@@ -730,8 +749,8 @@ bool LlvmCodeGen::VerifyFunction(llvm::Function* fn) {
 
   if (is_corrupt_) {
     string fn_name = fn->getName(); // llvm has some fancy operator overloading
-    LOG(ERROR) << "Function corrupt: " << fn_name;
-    fn->dump();
+    LOG(ERROR) << "Function corrupt: " << fn_name <<"\nFunction Dump: "
+        << LlvmCodeGen::Print(fn);
     return false;
   }
   return true;
@@ -790,8 +809,8 @@ llvm::Function* LlvmCodeGen::FnPrototype::GeneratePrototype(
   return fn;
 }
 
-Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
-    const ColumnType* return_type, const std::vector<ColumnType>& arg_types,
+Status LlvmCodeGen::LoadFunction(const TFunction& fn, const string& symbol,
+    const ColumnType* return_type, const vector<ColumnType>& arg_types,
     int num_fixed_args, bool has_varargs, llvm::Function** llvm_fn,
     LibCacheEntry** cache_entry) {
   DCHECK_GE(arg_types.size(), num_fixed_args);
@@ -810,7 +829,7 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
     // in a .so or a builtin using the UDF interface.
     void* fn_ptr;
     Status status = LibCache::instance()->GetSoFunctionPtr(
-        fn.hdfs_location, symbol, &fn_ptr, cache_entry);
+        fn.hdfs_location, symbol, fn.last_modified_time, &fn_ptr, cache_entry);
     if (!status.ok() && fn.binary_type == TFunctionBinaryType::BUILTIN) {
       // Builtins symbols should exist unless there is a version mismatch.
       status.AddDetail(
@@ -837,7 +856,7 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
     }
 
     // The "FunctionContext*" argument.
-    prototype.AddArgument("ctx", GetPtrType("class.impala_udf::FunctionContext"));
+    prototype.AddArgument("ctx", GetNamedPtrType("class.impala_udf::FunctionContext"));
 
     // The "fixed" arguments for the UDF function, followed by the variable arguments,
     // if any.
@@ -847,7 +866,7 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
     }
 
     if (has_varargs) {
-      prototype.AddArgument("num_var_arg", GetType(TYPE_INT));
+      prototype.AddArgument("num_var_arg", i32_type());
       // Get the vararg type from the first vararg.
       prototype.AddArgument(
           "var_arg", CodegenAnyVal::GetUnloweredPtrType(this, arg_types[num_fixed_args]));
@@ -881,7 +900,7 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const std::string& symbol,
 
     // Link the UDF module into this query's main module so the UDF's functions are
     // available in the main module.
-    RETURN_IF_ERROR(LinkModuleFromHdfs(fn.hdfs_location));
+    RETURN_IF_ERROR(LinkModuleFromHdfs(fn.hdfs_location, fn.last_modified_time));
 
     *llvm_fn = GetFunction(symbol, true);
     if (*llvm_fn == NULL) {
@@ -935,8 +954,7 @@ int LlvmCodeGen::ReplaceCallSitesWithValue(
 
 int LlvmCodeGen::ReplaceCallSitesWithBoolConst(llvm::Function* caller, bool constant,
     const string& target_name) {
-  llvm::Value* replacement =
-      llvm::ConstantInt::get(llvm::Type::getInt1Ty(context()), constant);
+  llvm::Value* replacement = GetBoolConstant(constant);
   return ReplaceCallSitesWithValue(caller, replacement, target_name);
 }
 
@@ -975,7 +993,7 @@ int LlvmCodeGen::InlineConstFnAttrs(const FunctionContext::TypeDesc& ret_type,
     int i_val = static_cast<int>(i_arg->getSExtValue());
     DCHECK(state_ != nullptr);
     // All supported constants are currently integers.
-    call_instr->replaceAllUsesWith(llvm::ConstantInt::get(GetType(TYPE_INT),
+    call_instr->replaceAllUsesWith(GetI32Constant(
         FunctionContextImpl::GetConstFnAttr(state_, ret_type, arg_types, t_val, i_val)));
     call_instr->eraseFromParent();
     ++replaced;
@@ -1014,27 +1032,29 @@ llvm::Function* LlvmCodeGen::CloneFunction(llvm::Function* fn) {
 
 llvm::Function* LlvmCodeGen::FinalizeFunction(llvm::Function* function) {
   SetCPUAttrs(function);
-  if (!VerifyFunction(function)) {
-    function->eraseFromParent(); // deletes function
-    return NULL;
-  }
+  if (!VerifyFunction(function)) return NULL;
   finalized_functions_.insert(function);
-  if (FLAGS_dump_ir) function->dump();
+  if (FLAGS_dump_ir) {
+    string fn_name = function->getName();
+    LOG(INFO) << "Dump of Function "<< fn_name << ": " << LlvmCodeGen::Print(function);
+  }
   return function;
 }
 
 Status LlvmCodeGen::MaterializeModule() {
-  std::error_code err = module_->materializeAll();
+  llvm::Error err = module_->materializeAll();
   if (UNLIKELY(err)) {
+    string err_string;
+    llvm::handleAllErrors(
+        move(err), [&](llvm::ErrorInfoBase& eib) { err_string = eib.message(); });
     return Status(Substitute("Failed to materialize module $0: $1",
-        module_->getName().str(), err.message()));
+        module_->getName().str(), err_string));
   }
   return Status::OK();
 }
 
 // It's okay to call this function even if the module has been materialized.
 Status LlvmCodeGen::FinalizeLazyMaterialization() {
-  SCOPED_TIMER(prepare_module_timer_);
   for (llvm::Function& fn : module_->functions()) {
     if (fn.isMaterializable()) {
       DCHECK(!module_->isMaterialized());
@@ -1074,6 +1094,7 @@ Status LlvmCodeGen::FinalizeModule() {
 
   if (is_corrupt_) return Status("Module is corrupt.");
   SCOPED_TIMER(profile_->total_time_counter());
+  SCOPED_THREAD_COUNTER_MEASUREMENT(llvm_thread_counters_);
 
   // Clean up handcrafted functions that have not been finalized. Clean up is done by
   // deleting the function from the module. Any reference to deleted functions in the
@@ -1087,7 +1108,7 @@ Status LlvmCodeGen::FinalizeModule() {
   }
   string non_finalized_fns_str = ss.str();
   if (!non_finalized_fns_str.empty()) {
-    LOG(INFO) << "For query " << state_->query_id()
+    LOG(INFO) << "For query " << PrintId(state_->query_id())
               << " the following functions were not finalized and have been removed from "
                  "the module:\n"
               << non_finalized_fns_str;
@@ -1247,7 +1268,7 @@ void LlvmCodeGen::DestroyModule() {
 void LlvmCodeGen::AddFunctionToJit(llvm::Function* fn, void** fn_ptr) {
   DCHECK(finalized_functions_.find(fn) != finalized_functions_.end())
       << "Attempted to add a non-finalized function to Jit: " << fn->getName().str();
-  llvm::Type* decimal_val_type = GetType(CodegenAnyVal::LLVM_DECIMALVAL_NAME);
+  llvm::Type* decimal_val_type = GetNamedType(CodegenAnyVal::LLVM_DECIMALVAL_NAME);
   if (fn->getReturnType() == decimal_val_type) {
     // Per the x86 calling convention ABI, DecimalVals should be returned via an extra
     // first DecimalVal* argument. We generate non-compliant functions that return the
@@ -1355,6 +1376,7 @@ void LlvmCodeGen::CodegenMinMax(LlvmBuilder* builder, const ColumnType& type,
     case TYPE_TINYINT:
     case TYPE_SMALLINT:
     case TYPE_INT:
+    case TYPE_DATE:
     case TYPE_BIGINT:
     case TYPE_DECIMAL:
       if (min) {
@@ -1400,7 +1422,7 @@ void LlvmCodeGen::CodegenMinMax(LlvmBuilder* builder, const ColumnType& type,
 Status LlvmCodeGen::LoadIntrinsics() {
   // Load memcpy
   {
-    llvm::Type* types[] = {ptr_type(), ptr_type(), GetType(TYPE_INT)};
+    llvm::Type* types[] = {ptr_type(), ptr_type(), i32_type()};
     llvm::Function* fn =
         llvm::Intrinsic::getDeclaration(module_, llvm::Intrinsic::memcpy, types);
     if (fn == NULL) {
@@ -1440,7 +1462,7 @@ void LlvmCodeGen::CodegenMemcpy(
     LlvmBuilder* builder, llvm::Value* dst, llvm::Value* src, int size) {
   DCHECK_GE(size, 0);
   if (size == 0) return;
-  llvm::Value* size_val = GetIntConstant(TYPE_BIGINT, size);
+  llvm::Value* size_val = GetI64Constant(size);
   CodegenMemcpy(builder, dst, src, size_val);
 }
 
@@ -1456,15 +1478,14 @@ void LlvmCodeGen::CodegenMemset(
   DCHECK(dst->getType()->isPointerTy()) << Print(dst);
   DCHECK_GE(size, 0);
   if (size == 0) return;
-  llvm::Value* value_const = GetIntConstant(TYPE_TINYINT, value);
+  llvm::Value* value_const = GetI8Constant(value);
   builder->CreateMemSet(dst, value_const, size, /* no alignment */ 0);
 }
 
 void LlvmCodeGen::CodegenClearNullBits(
     LlvmBuilder* builder, llvm::Value* tuple_ptr, const TupleDescriptor& tuple_desc) {
   llvm::Value* int8_ptr = builder->CreateBitCast(tuple_ptr, ptr_type(), "int8_ptr");
-  llvm::Value* null_bytes_offset =
-      llvm::ConstantInt::get(int_type(), tuple_desc.null_bytes_offset());
+  llvm::Value* null_bytes_offset = GetI32Constant(tuple_desc.null_bytes_offset());
   llvm::Value* null_bytes_ptr =
       builder->CreateInBoundsGEP(int8_ptr, null_bytes_offset, "null_bytes_ptr");
   CodegenMemset(builder, null_bytes_ptr, 0, tuple_desc.num_null_bytes());
@@ -1475,13 +1496,13 @@ llvm::Value* LlvmCodeGen::CodegenMemPoolAllocate(LlvmBuilder* builder,
   DCHECK(pool_val != nullptr);
   DCHECK(size_val->getType()->isIntegerTy());
   DCHECK_LE(size_val->getType()->getIntegerBitWidth(), 64);
-  DCHECK_EQ(pool_val->getType(), GetPtrType(MemPool::LLVM_CLASS_NAME));
+  DCHECK_EQ(pool_val->getType(), GetStructPtrType<MemPool>());
   // Extend 'size_val' to i64 if necessary
   if (size_val->getType()->getIntegerBitWidth() < 64) {
-    size_val = builder->CreateSExt(size_val, bigint_type());
+    size_val = builder->CreateSExt(size_val, i64_type());
   }
   llvm::Function* allocate_fn = GetFunction(IRFunction::MEMPOOL_ALLOCATE, false);
-  llvm::Value* alignment = GetIntConstant(TYPE_INT, MemPool::DEFAULT_ALIGNMENT);
+  llvm::Value* alignment = GetI32Constant(MemPool::DEFAULT_ALIGNMENT);
   llvm::Value* fn_args[] = {pool_val, size_val, alignment};
   return builder->CreateCall(allocate_fn, fn_args, name);
 }
@@ -1529,7 +1550,7 @@ void LlvmCodeGen::ClearHashFns() {
 //   ret i32 %12
 // }
 llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
-  if (CpuInfo::IsSupported(CpuInfo::SSE4_2)) {
+  if (IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
     if (num_bytes == -1) {
       // -1 indicates variable length, just return the generic loop based
       // hash fn.
@@ -1544,10 +1565,10 @@ llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
     // Generate a function to hash these bytes
     stringstream ss;
     ss << "CrcHash" << num_bytes;
-    FnPrototype prototype(this, ss.str(), GetType(TYPE_INT));
+    FnPrototype prototype(this, ss.str(), i32_type());
     prototype.AddArgument(LlvmCodeGen::NamedVariable("data", ptr_type()));
-    prototype.AddArgument(LlvmCodeGen::NamedVariable("len", GetType(TYPE_INT)));
-    prototype.AddArgument(LlvmCodeGen::NamedVariable("seed", GetType(TYPE_INT)));
+    prototype.AddArgument(LlvmCodeGen::NamedVariable("len", i32_type()));
+    prototype.AddArgument(LlvmCodeGen::NamedVariable("seed", i32_type()));
 
     llvm::Value* args[3];
     LlvmBuilder builder(context());
@@ -1562,38 +1583,38 @@ llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
 
     // Generate the crc instructions starting with the highest number of bytes
     if (num_bytes >= 8) {
-      llvm::Value* result_64 = builder.CreateZExt(result, GetType(TYPE_BIGINT));
-      llvm::Value* ptr = builder.CreateBitCast(data, GetPtrType(TYPE_BIGINT));
+      llvm::Value* result_64 = builder.CreateZExt(result, i64_type());
+      llvm::Value* ptr = builder.CreateBitCast(data, i64_ptr_type());
       int i = 0;
       while (num_bytes >= 8) {
-        llvm::Value* index[] = {GetIntConstant(TYPE_INT, i++)};
+        llvm::Value* index[] = {GetI32Constant(i++)};
         llvm::Value* d = builder.CreateLoad(builder.CreateInBoundsGEP(ptr, index));
         result_64 =
             builder.CreateCall(crc64_fn, llvm::ArrayRef<llvm::Value*>({result_64, d}));
         num_bytes -= 8;
       }
-      result = builder.CreateTrunc(result_64, GetType(TYPE_INT));
-      llvm::Value* index[] = {GetIntConstant(TYPE_INT, i * 8)};
+      result = builder.CreateTrunc(result_64, i32_type());
+      llvm::Value* index[] = {GetI32Constant(i * 8)};
       // Update data to past the 8-byte chunks
       data = builder.CreateInBoundsGEP(data, index);
     }
 
     if (num_bytes >= 4) {
       DCHECK_LT(num_bytes, 8);
-      llvm::Value* ptr = builder.CreateBitCast(data, GetPtrType(TYPE_INT));
+      llvm::Value* ptr = builder.CreateBitCast(data, i32_ptr_type());
       llvm::Value* d = builder.CreateLoad(ptr);
       result = builder.CreateCall(crc32_fn, llvm::ArrayRef<llvm::Value*>({result, d}));
-      llvm::Value* index[] = {GetIntConstant(TYPE_INT, 4)};
+      llvm::Value* index[] = {GetI32Constant(4)};
       data = builder.CreateInBoundsGEP(data, index);
       num_bytes -= 4;
     }
 
     if (num_bytes >= 2) {
       DCHECK_LT(num_bytes, 4);
-      llvm::Value* ptr = builder.CreateBitCast(data, GetPtrType(TYPE_SMALLINT));
+      llvm::Value* ptr = builder.CreateBitCast(data, i16_ptr_type());
       llvm::Value* d = builder.CreateLoad(ptr);
       result = builder.CreateCall(crc16_fn, llvm::ArrayRef<llvm::Value*>({result, d}));
-      llvm::Value* index[] = {GetIntConstant(TYPE_INT, 2)};
+      llvm::Value* index[] = {GetI16Constant(2)};
       data = builder.CreateInBoundsGEP(data, index);
       num_bytes -= 2;
     }
@@ -1606,7 +1627,7 @@ llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
     }
     DCHECK_EQ(num_bytes, 0);
 
-    llvm::Value* shift_16 = GetIntConstant(TYPE_INT, 16);
+    llvm::Value* shift_16 = GetI32Constant(16);
     llvm::Value* upper_bits = builder.CreateShl(result, shift_16);
     llvm::Value* lower_bits = builder.CreateLShr(result, shift_16);
     result = builder.CreateOr(upper_bits, lower_bits);
@@ -1631,7 +1652,7 @@ static llvm::Function* GetLenOptimizedHashFn(
     // length with num_bytes.
     fn = codegen->CloneFunction(fn);
     llvm::Value* len_arg = codegen->GetArgument(fn, 1);
-    len_arg->replaceAllUsesWith(codegen->GetIntConstant(TYPE_INT, len));
+    len_arg->replaceAllUsesWith(codegen->GetI32Constant(len));
   }
   return codegen->FinalizeFunction(fn);
 }
@@ -1664,7 +1685,7 @@ llvm::Constant* LlvmCodeGen::ConstantToGVPtr(
   llvm::GlobalVariable* gv = new llvm::GlobalVariable(
       *module_, type, true, llvm::GlobalValue::PrivateLinkage, ir_constant, name);
   return llvm::ConstantExpr::getGetElementPtr(
-      NULL, gv, llvm::ArrayRef<llvm::Constant*>({GetIntConstant(TYPE_INT, 0)}));
+      NULL, gv, llvm::ArrayRef<llvm::Constant*>({GetI32Constant(0)}));
 }
 
 llvm::Constant* LlvmCodeGen::ConstantsToGVArrayPtr(llvm::Type* element_type,
@@ -1674,8 +1695,9 @@ llvm::Constant* LlvmCodeGen::ConstantsToGVArrayPtr(llvm::Type* element_type,
   return ConstantToGVPtr(array_type, array_const, name);
 }
 
-vector<string> LlvmCodeGen::ApplyCpuAttrWhitelist(const vector<string>& cpu_attrs) {
-  vector<string> result;
+std::unordered_set<string> LlvmCodeGen::ApplyCpuAttrWhitelist(
+    const std::unordered_set<string>& cpu_attrs) {
+  std::unordered_set<string> result;
   vector<string> attr_whitelist;
   boost::split(attr_whitelist, FLAGS_llvm_cpu_attr_whitelist, boost::is_any_of(","));
   for (const string& attr : cpu_attrs) {
@@ -1683,17 +1705,17 @@ vector<string> LlvmCodeGen::ApplyCpuAttrWhitelist(const vector<string>& cpu_attr
     DCHECK(attr[0] == '-' || attr[0] == '+') << attr;
     if (attr[0] == '-') {
       // Already disabled - copy it over unmodified.
-      result.push_back(attr);
+      result.insert(attr);
       continue;
     }
     const string attr_name = attr.substr(1);
     auto it = std::find(attr_whitelist.begin(), attr_whitelist.end(), attr_name);
     if (it != attr_whitelist.end()) {
       // In whitelist - copy it over unmodified.
-      result.push_back(attr);
+      result.insert(attr);
     } else {
       // Not in whitelist - disable it.
-      result.push_back("-" + attr_name);
+      result.insert("-" + attr_name);
     }
   }
   return result;
@@ -1709,8 +1731,10 @@ void LlvmCodeGen::DiagnosticHandler::DiagnosticHandlerFn(
     diagnostic_printer << "LLVM diagnostic error: ";
     info.print(diagnostic_printer);
     error_msg.flush();
-    LOG(INFO) << "Query " << codegen->state_->query_id() << " encountered a "
-        << codegen->diagnostic_handler_.error_str_;
+    if (codegen->state_) {
+      LOG(INFO) << "Query " << PrintId(codegen->state_->query_id()) << " encountered a "
+          << codegen->diagnostic_handler_.error_str_;
+    }
   }
 }
 

@@ -28,6 +28,7 @@
 #include "rpc/jni-thrift-util.h"
 #include "service/query-options.h"
 #include "util/auth-util.h"
+#include "util/collection-metrics.h"
 #include "util/mem-info.h"
 #include "util/parse-util.h"
 #include "util/time.h"
@@ -121,10 +122,10 @@ RequestPoolService::RequestPoolService(MetricGroup* metrics) :
     {"resolveRequestPool", "([B)[B", &resolve_request_pool_id_},
     {"getPoolConfig", "([B)[B", &get_pool_config_id_}};
 
-  JNIEnv* jni_env = getJNIEnv();
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
   request_pool_service_class_ =
     jni_env->FindClass("org/apache/impala/util/RequestPoolService");
-  EXIT_IF_EXC(jni_env);
+  ABORT_IF_EXC(jni_env);
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
     ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, request_pool_service_class_,
@@ -133,18 +134,18 @@ RequestPoolService::RequestPoolService(MetricGroup* metrics) :
 
   jstring fair_scheduler_config_path =
       jni_env->NewStringUTF(FLAGS_fair_scheduler_allocation_path.c_str());
-  EXIT_IF_EXC(jni_env);
+  ABORT_IF_EXC(jni_env);
   jstring llama_site_path =
       jni_env->NewStringUTF(FLAGS_llama_site_path.c_str());
-  EXIT_IF_EXC(jni_env);
+  ABORT_IF_EXC(jni_env);
 
   jobject request_pool_service = jni_env->NewObject(request_pool_service_class_, ctor_,
       fair_scheduler_config_path, llama_site_path);
-  EXIT_IF_EXC(jni_env);
+  ABORT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, request_pool_service,
       &request_pool_service_));
   jni_env->CallObjectMethod(request_pool_service_, start_id);
-  EXIT_IF_EXC(jni_env);
+  ABORT_IF_EXC(jni_env);
 }
 
 Status RequestPoolService::ResolveRequestPool(const TQueryCtx& ctx,
@@ -195,6 +196,9 @@ Status RequestPoolService::GetPoolConfig(const string& pool_name,
         FLAGS_disable_pool_mem_limits ? -1 : default_pool_mem_limit_);
     pool_config->__set_max_queued(FLAGS_default_pool_max_queued);
     pool_config->__set_default_query_options("");
+    pool_config->__set_min_query_mem_limit(0);
+    pool_config->__set_max_query_mem_limit(0);
+    pool_config->__set_clamp_mem_limit_query_option(true);
     return Status::OK();
   }
 

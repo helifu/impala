@@ -36,13 +36,14 @@ using impala_udf::DoubleVal;
 using impala_udf::TimestampVal;
 using impala_udf::StringVal;
 using impala_udf::DecimalVal;
+using impala_udf::DateVal;
 
 class ScalarExprEvaluator;
 class TExprNode;
 
 class CaseExpr: public ScalarExpr {
  public:
-  virtual Status GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn)
+  virtual Status GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** fn)
       override WARN_UNUSED_RESULT;
   virtual std::string DebugString() const override;
 
@@ -60,18 +61,7 @@ class CaseExpr: public ScalarExpr {
       RuntimeState* state, ScalarExprEvaluator* eval)
       const override;
 
-  virtual BooleanVal GetBooleanVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual TinyIntVal GetTinyIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual SmallIntVal GetSmallIntVal(
-      ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual IntVal GetIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual BigIntVal GetBigIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual FloatVal GetFloatVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual DoubleVal GetDoubleVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual StringVal GetStringVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual TimestampVal GetTimestampVal(
-      ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual DecimalVal GetDecimalVal(ScalarExprEvaluator*, const TupleRow*) const override;
+  GENERATE_GET_VAL_INTERPRETED_OVERRIDES_FOR_ALL_SCALAR_TYPES
 
   bool has_case_expr() const { return has_case_expr_; }
   bool has_else_expr() const { return has_else_expr_; }

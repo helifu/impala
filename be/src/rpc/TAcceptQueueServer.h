@@ -29,7 +29,7 @@
 
 #include <boost/shared_ptr.hpp>
 
-#include "util/metrics.h"
+#include "util/metrics-fwd.h"
 
 namespace apache {
 namespace thrift {
@@ -40,6 +40,11 @@ using apache::thrift::transport::TServerTransport;
 using apache::thrift::transport::TTransportFactory;
 using apache::thrift::concurrency::Monitor;
 using apache::thrift::concurrency::ThreadFactory;
+
+struct TAcceptQueueEntry {
+  boost::shared_ptr<TTransport> client_;
+  int64_t expiration_time_ = 0LL;
+};
 
 /**
  * In TAcceptQueueServer, the main server thread calls accept() and then immediately
@@ -52,54 +57,26 @@ using apache::thrift::concurrency::ThreadFactory;
 class TAcceptQueueServer : public TServer {
  public:
   class Task;
-
-  // TODO: Determine which c'tors are used and remove unused ones.
-  template <typename ProcessorFactory>
-  TAcceptQueueServer(const boost::shared_ptr<ProcessorFactory>& processorFactory,
-      const boost::shared_ptr<TServerTransport>& serverTransport,
-      const boost::shared_ptr<TTransportFactory>& transportFactory,
-      const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-      int32_t maxTasks = 0,
-      THRIFT_OVERLOAD_IF(ProcessorFactory, TProcessorFactory));
-
-  template <typename ProcessorFactory>
-  TAcceptQueueServer(const boost::shared_ptr<ProcessorFactory>& processorFactory,
+  TAcceptQueueServer(const boost::shared_ptr<TProcessor>& processor,
       const boost::shared_ptr<TServerTransport>& serverTransport,
       const boost::shared_ptr<TTransportFactory>& transportFactory,
       const boost::shared_ptr<TProtocolFactory>& protocolFactory,
       const boost::shared_ptr<ThreadFactory>& threadFactory,
-      int32_t maxTasks = 0,
-      THRIFT_OVERLOAD_IF(ProcessorFactory, TProcessorFactory));
+      const std::string& name, int32_t maxTasks = 0,
+      int64_t queue_timeout_ms = 0, int64_t idle_poll_period_ms = 0);
 
-  template <typename Processor>
-  TAcceptQueueServer(const boost::shared_ptr<Processor>& processor,
-      const boost::shared_ptr<TServerTransport>& serverTransport,
-      const boost::shared_ptr<TTransportFactory>& transportFactory,
-      const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-      int32_t maxTasks = 0,
-      THRIFT_OVERLOAD_IF(Processor, TProcessor));
+  ~TAcceptQueueServer() override = default;
 
-  template <typename Processor>
-  TAcceptQueueServer(const boost::shared_ptr<Processor>& processor,
-      const boost::shared_ptr<TServerTransport>& serverTransport,
-      const boost::shared_ptr<TTransportFactory>& transportFactory,
-      const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-      const boost::shared_ptr<ThreadFactory>& threadFactory,
-      int32_t maxTasks = 0,
-      THRIFT_OVERLOAD_IF(Processor, TProcessor));
+  void serve() override;
 
-  virtual ~TAcceptQueueServer();
-
-  virtual void serve();
-
-  void stop() {
+  void stop() override {
     stop_ = true;
     serverTransport_->interrupt();
   }
 
   // New - Adds a metric for the size of the queue of connections waiting to be setup to
   // the provided MetricGroup, prefixing its key with key_prefix.
-  void InitMetrics(impala::MetricGroup* metrics, const string& key_prefix);
+  void InitMetrics(impala::MetricGroup* metrics, const std::string& key_prefix);
 
  protected:
   void init();
@@ -107,10 +84,19 @@ class TAcceptQueueServer : public TServer {
   // This is the work function for the thread pool, which does the work of setting up the
   // connection and starting a thread to handle it. Will block if there are currently
   // maxTasks_ connections and maxTasks_ is non-zero.
-  void SetupConnection(boost::shared_ptr<TTransport> client);
+  void SetupConnection(boost::shared_ptr<TAcceptQueueEntry> entry);
+
+  // Helper function to close a client connection in case of server side errors.
+  void CleanupAndClose(const std::string& error,
+      boost::shared_ptr<TTransport> input,
+      boost::shared_ptr<TTransport> output,
+      boost::shared_ptr<TTransport> client);
 
   boost::shared_ptr<ThreadFactory> threadFactory_;
-  volatile bool stop_;
+  volatile bool stop_ = false;
+
+  /// Name of the thrift server.
+  const std::string name_;
 
   // Monitor protecting tasks_, notified on removal.
   Monitor tasksMonitor_;
@@ -119,64 +105,32 @@ class TAcceptQueueServer : public TServer {
   // The maximum number of running tasks allowed at a time.
   const int32_t maxTasks_;
 
-  /// New - True if metrics are enabled
-  bool metrics_enabled_;
+  /// True if metrics are enabled
+  bool metrics_enabled_ = false;
 
-  /// New - Number of connections that have been accepted and are waiting to be setup.
-  impala::IntGauge* queue_size_metric_;
+  /// Number of connections that have been accepted and are waiting to be setup.
+  impala::IntGauge* queue_size_metric_ = nullptr;
+
+  /// Number of connections rejected due to timeout.
+  impala::IntGauge* timedout_cnxns_metric_ = nullptr;
+
+  /// Distribution of connection setup time in microseconds. This does not include the
+  /// time spent waiting for a service thread to be available.
+  impala::HistogramMetric* cnxns_setup_time_us_metric_ = nullptr;
+
+  /// Distribution of wait time in microseconds for service threads to be available.
+  impala::HistogramMetric* thread_wait_time_us_metric_ = nullptr;
+
+  /// Amount of time in milliseconds after which a connection request will be timed out.
+  /// Default value is 0, which means no timeout.
+  int64_t queue_timeout_ms_;
+
+  /// Amount of time in milliseconds of client's inactivity before the service thread
+  /// wakes up to check if the connection should be closed due to inactivity. If 0, no
+  /// polling happens.
+  int64_t idle_poll_period_ms_;
 };
 
-template <typename ProcessorFactory>
-TAcceptQueueServer::TAcceptQueueServer(
-    const boost::shared_ptr<ProcessorFactory>& processorFactory,
-    const boost::shared_ptr<TServerTransport>& serverTransport,
-    const boost::shared_ptr<TTransportFactory>& transportFactory,
-    const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-    int32_t maxTasks,
-    THRIFT_OVERLOAD_IF_DEFN(ProcessorFactory, TProcessorFactory))
-  : TServer(processorFactory, serverTransport, transportFactory, protocolFactory),
-    maxTasks_(maxTasks) {
-  init();
-}
-
-template <typename ProcessorFactory>
-TAcceptQueueServer::TAcceptQueueServer(
-    const boost::shared_ptr<ProcessorFactory>& processorFactory,
-    const boost::shared_ptr<TServerTransport>& serverTransport,
-    const boost::shared_ptr<TTransportFactory>& transportFactory,
-    const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-    const boost::shared_ptr<ThreadFactory>& threadFactory,
-    int32_t maxTasks,
-    THRIFT_OVERLOAD_IF_DEFN(ProcessorFactory, TProcessorFactory))
-  : TServer(processorFactory, serverTransport, transportFactory, protocolFactory),
-    threadFactory_(threadFactory), maxTasks_(maxTasks) {
-  init();
-}
-
-template <typename Processor>
-TAcceptQueueServer::TAcceptQueueServer(const boost::shared_ptr<Processor>& processor,
-    const boost::shared_ptr<TServerTransport>& serverTransport,
-    const boost::shared_ptr<TTransportFactory>& transportFactory,
-    const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-    int32_t maxTasks,
-    THRIFT_OVERLOAD_IF_DEFN(Processor, TProcessor))
-  : TServer(processor, serverTransport, transportFactory, protocolFactory),
-    maxTasks_(maxTasks) {
-  init();
-}
-
-template <typename Processor>
-TAcceptQueueServer::TAcceptQueueServer(const boost::shared_ptr<Processor>& processor,
-    const boost::shared_ptr<TServerTransport>& serverTransport,
-    const boost::shared_ptr<TTransportFactory>& transportFactory,
-    const boost::shared_ptr<TProtocolFactory>& protocolFactory,
-    const boost::shared_ptr<ThreadFactory>& threadFactory,
-    int32_t maxTasks,
-    THRIFT_OVERLOAD_IF_DEFN(Processor, TProcessor))
-  : TServer(processor, serverTransport, transportFactory, protocolFactory),
-    threadFactory_(threadFactory), maxTasks_(maxTasks) {
-  init();
-}
 } // namespace server
 } // namespace thrift
 } // namespace apache

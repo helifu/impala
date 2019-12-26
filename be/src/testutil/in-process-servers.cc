@@ -27,7 +27,10 @@
 #include "util/webserver.h"
 #include "util/default-path-handlers.h"
 #include "util/metrics.h"
+#include "util/openssl-util.h"
 #include "runtime/exec-env.h"
+#include "scheduling/scheduler.h"
+#include "service/frontend.h"
 #include "service/impala-server.h"
 
 #include "common/names.h"
@@ -40,74 +43,57 @@ DECLARE_int32(krpc_port);
 using namespace apache::thrift;
 using namespace impala;
 
-InProcessImpalaServer* InProcessImpalaServer::StartWithEphemeralPorts(
-    const string& statestore_host, int statestore_port) {
-  for (int tries = 0; tries < 10; ++tries) {
-    vector<int> used_ports;
-    int backend_port = FindUnusedEphemeralPort(&used_ports);
-    if (backend_port == -1) continue;
-    // This flag is read directly in several places to find the address of the local
-    // backend interface.
-    FLAGS_be_port = backend_port;
+Status InProcessImpalaServer::StartWithEphemeralPorts(const string& statestore_host,
+    int statestore_port, InProcessImpalaServer** server) {
+  // These flags are read directly in several places to find the address of the local
+  // backend interface.
+  FLAGS_be_port = 0;
+  // Thrift server ctor allows port to be set to 0. Not supported with KRPC.
+  // So KRPC port must be explicitly set here.
+  FLAGS_krpc_port = FindUnusedEphemeralPort();
 
-    int krpc_port = FindUnusedEphemeralPort(&used_ports);
-    if (krpc_port == -1) continue;
-    FLAGS_krpc_port = krpc_port;
-
-    int subscriber_port = FindUnusedEphemeralPort(&used_ports);
-    if (subscriber_port == -1) continue;
-
-    int webserver_port = FindUnusedEphemeralPort(&used_ports);
-    if (webserver_port == -1) continue;
-
-    int beeswax_port = FindUnusedEphemeralPort(&used_ports);
-    if (beeswax_port == -1) continue;
-
-    int hs2_port = FindUnusedEphemeralPort(&used_ports);
-    if (hs2_port == -1) continue;
-
-    InProcessImpalaServer* impala = new InProcessImpalaServer(FLAGS_hostname,
-        backend_port, krpc_port, subscriber_port, webserver_port, statestore_host,
-        statestore_port);
-    // Start the daemon and check if it works, if not delete the current server object and
-    // pick a new set of ports
-    Status started = impala->StartWithClientServers(beeswax_port, hs2_port);
-    if (started.ok()) return impala;
-    LOG(WARNING) << started.GetDetail();
-
-    delete impala;
-  }
-  DCHECK(false) << "Could not find port to start Impalad.";
-  return NULL;
+  // Use wildcard addresses of 0 so that the Thrift servers will pick their own port.
+  *server = new InProcessImpalaServer(FLAGS_hostname, 0, FLAGS_krpc_port, 0, 0,
+      statestore_host, statestore_port);
+  // Start the daemon and check if it works, if not delete the current server object and
+  // pick a new set of ports
+  return (*server)->StartWithClientServers(0, 0, 0);
 }
 
 InProcessImpalaServer::InProcessImpalaServer(const string& hostname, int backend_port,
     int krpc_port, int subscriber_port, int webserver_port, const string& statestore_host,
     int statestore_port)
-    : hostname_(hostname), backend_port_(backend_port),
-      beeswax_port_(0),
-      hs2_port_(0),
-      impala_server_(NULL),
-      exec_env_(new ExecEnv(hostname, backend_port, krpc_port, subscriber_port,
-          webserver_port, statestore_host, statestore_port)) {
-}
+  : backend_port_(backend_port),
+    beeswax_port_(0),
+    hs2_port_(0),
+    hs2_http_port_(0),
+    impala_server_(NULL),
+    exec_env_(new ExecEnv(backend_port, krpc_port, subscriber_port, webserver_port,
+        statestore_host, statestore_port)) {}
 
 void InProcessImpalaServer::SetCatalogIsReady() {
   DCHECK(impala_server_ != NULL) << "Call Start*() first.";
   exec_env_->frontend()->SetCatalogIsReady();
 }
 
-Status InProcessImpalaServer::StartWithClientServers(int beeswax_port, int hs2_port) {
+Status InProcessImpalaServer::StartWithClientServers(
+    int beeswax_port, int hs2_port, int hs2_http_port) {
   RETURN_IF_ERROR(exec_env_->Init());
   beeswax_port_ = beeswax_port;
   hs2_port_ = hs2_port;
+  hs2_http_port_ = hs2_http_port;
 
   impala_server_.reset(new ImpalaServer(exec_env_.get()));
   SetCatalogIsReady();
-  RETURN_IF_ERROR(impala_server_->Start(backend_port_, beeswax_port, hs2_port));
+  RETURN_IF_ERROR(
+      impala_server_->Start(backend_port_, beeswax_port, hs2_port, hs2_http_port_));
+
+  // This flag is read directly in several places to find the address of the local
+  // backend interface.
+  FLAGS_be_port = impala_server_->GetThriftBackendPort();
 
   // Wait for up to 1s for the backend server to start
-  RETURN_IF_ERROR(WaitForServer(hostname_, backend_port_, 10, 100));
+  RETURN_IF_ERROR(WaitForServer(FLAGS_hostname, FLAGS_be_port, 10, 100));
   return Status::OK();
 }
 
@@ -116,49 +102,10 @@ Status InProcessImpalaServer::Join() {
   return Status::OK();
 }
 
-InProcessStatestore* InProcessStatestore::StartWithEphemeralPorts() {
-  for (int tries = 0; tries < 10; ++tries) {
-    vector<int> used_ports;
-    int statestore_port = FindUnusedEphemeralPort(&used_ports);
-    if (statestore_port == -1) continue;
-
-    int webserver_port = FindUnusedEphemeralPort(&used_ports);
-    if (webserver_port == -1) continue;
-
-    InProcessStatestore* ips = new InProcessStatestore(statestore_port, webserver_port);
-    if (ips->Start().ok()) return ips;
-    delete ips;
-  }
-  DCHECK(false) << "Could not find port to start Statestore.";
-  return NULL;
+int InProcessImpalaServer::GetBeeswaxPort() const {
+  return impala_server_->GetBeeswaxPort();
 }
 
-InProcessStatestore::InProcessStatestore(int statestore_port, int webserver_port)
-    : webserver_(new Webserver(webserver_port)),
-      metrics_(new MetricGroup("statestore")),
-      statestore_port_(statestore_port),
-      statestore_(new Statestore(metrics_.get())) {
-  AddDefaultUrlCallbacks(webserver_.get());
-  statestore_->RegisterWebpages(webserver_.get());
-}
-
-Status InProcessStatestore::Start() {
-  RETURN_IF_ERROR(statestore_->Init());
-  RETURN_IF_ERROR(webserver_->Start());
-  boost::shared_ptr<TProcessor> processor(
-      new StatestoreServiceProcessor(statestore_->thrift_iface()));
-
-  ThriftServerBuilder builder("StatestoreService", processor, statestore_port_);
-  if (EnableInternalSslConnections()) {
-    LOG(INFO) << "Enabling SSL for Statestore";
-    builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key);
-  }
-  ThriftServer* server;
-  ABORT_IF_ERROR(builder.metrics(metrics_.get()).Build(&server));
-  statestore_server_.reset(server);
-  RETURN_IF_ERROR(Thread::Create("statestore", "main-loop",
-      &Statestore::MainLoop, statestore_.get(), &statestore_main_loop_));
-
-  RETURN_IF_ERROR(statestore_server_->Start());
-  return WaitForServer("localhost", statestore_port_, 10, 100);
+int InProcessImpalaServer::GetHS2Port() const {
+  return impala_server_->GetHS2Port();
 }

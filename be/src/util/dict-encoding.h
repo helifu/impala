@@ -23,12 +23,14 @@
 #include <boost/unordered_map.hpp>
 
 #include "common/compiler-util.h"
-#include "exec/parquet-common.h"
+#include "exec/parquet/parquet-common.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/mem-pool.h"
 #include "runtime/string-value.h"
 #include "util/bit-util.h"
+#include "util/mem-util.h"
 #include "util/rle-encoding.h"
+#include "util/ubsan.h"
 
 namespace impala {
 
@@ -230,6 +232,13 @@ class DictEncoder : public DictEncoderBase {
   int AddToTable(const T& value, NodeIndex* bucket);
 };
 
+/// Number of decoded values to buffer at a time. A multiple of 32 is chosen to allow
+/// efficient reading in batches from data_decoder_. Increasing the batch size up to
+/// 128 seems to improve performance, but increasing further did not make a noticeable
+/// difference. Defined outside DictDecoderBase to get static linkage because there is
+/// no dict-encoding.cc file.
+static constexpr int32_t DICT_DECODER_BUFFER_SIZE = 128;
+
 /// Decoder class for dictionary encoded data. This class does not allocate any
 /// buffers. The input buffers (dictionary buffer and RLE buffer) must be maintained
 /// by the caller and valid as long as this object is.
@@ -244,7 +253,8 @@ class DictDecoderBase {
     DCHECK_GE(buffer_len, 0);
     if (UNLIKELY(buffer_len == 0)) return Status("Dictionary cannot be 0 bytes");
     uint8_t bit_width = *buffer;
-    if (UNLIKELY(bit_width < 0 || bit_width > BatchedBitReader::MAX_BITWIDTH)) {
+    if (UNLIKELY(bit_width < 0 || bit_width > sizeof(IndexType) * 8
+          || bit_width > BatchedBitReader::MAX_BITWIDTH)) {
       return Status(strings::Substitute("Dictionary has invalid or unsupported bit "
           "width: $0", bit_width));
     }
@@ -274,13 +284,8 @@ class DictDecoderBase {
   }
 
  protected:
-  /// Number of decoded values to buffer at a time. A multiple of 32 is chosen to allow
-  /// efficient reading in batches from data_decoder_. Increasing the batch size up to
-  /// 128 seems to improve performance, but increasing further did not make a noticeable
-  /// difference.
-  static const int DECODED_BUFFER_SIZE = 128;
-
-  RleBatchDecoder<uint32_t> data_decoder_;
+  using IndexType = uint32_t;
+  RleBatchDecoder<IndexType> data_decoder_;
 
   /// Greater than zero if we've started decoding a repeated run.
   int64_t num_repeats_ = 0;
@@ -333,6 +338,11 @@ class DictDecoder : public DictDecoderBase {
   template<parquet::Type::type PARQUET_TYPE>
   bool Reset(uint8_t* dict_buffer, int dict_len, int fixed_len_size) WARN_UNUSED_RESULT;
 
+  /// Should be only called for Timestamp columns.
+  void SetTimestampHelper(ParquetTimestampDecoder timestamp_decoder) {
+    timestamp_decoder_ = timestamp_decoder;
+  }
+
   virtual int num_entries() const { return dict_.size(); }
 
   virtual void GetValue(int index, void* buffer) {
@@ -347,6 +357,11 @@ class DictDecoder : public DictDecoderBase {
   /// the string data is from the dictionary buffer passed into the c'tor.
   bool GetNextValue(T* value) WARN_UNUSED_RESULT;
 
+  /// Batched version of GetNextValue(). Reads the next 'count' values into
+  /// 'first_values'. Returns false if the data was invalid and 'count' values could not
+  /// be successfully read. 'stride' is the stride in bytes between each subsequent value.
+  bool GetNextValues(T* first_value, int64_t stride, int count) WARN_UNUSED_RESULT;
+
   /// This function returns the size in bytes of the dictionary vector.
   /// It is used by dict-test.cc for validation of bytes consumed against
   /// memory tracked.
@@ -354,19 +369,39 @@ class DictDecoder : public DictDecoderBase {
     return sizeof(T) * dict_.size();
   }
 
+  /// Skip 'num_values' values from the input.
+  bool SkipValues(int64_t num_values) WARN_UNUSED_RESULT;
+
  private:
   /// List of decoded values stored in the dict_
   std::vector<T> dict_;
+
+  /// Contains extra data needed for Timestamp decoding.
+  ParquetTimestampDecoder timestamp_decoder_;
 
   /// Decoded values, buffered to allow caller to consume one-by-one. If in the middle of
   /// a repeated run, the first element is the current dict value. If in a literal run,
   /// this contains 'num_literal_values_' values, with the next value to be returned at
   /// 'next_literal_idx_'.
-  T decoded_values_[DECODED_BUFFER_SIZE];
+  T decoded_values_[DICT_DECODER_BUFFER_SIZE];
+
+  /// Copy as many as possible literal values, up to 'max_to_copy' from 'decoded_values_'
+  /// to '*out'. Return the number copied and advance '*out'.
+  uint32_t CopyLiteralsToOutput(
+      uint32_t max_to_copy, StrideWriter<T>* RESTRICT out) RESTRICT;
 
   /// Slow path for GetNextValue() where we need to decode new values. Should not be
   /// inlined everywhere.
   bool DecodeNextValue(T* value);
+
+  /// Specialized for Timestamp columns, simple proxy to ParquetPlainEncoder::Decode
+  /// for other types.
+  template<parquet::Type::type PARQUET_TYPE>
+  int Decode(const uint8_t* buffer, const uint8_t* buffer_end,
+      int fixed_len_size, T* v) {
+    return  ParquetPlainEncoder::Decode<T, PARQUET_TYPE>(buffer, buffer_end,
+        fixed_len_size,  v);
+  }
 };
 
 template<typename T>
@@ -416,7 +451,7 @@ template<>
 inline int DictEncoder<StringValue>::AddToTable(const StringValue& value,
     NodeIndex* bucket) {
   char* ptr_copy = reinterpret_cast<char*>(pool_->Allocate(value.len));
-  memcpy(ptr_copy, value.ptr, value.len);
+  Ubsan::MemCpy(ptr_copy, value.ptr, value.len);
   StringValue sv(ptr_copy, value.len);
   Node node(sv, *bucket);
   ConsumeBytes(sizeof(node));
@@ -447,24 +482,115 @@ ALWAYS_INLINE inline bool DictDecoder<T>::GetNextValue(T* value) {
 }
 
 template <typename T>
+ALWAYS_INLINE inline bool DictDecoder<T>::GetNextValues(
+    T* first_value, int64_t stride, int count) {
+  DCHECK_GE(count, 0);
+  StrideWriter<T> out(first_value, stride);
+  if (num_repeats_ > 0) {
+    // Consume any already-decoded repeated value.
+    int num_to_copy = std::min<uint32_t>(num_repeats_, count);
+    T repeated_val = decoded_values_[0];
+    out.SetNext(repeated_val, num_to_copy);
+    count -= num_to_copy;
+    num_repeats_ -= num_to_copy;
+  } else if (next_literal_idx_ < num_literal_values_) {
+    // Consume any already-decoded literal values.
+    count -= CopyLiteralsToOutput(count, &out);
+  }
+  DCHECK_GE(count, 0);
+  while (count > 0) {
+    uint32_t num_repeats = data_decoder_.NextNumRepeats();
+    if (num_repeats > 0) {
+      // Decode repeats directly to the output.
+      uint32_t num_repeats_to_consume = std::min<uint32_t>(num_repeats, count);
+      const IndexType idx = data_decoder_.GetRepeatedValue(num_repeats_to_consume);
+      if (UNLIKELY(idx >= dict_.size())) return false;
+      T repeated_val = dict_[idx];
+      out.SetNext(repeated_val, num_repeats_to_consume);
+      count -= num_repeats_to_consume;
+    } else {
+      // Decode as many literals as possible directly to the output, buffer the rest.
+      uint32_t num_literals = data_decoder_.NextNumLiterals();
+      if (UNLIKELY(num_literals == 0)) return false;
+      // Case 1: decode the whole literal run directly to the output.
+      // Case 2: decode none or some of the run to the output, buffer some remaining.
+      if (count >= num_literals) { // Case 1
+        if (UNLIKELY(!data_decoder_.DecodeLiteralValues(
+                num_literals, dict_.data(), dict_.size(), &out))) {
+          return false;
+        }
+        count -= num_literals;
+      } else { // Case 2
+        uint32_t num_to_decode = BitUtil::RoundDown(count, 32);
+        if (num_to_decode > 0 && UNLIKELY(!data_decoder_.DecodeLiteralValues(
+                num_to_decode, dict_.data(), dict_.size(), &out))) {
+          return false;
+        }
+        count -= num_to_decode;
+        DCHECK_GE(count, 0);
+        if (count > 0) {
+          if (UNLIKELY(!DecodeNextValue(out.Advance()))) return false;
+          --count;
+          // Consume any already-decoded literal values.
+          count -= CopyLiteralsToOutput(count, &out);
+        }
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
+template <typename T>
+ALWAYS_INLINE inline bool DictDecoder<T>::SkipValues(int64_t num_values) {
+  int64_t num_remaining = num_values;
+  if (num_repeats_ > 0) {
+    int64_t num_to_skip = std::min(num_remaining, num_repeats_);
+    num_repeats_ -= num_to_skip;
+    num_remaining -= num_to_skip;
+  } else if (next_literal_idx_ < num_literal_values_) {
+    int64_t num_to_skip = std::min<int64_t>(num_literal_values_ -
+        next_literal_idx_, num_remaining);
+    next_literal_idx_ += num_to_skip;
+    num_remaining -= num_to_skip;
+  }
+  if (num_remaining > 0) return data_decoder_.SkipValues(num_remaining) == num_remaining;
+  return true;
+}
+
+template <typename T>
+uint32_t DictDecoder<T>::CopyLiteralsToOutput(
+    uint32_t max_to_copy, StrideWriter<T>* out) {
+  uint32_t num_to_copy =
+      std::min<uint32_t>(num_literal_values_ - next_literal_idx_, max_to_copy);
+  for (uint32_t i = 0; i < num_to_copy; ++i) {
+    out->SetNext(decoded_values_[next_literal_idx_++]);
+  }
+  return num_to_copy;
+}
+
+template <typename T>
 bool DictDecoder<T>::DecodeNextValue(T* value) {
   // IMPALA-959: Use memcpy() instead of '=' to set *value: addresses are not always 16
   // byte aligned for Decimal16Values.
-  uint32_t num_repeats = data_decoder_.NextNumRepeats();
+  int32_t num_repeats = data_decoder_.NextNumRepeats();
+  DCHECK_GE(num_repeats, 0);
   if (num_repeats > 0) {
-    uint32_t idx = data_decoder_.GetRepeatedValue(num_repeats);
+    const IndexType idx = data_decoder_.GetRepeatedValue(num_repeats);
     if (UNLIKELY(idx >= dict_.size())) return false;
     memcpy(&decoded_values_[0], &dict_[idx], sizeof(T));
     memcpy(value, &decoded_values_[0], sizeof(T));
     num_repeats_ = num_repeats - 1;
     return true;
   } else {
-    uint32_t num_literals = data_decoder_.NextNumLiterals();
+    int32_t num_literals = data_decoder_.NextNumLiterals();
     if (UNLIKELY(num_literals == 0)) return false;
 
-    uint32_t num_to_decode = std::min<uint32_t>(num_literals, DECODED_BUFFER_SIZE);
-    if (UNLIKELY(!data_decoder_.DecodeLiteralValues(
-            num_to_decode, dict_.data(), dict_.size(), &decoded_values_[0]))) {
+    DCHECK_GT(num_literals, 0);
+    int32_t num_to_decode = std::min(num_literals, DICT_DECODER_BUFFER_SIZE);
+    StrideWriter<T> dst(&decoded_values_[0], sizeof(T));
+    if (UNLIKELY(!data_decoder_.DecodeLiteralValues(num_to_decode, dict_.data(),
+            dict_.size(), &dst))) {
       return false;
     }
     num_literal_values_ = num_to_decode;
@@ -495,6 +621,13 @@ inline int DictEncoderBase::WriteData(uint8_t* buffer, int buffer_len) {
   return 1 + encoder.len();
 }
 
+template <>
+template<parquet::Type::type PARQUET_TYPE>
+inline int DictDecoder<TimestampValue>::Decode(const uint8_t* buffer,
+    const uint8_t* buffer_end, int fixed_len_size, TimestampValue* v) {
+  return timestamp_decoder_.Decode<PARQUET_TYPE>(buffer, buffer_end, v);
+}
+
 template<typename T>
 template<parquet::Type::type PARQUET_TYPE>
 inline bool DictDecoder<T>::Reset(uint8_t* dict_buffer, int dict_len,
@@ -504,7 +637,7 @@ inline bool DictDecoder<T>::Reset(uint8_t* dict_buffer, int dict_len,
   uint8_t* end = dict_buffer + dict_len;
   while (dict_buffer < end) {
     T value;
-    int decoded_len = ParquetPlainEncoder::Decode<T, PARQUET_TYPE>(dict_buffer, end,
+    int decoded_len = Decode<PARQUET_TYPE>(dict_buffer, end,
         fixed_len_size, &value);
     if (UNLIKELY(decoded_len < 0)) return false;
     dict_buffer += decoded_len;

@@ -25,9 +25,12 @@
 
 #include "common/atomic.h"
 #include "common/status.h"
+#include "common/thread-debug-info.h"
 #include "util/promise.h"
 
+#include "gen-cpp/control_service.pb.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
+#include "gutil/threading/thread_collision_warner.h" // for DFAKE_*
 #include "runtime/row-batch.h"
 #include "util/condition-variable.h"
 #include "util/promise.h"
@@ -44,6 +47,7 @@ class TQueryCtx;
 class QueryState;
 class RuntimeProfile;
 class ExecNode;
+class PlanNode;
 class PlanRootSink;
 class Thread;
 class DataSink;
@@ -57,15 +61,6 @@ class RuntimeState;
 /// The FIS makes an aggregated profile for the entire fragment available, which
 /// includes profile information for the plan itself as well as the output sink. It also
 /// contains a timeline of events of the fragment instance.
-/// The FIS periodically makes a ReportExecStatus RPC to the coordinator to report the
-/// execution status, the current state of the execution, and the instance profile. The
-/// frequency of those reports is controlled by the flag status_report_interval; setting
-/// that flag to 0 disables periodic reporting altogether Regardless of the value of that
-/// flag, a report is sent at least once at the end of execution with an overall status
-/// and profile (and 'done' indicator).
-/// The FIS will send at least one final status report. If execution ended with an error,
-/// that error status will be part of the final report (it will not be overridden by
-/// the resulting cancellation).
 ///
 /// This class is thread-safe.
 /// All non-getter public functions other than Exec() block until the Prepare phase
@@ -75,8 +70,6 @@ class RuntimeState;
 ///
 /// TODO:
 /// - absorb RuntimeState?
-/// - should WaitForPrepare/Open() return the overall execution status, if there
-///   was a failure?
 class FragmentInstanceState {
  public:
   FragmentInstanceState(QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
@@ -87,14 +80,8 @@ class FragmentInstanceState {
   /// Must only be called once.
   Status Exec() WARN_UNUSED_RESULT;
 
-  /// Cancels execution and sends a final status report. Idempotent.
+  /// Cancels execution. Idempotent.
   void Cancel();
-
-  /// Blocks until the Prepare phase of Exec() is finished and returns the status.
-  Status WaitForPrepare();
-
-  /// Returns true if the Prepare phase of Exec() is finished.
-  bool IsPrepared();
 
   /// Blocks until the Prepare phase of Exec() is finished and the exec tree is
   /// opened, and returns that status. If the preparation phase encountered an error,
@@ -104,12 +91,25 @@ class FragmentInstanceState {
   /// Publishes filter with ID 'filter_id' to this fragment instance's filter bank.
   void PublishFilter(const TPublishFilterParams& params);
 
+  /// Called periodically by query state thread to get the current status of this fragment
+  /// instance. The fragment instance's status is stored in 'instance_status' and its
+  /// Thrift runtime profile is stored in 'thrift_profile'.
+  void GetStatusReport(FragmentInstanceExecStatusPB* instance_status,
+      TRuntimeProfileTree* thrift_profile);
+
+  /// After each call to GetStatusReport(), the query state thread should call one of the
+  /// following to indicate if the report rpc was successful. Note that in the case of
+  /// ReportFailed(), the report may have been received by the coordinator even though the
+  /// rpc appeared to fail.
+  void ReportSuccessful(const FragmentInstanceExecStatusPB& instance_status);
+  void ReportFailed(const FragmentInstanceExecStatusPB& instance_status);
+
   /// Returns fragment instance's sink if this is the root fragment instance. Valid after
   /// the Prepare phase. May be nullptr.
-  PlanRootSink* root_sink() { return root_sink_; }
+  PlanRootSink* GetRootSink() const;
 
-  /// Returns a string description of 'current_state_'.
-  static string ExecStateToString(const TFInstanceExecState::type state);
+  /// Returns a string description of 'state'.
+  static const string& ExecStateToString(FInstanceExecStatePB state);
 
   /// Name of the counter that is tracking per query, per host peak mem usage.
   /// TODO: this doesn't look like it belongs here
@@ -123,11 +123,25 @@ class FragmentInstanceState {
   const TPlanFragmentInstanceCtx& instance_ctx() const { return instance_ctx_; }
   const TUniqueId& query_id() const { return query_ctx().query_id; }
   const TUniqueId& instance_id() const { return instance_ctx_.fragment_instance_id; }
-  TFInstanceExecState::type current_state() const { return current_state_.Load(); }
+  FInstanceExecStatePB current_state() const { return current_state_.Load(); }
+  bool final_report_sent() const { return final_report_sent_; }
   const TNetworkAddress& coord_address() const { return query_ctx().coord_address; }
+  bool IsDone() const { return current_state_.Load() == FInstanceExecStatePB::FINISHED; }
   ObjectPool* obj_pool();
 
+  /// Returns true if the current thread is a thread executing the whole or part of
+  /// a fragment instance.
+  static bool IsFragmentExecThread() {
+    const static size_t name_len =
+        strlen(FragmentInstanceState::FINST_THREAD_NAME_PREFIX.c_str());
+    const char* name = GetThreadDebugInfo()->GetThreadName();
+    return name != nullptr &&
+        (strncmp(name, FINST_THREAD_NAME_PREFIX.c_str(), name_len) == 0 ||
+         strncmp(name, "join-build-thread", 17) == 0);
+  }
+
   static const std::string FINST_THREAD_GROUP_NAME;
+  static const std::string FINST_THREAD_NAME_PREFIX;
 
  private:
   QueryState* query_state_;
@@ -136,27 +150,30 @@ class FragmentInstanceState {
 
   /// All following member variables that are initialized to nullptr are set
   /// in Prepare().
-
   ExecNode* exec_tree_ = nullptr; // lives in obj_pool()
   RuntimeState* runtime_state_ = nullptr;  // lives in obj_pool()
+  /// Lives in obj_pool(). Not mutated after being initialized.
+  const PlanNode* plan_tree_ = nullptr;
 
-  /// profile reporting-related
-  std::unique_ptr<Thread> report_thread_;
-  boost::mutex report_thread_lock_;
+  /// A 'fake mutex' to detect any race condition in accessing 'report_seq_no_' below.
+  /// There should be only one thread doing status report at the same time.
+  DFAKE_MUTEX(report_status_lock_);
 
-  /// Indicates that profile reporting thread should stop.
-  /// Tied to report_thread_lock_.
-  ConditionVariable stop_report_thread_cv_;
+  /// Monotonically increasing sequence number used in status report to prevent
+  /// duplicated or out-of-order reports.
+  int64_t report_seq_no_ = 0;
 
-  /// Indicates that profile reporting thread started.
-  /// Tied to report_thread_lock_.
-  ConditionVariable report_thread_started_cv_;
+  /// True iff the final report has already been sent. Read exclusively by the query
+  /// state thread only. Written in GetStatusReport() by the query state thread.
+  bool final_report_sent_ = false;
 
-  /// When the report thread starts, it sets report_thread_active_ to true and signals
-  /// report_thread_started_cv_. The report thread is shut down by setting
-  /// report_thread_active_ to false and signalling stop_report_thread_cv_. Protected
-  /// by report_thread_lock_.
-  bool report_thread_active_ = false;
+  /// The non-idempotent parts of any reports that were generated but may not have been
+  /// received by the coordinator.
+  std::vector<StatefulStatusPB> prev_stateful_reports_;
+
+  /// True if a report has been generated where 'done' is true, after which the sequence
+  /// number should not be bumped for future reports.
+  bool final_report_generated_ = false;
 
   /// Profile for timings for each stage of the plan fragment instance's lifecycle.
   /// Lives in obj_pool().
@@ -191,15 +208,11 @@ class FragmentInstanceState {
 
   /// The current state of this fragment instance's execution. Only updated by the
   /// fragment instance thread in UpdateState() and read by the profile reporting threads.
-  AtomicEnum<TFInstanceExecState::type> current_state_;
+  AtomicEnum<FInstanceExecStatePB> current_state_{FInstanceExecStatePB::WAITING_FOR_EXEC};
 
   /// Output sink for rows sent to this fragment. Created in Prepare(), lives in
   /// obj_pool().
   DataSink* sink_ = nullptr;
-
-  /// Set if this fragment instance is the root of the entire plan, so that a consumer can
-  /// pull results by calling root_sink_->GetNext(). Same object as sink_.
-  PlanRootSink* root_sink_ = nullptr;
 
   /// should live in obj_pool(), but managed separately so we can delete it in Close()
   boost::scoped_ptr<RowBatch> row_batch_;
@@ -209,6 +222,13 @@ class FragmentInstanceState {
 
   /// Set when OpenInternal() returns.
   Promise<Status> opened_promise_;
+
+  /// Returns the monotonically increasing sequence number.
+  /// Called by query state thread only.
+  int64_t AdvanceReportSeqNo() {
+    DCHECK(!final_report_generated_);
+    return ++report_seq_no_;
+  }
 
   /// A counter for the per query, per host peak mem usage. Note that this is not the
   /// max of the peak memory of all fragments running on a host since it needs to take
@@ -255,20 +275,8 @@ class FragmentInstanceState {
   Status ExecInternal() WARN_UNUSED_RESULT;
 
   /// Closes the underlying fragment instance and frees up all resources allocated in
-  /// Prepare() and Open(). Assumes the report thread is stopped. Can handle
-  /// partially-finished Prepare().
+  /// Prepare() and Open(). Can handle partially-finished Prepare().
   void Close();
-
-  /// Main loop of profile reporting thread.
-  /// Exits when notified on stop_report_thread_cv_ and report_thread_active_ is set to
-  /// false. This will not send the final report.
-  void ReportProfileThread();
-
-  /// Invoked the report callback. If 'done' is true, sends the final report with
-  /// 'status' and the profile. This type of report is sent once and only by the
-  /// instance execution thread.  Otherwise, a profile-only report is sent, which the
-  /// ReportProfileThread() thread will do periodically.
-  void SendReport(bool done, const Status& status);
 
   /// Handle the execution event 'event'. This implements a state machine and will update
   /// the current execution state of this fragment instance. Also marks an event in
@@ -276,17 +284,9 @@ class FragmentInstanceState {
   /// concurrently.
   void UpdateState(const StateEvent event);
 
-  /// Called when execution is complete to finalize counters and send the final status
-  /// report.  Must be called only once. Can handle partially-finished Prepare().
-  void Finalize(const Status& status);
-
   /// Releases the thread token for this fragment executor. Can handle
   /// partially-finished Prepare().
   void ReleaseThreadToken();
-
-  /// Stops report thread, if one is running. Blocks until report thread terminates.
-  /// Idempotent.
-  void StopReportThread();
 
   /// Print stats about scan ranges for each volumeId in params to info log.
   void PrintVolumeIds();

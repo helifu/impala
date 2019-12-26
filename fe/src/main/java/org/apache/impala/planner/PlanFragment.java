@@ -17,29 +17,27 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.TupleId;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.planner.PlanNode.ExecPhaseResourceProfiles;
+import org.apache.impala.planner.RuntimeFilterGenerator.RuntimeFilter;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPartitionType;
 import org.apache.impala.thrift.TPlanFragment;
 import org.apache.impala.thrift.TPlanFragmentTree;
 import org.apache.impala.thrift.TQueryOptions;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * PlanFragments form a tree structure via their ExchangeNodes. A tree of fragments
@@ -76,8 +74,6 @@ import com.google.common.collect.Sets;
  *   fix that
  */
 public class PlanFragment extends TreeNode<PlanFragment> {
-  private final static Logger LOG = LoggerFactory.getLogger(PlanFragment.class);
-
   private final PlanFragmentId fragmentId_;
   private PlanId planId_;
   private CohortId cohortId_;
@@ -87,9 +83,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
 
   // exchange node to which this fragment sends its output
   private ExchangeNode destNode_;
-
-  // if null, outputs the entire row produced by planRoot_
-  private List<Expr> outputExprs_;
 
   // created in finalize() or set in setSink()
   private DataSink sink_;
@@ -109,9 +102,17 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   // computeResourceProfile().
   private ResourceProfile resourceProfile_ = ResourceProfile.invalid();
 
-  // The total of initial reservations (in bytes) that will be claimed over the lifetime
-  // of this fragment. Computed in computeResourceProfile().
-  private long initialReservationTotalClaims_ = -1;
+  // The total of initial memory reservations (in bytes) that will be claimed over the
+  // lifetime of this fragment. Computed in computeResourceProfile().
+  private long initialMemReservationTotalClaims_ = -1;
+
+  // The total memory (in bytes) required for the runtime filters used by the plan nodes
+  // managed by this fragment.
+  private long runtimeFiltersMemReservationBytes_ = 0;
+
+  public long getRuntimeFiltersMemReservationBytes() {
+    return runtimeFiltersMemReservationBytes_;
+  }
 
   /**
    * C'tor for fragment with specific partition; the output is by default broadcast.
@@ -140,7 +141,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
    * Collect and return all PlanNodes that belong to the exec tree of this fragment.
    */
   public List<PlanNode> collectPlanNodes() {
-    List<PlanNode> nodes = Lists.newArrayList();
+    List<PlanNode> nodes = new ArrayList<>();
     collectPlanNodesHelper(planRoot_, nodes);
     return nodes;
   }
@@ -151,11 +152,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     if (root instanceof ExchangeNode) return;
     for (PlanNode child: root.getChildren()) collectPlanNodesHelper(child, nodes);
   }
-
-  public void setOutputExprs(List<Expr> outputExprs) {
-    outputExprs_ = Expr.cloneList(outputExprs);
-  }
-  public List<Expr> getOutputExprs() { return outputExprs_; }
 
   /**
    * Do any final work to set up the ExchangeNodes and DataStreamSinks for this fragment.
@@ -187,11 +183,11 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     if (node instanceof HashJoinNode
         && ((JoinNode) node).getDistributionMode() == DistributionMode.PARTITIONED) {
       // Contains all exchange nodes in this fragment below the current join node.
-      List<ExchangeNode> exchNodes = Lists.newArrayList();
+      List<ExchangeNode> exchNodes = new ArrayList<>();
       node.collect(ExchangeNode.class, exchNodes);
 
       // Contains partition-expr lists of all hash-partitioning sender fragments.
-      List<List<Expr>> senderPartitionExprs = Lists.newArrayList();
+      List<List<Expr>> senderPartitionExprs = new ArrayList<>();
       for (ExchangeNode exchNode: exchNodes) {
         Preconditions.checkState(!exchNode.getChildren().isEmpty());
         PlanFragment senderFragment = exchNode.getChild(0).getFragment();
@@ -216,16 +212,30 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     }
   }
 
+  public void computePipelineMembership() {
+    planRoot_.computePipelineMembership();
+  }
+
   /**
    * Compute the peak resource profile for an instance of this fragment. Must
    * be called after all the plan nodes and sinks are added to the fragment and resource
-   * profiles of all children fragments are computed.
+   * profiles of all children fragments are computed. Also accounts for the memory used by
+   * runtime filters that are stored at the fragment level.
    */
   public void computeResourceProfile(Analyzer analyzer) {
     // Compute resource profiles for all plan nodes and sinks in the fragment.
     sink_.computeResourceProfile(analyzer.getQueryOptions());
+    Set<RuntimeFilterId> filterSet = new HashSet<>();
     for (PlanNode node: collectPlanNodes()) {
       node.computeNodeResourceProfile(analyzer.getQueryOptions());
+      for (RuntimeFilter filter: node.getRuntimeFilters()) {
+        // A filter can be a part of both produced and consumed filters in a fragment,
+        // so only add it once.
+        if (!filterSet.contains(filter.getFilterId())) {
+          filterSet.add(filter.getFilterId());
+          runtimeFiltersMemReservationBytes_ += filter.getFilterSize();
+        }
+      }
     }
 
     if (sink_ instanceof JoinBuildSink) {
@@ -241,13 +251,17 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     // The sink is opened after the plan tree.
     ResourceProfile fInstancePostOpenProfile =
         planTreeProfile.postOpenProfile.sum(sink_.getResourceProfile());
-    resourceProfile_ =
-        planTreeProfile.duringOpenProfile.max(fInstancePostOpenProfile);
-
-    initialReservationTotalClaims_ = sink_.getResourceProfile().getMinReservationBytes();
+    // One thread is required to execute the plan tree.
+    resourceProfile_ = new ResourceProfileBuilder()
+        .setMemEstimateBytes(runtimeFiltersMemReservationBytes_)
+        .setMinMemReservationBytes(runtimeFiltersMemReservationBytes_)
+        .setThreadReservation(1).build()
+        .sum(planTreeProfile.duringOpenProfile.max(fInstancePostOpenProfile));
+    initialMemReservationTotalClaims_ = sink_.getResourceProfile().getMinMemReservationBytes() +
+        runtimeFiltersMemReservationBytes_;
     for (PlanNode node: collectPlanNodes()) {
-      initialReservationTotalClaims_ +=
-          node.getNodeResourceProfile().getMinReservationBytes();
+      initialMemReservationTotalClaims_ +=
+          node.getNodeResourceProfile().getMinMemReservationBytes();
     }
   }
 
@@ -313,18 +327,18 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     TPlanFragment result = new TPlanFragment();
     result.setDisplay_name(fragmentId_.toString());
     if (planRoot_ != null) result.setPlan(planRoot_.treeToThrift());
-    if (outputExprs_ != null) {
-      result.setOutput_exprs(Expr.treesToThrift(outputExprs_));
-    }
     if (sink_ != null) result.setOutput_sink(sink_.toThrift());
     result.setPartition(dataPartition_.toThrift());
     if (resourceProfile_.isValid()) {
-      Preconditions.checkArgument(initialReservationTotalClaims_ > -1);
-      result.setMin_reservation_bytes(resourceProfile_.getMinReservationBytes());
-      result.setInitial_reservation_total_claims(initialReservationTotalClaims_);
+      Preconditions.checkArgument(initialMemReservationTotalClaims_ > -1);
+      result.setMin_mem_reservation_bytes(resourceProfile_.getMinMemReservationBytes());
+      result.setInitial_mem_reservation_total_claims(initialMemReservationTotalClaims_);
+      result.setRuntime_filters_reservation_bytes(runtimeFiltersMemReservationBytes_);
+      result.setThread_reservation(resourceProfile_.getThreadReservation());
     } else {
-      result.setMin_reservation_bytes(0);
-      result.setInitial_reservation_total_claims(0);
+      result.setMin_mem_reservation_bytes(0);
+      result.setInitial_mem_reservation_total_claims(0);
+      result.setRuntime_filters_reservation_bytes(0);
     }
     return result;
   }
@@ -408,6 +422,10 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     } else {
       builder.append(resourceProfile_.multiply(getNumInstancesPerHost(mt_dop))
           .getExplainString());
+      if (resourceProfile_.isValid() && runtimeFiltersMemReservationBytes_ > 0) {
+        builder.append(" runtime-filters-memory=");
+        builder.append(PrintUtils.printBytes(runtimeFiltersMemReservationBytes_));
+      }
     }
     builder.append("\n");
     return builder.toString();
@@ -476,7 +494,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   public void verifyTree() {
     // PlanNode.fragment_ is set correctly
     List<PlanNode> nodes = collectPlanNodes();
-    List<PlanNode> exchNodes = Lists.newArrayList();
+    List<PlanNode> exchNodes = new ArrayList<>();
     for (PlanNode node: nodes) {
       if (node instanceof ExchangeNode) exchNodes.add(node);
       Preconditions.checkState(node.getFragment() == this);
@@ -484,7 +502,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
 
     // all ExchangeNodes have registered input fragments
     Preconditions.checkState(exchNodes.size() == getChildren().size());
-    List<PlanFragment> childFragments = Lists.newArrayList();
+    List<PlanFragment> childFragments = new ArrayList<>();
     for (PlanNode exchNode: exchNodes) {
       PlanFragment childFragment = exchNode.getChild(0).getFragment();
       Preconditions.checkState(!childFragments.contains(childFragment));

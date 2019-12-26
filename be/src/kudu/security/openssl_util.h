@@ -19,14 +19,16 @@
 
 #include <functional>
 #include <memory>
+#include <ostream>
 #include <string>
 
+#include <glog/logging.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
-#include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 // Forward declarations for the OpenSSL typedefs.
@@ -69,7 +71,7 @@ typedef struct x509_st X509;
 namespace kudu {
 namespace security {
 
-using PasswordCallback = std::function<string(void)>;
+using PasswordCallback = std::function<std::string(void)>;
 
 // Disable initialization of OpenSSL. Must be called before
 // any call to InitializeOpenSSL().

@@ -30,6 +30,7 @@ import org.apache.impala.thrift.TNestedLoopJoinNode;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 
@@ -104,11 +105,11 @@ public class NestedLoopJoinNode extends JoinNode {
       }
       if (!otherJoinConjuncts_.isEmpty()) {
         output.append(detailPrefix + "join predicates: ")
-        .append(getExplainString(otherJoinConjuncts_) + "\n");
+            .append(Expr.getExplainString(otherJoinConjuncts_, detailLevel) + "\n");
       }
       if (!conjuncts_.isEmpty()) {
         output.append(detailPrefix + "predicates: ")
-        .append(getExplainString(conjuncts_) + "\n");
+            .append(Expr.getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     return output.toString();

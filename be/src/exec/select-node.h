@@ -30,17 +30,24 @@ namespace impala {
 class Tuple;
 class TupleRow;
 
+class SelectPlanNode : public PlanNode {
+ public:
+  virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+  ~SelectPlanNode(){}
+};
+
 /// Node that evaluates conjuncts and enforces a limit but otherwise passes along
 /// the rows pulled from its child unchanged.
+
 class SelectNode : public ExecNode {
  public:
-  SelectNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  SelectNode(ObjectPool* pool, const SelectPlanNode& pnode, const DescriptorTbl& descs);
 
   virtual Status Prepare(RuntimeState* state) override;
   virtual void Codegen(RuntimeState* state) override;
   virtual Status Open(RuntimeState* state) override;
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
-  virtual Status Reset(RuntimeState* state) override;
+  virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
   virtual void Close(RuntimeState* state) override;
 
  private:

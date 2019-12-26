@@ -27,6 +27,7 @@
 #include "gen-cpp/ErrorCodes_constants.h"
 #include "gen-cpp/ErrorCodes_types.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
+#include "gen-cpp/TCLIService_types.h"
 #include "gutil/strings/substitute.h"
 
 namespace impala {
@@ -35,6 +36,10 @@ namespace impala {
 /// as that is not thread safe.
 /// Returns empty string if errno is 0.
 std::string GetStrErrMsg();
+
+// This version of the function receives errno as a parameter instead of reading it
+// itself.
+std::string GetStrErrMsg(int err_no);
 
 /// Returns an error message warning that the given table names are missing relevant
 /// table/and or column statistics.
@@ -89,16 +94,16 @@ class ErrorMsg {
   /// the cost of this method is proportional to the number of entries in the global error
   /// message list.
   /// WARNING: DO NOT CALL THIS METHOD IN A NON STATIC CONTEXT
-  static ErrorMsg Init(TErrorCode::type error, const ArgType& arg0 = ArgType::NoArg,
-      const ArgType& arg1 = ArgType::NoArg,
-      const ArgType& arg2 = ArgType::NoArg,
-      const ArgType& arg3 = ArgType::NoArg,
-      const ArgType& arg4 = ArgType::NoArg,
-      const ArgType& arg5 = ArgType::NoArg,
-      const ArgType& arg6 = ArgType::NoArg,
-      const ArgType& arg7 = ArgType::NoArg,
-      const ArgType& arg8 = ArgType::NoArg,
-      const ArgType& arg9 = ArgType::NoArg);
+  static ErrorMsg Init(TErrorCode::type error, const ArgType& arg0 = ArgType::kNoArg,
+      const ArgType& arg1 = ArgType::kNoArg,
+      const ArgType& arg2 = ArgType::kNoArg,
+      const ArgType& arg3 = ArgType::kNoArg,
+      const ArgType& arg4 = ArgType::kNoArg,
+      const ArgType& arg5 = ArgType::kNoArg,
+      const ArgType& arg6 = ArgType::kNoArg,
+      const ArgType& arg7 = ArgType::kNoArg,
+      const ArgType& arg8 = ArgType::kNoArg,
+      const ArgType& arg9 = ArgType::kNoArg);
 
   TErrorCode::type error() const { return error_; }
 
@@ -136,36 +141,9 @@ private:
   std::vector<std::string> details_;
 };
 
-/// Track log messages per error code.
-typedef std::map<TErrorCode::type, TErrorLogEntry> ErrorLogMap;
-
-/// Merge error map m1 into m2. Merging of error maps occurs when the errors from
-/// multiple backends are merged into a single error map.  General log messages are
-/// simply appended, specific errors are deduplicated by either appending a new
-/// instance or incrementing the count of an existing one.
-void MergeErrorMaps(const ErrorLogMap& m1, ErrorLogMap* m2);
-
-/// Append an error to the error map. Performs the aggregation as follows: GENERAL errors
-/// are appended to the list of GENERAL errors, to keep one item each in the map, while
-/// for all other error codes only the count is incremented and only the first message
-/// is kept as a sample.
-void AppendError(ErrorLogMap* map, const ErrorMsg& e);
-
-/// Helper method to print the contents of an ErrorMap to a stream.
-void PrintErrorMap(std::ostream* stream, const ErrorLogMap& errors);
-
-/// Reset all messages and count, but keep all keys to prevent sending already reported
-/// general errors and counting the same non-general error multiple times.
-void ClearErrorMap(ErrorLogMap& errors);
-
-/// Return the number of errors within this error maps. General errors are counted
-/// individually, while specific errors are counted once per distinct occurrence.
-size_t ErrorCount(const ErrorLogMap& errors);
-
-/// Generate a string representation of the error map. Produces the same output as
-/// PrintErrorMap, but returns a string instead of using a stream.
-std::string PrintErrorMapToString(const ErrorLogMap& errors);
-
+/// Maps the HS2 TStatusCode types to the corresponding TErrorCode.
+TErrorCode::type HS2TStatusCodeToTErrorCode(
+    const apache::hive::service::cli::thrift::TStatusCode::type& hs2Code);
 }
 
 #endif

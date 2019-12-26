@@ -24,7 +24,6 @@ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.impala.extdatasource.v1.ExternalDataSource;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TColumn;
@@ -39,14 +38,14 @@ import org.apache.impala.util.TResultRowBuilder;
 import com.google.common.base.Preconditions;
 
 /**
- * Represents a table backed by an external data source. All data source properties are
- * stored as table properties (persisted in the metastore) because the DataSource catalog
- * object is not persisted so the DataSource catalog object will not exist if the catalog
- * server is restarted, but the table does not need the DataSource catalog object in
- * order to scan the table. Tables that contain the TBL_PROP_DATA_SRC_NAME table
- * parameter are assumed to be backed by an external data source.
+ * All data source properties are stored as table properties (persisted in the
+ * metastore) because the DataSource catalog object is not persisted so the
+ * DataSource catalog object will not exist if the catalog server is restarted,
+ * but the table does not need the DataSource catalog object in order to scan
+ * the table. Tables that contain the TBL_PROP_DATA_SRC_NAME table parameter are
+ * assumed to be backed by an external data source.
  */
-public class DataSourceTable extends Table {
+public class DataSourceTable extends Table implements FeDataSourceTable {
   private final static Logger LOG = LoggerFactory.getLogger(DataSourceTable.class);
 
   /**
@@ -85,13 +84,16 @@ public class DataSourceTable extends Table {
   /**
    * Gets the the data source.
    */
+  @Override // FeDataSourceTable
   public TDataSource getDataSource() { return dataSource_; }
 
   /**
    * Gets the table init string passed to the data source.
    */
+  @Override // FeDataSourceTable
   public String getInitString() { return initString_; }
 
+  @Override // FeDataSourceTable
   public int getNumNodes() { return 1; }
 
   @Override
@@ -103,6 +105,16 @@ public class DataSourceTable extends Table {
   public static boolean isSupportedColumnType(Type colType) {
     Preconditions.checkNotNull(colType);
     return isSupportedPrimitiveType(colType.getPrimitiveType());
+  }
+
+  @Override
+  public long getWriteId() {
+    return -1;
+  }
+
+  @Override
+  public String getValidWriteIds() {
+    return null;
   }
 
   /**
@@ -121,10 +133,10 @@ public class DataSourceTable extends Table {
       case STRING:
       case TIMESTAMP:
       case DECIMAL:
+      case DATE:
         return true;
       case BINARY:
       case CHAR:
-      case DATE:
       case DATETIME:
       case INVALID_TYPE:
       case NULL_TYPE:
@@ -159,7 +171,8 @@ public class DataSourceTable extends Table {
 
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
+      throws TableLoadingException {
     Preconditions.checkNotNull(msTbl);
     msTable_ = msTbl;
     clearColumns();
@@ -187,6 +200,7 @@ public class DataSourceTable extends Table {
 
       // Set table stats.
       setTableStats(msTable_);
+      refreshLastUsedTime();
     } catch (Exception e) {
       throw new TableLoadingException("Failed to load metadata for data source table: " +
           name_, e);
@@ -210,6 +224,7 @@ public class DataSourceTable extends Table {
    * SHOW TABLE STATS statement. The schema of the returned TResultSet is set
    * inside this method.
    */
+  @Override // FeDataSourceTable
   public TResultSet getTableStats() {
     TResultSet result = new TResultSet();
     TResultSetMetadata resultSchema = new TResultSetMetadata();

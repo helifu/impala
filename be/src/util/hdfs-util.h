@@ -50,10 +50,18 @@ bool IsHdfsPath(const char* path);
 /// Returns true iff the path refers to a location on an S3A filesystem.
 bool IsS3APath(const char* path);
 
+/// Returns true iff the path refers to a location on an ABFS filesystem.
+bool IsABFSPath(const char* path);
+
 /// Returns true iff the path refers to a location on an ADL filesystem.
 bool IsADLSPath(const char* path);
 
 /// Returns true iff 'pathA' and 'pathB' are on the same filesystem.
 bool FilesystemsMatch(const char* pathA, const char* pathB);
+
+/// Returns the terminal component of 'path'.
+/// E.g. if 'path' is "hdfs://localhost:8020/a/b/c", "c" is returned.
+/// If the terminal component is empty string or "/", the function returns ".".
+string GetBaseName(const char* path);
 }
 #endif // IMPALA_UTIL_HDFS_UTIL_H

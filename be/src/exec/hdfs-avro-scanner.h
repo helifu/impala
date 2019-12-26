@@ -100,6 +100,8 @@ class HdfsAvroScanner : public BaseSequenceScanner {
       llvm::Function** decode_avro_data_fn)
       WARN_UNUSED_RESULT;
 
+  static const char* LLVM_CLASS_NAME;
+
  protected:
   /// Implementation of BaseSeqeunceScanner super class methods
   virtual FileHeader* AllocateFileHeader();
@@ -265,6 +267,8 @@ class HdfsAvroScanner : public BaseSequenceScanner {
   ///
   bool ReadAvroBoolean(PrimitiveType type, uint8_t** data, uint8_t* data_end,
       bool write_slot, void* slot, MemPool* pool);
+  bool ReadAvroDate(PrimitiveType type, uint8_t** data, uint8_t* data_end,
+      bool write_slot, void* slot, MemPool* pool);
   bool ReadAvroInt32(PrimitiveType type, uint8_t** data, uint8_t* data_end,
       bool write_slot, void* slot, MemPool* pool);
   bool ReadAvroInt64(PrimitiveType type, uint8_t** data, uint8_t* data_end,
@@ -309,8 +313,6 @@ class HdfsAvroScanner : public BaseSequenceScanner {
 
   /// Unit test constructor
   HdfsAvroScanner();
-
-  static const char* LLVM_CLASS_NAME;
 };
 } // namespace impala
 

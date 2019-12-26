@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 #ifndef IMPALA_EXPRS_MATH_FUNCTIONS_H
 #define IMPALA_EXPRS_MATH_FUNCTIONS_H
 
@@ -36,6 +35,7 @@ using impala_udf::DoubleVal;
 using impala_udf::TimestampVal;
 using impala_udf::StringVal;
 using impala_udf::DecimalVal;
+using impala_udf::DateVal;
 
 class Expr;
 struct ExprValue;
@@ -45,9 +45,14 @@ class MathFunctions {
  public:
   static DoubleVal Pi(FunctionContext*);
   static DoubleVal E(FunctionContext*);
-  static BigIntVal Abs(FunctionContext*, const BigIntVal&);
   static DoubleVal Abs(FunctionContext*, const DoubleVal&);
   static FloatVal Abs(FunctionContext*, const FloatVal&);
+  // For integer math, we have to promote ABS() to the next highest integer type because
+  // in two's complement arithmetic, the largest negative value for any bit width is not
+  // representable as a positive value within the same width.  For the largest width, we
+  // simply overflow.  In the unlikely event a workaround is needed, one can simply cast
+  // to a higher precision decimal type.
+  static BigIntVal Abs(FunctionContext*, const BigIntVal&);
   static BigIntVal Abs(FunctionContext*, const IntVal&);
   static IntVal Abs(FunctionContext*, const SmallIntVal&);
   static SmallIntVal Abs(FunctionContext*, const TinyIntVal&);
@@ -64,16 +69,16 @@ class MathFunctions {
   static DoubleVal Sinh(FunctionContext*, const DoubleVal&);
   static DoubleVal Sqrt(FunctionContext*, const DoubleVal&);
   static DoubleVal Exp(FunctionContext*, const DoubleVal&);
-  static BigIntVal Ceil(FunctionContext*, const DoubleVal&);
-  static BigIntVal Floor(FunctionContext*, const DoubleVal&);
-  static BigIntVal Truncate(FunctionContext*, const DoubleVal&);
+  static DoubleVal Ceil(FunctionContext*, const DoubleVal&);
+  static DoubleVal Floor(FunctionContext*, const DoubleVal&);
+  static DoubleVal Truncate(FunctionContext*, const DoubleVal&);
   static DoubleVal Ln(FunctionContext*, const DoubleVal&);
   static DoubleVal Log10(FunctionContext*, const DoubleVal&);
-  static FloatVal Sign(FunctionContext*, const DoubleVal&);
+  static DoubleVal Sign(FunctionContext*, const DoubleVal&);
   static DoubleVal Radians(FunctionContext*, const DoubleVal&);
   static DoubleVal Degrees(FunctionContext*, const DoubleVal&);
-  static BigIntVal Round(FunctionContext*, const DoubleVal&);
-  static DoubleVal RoundUpTo(FunctionContext*, const DoubleVal&, const IntVal&);
+  static DoubleVal Round(FunctionContext*, const DoubleVal&);
+  static DoubleVal RoundUpTo(FunctionContext*, const DoubleVal&, const BigIntVal&);
   static DoubleVal Log2(FunctionContext*, const DoubleVal&);
   static DoubleVal Log(FunctionContext*, const DoubleVal& base, const DoubleVal& val);
   static DoubleVal Pow(FunctionContext*, const DoubleVal& base, const DoubleVal& val);
@@ -111,6 +116,12 @@ class MathFunctions {
       FunctionContext*, int num_args, const TimestampVal* args);
   template <bool ISLEAST> static DecimalVal LeastGreatest(
       FunctionContext*, int num_args, const DecimalVal* args);
+  template <bool ISLEAST> static DateVal LeastGreatest(
+      FunctionContext*, int num_args, const DateVal* args);
+
+  static BigIntVal WidthBucket(FunctionContext* ctx, const DecimalVal& expr,
+      const DecimalVal& min_range, const DecimalVal& max_range,
+      const IntVal& num_buckets);
 
  private:
   static const int32_t MIN_BASE = 2;
@@ -135,6 +146,15 @@ class MathFunctions {
   /// Returns false otherwise, indicating some other error condition.
   static bool HandleParseResult(int8_t dest_base, int64_t* num,
       StringParser::ParseResult parse_res);
+
+  /// This function creates equiwidth histograms , where the histogram range
+  /// is divided into num_buckets buckets having identical sizes. This function
+  /// returns the bucket in which the expr value would fall. min_val and
+  /// max_val are the minimum and maximum value of the histogram range
+  /// respectively.
+  template <typename T1>
+  static BigIntVal WidthBucketImpl(FunctionContext* ctx,const T1& expr,
+      const T1& min_range,const T1& max_range, const IntVal& num_buckets);
 };
 
 }

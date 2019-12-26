@@ -21,14 +21,14 @@
 
 #include "common/object-pool.h"
 #include "common/status.h"
-#include "exprs/anyval-util.h"
-#include "exprs/scalar-expr.h"
 #include "exprs/aggregate-functions.h"
+#include "exprs/anyval-util.h"
 #include "exprs/bit-byte-functions.h"
 #include "exprs/case-expr.h"
 #include "exprs/cast-functions.h"
 #include "exprs/compound-predicates.h"
 #include "exprs/conditional-functions.h"
+#include "exprs/date-functions.h"
 #include "exprs/decimal-functions.h"
 #include "exprs/decimal-operators.h"
 #include "exprs/hive-udf-call.h"
@@ -41,6 +41,7 @@
 #include "exprs/null-literal.h"
 #include "exprs/operators.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.inline.h"
 #include "exprs/scalar-fn-call.h"
 #include "exprs/slot-ref.h"
 #include "exprs/string-functions.h"
@@ -48,6 +49,7 @@
 #include "exprs/tuple-is-null-predicate.h"
 #include "exprs/udf-builtins.h"
 #include "exprs/utility-functions.h"
+#include "runtime/date-value.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
@@ -334,6 +336,14 @@ void* ScalarExprEvaluator::GetValue(const ScalarExpr& expr, const TupleRow* row)
           return nullptr;
       }
     }
+    case TYPE_DATE: {
+      impala_udf::DateVal v = expr.GetDateVal(this, row);
+      if (v.is_null) return nullptr;
+      const DateValue dv = DateValue::FromDateVal(v);
+      if (UNLIKELY(!dv.IsValid())) return nullptr;
+      result_.date_val = dv;
+      return &result_.date_val;
+    }
     case TYPE_ARRAY:
     case TYPE_MAP: {
       impala_udf::CollectionVal v = expr.GetCollectionVal(this, row);
@@ -364,48 +374,52 @@ void ScalarExprEvaluator::PrintValue(const TupleRow* row, stringstream* stream) 
   RawValue::PrintValue(GetValue(row), root_.type(), output_scale_, stream);
 }
 
-BooleanVal ScalarExprEvaluator::GetBooleanVal(TupleRow* row) {
+BooleanVal ScalarExprEvaluator::GetBooleanVal(const TupleRow* row) {
   return root_.GetBooleanVal(this, row);
 }
 
-TinyIntVal ScalarExprEvaluator::GetTinyIntVal(TupleRow* row) {
+TinyIntVal ScalarExprEvaluator::GetTinyIntVal(const TupleRow* row) {
   return root_.GetTinyIntVal(this, row);
 }
 
-SmallIntVal ScalarExprEvaluator::GetSmallIntVal(TupleRow* row) {
+SmallIntVal ScalarExprEvaluator::GetSmallIntVal(const TupleRow* row) {
   return root_.GetSmallIntVal(this, row);
 }
 
-IntVal ScalarExprEvaluator::GetIntVal(TupleRow* row) {
+IntVal ScalarExprEvaluator::GetIntVal(const TupleRow* row) {
   return root_.GetIntVal(this, row);
 }
 
-BigIntVal ScalarExprEvaluator::GetBigIntVal(TupleRow* row) {
+BigIntVal ScalarExprEvaluator::GetBigIntVal(const TupleRow* row) {
   return root_.GetBigIntVal(this, row);
 }
 
-FloatVal ScalarExprEvaluator::GetFloatVal(TupleRow* row) {
+FloatVal ScalarExprEvaluator::GetFloatVal(const TupleRow* row) {
   return root_.GetFloatVal(this, row);
 }
 
-DoubleVal ScalarExprEvaluator::GetDoubleVal(TupleRow* row) {
+DoubleVal ScalarExprEvaluator::GetDoubleVal(const TupleRow* row) {
   return root_.GetDoubleVal(this, row);
 }
 
-StringVal ScalarExprEvaluator::GetStringVal(TupleRow* row) {
+StringVal ScalarExprEvaluator::GetStringVal(const TupleRow* row) {
   return root_.GetStringVal(this, row);
 }
 
-CollectionVal ScalarExprEvaluator::GetCollectionVal(TupleRow* row) {
+CollectionVal ScalarExprEvaluator::GetCollectionVal(const TupleRow* row) {
   return root_.GetCollectionVal(this, row);
 }
 
-TimestampVal ScalarExprEvaluator::GetTimestampVal(TupleRow* row) {
+TimestampVal ScalarExprEvaluator::GetTimestampVal(const TupleRow* row) {
   return root_.GetTimestampVal(this, row);
 }
 
-DecimalVal ScalarExprEvaluator::GetDecimalVal(TupleRow* row) {
+DecimalVal ScalarExprEvaluator::GetDecimalVal(const TupleRow* row) {
   return root_.GetDecimalVal(this, row);
+}
+
+DateVal ScalarExprEvaluator::GetDateVal(const TupleRow* row) {
+  return root_.GetDateVal(this, row);
 }
 
 void ScalarExprEvaluator::InitBuiltinsDummy() {
@@ -426,6 +440,7 @@ void ScalarExprEvaluator::InitBuiltinsDummy() {
   StringFunctions::Length(nullptr, StringVal::null());
   TimestampFunctions::Year(nullptr, TimestampVal::null());
   TimestampFunctions::UnixAndFromUnixPrepare(nullptr, FunctionContext::FRAGMENT_LOCAL);
+  DateFunctions::Year(nullptr, DateVal::null());
   UdfBuiltins::Pi(nullptr);
   UtilityFunctions::Pid(nullptr);
 }

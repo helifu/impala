@@ -25,87 +25,45 @@
 
 #include "common/status.h"
 #include "gen-cpp/Frontend_types.h"
-
-#define THROW_IF_ERROR_WITH_LOGGING(stmt, env, adaptor) \
-  do { \
-    Status status = (stmt); \
-    if (!status.ok()) { \
-      (adaptor)->WriteErrorLog(); \
-      (adaptor)->WriteFileErrors(); \
-      (env)->ThrowNew((adaptor)->impala_exc_cl(), status.GetDetail().c_str()); \
-      return; \
-    } \
-  } while (false)
+#include "gutil/macros.h"
 
 #define THROW_IF_ERROR(stmt, env, impala_exc_cl) \
   do { \
-    Status status = (stmt); \
-    if (!status.ok()) { \
-      (env)->ThrowNew((impala_exc_cl), status.GetDetail().c_str()); \
+    const Status& _status = (stmt); \
+    if (!_status.ok()) { \
+      (env)->ThrowNew((impala_exc_cl), _status.GetDetail().c_str()); \
       return; \
     } \
   } while (false)
 
 #define THROW_IF_ERROR_RET(stmt, env, impala_exc_cl, ret) \
   do { \
-    Status status = (stmt); \
-    if (!status.ok()) { \
-      (env)->ThrowNew((impala_exc_cl), status.GetDetail().c_str()); \
+    const Status& _status = (stmt); \
+    if (!_status.ok()) { \
+      (env)->ThrowNew((impala_exc_cl), _status.GetDetail().c_str()); \
       return (ret); \
-    } \
-  } while (false)
-
-#define THROW_IF_EXC(env, exc_class) \
-  do { \
-    jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) { \
-      DCHECK((throwable_to_string_id_) != NULL); \
-      jstring stack = (jstring) env->CallStaticObjectMethod(JniUtil::jni_util_class(), \
-          (JniUtil::throwable_to_stack_trace_id()), exc); \
-      jboolean is_copy; \
-      const char* c_stack = \
-          reinterpret_cast<const char*>((env)->GetStringUTFChars(stack, &is_copy)); \
-      (env)->ExceptionClear(); \
-      (env)->ThrowNew((exc_class), c_stack); \
-      return; \
-    } \
-  } while (false)
-
-#define RETURN_IF_EXC(env) \
-  do { \
-    jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) { \
-      jstring stack = (jstring) env->CallStaticObjectMethod(JniUtil::jni_util_class(), \
-          (JniUtil::throwable_to_stack_trace_id()), exc); \
-      jboolean is_copy; \
-      const char* c_stack = \
-          reinterpret_cast<const char*>((env)->GetStringUTFChars(stack, &is_copy)); \
-      VLOG(1) << string(c_stack); \
-      return; \
-    } \
-  } while (false)
-
-#define EXIT_IF_EXC(env) \
-  do { \
-    jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) { \
-      jstring stack = (jstring) env->CallStaticObjectMethod(JniUtil::jni_util_class(), \
-          (JniUtil::throwable_to_stack_trace_id()), exc); \
-      jboolean is_copy; \
-      const char* c_stack = \
-          reinterpret_cast<const char*>((env)->GetStringUTFChars(stack, &is_copy)); \
-      LOG(FATAL) << string(c_stack); \
     } \
   } while (false)
 
 #define RETURN_ERROR_IF_EXC(env) \
   do { \
     jthrowable exc = (env)->ExceptionOccurred(); \
-    if (exc != NULL) return JniUtil::GetJniExceptionMsg(env);\
+    if (exc != nullptr) return JniUtil::GetJniExceptionMsg(env);\
   } while (false)
 
-/// C linkage for helper functions in hdfsJniHelper.h
-extern  "C" { extern JNIEnv* getJNIEnv(void); }
+// If there's an exception in 'env', log the backtrace at FATAL level and abort the
+// process. This will generate a core dump if core dumps are enabled, so this should
+// generally only be called for internal errors where the coredump is useful for
+// diagnostics.
+#define ABORT_IF_EXC(env) do { ABORT_IF_ERROR(JniUtil::GetJniExceptionMsg(env)); } while (false)
+
+// If there's an exception in 'env', log the backtrace at ERROR level and exit the process
+// cleanly with status 1.
+#define CLEAN_EXIT_IF_EXC(env) \
+  do { \
+    Status s = JniUtil::GetJniExceptionMsg(env); \
+    if (!s.ok()) CLEAN_EXIT_WITH_ERROR(s.GetDetail()); \
+  } while (false)
 
 namespace impala {
 
@@ -117,8 +75,13 @@ class Status;
 /// the corresponding objects.
 class JniLocalFrame {
  public:
-  JniLocalFrame(): env_(NULL) {}
-  ~JniLocalFrame() { if (env_ != NULL) env_->PopLocalFrame(NULL); }
+  JniLocalFrame(): env_(nullptr) {}
+  ~JniLocalFrame() { if (env_ != nullptr) env_->PopLocalFrame(nullptr); }
+
+  JniLocalFrame(JniLocalFrame&& other) noexcept
+    : env_(other.env_) {
+    other.env_ = nullptr;
+  }
 
   /// Pushes a new JNI local frame. The frame can support max_local_ref local references.
   /// The number of local references created inside the frame might exceed max_local_ref,
@@ -127,6 +90,8 @@ class JniLocalFrame {
   Status push(JNIEnv* env, int max_local_ref = 10) WARN_UNUSED_RESULT;
 
  private:
+  DISALLOW_COPY_AND_ASSIGN(JniLocalFrame);
+
   JNIEnv* env_;
 };
 
@@ -168,6 +133,112 @@ class JniUtfCharGuard {
   DISALLOW_COPY_AND_ASSIGN(JniUtfCharGuard);
 };
 
+class JniScopedArrayCritical {
+ public:
+  /// Construct a JniScopedArrayCritical holding nothing.
+  JniScopedArrayCritical():  env_(nullptr), jarr_(nullptr), arr_(nullptr), size_(0) {}
+
+  /// Release the held byte[] contents if necessary.
+  ~JniScopedArrayCritical() {
+    if (env_ != nullptr && jarr_ != nullptr && arr_ != nullptr) {
+      env_->ReleasePrimitiveArrayCritical(jarr_, arr_, JNI_ABORT);
+    }
+  }
+
+  /// Try to get the contents of 'jarr' via JNIEnv::GetPrimitiveArrayCritical() and set
+  /// the results in 'out'. Returns true upon success and false otherwise. If false is
+  /// returned 'out' is not modified.
+  static bool Create(JNIEnv* env, jbyteArray jarr, JniScopedArrayCritical* out)
+      WARN_UNUSED_RESULT;
+
+  uint8_t* get() const { return arr_; }
+
+  int size() const { return size_; }
+ private:
+  JNIEnv* env_;
+  jbyteArray jarr_;
+  uint8_t* arr_;
+  int size_;
+  DISALLOW_COPY_AND_ASSIGN(JniScopedArrayCritical);
+};
+
+/// Utility class for making JNI calls, with various types of argument
+/// or response.
+///
+/// Example usages:
+///
+/// 1) Static call taking a Thrift struct and returning a string:
+///
+///   string s;
+///   RETURN_IF_ERROR(JniCall::static_method(my_jclass, my_method)
+///       .with_thrift_arg(foo).Call(&s));
+///
+/// 2) Non-static call taking no arguments and returning a Thrift struct:
+///
+///   TMyObject result;
+///   RETURN_IF_ERROR(JniCall::instance_method(my_jobject, my_method).Call(&result);
+class JniCall {
+ public:
+   JniCall(JniCall&& other) noexcept = default;
+
+   static JniCall static_method(jclass clazz, jmethodID method) WARN_UNUSED_RESULT {
+     return JniCall(method, clazz);
+   }
+
+   static JniCall instance_method(jobject obj, jmethodID method) WARN_UNUSED_RESULT {
+     return JniCall(method, obj);
+   }
+
+  /// Pass a Thrift-encoded argument. The JNI method should take a byte[] for the
+  /// Thrift-serialized data. Multiple arguments may be passed by repeated calls.
+  template<class T>
+  JniCall& with_thrift_arg(const T& arg) WARN_UNUSED_RESULT;
+
+  /// Pass a primitive arg (eg an integer).
+  /// Multiple arguments may be passed by repeated calls.
+  template<class T>
+  JniCall& with_primitive_arg(T arg) WARN_UNUSED_RESULT;
+
+  /// Call the method expecting no result.
+  Status Call() WARN_UNUSED_RESULT {
+    return Call(static_cast<void*>(nullptr));
+  }
+
+  /// Call the method and return a result (either std::string or a Thrift struct).
+  template<class T>
+  Status Call(T* result) WARN_UNUSED_RESULT;
+
+ private:
+  explicit JniCall(jmethodID method);
+
+  explicit JniCall(jmethodID method, jclass cls) : JniCall(method) {
+    class_ = DCHECK_NOTNULL(cls);
+  }
+
+  explicit JniCall(jmethodID method, jobject instance) : JniCall(method) {
+    instance_ = DCHECK_NOTNULL(instance);
+  }
+
+  template<class T>
+  Status ObjectToResult(jobject obj, T* result) WARN_UNUSED_RESULT;
+
+  Status ObjectToResult(jobject obj, void* no_result) WARN_UNUSED_RESULT;
+
+  Status ObjectToResult(jobject obj, std::string* result) WARN_UNUSED_RESULT;
+
+  const jmethodID method_;
+  JNIEnv* const env_;
+  JniLocalFrame frame_;
+
+  jclass class_ = nullptr;
+  jobject instance_ = nullptr;
+  std::vector<jvalue> args_;
+  Status status_;
+
+  DISALLOW_COPY_AND_ASSIGN(JniCall);
+};
+
+
 /// Utility class for JNI-related functionality.
 /// Init() should be called as soon as the native library is loaded.
 /// Creates global class references, and promotes local references to global references.
@@ -183,11 +254,21 @@ class JniUtfCharGuard {
 ///    to explicitly create a global reference to them.
 class JniUtil {
  public:
+  /// Init JniUtil. This should be called prior to any other calls.
+  static Status Init() WARN_UNUSED_RESULT;
+
   /// Call this prior to any libhdfs calls.
   static void InitLibhdfs();
 
-  /// Find JniUtil class, and get JniUtil.throwableToString method id
-  static Status Init() WARN_UNUSED_RESULT;
+  /// Returns the JNIEnv attached to the current thread, attaching it
+  /// if necessary. Always returns a valid non-NULL value.
+  static JNIEnv* GetJNIEnv() {
+    if (tls_env_) return tls_env_;
+    return GetJNIEnvSlowPath();
+  }
+
+  /// Initializes the JvmPauseMonitor.
+  static Status InitJvmPauseMonitor() WARN_UNUSED_RESULT;
 
   /// Returns true if the given class could be found on the CLASSPATH in env.
   /// Returns false otherwise, or if any other error occurred (e.g. a JNI exception).
@@ -234,6 +315,9 @@ class JniUtil {
   static jmethodID throwable_to_string_id() { return throwable_to_string_id_; }
   static jmethodID throwable_to_stack_trace_id() { return throwable_to_stack_trace_id_; }
 
+  /// Returns true if an embedded JVM is initialized, false otherwise.
+  static bool is_jvm_inited() { return jvm_inited_; }
+
   /// Global reference to java JniUtil class
   static jclass jni_util_class() { return jni_util_cl_; }
 
@@ -248,13 +332,16 @@ class JniUtil {
 
   /// Populates 'result' with a list of memory metrics from the Jvm. Returns Status::OK
   /// unless there is an exception.
-  static Status GetJvmMetrics(const TGetJvmMetricsRequest& request,
-      TGetJvmMetricsResponse* result) WARN_UNUSED_RESULT;
+  static Status GetJvmMemoryMetrics(
+      TGetJvmMemoryMetricsResponse* result) WARN_UNUSED_RESULT;
 
-  // Populates 'result' with information about live JVM threads. Returns
-  // Status::OK unless there is an exception.
+  /// Populates 'result' with information about live JVM threads. Returns
+  /// Status::OK unless there is an exception.
   static Status GetJvmThreadsInfo(const TGetJvmThreadsInfoRequest& request,
       TGetJvmThreadsInfoResponse* result) WARN_UNUSED_RESULT;
+
+  /// Gets JMX metrics of the JVM encoded as a JSON string.
+  static Status GetJMXJson(TGetJMXJsonResponse* result) WARN_UNUSED_RESULT;
 
   /// Loads a method whose signature is in the supplied descriptor. Returns Status::OK
   /// and sets descriptor->method_id to a JNI method handle if successful, otherwise an
@@ -267,107 +354,157 @@ class JniUtil {
       JniMethodDescriptor* descriptor) WARN_UNUSED_RESULT;
 
   /// Utility methods to avoid repeating lots of the JNI call boilerplate.
+  /// New code should prefer using JniCall() directly for better clarity.
   static Status CallJniMethod(
       const jobject& obj, const jmethodID& method) WARN_UNUSED_RESULT {
-    JNIEnv* jni_env = getJNIEnv();
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    jni_env->CallObjectMethod(obj, method);
-    RETURN_ERROR_IF_EXC(jni_env);
-    return Status::OK();
+    return JniCall::instance_method(obj, method).Call();
+  }
+
+  static Status CallStaticJniMethod(
+      const jclass& cls, const jmethodID& method) WARN_UNUSED_RESULT {
+    return JniCall::static_method(cls, method).Call();
   }
 
   template <typename T>
-  static Status CallJniMethod(const jobject& obj, const jmethodID& method, const T& arg) {
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray request_bytes;
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &arg, &request_bytes));
-    jni_env->CallObjectMethod(obj, method, request_bytes);
-    RETURN_ERROR_IF_EXC(jni_env);
-    return Status::OK();
-  }
+  static Status CallJniMethod(const jobject& obj, const jmethodID& method,
+      const T& arg) WARN_UNUSED_RESULT;
+
+  template <typename T, typename R>
+  static Status CallJniMethod(const jobject& obj, const jmethodID& method,
+      const T& arg, R* response) WARN_UNUSED_RESULT;
 
   template <typename R>
-  static Status CallJniMethod(const jobject& obj, const jmethodID& method, R* response) {
-    JNIEnv* jni_env = getJNIEnv();
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    jbyteArray result_bytes = static_cast<jbyteArray>(
-        jni_env->CallObjectMethod(obj, method));
-    RETURN_ERROR_IF_EXC(jni_env);
-    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, response));
-    return Status::OK();
-  }
-
-  template <typename T, typename R>
   static Status CallJniMethod(const jobject& obj, const jmethodID& method,
-      const T& arg, R* response) {
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray request_bytes;
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &arg, &request_bytes));
-    jbyteArray result_bytes = static_cast<jbyteArray>(
-        jni_env->CallObjectMethod(obj, method, request_bytes));
-    RETURN_ERROR_IF_EXC(jni_env);
-    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, response));
-    return Status::OK();
-  }
-
-  template <typename T, typename R>
-  static Status CallJniMethod(const jobject& obj, const jmethodID& method,
-      const vector<T>& args, R* response) {
-    JNIEnv* jni_env = getJNIEnv();
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    jclass jByteArray_class = jni_env->FindClass("[B");
-    jobjectArray array_of_jByteArray =
-        jni_env->NewObjectArray(args.size(), jByteArray_class, NULL);
-    RETURN_ERROR_IF_EXC(jni_env);
-    jbyteArray request_bytes;
-    for (int i = 0; i < args.size(); i++) {
-      RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &args[i], &request_bytes));
-      jni_env->SetObjectArrayElement(array_of_jByteArray, i, request_bytes);
-      RETURN_ERROR_IF_EXC(jni_env);
-      jni_env->DeleteLocalRef(request_bytes);
-    }
-    jbyteArray result_bytes = static_cast<jbyteArray>(
-        jni_env->CallObjectMethod(obj, method, array_of_jByteArray));
-    RETURN_ERROR_IF_EXC(jni_env);
-    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, response));
-    return Status::OK();
-  }
-
-  template <typename T>
-  static Status CallJniMethod(const jobject& obj, const jmethodID& method,
-      const T& arg, std::string* response) {
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray request_bytes;
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &arg, &request_bytes));
-    jstring java_response_string = static_cast<jstring>(
-        jni_env->CallObjectMethod(obj, method, request_bytes));
-    RETURN_ERROR_IF_EXC(jni_env);
-    jboolean is_copy;
-    const char *str = jni_env->GetStringUTFChars(java_response_string, &is_copy);
-    RETURN_ERROR_IF_EXC(jni_env);
-    *response = str;
-    jni_env->ReleaseStringUTFChars(java_response_string, str);
-    RETURN_ERROR_IF_EXC(jni_env);
-    return Status::OK();
-  }
+      R* response) WARN_UNUSED_RESULT;
 
  private:
+  // Slow-path for GetJNIEnv, used on the first call by any thread.
+  static JNIEnv* GetJNIEnvSlowPath();
+
+  // Set in Init() once the JVM is initialized.
+  static bool jvm_inited_;
   static jclass jni_util_cl_;
   static jclass internal_exc_cl_;
   static jmethodID throwable_to_string_id_;
   static jmethodID throwable_to_stack_trace_id_;
   static jmethodID get_jvm_metrics_id_;
   static jmethodID get_jvm_threads_id_;
+  static jmethodID get_jmx_json_;
+
+  // Thread-local cache of the JNIEnv for this thread.
+  static __thread JNIEnv* tls_env_;
 };
+
+/// Convert a C++ primitive to a JNI 'jvalue' union.
+/// See https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/types.html
+/// for reference on the union members.
+template<typename T>
+jvalue PrimitiveToValue(T cpp_val);
+
+#define SPECIALIZE_PRIMITIVE_TO_VALUE(cpp_type, union_field)    \
+  template<> inline jvalue PrimitiveToValue(cpp_type cpp_val) { \
+    jvalue v;                                                   \
+    memset(&v, 0, sizeof(v));                                    \
+    v.union_field = cpp_val;                                    \
+    return v;                                                   \
+  }
+SPECIALIZE_PRIMITIVE_TO_VALUE(bool, z);
+SPECIALIZE_PRIMITIVE_TO_VALUE(int8_t, b);
+SPECIALIZE_PRIMITIVE_TO_VALUE(char, c);
+SPECIALIZE_PRIMITIVE_TO_VALUE(int16_t, s);
+SPECIALIZE_PRIMITIVE_TO_VALUE(int32_t, i);
+SPECIALIZE_PRIMITIVE_TO_VALUE(int64_t, j);
+SPECIALIZE_PRIMITIVE_TO_VALUE(float, f);
+SPECIALIZE_PRIMITIVE_TO_VALUE(double, d);
+#undef SPECIALIZE_PRIMITIVE_TO_VALUE
+
+template <typename T>
+inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
+    const T& arg) {
+  return JniCall::instance_method(obj, method).with_thrift_arg(arg).Call();
+}
+
+template <>
+inline Status JniUtil::CallJniMethod<int64_t>(const jobject& obj, const jmethodID& method,
+    const int64_t& arg) {
+  return JniCall::instance_method(obj, method).with_primitive_arg(arg).Call();
+}
+
+template <typename T, typename R>
+inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
+    const T& arg, R* response) {
+  return JniCall::instance_method(obj, method).with_thrift_arg(arg).Call(response);
+}
+
+template <typename R>
+inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
+    R* response) {
+  return JniCall::instance_method(obj, method).Call(response);
+}
+
+inline JniCall::JniCall(jmethodID method)
+  : method_(method),
+    env_(JniUtil::GetJNIEnv()) {
+  status_ = frame_.push(env_);
+}
+
+template<class T>
+inline JniCall& JniCall::with_thrift_arg(const T& arg) {
+  if (!status_.ok()) return *this;
+  jbyteArray bytes;
+  status_ = SerializeThriftMsg(env_, &arg, &bytes);
+  if (status_.ok()) {
+    jvalue arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.l = bytes;
+    args_.emplace_back(arg);
+  }
+  return *this;
+}
+template<class T>
+inline JniCall& JniCall::with_primitive_arg(T arg) {
+  if (!status_.ok()) return *this;
+  args_.emplace_back(PrimitiveToValue(arg));
+  return *this;
+}
+
+template<class T>
+inline Status JniCall::Call(T* result) {
+  RETURN_IF_ERROR(status_);
+  DCHECK((instance_ != nullptr) ^ (class_ != nullptr));
+
+  // Even if the function takes no arguments, it's OK to pass an array here.
+  // The JNI API doesn't take a length and just assumes that you've passed
+  // an appropriate number of elements.
+  jobject ret;
+  if (class_) {
+    ret = env_->CallStaticObjectMethodA(class_, method_, args_.data());
+  } else {
+    ret = env_->CallObjectMethodA(instance_, method_, args_.data());
+  }
+  RETURN_ERROR_IF_EXC(env_);
+  RETURN_IF_ERROR(ObjectToResult(ret, result));
+  return Status::OK();
+}
+
+template<class T>
+inline Status JniCall::ObjectToResult(jobject obj, T* result) {
+  DCHECK(obj) << "Call returned unexpected null Thrift object";
+  RETURN_IF_ERROR(DeserializeThriftMsg(env_, static_cast<jbyteArray>(obj), result));
+  return Status::OK();
+}
+
+inline Status JniCall::ObjectToResult(jobject obj, void* no_result) {
+  return Status::OK();
+}
+
+inline Status JniCall::ObjectToResult(jobject obj, std::string* result) {
+  DCHECK(obj) << "Call returned unexpected null String instance";
+  JniUtfCharGuard utf;
+  RETURN_IF_ERROR(JniUtfCharGuard::create(env_, static_cast<jstring>(obj), &utf));
+  *result = utf.get();;
+  return Status::OK();
+}
 
 }
 

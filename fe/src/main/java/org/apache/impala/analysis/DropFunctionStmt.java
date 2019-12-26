@@ -19,10 +19,8 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 
-import org.apache.impala.authorization.AuthorizeableFn;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequest;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
@@ -55,7 +53,7 @@ public class DropFunctionStmt extends StatementBase {
   private boolean hasSignature() { return fnArgs_ != null; }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("DROP FUNCTION");
     if (ifExists_) sb.append(" IF EXISTS ");
     sb.append(desc_.signatureString());
@@ -74,38 +72,48 @@ public class DropFunctionStmt extends StatementBase {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
-    fnName_.analyze(analyzer);
+    fnName_.analyze(analyzer, false);
 
     if (hasSignature()) {
       fnArgs_.analyze(analyzer);
       desc_ = new Function(fnName_, fnArgs_.getArgTypes(), Type.INVALID,
           fnArgs_.hasVarArgs());
     } else {
-      desc_ = new Function(fnName_, new ArrayList<Type>(), Type.INVALID,
+      desc_ = new Function(fnName_, new ArrayList<>(), Type.INVALID,
           false);
     }
 
-    // For now, if authorization is enabled, the user needs ALL on the server
-    // to drop functions.
-    // TODO: this is not the right granularity but acceptable for now.
-    analyzer.registerPrivReq(new PrivilegeRequest(
-        new AuthorizeableFn(desc_.signatureString()), Privilege.ALL));
+    // Start with ANY privilege in case of IF EXISTS, and register DROP privilege later
+    // only if the function exists. See IMPALA-8851 for more explanation.
+    registerFnPriv(analyzer, ifExists_ ? Privilege.ANY : Privilege.DROP);
 
-    Db db =  analyzer.getDb(desc_.dbName(), Privilege.DROP, false);
-    if (db == null && !ifExists_) {
+    FeDb db =  analyzer.getDb(desc_.dbName(), false);
+    if (db == null) {
+      if (ifExists_) return;
+      // db does not exist and if exists clause is not provided
       throw new AnalysisException(Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + desc_.dbName());
     }
-
-    if (!hasSignature() && db != null && db.getFunctions(
-        desc_.functionName()).isEmpty() && !ifExists_) {
+    if (!hasSignature() && db.getFunctions(desc_.functionName()).isEmpty()) {
+      if (ifExists_) return;
       throw new AnalysisException(
           Analyzer.FN_DOES_NOT_EXIST_ERROR_MSG + desc_.functionName());
     }
-
     if (hasSignature() && analyzer.getCatalog().getFunction(
-        desc_, Function.CompareMode.IS_IDENTICAL) == null && !ifExists_) {
+        desc_, Function.CompareMode.IS_IDENTICAL) == null) {
+      if (ifExists_) return;
       throw new AnalysisException(
           Analyzer.FN_DOES_NOT_EXIST_ERROR_MSG + desc_.signatureString());
     }
+
+    // Register the "stronger" DROP privilege if only ANY was registered due to
+    // IF EXISTS.
+    if (ifExists_) registerFnPriv(analyzer, Privilege.DROP);
+  }
+
+  private void registerFnPriv(Analyzer analyzer, Privilege priv) {
+    analyzer.registerPrivReq(builder ->
+          builder.onFunction(desc_.dbName(), desc_.signatureString())
+              .allOf(priv)
+              .build());
   }
 }

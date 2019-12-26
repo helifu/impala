@@ -17,12 +17,15 @@
 
 #include "exprs/operators.h"
 
+#include <functional>
+
 #include <boost/cstdint.hpp>
 
 #include "exprs/anyval-util.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
+#include "util/bit-util.h"
 
 #include "common/names.h"
 
@@ -31,6 +34,27 @@
       FunctionContext* c, const TYPE& v1, const TYPE& v2) {\
     if (v1.is_null || v2.is_null) return TYPE::null();\
     return TYPE(v1.val OP v2.val);\
+  }
+
+// Operations on signed integers that overflow are undefined in C++. From the standard:
+// [expr] "If during the evaluation of an expression, the result is not mathematically
+// defined or not in the range of representable values for its type, the behavior is
+// undefined."
+//
+// Unsigned integers do not suffer the same fate: [basic.fundamental] "unsigned arithmetic
+// does not overflow because a result that cannot be represented by the resulting unsigned
+// integer type is reduced modulo the number that is one greater than the largest value
+// that can be represented by the resulting unsigned integer type."
+//
+// If we take the bits in two signed values and treat them as unsigned values, the result
+// of multiplication, addition, and subtraction are identical to the version of the signed
+// operation on a two's complement machine in which overflowing is not undefined, but
+// wraps.
+#define BINARY_OP_AS_UNSIGNED_FN(NAME, TYPE, OP)                 \
+  TYPE Operators::NAME##_##TYPE##_##TYPE(                        \
+      FunctionContext* c, const TYPE& v1, const TYPE& v2) {      \
+    if (v1.is_null || v2.is_null) return TYPE::null();           \
+    return TYPE(ArithmeticUtil::AsUnsigned<OP>(v1.val, v2.val)); \
   }
 
 #define BINARY_OP_CHECK_ZERO_FN(NAME, TYPE, OP) \
@@ -118,11 +142,13 @@
     BINARY_PREDICATE_CHAR_NONNULL(OP, v1, v2);\
   }
 
-#define BINARY_OP_NUMERIC_TYPES(NAME, OP) \
-  BINARY_OP_FN(NAME, TinyIntVal, OP); \
-  BINARY_OP_FN(NAME, SmallIntVal, OP);\
-  BINARY_OP_FN(NAME, IntVal, OP);\
-  BINARY_OP_FN(NAME, BigIntVal, OP);\
+#define BINARY_OP_AS_UNSIGNED_TYPES(NAME, OP) \
+  BINARY_OP_AS_UNSIGNED_FN(NAME, TinyIntVal, OP); \
+  BINARY_OP_AS_UNSIGNED_FN(NAME, SmallIntVal, OP);\
+  BINARY_OP_AS_UNSIGNED_FN(NAME, IntVal, OP);\
+  BINARY_OP_AS_UNSIGNED_FN(NAME, BigIntVal, OP);
+
+#define BINARY_OP_FLOAT_TYPES(NAME, OP) \
   BINARY_OP_FN(NAME, FloatVal, OP);\
   BINARY_OP_FN(NAME, DoubleVal, OP);
 
@@ -146,6 +172,7 @@
   BINARY_PREDICATE_NUMERIC_FN(NAME, BigIntVal, OP);\
   BINARY_PREDICATE_NUMERIC_FN(NAME, FloatVal, OP);\
   BINARY_PREDICATE_NUMERIC_FN(NAME, DoubleVal, OP);\
+  BINARY_PREDICATE_NUMERIC_FN(NAME, DateVal, OP);\
   BINARY_PREDICATE_NONNUMERIC_FN(NAME, StringVal, StringValue, OP);\
   BINARY_PREDICATE_NONNUMERIC_FN(NAME, TimestampVal, TimestampValue, OP);\
   BINARY_PREDICATE_CHAR(NAME, OP);
@@ -158,15 +185,20 @@
   NULLSAFE_NUMERIC_DISTINCTION(NAME, BigIntVal, OP, IS_EQUAL); \
   NULLSAFE_NUMERIC_DISTINCTION(NAME, FloatVal, OP, IS_EQUAL); \
   NULLSAFE_NUMERIC_DISTINCTION(NAME, DoubleVal, OP, IS_EQUAL); \
+  NULLSAFE_NUMERIC_DISTINCTION(NAME, DateVal, OP, IS_EQUAL); \
   NULLSAFE_NONNUMERIC_DISTINCTION(NAME, StringVal, StringValue, OP, IS_EQUAL);\
   NULLSAFE_NONNUMERIC_DISTINCTION(NAME, TimestampVal, TimestampValue, OP, IS_EQUAL);\
   NULLSAFE_CHAR_DISTINCTION(NAME, OP, IS_EQUAL);
 
 namespace impala {
 
-BINARY_OP_NUMERIC_TYPES(Add, +);
-BINARY_OP_NUMERIC_TYPES(Subtract, -);
-BINARY_OP_NUMERIC_TYPES(Multiply, *);
+BINARY_OP_AS_UNSIGNED_TYPES(Add, std::plus);
+BINARY_OP_AS_UNSIGNED_TYPES(Subtract, std::minus);
+BINARY_OP_AS_UNSIGNED_TYPES(Multiply, std::multiplies);
+
+BINARY_OP_FLOAT_TYPES(Add, +);
+BINARY_OP_FLOAT_TYPES(Subtract, -);
+BINARY_OP_FLOAT_TYPES(Multiply, *);
 
 BINARY_OP_FN(Divide, DoubleVal, /);
 

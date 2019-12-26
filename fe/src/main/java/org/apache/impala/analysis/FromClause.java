@@ -17,11 +17,14 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
 import org.apache.impala.common.AnalysisException;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -30,9 +33,9 @@ import com.google.common.collect.Lists;
  * analyzed independently of the statement using them. To increase the flexibility of
  * the class it implements the Iterable interface.
  */
-public class FromClause implements ParseNode, Iterable<TableRef> {
+public class FromClause extends StmtNode implements Iterable<TableRef> {
 
-  private final ArrayList<TableRef> tableRefs_;
+  private final List<TableRef> tableRefs_;
 
   private boolean analyzed_ = false;
 
@@ -44,44 +47,48 @@ public class FromClause implements ParseNode, Iterable<TableRef> {
     }
   }
 
-  public FromClause() { tableRefs_ = Lists.newArrayList(); }
+  public FromClause() { tableRefs_ = new ArrayList<>(); }
   public List<TableRef> getTableRefs() { return tableRefs_; }
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     if (analyzed_) return;
 
-    if (tableRefs_.isEmpty()) {
-      analyzed_ = true;
-      return;
-    }
-
-    // Start out with table refs to establish aliases.
     TableRef leftTblRef = null;  // the one to the left of tblRef
     for (int i = 0; i < tableRefs_.size(); ++i) {
-      // Resolve and replace non-InlineViewRef table refs with a BaseTableRef or ViewRef.
       TableRef tblRef = tableRefs_.get(i);
+      // Replace non-InlineViewRef table refs with a BaseTableRef or ViewRef.
       tblRef = analyzer.resolveTableRef(tblRef);
       tableRefs_.set(i, Preconditions.checkNotNull(tblRef));
       tblRef.setLeftTblRef(leftTblRef);
-      try {
-        tblRef.analyze(analyzer);
-      } catch (AnalysisException e) {
-        // Only re-throw the exception if no tables are missing.
-        if (analyzer.getMissingTbls().isEmpty()) throw e;
-      }
+      tblRef.analyze(analyzer);
       leftTblRef = tblRef;
-    }
-
-    // All tableRefs have been analyzed, but at least one table is missing metadata.
-    if (!analyzer.getMissingTbls().isEmpty()) {
-      throw new AnalysisException("Found missing tables. Aborting analysis.");
     }
     analyzed_ = true;
   }
 
+  public void collectFromClauseTableRefs(List<TableRef> tblRefs) {
+    collectTableRefs(tblRefs, true);
+  }
+
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    collectTableRefs(tblRefs, false);
+  }
+
+  private void collectTableRefs(List<TableRef> tblRefs, boolean fromClauseOnly) {
+    for (TableRef tblRef: tableRefs_) {
+      if (tblRef instanceof InlineViewRef) {
+        InlineViewRef inlineViewRef = (InlineViewRef) tblRef;
+        inlineViewRef.getViewStmt().collectTableRefs(tblRefs, fromClauseOnly);
+      } else {
+        tblRefs.add(tblRef);
+      }
+    }
+  }
+
+  @Override
   public FromClause clone() {
-    ArrayList<TableRef> clone = Lists.newArrayList();
+    List<TableRef> clone = new ArrayList<>();
     for (TableRef tblRef: tableRefs_) clone.add(tblRef.clone());
     return new FromClause(clone);
   }
@@ -107,12 +114,17 @@ public class FromClause implements ParseNode, Iterable<TableRef> {
   }
 
   @Override
-  public String toSql() {
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
     StringBuilder builder = new StringBuilder();
     if (!tableRefs_.isEmpty()) {
       builder.append(" FROM ");
       for (int i = 0; i < tableRefs_.size(); ++i) {
-        builder.append(tableRefs_.get(i).toSql());
+        builder.append(tableRefs_.get(i).toSql(options));
       }
     }
     return builder.toString();

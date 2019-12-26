@@ -20,8 +20,8 @@ package org.apache.impala.analysis;
 import java.util.List;
 
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableAddDropRangePartitionParams;
 import org.apache.impala.thrift.TAlterTableParams;
@@ -63,11 +63,11 @@ public class AlterTableAddDropRangePartitionStmt extends AlterTableStmt {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("ALTER TABLE " + getTbl());
     sb.append(" " + operation_.name());
     if (ignoreErrors_) sb.append(" " + operation_.option());
-    sb.append(" " + rangePartitionSpec_.toSql());
+    sb.append(" " + rangePartitionSpec_.toSql(options));
     return sb.toString();
   }
 
@@ -87,13 +87,13 @@ public class AlterTableAddDropRangePartitionStmt extends AlterTableStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    Table table = getTargetTable();
-    if (!(table instanceof KuduTable)) {
+    FeTable table = getTargetTable();
+    if (!(table instanceof FeKuduTable)) {
       throw new AnalysisException(String.format("Table %s does not support range " +
           "partitions: RANGE %s", table.getFullName(), rangePartitionSpec_.toSql()));
     }
-    KuduTable kuduTable = (KuduTable) table;
-    List<String> colNames = kuduTable.getRangePartitioningColNames();
+    FeKuduTable kuduTable = (FeKuduTable) table;
+    List<String> colNames = FeKuduTable.Utils.getRangePartitioningColNames(kuduTable);
     if (colNames.isEmpty()) {
       throw new AnalysisException(String.format("Cannot add/drop partition %s: " +
           "Kudu table %s doesn't have a range-based partitioning.",

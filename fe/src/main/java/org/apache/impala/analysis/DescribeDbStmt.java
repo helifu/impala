@@ -21,6 +21,7 @@ import org.apache.impala.authorization.Privilege;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TDescribeDbParams;
 import org.apache.impala.thrift.TDescribeOutputStyle;
+
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 
@@ -46,7 +47,7 @@ public class DescribeDbStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("DESCRIBE DATABASE ");
     if (outputStyle_ != TDescribeOutputStyle.MINIMAL) {
       sb.append(outputStyle_.toString() + " ");

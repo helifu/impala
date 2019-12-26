@@ -32,7 +32,7 @@ error_codes = (
 
   ("GENERAL", 2, "$0"),
 
-  ("CANCELLED", 3, "$0"),
+  ("CANCELLED", 3, "Cancelled"),
 
   ("ANALYSIS_ERROR", 4, "$0"),
 
@@ -192,8 +192,10 @@ error_codes = (
   ("STALE_METADATA_FILE_TOO_SHORT", 59, "Metadata for file '$0' appears stale. "
    "Try running \\\"refresh $1\\\" to reload the file metadata."),
 
-  ("PARQUET_BAD_VERSION_NUMBER", 60, "File '$0' has an invalid version number: $1\\n"
-   "This could be due to stale metadata. Try running \\\"refresh $2\\\"."),
+  ("PARQUET_BAD_VERSION_NUMBER", 60, "File '$0' has an invalid Parquet version number: "
+   "$1\\n. Please check that it is a valid Parquet file. "
+   "This error can also occur due to stale metadata. "
+   "If you believe this is a valid Parquet file, try running \\\"refresh $2\\\"."),
 
   ("SCANNER_INCOMPLETE_READ", 61, "Tried to read $0 bytes but could only read $1 bytes. "
    "This may indicate data file corruption. (file $2, byte offset: $3)"),
@@ -306,8 +308,10 @@ error_codes = (
   # TODO: IMPALA-4697: the merged errors do not show up in the query error log,
   # so we must point users to the impalad error log.
   ("SCRATCH_ALLOCATION_FAILED", 101, "Could not create files in any configured scratch "
-   "directories (--scratch_dirs=$0) on backend '$1'. See logs for previous errors that may "
-   "have prevented creating or writing scratch files."),
+   "directories (--scratch_dirs=$0) on backend '$1'. $2 of scratch is currently in "
+   "use by this Impala Daemon ($3 by this query). See logs for previous errors that "
+   "may have prevented creating or writing scratch files. The following directories "
+   "were at capacity: $4"),
 
   ("SCRATCH_READ_TRUNCATED", 102, "Error reading $0 bytes from scratch file '$1' "
    "on backend $2 at offset $3: could only read $4 bytes"),
@@ -316,8 +320,8 @@ error_codes = (
    "Kudu table '$0' column '$1' contains an out of range timestamp. "
    "The valid date range is 1400-01-01..9999-12-31."),
 
-  ("MAX_ROW_SIZE", 104, "Row of size $0 could not be materialized in plan node with "
-    "id $1. Increase the max_row_size query option (currently $2) to process larger rows."),
+  ("MAX_ROW_SIZE", 104, "Row of size $0 could not be materialized by $1. Increase the "
+   "max_row_size query option (currently $2) to process larger rows."),
 
   ("IR_VERIFY_FAILED", 105,
    "Failed to verify generated IR function $0, see log for more details."),
@@ -334,7 +338,7 @@ error_codes = (
 
   ("THREAD_CREATION_FAILED", 109, "Failed to create thread $0 in category $1: $2"),
 
-  ("DISK_IO_ERROR", 110, "Disk I/O error: $0"),
+  ("DISK_IO_ERROR", 110, "Disk I/O error on $0: $1"),
 
   ("DATASTREAM_RECVR_CLOSED", 111,
    "DataStreamRecvr for fragment=$0, node=$1 is closed already"),
@@ -347,7 +351,97 @@ error_codes = (
 
   ("SASL_APP_NAME_MISMATCH", 114,
    "InitAuth() called multiple times with different names. Was called with $0. "
-   "Now using $1.")
+   "Now using $1."),
+
+  ("PARQUET_BIT_PACKED_LEVELS", 115,
+      "Can not read Parquet file $0 with deprecated BIT_PACKED encoding for rep or "
+      "def levels. Support was removed in Impala 3.0 - see IMPALA-6077."),
+
+  ("ROW_BATCH_TOO_LARGE", 116,
+   "Row batch cannot be serialized: size of $0 bytes exceeds supported limit of $1"),
+
+  ("LIB_VERSION_MISMATCH", 117,
+   "The library $0 last modified time $1 does not match the expected last "
+   "modified time $2. Run 'refresh functions <db name>'."),
+
+  ("SCRATCH_READ_VERIFY_FAILED", 118, "Error reading $0 bytes from scratch file '$1' "
+   "on backend $2 at offset $3: verification of read data failed."),
+
+  ("CANCELLED_INTERNALLY", 119, "Cancelled in $0"),
+
+  ("SERVER_SHUTTING_DOWN", 120, "Server is being shut down: $0."),
+
+  ("PARQUET_TIMESTAMP_INVALID_TIME_OF_DAY", 121,
+   "Parquet file '$0' column '$1' contains a timestamp with invalid time of day. "
+   "The time of day should be 0 <= and < 24 hour (in nanoseconds)."),
+
+  ("PARQUET_CORRUPT_BOOL_VALUE", 122, "File '$0' is corrupt: error decoding BOOLEAN "
+   "value with encoding $1 at offset $2"),
+
+  ("THREAD_POOL_SUBMIT_FAILED", 123,
+   "Failed to submit $0 to thread pool after waiting $1 seconds"),
+
+  ("THREAD_POOL_TASK_TIMED_OUT", 124,
+   "$0 failed to finish before the $1 second timeout"),
+
+  ("UNREACHABLE_IMPALADS", 125, "Failed due to unreachable impalad(s): $0"),
+
+  ("INACTIVE_SESSION_EXPIRED", 126, "Session expired due to inactivity"),
+
+  ("INACTIVE_QUERY_EXPIRED", 127,
+   "Query $0 expired due to client inactivity (timeout is $1)"),
+
+  ("EXEC_TIME_LIMIT_EXCEEDED", 128, "Query $0 expired due to execution time limit of $1"),
+
+  ("CPU_LIMIT_EXCEEDED", 129, "Query $0 terminated due to CPU limit of $1"),
+
+  ("SCAN_BYTES_LIMIT_EXCEEDED", 130, "Query $0 terminated due to scan bytes limit of $1"),
+
+  ("ROWS_PRODUCED_LIMIT_EXCEEDED", 131,
+   "Query $0 terminated due to rows produced limit of $1. "
+   "Unset or increase NUM_ROWS_PRODUCED_LIMIT query option to produce more rows."),
+
+  ("EXPR_REWRITE_RESULT_LIMIT_EXCEEDED", 132,
+   "Expression rewrite rejected due to result size ($0) exceeding the limit ($1)."),
+
+  ("UNRESPONSIVE_BACKEND", 133,
+   "Query $0 cancelled due to unresponsive backend: $1 has not sent a report in $2ms "
+   "(max allowed lag is $3ms)"),
+
+  ("PARQUET_DATE_OUT_OF_RANGE", 134,
+   "Parquet file '$0' column '$1' contains an out of range date. "
+   "The valid date range is 0001-01-01..9999-12-31."),
+
+  ("DISCONNECTED_SESSION_CLOSED", 135,
+   "Session closed because it has no active connections"),
+
+  ("UNAUTHORIZED_SESSION_USER", 136,
+   "The user authorized on the connection '$0' does not match the session username '$1'"),
+
+  ("ZSTD_ERROR", 137, "$0 failed with error: $1"),
+
+  ("LZ4_BLOCK_DECOMPRESS_DECOMPRESS_SIZE_INCORRECT", 138,
+   "LZ4Block: Decompressed size is not correct."),
+
+  ("LZ4_BLOCK_DECOMPRESS_INVALID_INPUT_LENGTH", 139,
+   "LZ4Block: Invalid input length."),
+
+  ("LZ4_BLOCK_DECOMPRESS_INVALID_COMPRESSED_LENGTH", 140,
+   "LZ4Block: Invalid compressed length.  Data is likely corrupt."),
+
+  ("LZ4_DECOMPRESS_SAFE_FAILED", 141, "LZ4: LZ4_decompress_safe failed"),
+
+  ("LZ4_COMPRESS_DEFAULT_FAILED", 142, "LZ4: LZ4_compress_default failed"),
+
+  ("MAX_STATEMENT_LENGTH_EXCEEDED", 143, "Statement length of $0 bytes exceeds the "
+   "maximum statement length ($1 bytes)"),
+
+  ("AVRO_INVALID_DATE", 144, "Avro file '$0' is corrupt: out of range date value $1 "
+   "at offset $2. The valid date range is -719162..2932896 (0001-01-01..9999-12-31)."),
+
+  ("ORC_TIMESTAMP_OUT_OF_RANGE", 145,
+   "ORC file '$0' column '$1' contains an out of range timestamp. "
+   "The valid date range is 1400-01-01..9999-12-31."),
 )
 
 import sys

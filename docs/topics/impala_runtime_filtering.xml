@@ -82,13 +82,13 @@ under the License.
       </p>
       <ul>
         <li>
-          <p>
-            What a <term>plan fragment</term> is.
-            Impala decomposes each query into smaller units of work that are distributed across the cluster.
-            Wherever possible, a data block is read, filtered, and aggregated by plan fragments executing
-            on the same host. For some operations, such as joins and combining intermediate results into
-            a final result set, data is transmitted across the network from one DataNode to another.
-          </p>
+          <p> What a <term>plan fragment</term> is. Impala decomposes each query
+            into smaller units of work that are distributed across the cluster.
+            Wherever possible, a data block is read, filtered, and aggregated by
+            plan fragments executing on the same host. For some operations, such
+            as joins and combining intermediate results into a final result set,
+            data is transmitted across the network from one Impala daemon to
+            another. </p>
         </li>
         <li>
           <p>
@@ -166,7 +166,7 @@ under the License.
     <conbody>
       <p>
         The <term>filter</term> that is transmitted between plan fragments is essentially a list
-        of values for join key columns. When this list is values is transmitted in time to a scan node,
+        of values for join key columns. When this list of values is transmitted in time to a scan node,
         Impala can filter out non-matching values immediately after reading them, rather than transmitting
         the raw data to another host to compare against the in-memory hash table on that host.
       </p>
@@ -344,18 +344,20 @@ under the License.
       </p>
 
       <p>
-        The following example shows a query that uses a single runtime filter (labelled <codeph>RF00</codeph>)
-        to prune the partitions that are scanned in one stage of the query, based on evaluating the
-        result set of a subquery:
+        The following example shows a query that uses a single runtime filter,
+        labeled <codeph>RF000</codeph>, to prune the partitions based on
+        evaluating the result set of a subquery at runtime:
       </p>
 
 <codeblock conref="../shared/impala_common.xml#common/simple_dpp_example"/>
 
       <p>
-        The query profile (displayed by the <codeph>PROFILE</codeph> command in <cmdname>impala-shell</cmdname>)
-        contains both the <codeph>EXPLAIN</codeph> plan and more detailed information about the internal
-        workings of the query. The profile output includes a section labelled the <q>filter routing table</q>,
-        with information about each filter based on its ID.
+        The query profile (displayed by the <codeph>PROFILE</codeph> command
+        in <cmdname>impala-shell</cmdname>) contains both the
+          <codeph>EXPLAIN</codeph> plan and more detailed information about the
+        internal workings of the query. The profile output includes the
+          <codeph>Filter routing table</codeph> section with information about
+        each filter based on its ID.
       </p>
     </conbody>
   </concept>

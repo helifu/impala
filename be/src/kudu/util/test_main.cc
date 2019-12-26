@@ -15,25 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <cstdlib>
+#include <ostream>
 #include <thread>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/atomicops.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
-#include "kudu/util/pstack_watcher.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/minidump.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/pstack_watcher.h"
 #include "kudu/util/signal.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_util.h"
 
-DEFINE_int32_hidden(test_timeout_after, 0,
+DEFINE_int32(test_timeout_after, 0,
              "Maximum total seconds allowed for all unit tests in the suite. Default: disabled");
 
-DEFINE_int32_hidden(stress_cpu_threads, 0,
+DEFINE_int32(stress_cpu_threads, 0,
              "Number of threads to start that burn CPU in an attempt to "
              "stimulate race conditions");
 

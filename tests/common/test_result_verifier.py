@@ -26,8 +26,7 @@ from tests.util.test_file_parser import (join_section_lines, remove_comments,
     split_section_lines)
 from tests.util.hdfs_util import NAMENODE
 
-logging.basicConfig(level=logging.INFO, format='%(threadName)s: %(message)s')
-LOG = logging.getLogger('test_result_verfier')
+LOG = logging.getLogger('test_result_verifier')
 
 # Special prefix for column values that indicates the actual column value
 # is equal to the expected one if the actual value matches the given regex.
@@ -39,6 +38,13 @@ COLUMN_REGEX_PREFIX = re.compile(COLUMN_REGEX_PREFIX_PATTERN, re.I)
 # is equal to the expected one if the actual value matches the given regex.
 ROW_REGEX_PREFIX_PATTERN = 'row_regex:'
 ROW_REGEX_PREFIX = re.compile(ROW_REGEX_PREFIX_PATTERN, re.I)
+
+# Json keys that are skipped during comparison of two lineage JSON objects.
+# Lineages contain keys like timestamps, query_ids etc that are not expected
+# to match with other lineages. This list maintains the keys that are skipped
+# during comparison.
+DEFAULT_LINEAGE_SKIP_KEYS = ['tableCreateTime', 'queryId', 'timestamp', 'endTime',
+    'user']
 
 # Represents a single test result (row set)
 class QueryTestResult(object):
@@ -63,6 +69,18 @@ class QueryTestResult(object):
   def __str__(self):
     return '\n'.join(['%s' % row for row in self.rows])
 
+  def separate_rows(self):
+    """Returns rows that are literal rows and rows that are not literals (e.g. regex)
+    in two lists."""
+    literal_rows = []
+    non_literal_rows = []
+    for row in self.rows:
+      if row.regex is None:
+        literal_rows.append(row)
+      else:
+        non_literal_rows.append(row)
+    return (literal_rows, non_literal_rows)
+
 
 # Represents a row in a result set
 class ResultRow(object):
@@ -74,34 +92,45 @@ class ResultRow(object):
     self.regex = try_compile_regex(row_string)
 
   def __parse_row(self, row_string, column_types, column_labels):
-    """Parses a row string and build a list of ResultColumn objects"""
+    """Parses a row string (from Beeswax) and build a list of ResultColumn objects"""
     column_values = list()
     if not row_string:
       return column_values
     string_val = None
     current_column = 0
-    for col_val in row_string.split(','):
-      # This is a bit tricky because we need to handle the case where a comma may be in
-      # the middle of a string. We detect this by finding a split that starts with an
-      # opening string character but that doesn't end in a string character. It is
-      # possible for the first character to be a single-quote, so handle that case
-      if (col_val.startswith("'") and not col_val.endswith("'")) or (col_val == "'"):
-        string_val = col_val
-        continue
 
-      if string_val is not None:
-        string_val += ',' + col_val
-        if col_val.endswith("'"):
-          col_val = string_val
-          string_val = None
-        else:
-          continue
+    for i, col_val in enumerate(self.__tokenize_row(row_string)):
       assert current_column < len(column_types),\
           'Number of columns returned > the number of column types: %s' % column_types
-      column_values.append(ResultColumn(col_val, column_types[current_column],
-          column_labels[current_column]))
-      current_column = current_column + 1
+      column_values.append(ResultColumn(col_val, column_types[i], column_labels[i]))
     return column_values
+
+  def __tokenize_row(self, row_string):
+    """Break the comma-separated row up into values. Commas inside single-quoted string
+    values are not treated as value separates. Two single quotes inside a single-quoted
+    string is escaped to a single quote."""
+    col_vals = []
+    in_quotes = False
+    curr_val_chars = []
+    i = 0
+    while i < len(row_string):
+      c = row_string[i]
+      if not in_quotes and c == ",":
+        col_vals.append(''.join(curr_val_chars))
+        curr_val_chars = []
+      else:
+        curr_val_chars.append(c)
+        if c == "'":
+          if in_quotes and i + 1 < len(row_string) and row_string[i + 1] == "'":
+            # Double single-quote escape - combine the two quotes.
+            i += 1
+          else:
+            in_quotes = not in_quotes
+      i += 1
+    assert not in_quotes, "Unclosed quote in row:\n{0}".format(row_string)
+    # Append the last value in the row, which does not have a trailing comma.
+    col_vals.append(''.join(curr_val_chars))
+    return col_vals
 
   def __getitem__(self, key):
     """Allows accessing a column value using the column alias or the position of the
@@ -207,24 +236,42 @@ def assert_args_not_none(*args):
   for arg in args:
     assert arg is not None
 
-def convert_results_to_sets(expected_results, actual_results):
-  assert_args_not_none(expected_results, actual_results)
-  expected_set = set(map(str, expected_results.rows))
-  actual_set = set(map(str, actual_results.rows))
-  return expected_set, actual_set
-
 def verify_query_result_is_subset(expected_results, actual_results):
   """Check whether the results in expected_results are a subset of the results in
   actual_results. This uses set semantics, i.e. any duplicates are ignored."""
-  expected_set, actual_set = convert_results_to_sets(expected_results, actual_results)
-  assert expected_set <= actual_set
+  expected_literals, expected_non_literals = expected_results.separate_rows()
+  expected_literal_strings = set([str(row) for row in expected_literals])
+  actual_literal_strings = set([str(row) for row in actual_results.rows])
+  # Expected literal strings must all be present in the actual strings.
+  assert expected_literal_strings <= actual_literal_strings
+  # Expected patterns must be present in the actual strings.
+  for expected_row in expected_non_literals:
+    matched = False
+    for actual_row in actual_results.rows:
+      if actual_row == expected_row:
+        matched = True
+        break
+    assert matched, "Could not find expected row {0} in actual rows:\n{1}".format(
+        str(expected_row), str(actual_results))
 
 def verify_query_result_is_superset(expected_results, actual_results):
   """Check whether the results in expected_results are a superset of the results in
   actual_results. This uses set semantics, i.e. any duplicates are ignored."""
-  expected_set, actual_set = convert_results_to_sets(expected_results, actual_results)
-  assert expected_set >= actual_set
-
+  expected_literals, expected_non_literals = expected_results.separate_rows()
+  expected_literal_strings = set([str(row) for row in expected_literals])
+  # Check that all actual rows are present in either expected_literal_strings or
+  # expected_non_literals.
+  for actual_row in actual_results.rows:
+    if str(actual_row) in expected_literal_strings:
+      # Matched to a literal string
+      continue
+    matched = False
+    for expected_row in expected_non_literals:
+      if actual_row == expected_row:
+        matched = True
+        break
+    assert matched, "Could not find actual row {0} in expected rows:\n{1}".format(
+        str(actual_row), str(expected_results))
 
 def verify_query_result_is_equal(expected_results, actual_results):
   assert_args_not_none(expected_results, actual_results)
@@ -285,8 +332,10 @@ def apply_error_match_filter(error_list, replace_filenames=True):
     return re.sub(r'Backend \d+:', '', row)
   return [replace_fn(row) for row in error_list]
 
-def verify_raw_results(test_section, exec_result, file_format, update_section=False,
-                       replace_filenames=True, result_section='RESULTS'):
+
+def verify_raw_results(test_section, exec_result, file_format, result_section,
+                       type_section='TYPES', update_section=False,
+                       replace_filenames=True):
   """
   Accepts a raw exec_result object and verifies it matches the expected results,
   including checking the ERRORS, TYPES, and LABELS test sections.
@@ -299,6 +348,9 @@ def verify_raw_results(test_section, exec_result, file_format, update_section=Fa
 
   The result_section parameter can be used to make this function check the results in
   a DML_RESULTS section instead of the regular RESULTS section.
+
+  The 'type_section' parameter can be used to make this function check the types against
+  an alternative section from the default TYPES.
   TODO: separate out the handling of sections like ERRORS from checking of query results
   to allow regular RESULTS/ERRORS sections in tests with DML_RESULTS (IMPALA-4471).
   """
@@ -307,7 +359,7 @@ def verify_raw_results(test_section, exec_result, file_format, update_section=Fa
     expected_results = remove_comments(test_section[result_section])
   else:
     assert 'ERRORS' not in test_section, "'ERRORS' section must have accompanying 'RESULTS' section"
-    LOG.info("No results found. Skipping verification");
+    LOG.info("No results found. Skipping verification")
     return
   if 'ERRORS' in test_section:
     expected_errors = split_section_lines(remove_comments(test_section['ERRORS']))
@@ -321,11 +373,11 @@ def verify_raw_results(test_section, exec_result, file_format, update_section=Fa
       else:
         raise
 
-  if 'TYPES' in test_section:
+  if type_section in test_section:
     # Distinguish between an empty list and a list with an empty string.
-    expected_types = list()
-    if test_section.get('TYPES'):
-      expected_types = [c.strip().upper() for c in test_section['TYPES'].rstrip('\n').split(',')]
+    section = test_section[type_section]
+    expected_types = [c.strip().upper()
+                      for c in remove_comments(section).rstrip('\n').split(',')]
 
     # Avro and Kudu represent TIMESTAMP columns as strings, so tests using TIMESTAMP are
     # skipped because results will be wrong.
@@ -342,7 +394,7 @@ def verify_raw_results(test_section, exec_result, file_format, update_section=Fa
       LOG.info("Skipping type verification of Avro-format table.")
       actual_types = expected_types
     else:
-      actual_types = parse_column_types(exec_result.schema)
+      actual_types = exec_result.column_types
 
     try:
       verify_results(expected_types, actual_types, order_matters=True)
@@ -357,8 +409,8 @@ def verify_raw_results(test_section, exec_result, file_format, update_section=Fa
     actual_types = ['BIGINT']
 
   actual_labels = ['DUMMY_LABEL']
-  if exec_result and exec_result.schema:
-    actual_labels = parse_column_labels(exec_result.schema)
+  if exec_result and exec_result.column_labels:
+    actual_labels = exec_result.column_labels
 
   if 'LABELS' in test_section:
     assert actual_labels is not None
@@ -412,22 +464,11 @@ def contains_order_by(query):
   """Returns true of the query contains an 'order by' clause"""
   return re.search( r'order\s+by\b', query, re.M|re.I) is not None
 
-def parse_column_types(schema):
-  """Enumerates all field schemas and returns a list of column type strings"""
-  return [fs.type.upper() for fs in schema.fieldSchemas]
-
-def parse_column_labels(schema):
-  """Enumerates all field schemas and returns a list of column label strings"""
-  # This is an statement doesn't return a field schema (insert statement).
-  if schema is None or schema.fieldSchemas is None: return list()
-  return [fs.name.upper() for fs in schema.fieldSchemas]
-
 def create_query_result(exec_result, order_matters=False):
   """Creates query result in the test format from the result returned from a query"""
-  col_labels = parse_column_labels(exec_result.schema)
-  col_types = parse_column_types(exec_result.schema)
   data = parse_result_rows(exec_result)
-  return QueryTestResult(data, col_types, col_labels, order_matters)
+  return QueryTestResult(data, exec_result.column_types, exec_result.column_labels,
+                         order_matters)
 
 def parse_result_rows(exec_result):
   """
@@ -438,18 +479,20 @@ def parse_result_rows(exec_result):
     return []
 
   # If the schema is 'None' assume this is an insert statement
-  if exec_result.schema is None:
+  if exec_result.column_labels is None:
     return raw_result
 
   result = list()
-  col_types = parse_column_types(exec_result.schema)
+  col_types = exec_result.column_types or []
   for row in exec_result.data:
     cols = row.split('\t')
     assert len(cols) == len(col_types)
     new_cols = list()
     for i in xrange(len(cols)):
-      if col_types[i] == 'STRING' or col_types[i] == 'CHAR':
+      if col_types[i] in ['STRING', 'CHAR', 'VARCHAR']:
         col = cols[i].encode('unicode_escape')
+        # Escape single quotes to match .test file format.
+        col = col.replace("'", "''")
         new_cols.append("'%s'" % col)
       else:
         new_cols.append(cols[i])
@@ -483,10 +526,18 @@ def compute_aggregation(function, field, runtime_profile):
   """
   Evaluate an aggregation function over a field on the runtime_profile. This skips
   the averaged fragment and returns the aggregate value. It currently supports only
-  integer values and the SUM function.
+  TUnit::UNIT types and the SUM function. It expects the profile to write counters
+  in verbose mode.
   """
   start_avg_fragment_re = re.compile('[ ]*Averaged Fragment')
-  field_regex = "{0}: (\d+)".format(field)
+  # 'field_regex' matches a TUnit::UNIT field from the runtime profile.
+  # For example, it matches the following line if 'field' is 'RowsReturned':
+  # RowsReturned: 2.14M (2142543)
+  #
+  # These lines are printed by 'be/src/util/pretty-printer.h' with verbose=true.
+  # 'field_regex' also captures the accurate value of the field which is the number
+  # in parenthesis. It means we can retrieve this value with 're.findall()'.
+  field_regex = "{0}: \d+(?:\.\d+[KMB])? \((\d+)\)".format(field)
   field_regex_re = re.compile(field_regex)
   inside_avg_fragment = False
   avg_fragment_indent = None
@@ -519,7 +570,8 @@ def compute_aggregation(function, field, runtime_profile):
 
   return result
 
-def verify_runtime_profile(expected, actual):
+
+def verify_runtime_profile(expected, actual, update_section=False):
   """
   Check that lines matching all of the expected runtime profile entries are present
   in the actual text runtime profile. The check passes if, for each of the expected
@@ -559,14 +611,36 @@ def verify_runtime_profile(expected, actual):
       "\nEXPECTED LINES:\n%s\n\nACTUAL PROFILE:\n%s" % ('\n'.join(unmatched_lines),
         actual))
 
+  updated_aggregations = []
   # Compute the aggregations and check against values
   for i in xrange(len(expected_aggregations)):
     if (expected_aggregations[i] is None): continue
     function, field, expected_value = expected_aggregations[i]
     actual_value = compute_aggregation(function, field, actual)
-    assert actual_value == expected_value, ("Aggregation of %s over %s did not match "
-        "expected results.\nEXPECTED VALUE:\n%d\n\nACTUAL VALUE:\n%d"
-        "\n\nPROFILE:\n%s\n" % (function, field, expected_value, actual_value, actual))
+    if update_section:
+      updated_aggregations.append("aggregation(%s, %s): %d"
+                                  % (function, field, actual_value))
+    else:
+        assert actual_value == expected_value, ("Aggregation of %s over %s did not match "
+            "expected results.\nEXPECTED VALUE:\n%d\n\nACTUAL VALUE:\n%d"
+            "\n\nPROFILE:\n%s\n"
+            % (function, field, expected_value, actual_value, actual))
+  return updated_aggregations
+
+
+def verify_lineage(expected, actual, lineage_skip_json_keys=DEFAULT_LINEAGE_SKIP_KEYS):
+  """Compares the lineage JSON objects expected and actual."""
+  def recursive_sort(obj):
+    if isinstance(obj, dict):
+      return sorted((k, recursive_sort(v))
+          for k, v in obj.items() if k not in lineage_skip_json_keys)
+    if isinstance(obj, list):
+      return sorted(recursive_sort(x) for x in obj)
+    return obj
+  sort_expected = recursive_sort(expected)
+  sort_actual = recursive_sort(actual)
+  assert sort_expected == sort_actual,\
+      "Lineage mismatch. EXPECTED:\n%s\n\nACTUAL:\n %s\n" % (sort_expected, sort_actual)
 
 def get_node_exec_options(profile_string, exec_node_id):
   """ Return a list with all of the ExecOption strings for the given exec node id. """

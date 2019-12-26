@@ -30,7 +30,6 @@ import java.util.Scanner;
 
 import org.apache.impala.common.InternalException;
 import org.apache.impala.service.FeSupport;
-import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.log4j.Logger;
 
@@ -96,7 +95,8 @@ public class TestFileParser {
     ERRORS,
     SCANRANGELOCATIONS,
     LINEAGE,
-    QUERYOPTIONS;
+    QUERYOPTIONS,
+    HIVE_MAJOR_VERSION;
 
     // Return header line for this section
     public String getHeader() {

@@ -10,7 +10,7 @@ aggregation(SUM, NumStatsFilteredRowGroups): 4
 set explain_level=2;
 explain select id, bool_col from functional_parquet.alltypessmall where int_col < 0;
 ---- RESULTS: VERIFY_IS_SUBSET
-'   parquet statistics predicates: int_col < 0'
+'   parquet statistics predicates: int_col < CAST(0 AS INT)'
 ====
 ---- QUERY
 select count(*) from functional_parquet.alltypessmall where tinyint_col < 0
@@ -160,7 +160,7 @@ aggregation(SUM, NumStatsFilteredRowGroups): 4
 set explain_level=2;
 explain select count(*) from functional_parquet.alltypessmall where tinyint_col = 10
 ---- RESULTS: VERIFY_IS_SUBSET
-'   parquet statistics predicates: tinyint_col = 10'
+'   parquet statistics predicates: tinyint_col = CAST(10 AS TINYINT)'
 ====
 ---- QUERY
 select count(*) from functional_parquet.alltypessmall where id >= 30 and id <= 80
@@ -376,6 +376,60 @@ aggregation(SUM, NumRowGroups): 4
 aggregation(SUM, NumStatsFilteredRowGroups): 3
 ====
 ---- QUERY
+select count(*) from functional_parquet.date_tbl
+where date_part in ("2017-11-27", "1399-06-27") and date_col < '0001-06-21';
+---- RESULTS
+0
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 2
+====
+---- QUERY
+select count(*) from functional_parquet.date_tbl
+where date_part in ("2017-11-27", "1399-06-27") and date_col <= '0001-06-21';
+---- RESULTS
+1
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
+select count(*) from functional_parquet.date_tbl
+where date_part in ("2017-11-27", "1399-06-27") and date_col = '0001-06-21';
+---- RESULTS
+1
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
+select count(*) from functional_parquet.date_tbl
+where date_part in ("2017-11-27", "1399-06-27") and date_col > '2018-12-31';
+---- RESULTS
+0
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 2
+====
+---- QUERY
+select count(*) from functional_parquet.date_tbl
+where date_part in ("2017-11-27", "1399-06-27") and date_col >= '2018-12-31';
+---- RESULTS
+1
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
+select count(*) from functional_parquet.date_tbl
+where date_part in ("2017-11-27", "1399-06-27") and date_col = '2018-12-31';
+---- RESULTS
+1
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
 select count(*) from functional_parquet.decimal_tbl where d1 < 1234
 ---- RESULTS
 0
@@ -457,4 +511,173 @@ select count(*) from functional_parquet.alltypes where id < 0;
 ---- RUNTIME_PROFILE
 aggregation(SUM, NumRowGroups): 24
 aggregation(SUM, NumStatsFilteredRowGroups): 0
+====
+---- QUERY
+# Check that all the row groups are skipped using null_count stat
+create table table_for_null_count_test (i int, j int) stored as parquet;
+insert into table_for_null_count_test values (1, NULL), (2, NULL), (3, NULL);
+select count(*) from table_for_null_count_test where j < 3;
+---- RESULTS
+0
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 1
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
+# Insert another row group where not all the 'j' values are NULL
+insert into table_for_null_count_test values (4, 1), (5, NULL);
+select i from table_for_null_count_test where j < 3;
+---- RESULTS
+4
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 2
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
+# Turning off parquet stats and verifying that no row groups are skipped
+set PARQUET_READ_STATISTICS=0;
+create table table_for_null_count_test2 (i int, j int) stored as parquet;
+insert into table_for_null_count_test2 values (1, NULL), (2, NULL), (3, NULL);
+select count(*) from table_for_null_count_test2 where j < 3;
+---- RESULTS
+0
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 1
+aggregation(SUM, NumStatsFilteredRowGroups): 0
+====
+---- QUERY
+# IMPALA-6527: NaN values lead to incorrect filtering.
+# When the first value is NaN in a column chunk, Impala chose it as min_value and
+# max_value for statistics. Test if it is no longer the case.
+create table test_nan(val double) stored as parquet;
+insert into test_nan values (cast('NaN' as double)), (42);
+select * from test_nan where val > 0
+---- RESULTS
+42
+====
+---- QUERY
+# IMPALA-6527: NaN values lead to incorrect filtering
+# Test if '<' predicate produces expected results as well.
+select * from test_nan where val < 100
+---- RESULTS
+42
+====
+---- QUERY
+# IMPALA-6527: NaN values lead to incorrect filtering
+# Test if valid statistics are written. The column chunk should be filtered out by
+# the min filter.
+select * from test_nan where val < 10
+---- RESULTS
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 1
+aggregation(SUM, NumStatsFilteredRowGroups): 1
+====
+---- QUERY
+# IMPALA-6527: NaN values lead to incorrect filtering
+# Test predicate that is true for NaN.
+select * from test_nan where not val >= 0
+---- RESULTS
+NaN
+====
+---- QUERY
+# IMPALA-6527: NaN values lead to incorrect filtering
+# Test predicate that is true for NaN.
+select * from test_nan where val != 0
+---- RESULTS
+NaN
+42
+====
+---- QUERY
+# Statistics filtering must not filter out row groups if predicate can be true for NaN.
+create table test_nan_true_predicate(val double) stored as parquet;
+insert into test_nan_true_predicate values (10), (20), (cast('NaN' as double));
+select * from test_nan_true_predicate where not val >= 0
+---- RESULTS
+NaN
+====
+---- QUERY
+# NaN is the last element, predicate is true for NaN and value.
+select * from test_nan_true_predicate where not val >= 20
+---- RESULTS
+10
+NaN
+====
+---- QUERY
+# NaN is the last element, predicate is true for NaN and value.
+select * from test_nan_true_predicate where val != 10
+---- RESULTS
+20
+NaN
+====
+---- QUERY
+# Test the case when NaN is inserted between two values.
+# Test predicate true for NaN and false for the values.
+create table test_nan_in_the_middle(val double) stored as parquet;
+insert into test_nan_in_the_middle values (10), (cast('NaN' as double)), (20);
+select * from test_nan_in_the_middle where not val >= 0
+---- RESULTS
+NaN
+====
+---- QUERY
+# NaN in the middle, predicate true for NaN and value.
+select * from test_nan_in_the_middle where not val >= 20
+---- RESULTS
+10
+NaN
+====
+---- QUERY
+# NaN in the middle, '!=' should return NaN and value.
+select * from test_nan_in_the_middle where val != 10
+---- RESULTS
+NaN
+20
+====
+---- QUERY
+# Test the case when there are only NaNs in the column chunk.
+# Test predicate true for NaN
+create table test_nan_only(val double) stored as parquet;
+insert into test_nan_only values (cast('NaN' as double)), (cast('NaN' as double)),
+    (cast('NaN' as double));
+select * from test_nan_only where not val >= 0
+---- RESULTS
+NaN
+NaN
+NaN
+====
+---- QUERY
+# There are only NaN values, predicate is false for NaN
+select * from test_nan_only where val >= 20
+---- RESULTS
+====
+---- QUERY
+# Test the case when a number is following multiple NaNs.
+# Test predicate true for NaN, false for the inserted number
+create table test_multiple_nans(val double) stored as parquet;
+insert into test_multiple_nans values (cast('NaN' as double)), (cast('NaN' as double)),
+    (cast('NaN' as double)), (20);
+select * from test_multiple_nans where not val >= 0
+---- RESULTS
+NaN
+NaN
+NaN
+====
+---- QUERY
+# Multiple NaNs followed by a number, predicate is false for NaN and true for the number
+select * from test_multiple_nans where val >= 20
+---- RESULTS
+20
+====
+---- QUERY
+# Multiple NaNs followed by a number, predicate is true for NaN and true for the number
+select * from test_multiple_nans where not val > 20
+---- RESULTS
+NaN
+NaN
+NaN
+20
+====
+---- QUERY
+# Multiple NaNs followed by a number, predicate is false for NaN and false for the number
+select * from test_multiple_nans where val > 20
+---- RESULTS
 ====

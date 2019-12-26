@@ -20,11 +20,14 @@
 #include <stdio.h>
 #include <signal.h>
 #include <boost/algorithm/string.hpp>
-#include <boost/thread/thread.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int.hpp>
 #include <boost/filesystem.hpp>
+#include <gutil/casts.h>
+#include <gutil/strings/escaping.h>
+#include <gutil/strings/split.h>
+#include <gutil/strings/strip.h>
 #include <gutil/strings/substitute.h>
 #include <random>
 #include <string>
@@ -38,17 +41,20 @@
 
 #include "exec/kudu-util.h"
 #include "kudu/rpc/sasl_common.h"
+#include "kudu/security/gssapi.h"
 #include "kudu/security/init.h"
 #include "rpc/auth-provider.h"
+#include "rpc/cookie-util.h"
 #include "rpc/thrift-server.h"
+#include "transport/THttpServer.h"
 #include "transport/TSaslClientTransport.h"
 #include "util/auth-util.h"
+#include "util/coding-util.h"
 #include "util/debug-util.h"
 #include "util/error-util.h"
 #include "util/network-util.h"
 #include "util/os-util.h"
 #include "util/promise.h"
-#include "util/thread.h"
 #include "util/time.h"
 
 #include <sys/types.h>    // for stat system call
@@ -64,19 +70,21 @@ using boost::algorithm::trim;
 using boost::mt19937;
 using boost::uniform_int;
 using namespace apache::thrift;
-using namespace boost::filesystem;   // for is_regular()
+using namespace apache::thrift::transport;
+using namespace boost::filesystem;   // for is_regular(), is_absolute()
 using namespace strings;
 
 DECLARE_string(keytab_file);
 DECLARE_string(principal);
 DECLARE_string(be_principal);
+DECLARE_string(krb5_ccname);
 DECLARE_string(krb5_conf);
 DECLARE_string(krb5_debug_file);
 
-// TODO: Remove this flag in a compatibility-breaking release. (IMPALA-5893)
-DEFINE_int32(kerberos_reinit_interval, 60,
-    "Interval, in minutes, between kerberos ticket renewals. "
-    "Only used when FLAGS_use_krpc is false");
+// Defined in kudu/security/init.cc
+DECLARE_bool(use_system_auth_to_local);
+
+DECLARE_int64(max_cookie_lifetime_s);
 
 DEFINE_string(sasl_path, "", "Colon separated list of paths to look for SASL "
     "security library plugins.");
@@ -107,12 +115,6 @@ DEFINE_string(internal_principals_whitelist, "hdfs", "(Advanced) Comma-separated
     "'hdfs' which is the system user that in certain deployments must access "
     "catalog server APIs.");
 
-// TODO: Remove this flag and the old kerberos code in a compatibility-breaking release.
-// (IMPALA-5893)
-DEFINE_bool(use_kudu_kinit, true, "If true, Impala will programatically perform kinit "
-    "by calling into the libkrb5 library using the provided APIs. If false, it will fork "
-    "off a kinit process.");
-
 namespace impala {
 
 // Sasl callbacks.  Why are these here?  Well, Sasl isn't that bright, and
@@ -135,10 +137,6 @@ static vector<sasl_callback_t> LDAP_EXT_CALLBACKS;  // External LDAP connections
 // This is initialized the first time InitAuth() is called. Future call must pass
 // the same 'appname' or InitAuth() will fail.
 static string APP_NAME;
-
-// Path to the file based credential cache that we pass to the KRB5CCNAME environment
-// variable.
-static const string KRB5CCNAME_PATH = "/tmp/krb5cc_impala_internal";
 
 // Constants for the two Sasl mechanisms we support
 static const string KERBEROS_MECHANISM = "GSSAPI";
@@ -205,18 +203,14 @@ static int SaslLogCallback(void* context, int level, const char* message) {
 // Use --ldap_ca_certificate to specify the location of the certificate used to confirm
 // the authenticity of the LDAP server certificate.
 //
-// conn: The Sasl connection struct, which we ignore
-// context: Ignored; always NULL
 // user: The username to authenticate
 // pass: The password to use
 // passlen: The length of pass
-// propctx: Ignored - properties requested
-// Return: SASL_OK on success, SASL_FAIL otherwise
-int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
-    const char* pass, unsigned passlen, struct propctx* propctx) {
+// Return: true on success, false otherwise
+static bool LdapCheckPass(const char* user, const char* pass, unsigned passlen) {
   if (passlen == 0 && !FLAGS_ldap_allow_anonymous_binds) {
     // Disable anonymous binds.
-    return SASL_FAIL;
+    return false;
   }
 
   LDAP* ld;
@@ -224,7 +218,7 @@ int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
   if (rc != LDAP_SUCCESS) {
     LOG(WARNING) << "Could not initialize connection with LDAP server ("
                  << FLAGS_ldap_uri << "). Error: " << ldap_err2string(rc);
-    return SASL_FAIL;
+    return false;
   }
 
   // Force the LDAP version to 3 to make sure TLS is supported.
@@ -240,7 +234,7 @@ int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
       LOG(WARNING) << "Could not start TLS secure connection to LDAP server ("
                    << FLAGS_ldap_uri << "). Error: " << ldap_err2string(tls_rc);
       ldap_unbind_ext(ld, NULL, NULL);
-      return SASL_FAIL;
+      return false;
     }
     VLOG(2) << "Started TLS connection with LDAP server: " << FLAGS_ldap_uri;
   }
@@ -273,12 +267,27 @@ int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
   if (rc != LDAP_SUCCESS) {
     LOG(WARNING) << "LDAP authentication failure for " << user_str
                  << " : " << ldap_err2string(rc);
-    return SASL_FAIL;
+    return false;
   }
 
   VLOG_QUERY << "LDAP bind successful";
 
-  return SASL_OK;
+  return true;
+}
+
+// Wrapper around the function we use to check passwords with LDAP which converts the
+// return value to something appropriate for SASL.
+//
+// conn: The Sasl connection struct, which we ignore
+// context: Ignored; always NULL
+// user: The username to authenticate
+// pass: The password to use
+// passlen: The length of pass
+// propctx: Ignored - properties requested
+// Return: SASL_OK on success, SASL_FAIL otherwise
+int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
+    const char* pass, unsigned passlen, struct propctx* propctx) {
+  return LdapCheckPass(user, pass, passlen) ? SASL_OK : SASL_FAIL;
 }
 
 // Sasl wants a way to ask us about some options, this function provides
@@ -422,14 +431,14 @@ int SaslAuthorizeInternal(sasl_conn_t* conn, void* context,
               << "<service>/<hostname>@<realm> - got: " << requested_user;
     return SASL_BADAUTH;
   }
-  SaslAuthProvider* internal_auth_provider;
+  SecureAuthProvider* internal_auth_provider;
   if (context == NULL) {
-    internal_auth_provider = static_cast<SaslAuthProvider*>(
+    internal_auth_provider = static_cast<SecureAuthProvider*>(
         AuthManager::GetInstance()->GetInternalAuthProvider());
   } else {
     // Branch should only be taken for testing, where context is used to inject an auth
     // provider.
-    internal_auth_provider = static_cast<SaslAuthProvider*>(context);
+    internal_auth_provider = static_cast<SecureAuthProvider*>(context);
   }
 
   vector<string> whitelist;
@@ -494,49 +503,136 @@ static int SaslGetPath(void* context, const char** path) {
   return SASL_OK;
 }
 
-// When operating as a Kerberos client (internal connections only), we need to
-// 'kinit' as the principal.  A thread is created and calls this function for
-// that purpose, and to periodically renew the ticket as well.
-//
-// first_kinit: Used to communicate success/failure of the initial kinit call to
-//              the parent thread
-// Return: Only if the first call to 'kinit' fails
-void SaslAuthProvider::RunKinit(Promise<Status>* first_kinit) {
-
-  // Pass the path to the key file and the principal.
-  const string kinit_cmd = Substitute("kinit -k -t $0 $1 2>&1",
-      keytab_file_, principal_);
-
-  bool first_time = true;
-  std::random_device rd;
-  mt19937 generator(rd());
-  uniform_int<> dist(0, 300);
-
-  while (true) {
-    LOG(INFO) << "Registering " << principal_ << ", keytab file " << keytab_file_;
-    string kinit_output;
-    bool success = RunShellProcess(kinit_cmd, &kinit_output);
-
-    if (!success) {
-      const string& err_msg = Substitute(
-          "Failed to obtain Kerberos ticket for principal: $0. $1", principal_,
-          kinit_output);
-      if (first_time) {
-        first_kinit->Set(Status(err_msg));
-        return;
-      } else {
-        LOG(ERROR) << err_msg;
-      }
-    } else if (first_time) {
-      first_time = false;
-      first_kinit->Set(Status::OK());
-    }
-
-    // Sleep for the renewal interval, minus a random time between 0-5 minutes to help
-    // avoid a storm at the KDC. Additionally, never sleep less than a minute to
-    // reduce KDC stress due to frequent renewals.
-    SleepForMs(1000 * max((60 * FLAGS_kerberos_reinit_interval) - dist(generator), 60));
+bool CookieAuth(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash, const std::string& cookie_header) {
+  string username;
+  Status cookie_status = AuthenticateCookie(hash, cookie_header, &username);
+  if (cookie_status.ok()) {
+    connection_context->username = username;
+    return true;
   }
+
+  LOG(INFO) << "Invalid cookie provided: " << cookie_header
+            << " from: " << TNetworkAddressToString(connection_context->network_address)
+            << ": " << cookie_status.GetDetail();
+  connection_context->return_headers.push_back(
+      Substitute("Set-Cookie: $0", GetDeleteCookie()));
+  return false;
+}
+
+bool BasicAuth(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash, const std::string& base64) {
+  if (base64.empty()) {
+    connection_context->return_headers.push_back("WWW-Authenticate: Basic");
+    return false;
+  }
+  string decoded;
+  if (!Base64Unescape(base64, &decoded)) {
+    LOG(ERROR) << "Failed to decode base64 auth string from: "
+               << TNetworkAddressToString(connection_context->network_address);
+    connection_context->return_headers.push_back("WWW-Authenticate: Basic");
+    return false;
+  }
+  std::size_t colon = decoded.find(':');
+  if (colon == std::string::npos) {
+    LOG(ERROR) << "Auth string must be in the form '<username>:<password>' from: "
+               << TNetworkAddressToString(connection_context->network_address);
+    connection_context->return_headers.push_back("WWW-Authenticate: Basic");
+    return false;
+  }
+  string username = decoded.substr(0, colon);
+  string password = decoded.substr(colon + 1);
+  bool ret = LdapCheckPass(username.c_str(), password.c_str(), password.length());
+  if (ret) {
+    // Authenication was successful, so set the username on the connection.
+    connection_context->username = username;
+    // Create a cookie to return.
+    connection_context->return_headers.push_back(
+        Substitute("Set-Cookie: $0", GenerateCookie(username, hash)));
+    return true;
+  }
+  connection_context->return_headers.push_back("WWW-Authenticate: Basic");
+  return false;
+}
+
+// Performs a step of SPNEGO auth for the HTTP transport and sets the username on
+// 'connection_context' if auth is successful. 'header_token' is the value from an
+// 'Authorization: Negotiate" header. Returns true if the step was successful and sets
+// 'is_complete' to indicate if more steps are needed. Returns false if an error was
+// encountered and the connection should be closed.
+bool NegotiateAuth(ThriftServer::ConnectionContext* connection_context,
+    const AuthenticationHash& hash, const std::string& header_token, bool* is_complete) {
+  if (header_token.empty()) {
+    connection_context->return_headers.push_back("WWW-Authenticate: Negotiate");
+    *is_complete = false;
+    return false;
+  }
+  std::string token;
+  // Note: according to RFC 2616, the correct format for the header is:
+  // 'Authorization: Negotiate <token>'. However, beeline incorrectly adds an additional
+  // ':', i.e. 'Authorization: Negotiate: <token>'. We handle that here.
+  TryStripPrefixString(header_token, ": ", &token);
+  string resp_token;
+  string username;
+  kudu::Status spnego_status =
+      kudu::gssapi::SpnegoStep(token, &resp_token, is_complete, &username);
+  if (spnego_status.ok()) {
+    if (!resp_token.empty()) {
+      string resp_header = Substitute("WWW-Authenticate: Negotiate $0", resp_token);
+      connection_context->return_headers.push_back(resp_header);
+    }
+    if (*is_complete) {
+      if (username.empty()) {
+        spnego_status = kudu::Status::RuntimeError(
+            "SPNEGO indicated complete, but got empty principal");
+        // Crash in debug builds, but fall through to treating as an error in release.
+        LOG(DFATAL) << "Got no authenticated principal for SPNEGO-authenticated "
+                    << " connection from "
+                    << TNetworkAddressToString(connection_context->network_address)
+                    << ": " << spnego_status.ToString();
+      } else {
+        // Authentication was successful, so set the username on the connection.
+        connection_context->username = username;
+        // Create a cookie to return.
+        connection_context->return_headers.push_back(
+            Substitute("Set-Cookie: $0", GenerateCookie(username, hash)));
+      }
+    }
+  } else {
+    LOG(WARNING) << "Failed to authenticate request from "
+                 << TNetworkAddressToString(connection_context->network_address)
+                 << " via SPNEGO: " << spnego_status.ToString();
+  }
+  return spnego_status.ok();
+}
+
+vector<string> ReturnHeaders(ThriftServer::ConnectionContext* connection_context) {
+  return std::move(connection_context->return_headers);
+}
+
+// Takes the path component of an HTTP request and parses it. For now, we only care about
+// the 'doAs' parameter.
+bool HttpPathFn(ThriftServer::ConnectionContext* connection_context, const string& path,
+    string* err_msg) {
+  // 'path' should be of the form '/.*[?<key=value>[&<key=value>...]]'
+  vector<string> split = Split(path, delimiter::Limit("?", 1));
+  if (split.size() == 2) {
+    for (auto pair : Split(split[1], "&")) {
+      vector<string> key_value = Split(pair, delimiter::Limit("=", 1));
+      if (key_value.size() == 2 && key_value[0] == "doAs") {
+        string decoded;
+        if (!UrlDecode(key_value[1], &decoded)) {
+          *err_msg = Substitute(
+              "Could not decode 'doAs' parameter from HTTP request with path: $0", path);
+          return false;
+        } else {
+          connection_context->do_as_user = decoded;
+        }
+        break;
+      }
+    }
+  }
+  return true;
 }
 
 namespace {
@@ -716,9 +812,8 @@ Status CheckReplayCacheDirPermissions() {
   return Status::OK();
 }
 
-Status SaslAuthProvider::InitKerberos(const string& principal,
-    const string& keytab_file) {
-
+Status SecureAuthProvider::InitKerberos(
+    const string& principal, const string& keytab_file) {
   principal_ = principal;
   keytab_file_ = keytab_file;
   // The logic here is that needs_kinit_ is false unless we are the internal
@@ -790,7 +885,12 @@ Status AuthManager::InitKerberosEnv() {
   // is normally fine, but if you're not running impala daemons as user
   // 'impala', the kinit we perform is going to blow away credentials for the
   // current user.  Not setting this isn't technically fatal, so ignore errors.
-  (void) setenv("KRB5CCNAME", "/tmp/krb5cc_impala_internal", 1);
+  const path krb5_ccname_path(FLAGS_krb5_ccname);
+  if (!krb5_ccname_path.is_absolute()) {
+    return Status(Substitute("Bad --krb5_ccname value: $0 is not an absolute file path",
+        FLAGS_krb5_ccname));
+  }
+  discard_result(setenv("KRB5CCNAME", FLAGS_krb5_ccname.c_str(), 1));
 
   // If an alternate krb5_conf location is supplied, set both KRB5_CONFIG and
   // JAVA_TOOL_OPTIONS in the environment.
@@ -832,29 +932,20 @@ Status AuthManager::InitKerberosEnv() {
                 << FLAGS_krb5_debug_file;
     }
   }
-
   return Status::OK();
 }
 
-Status SaslAuthProvider::Start() {
+Status SecureAuthProvider::Start() {
   // True for kerberos internal use
   if (needs_kinit_) {
     DCHECK(is_internal_);
     DCHECK(!principal_.empty());
-    if (FLAGS_use_kudu_kinit) {
-      // Starts a thread that periodically does a 'kinit'. The thread lives as long as the
-      // process does.
-      KUDU_RETURN_IF_ERROR(kudu::security::InitKerberosForServer(principal_, keytab_file_,
-          KRB5CCNAME_PATH, false), "Could not init kerberos");
-    } else {
-      Promise<Status> first_kinit;
-      stringstream thread_name;
-      thread_name << "kinit-" << principal_;
-      RETURN_IF_ERROR(Thread::Create("authentication", thread_name.str(),
-          &SaslAuthProvider::RunKinit, this, &first_kinit, &kinit_thread_));
-      LOG(INFO) << "Waiting for Kerberos ticket for principal: " << principal_;
-      RETURN_IF_ERROR(first_kinit.Get());
-    }
+    // IMPALA-8154: Disable any Kerberos auth_to_local mappings.
+    FLAGS_use_system_auth_to_local = false;
+    // Starts a thread that periodically does a 'kinit'. The thread lives as long as the
+    // process does.
+    KUDU_RETURN_IF_ERROR(kudu::security::InitKerberosForServer(principal_, keytab_file_,
+        FLAGS_krb5_ccname, false), "Could not init kerberos");
     LOG(INFO) << "Kerberos ticket granted to " << principal_;
   }
 
@@ -887,10 +978,20 @@ Status SaslAuthProvider::Start() {
   return Status::OK();
 }
 
-Status SaslAuthProvider::GetServerTransportFactory(
-    boost::shared_ptr<TTransportFactory>* factory) {
+Status SecureAuthProvider::GetServerTransportFactory(
+    ThriftServer::TransportType underlying_transport_type, const std::string& server_name,
+    MetricGroup* metrics, boost::shared_ptr<TTransportFactory>* factory) {
   DCHECK(!principal_.empty() || has_ldap_);
 
+  if (underlying_transport_type == ThriftServer::HTTP) {
+    bool has_kerberos = !principal_.empty();
+    bool use_cookies = FLAGS_max_cookie_lifetime_s > 0;
+    factory->reset(new THttpServerTransportFactory(
+        server_name, metrics, has_ldap_, has_kerberos, use_cookies));
+    return Status::OK();
+  }
+
+  DCHECK(underlying_transport_type == ThriftServer::BINARY);
   // This is the heart of the link between this file and thrift.  Here we
   // associate a Sasl mechanism with our callbacks.
   try {
@@ -925,10 +1026,9 @@ Status SaslAuthProvider::GetServerTransportFactory(
   return Status::OK();
 }
 
-Status SaslAuthProvider::WrapClientTransport(const string& hostname,
+Status SecureAuthProvider::WrapClientTransport(const string& hostname,
     boost::shared_ptr<TTransport> raw_transport, const string& service_name,
     boost::shared_ptr<TTransport>* wrapped_transport) {
-
   boost::shared_ptr<sasl::TSasl> sasl_client;
   const map<string, string> props; // Empty; unused by thrift
   const string auth_id; // Empty; unused by thrift
@@ -956,10 +1056,65 @@ Status SaslAuthProvider::WrapClientTransport(const string& hostname,
   return Status::OK();
 }
 
+void SecureAuthProvider::SetupConnectionContext(
+    const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+    ThriftServer::TransportType underlying_transport_type, TTransport* input_transport,
+    TTransport* output_transport) {
+  TSocket* socket = nullptr;
+  switch (underlying_transport_type) {
+    case ThriftServer::BINARY: {
+      TBufferedTransport* buffered_transport =
+          down_cast<TBufferedTransport*>(input_transport);
+      TSaslServerTransport* sasl_transport = down_cast<TSaslServerTransport*>(
+          buffered_transport->getUnderlyingTransport().get());
+      socket = down_cast<TSocket*>(sasl_transport->getUnderlyingTransport().get());
+      // Get the username from the transport.
+      connection_ptr->username = sasl_transport->getUsername();
+      break;
+    }
+    case ThriftServer::HTTP: {
+      THttpServer* http_input_transport = down_cast<THttpServer*>(input_transport);
+      THttpServer* http_output_transport = down_cast<THttpServer*>(output_transport);
+      THttpServer::HttpCallbacks callbacks;
+      callbacks.path_fn = std::bind(
+          HttpPathFn, connection_ptr.get(), std::placeholders::_1, std::placeholders::_2);
+      callbacks.return_headers_fn = std::bind(ReturnHeaders, connection_ptr.get());
+      callbacks.cookie_auth_fn =
+          std::bind(CookieAuth, connection_ptr.get(), hash_, std::placeholders::_1);
+      if (has_ldap_) {
+        callbacks.basic_auth_fn =
+            std::bind(BasicAuth, connection_ptr.get(), hash_, std::placeholders::_1);
+      }
+      if (!principal_.empty()) {
+        callbacks.negotiate_auth_fn = std::bind(NegotiateAuth, connection_ptr.get(),
+            hash_, std::placeholders::_1, std::placeholders::_2);
+      }
+      http_input_transport->setCallbacks(callbacks);
+      http_output_transport->setCallbacks(callbacks);
+      socket = down_cast<TSocket*>(http_input_transport->getUnderlyingTransport().get());
+      break;
+    }
+    default:
+      LOG(FATAL) << Substitute("Bad transport type: $0", underlying_transport_type);
+  }
+  connection_ptr->network_address =
+      MakeNetworkAddress(socket->getPeerAddress(), socket->getPeerPort());
+}
+
 Status NoAuthProvider::GetServerTransportFactory(
-    boost::shared_ptr<TTransportFactory>* factory) {
+    ThriftServer::TransportType underlying_transport_type, const std::string& server_name,
+    MetricGroup* metrics, boost::shared_ptr<TTransportFactory>* factory) {
   // No Sasl - yawn.  Here, have a regular old buffered transport.
-  factory->reset(new ThriftServer::BufferedTransportFactory());
+  switch (underlying_transport_type) {
+    case ThriftServer::BINARY:
+      factory->reset(new ThriftServer::BufferedTransportFactory());
+      break;
+    case ThriftServer::HTTP:
+      factory->reset(new THttpServerTransportFactory());
+      break;
+    default:
+      LOG(FATAL) << Substitute("Bad transport type: $0", underlying_transport_type);
+  }
   return Status::OK();
 }
 
@@ -971,8 +1126,42 @@ Status NoAuthProvider::WrapClientTransport(const string& hostname,
   return Status::OK();
 }
 
+void NoAuthProvider::SetupConnectionContext(
+    const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+    ThriftServer::TransportType underlying_transport_type, TTransport* input_transport,
+    TTransport* output_transport) {
+  connection_ptr->username = "";
+  TSocket* socket = nullptr;
+  switch (underlying_transport_type) {
+    case ThriftServer::BINARY: {
+      TBufferedTransport* buffered_transport =
+          down_cast<TBufferedTransport*>(input_transport);
+      socket = down_cast<TSocket*>(buffered_transport->getUnderlyingTransport().get());
+      break;
+    }
+    case ThriftServer::HTTP: {
+      THttpServer* http_input_transport = down_cast<THttpServer*>(input_transport);
+      THttpServer* http_output_transport = down_cast<THttpServer*>(input_transport);
+      THttpServer::HttpCallbacks callbacks;
+      // Even though there's no security, we set up some callbacks, eg. to allow
+      // impersonation over unsecured connections for testing purposes.
+      callbacks.path_fn = std::bind(
+          HttpPathFn, connection_ptr.get(), std::placeholders::_1, std::placeholders::_2);
+      callbacks.return_headers_fn = std::bind(ReturnHeaders, connection_ptr.get());
+      http_input_transport->setCallbacks(callbacks);
+      http_output_transport->setCallbacks(callbacks);
+      socket = down_cast<TSocket*>(http_input_transport->getUnderlyingTransport().get());
+      break;
+    }
+    default:
+      LOG(FATAL) << Substitute("Bad transport type: $0", underlying_transport_type);
+  }
+  connection_ptr->network_address =
+      MakeNetworkAddress(socket->getPeerAddress(), socket->getPeerPort());
+}
+
 Status AuthManager::Init() {
-  ssl_socket_factory_.reset(new TSSLSocketFactory());
+  ssl_socket_factory_.reset(new TSSLSocketFactory(TLSv1_0));
 
   bool use_ldap = false;
   const string excl_msg = "--$0 and --$1 are mutually exclusive "
@@ -1068,8 +1257,8 @@ Status AuthManager::Init() {
   // the client side, this is just a check for the "back end" kerberos
   // principal.
   if (use_kerberos) {
-    SaslAuthProvider* sap = NULL;
-    internal_auth_provider_.reset(sap = new SaslAuthProvider(true));
+    SecureAuthProvider* sap = NULL;
+    internal_auth_provider_.reset(sap = new SecureAuthProvider(true));
     RETURN_IF_ERROR(sap->InitKerberos(kerberos_internal_principal,
         FLAGS_keytab_file));
     LOG(INFO) << "Internal communication is authenticated with Kerberos";
@@ -1080,11 +1269,11 @@ Status AuthManager::Init() {
   RETURN_IF_ERROR(internal_auth_provider_->Start());
 
   // Set up the external auth provider as per above.  Either a "front end"
-  // principal or ldap tells us to use a SaslAuthProvider, and we fill in
+  // principal or ldap tells us to use a SecureAuthProvider, and we fill in
   // details from there.
   if (use_ldap || use_kerberos) {
-    SaslAuthProvider* sap = NULL;
-    external_auth_provider_.reset(sap = new SaslAuthProvider(false));
+    SecureAuthProvider* sap = NULL;
+    external_auth_provider_.reset(sap = new SecureAuthProvider(false));
     if (use_kerberos) {
       RETURN_IF_ERROR(sap->InitKerberos(kerberos_external_principal,
           FLAGS_keytab_file));

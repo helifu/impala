@@ -20,6 +20,8 @@
 
 #include "gen-cpp/data_stream_service.service.h"
 
+#include "common/status.h"
+
 namespace kudu {
 namespace rpc {
 class RpcContext;
@@ -28,16 +30,28 @@ class RpcContext;
 
 namespace impala {
 
-class RpcMgr;
+class DataStreamServiceProxy;
+class MemTracker;
+class MetricGroup;
 
 /// This is singleton class which provides data transmission services between fragment
 /// instances. The client for this service is implemented in KrpcDataStreamSender.
 /// The processing of incoming requests is implemented in KrpcDataStreamRecvr.
 /// KrpcDataStreamMgr is responsible for routing the incoming requests to the
-/// appropriate receivers.
+/// appropriate receivers. Metrics exposed by the service will be added to 'metric_group'.
 class DataStreamService : public DataStreamServiceIf {
  public:
-  DataStreamService(RpcMgr* rpc_mgr);
+  DataStreamService(MetricGroup* metric_group);
+
+  /// Initializes the service by registering it with the singleton RPC manager.
+  /// This mustn't be called until RPC manager has been initialized.
+  Status Init();
+
+  /// Returns true iff the 'remote_user' in 'context' is authorized to access
+  /// DataStreamService. On denied access, the RPC is replied to with an error message.
+  /// Authorization is enforced only when Kerberos is enabled.
+  virtual bool Authorize(const google::protobuf::Message* req,
+      google::protobuf::Message* resp, kudu::rpc::RpcContext* context);
 
   /// Notifies the receiver to close the data stream specified in 'request'.
   /// The receiver replies to the client with a status serialized in 'response'.
@@ -48,6 +62,28 @@ class DataStreamService : public DataStreamServiceIf {
   /// The receiver replies to the client with a status serialized in 'response'.
   virtual void TransmitData(const TransmitDataRequestPB* request,
       TransmitDataResponsePB* response, kudu::rpc::RpcContext* context);
+
+  /// Respond to a RPC passed in 'response'/'ctx' with 'status' and release
+  /// the payload memory from 'mem_tracker'. Takes ownership of 'ctx'.
+  template<typename ResponsePBType>
+  static void RespondAndReleaseRpc(const Status& status, ResponsePBType* response,
+      kudu::rpc::RpcContext* ctx, MemTracker* mem_tracker);
+
+  /// Respond to a RPC passed in 'response'/'ctx' with 'status'. Takes ownership of 'ctx'.
+  template<typename ResponsePBType>
+  static void RespondRpc(const Status& status, ResponsePBType* response,
+      kudu::rpc::RpcContext* ctx);
+
+  MemTracker* mem_tracker() { return mem_tracker_.get(); }
+
+  /// Gets a DataStreamService proxy to a server with 'address' and 'hostname'.
+  /// The newly created proxy is returned in 'proxy'. Returns error status on failure.
+  static Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+      std::unique_ptr<DataStreamServiceProxy>* proxy);
+
+ private:
+  /// Tracks the memory usage of the payloads in the service queue.
+  std::unique_ptr<MemTracker> mem_tracker_;
 };
 
 } // namespace impala

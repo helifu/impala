@@ -17,6 +17,9 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +28,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TKuduPartitionByHashParam;
 import org.apache.impala.thrift.TKuduPartitionByRangeParam;
 import org.apache.impala.thrift.TKuduPartitionParam;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -62,7 +66,7 @@ import com.google.common.collect.Lists;
  *   )
  *
  */
-public class KuduPartitionParam implements ParseNode {
+public class KuduPartitionParam extends StmtNode {
 
   /**
    * Creates a hash-based KuduPartitionParam.
@@ -90,7 +94,7 @@ public class KuduPartitionParam implements ParseNode {
 
   // Columns of this partitioning. If no columns are specified, all
   // the primary key columns of the associated table are used.
-  private final List<String> colNames_ = Lists.newArrayList();
+  private final List<String> colNames_ = new ArrayList<>();
 
   // Map of primary key column names to the associated column definitions. Must be set
   // before the call to analyze().
@@ -142,7 +146,12 @@ public class KuduPartitionParam implements ParseNode {
   }
 
   @Override
-  public String toSql() {
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
     StringBuilder builder = new StringBuilder(type_.toString());
     if (!colNames_.isEmpty()) {
       builder.append(" (");
@@ -154,9 +163,9 @@ public class KuduPartitionParam implements ParseNode {
     } else {
       builder.append(" (");
       if (rangePartitions_ != null) {
-        List<String> partsSql = Lists.newArrayList();
+        List<String> partsSql = new ArrayList<>();
         for (RangePartition rangePartition: rangePartitions_) {
-          partsSql.add(rangePartition.toSql());
+          partsSql.add(rangePartition.toSql(options));
         }
         builder.append(Joiner.on(", ").join(partsSql));
       } else {
@@ -168,7 +177,9 @@ public class KuduPartitionParam implements ParseNode {
   }
 
   @Override
-  public String toString() { return toSql(); }
+  public String toString() {
+    return toSql(DEFAULT);
+  }
 
   public TKuduPartitionParam toThrift() {
     TKuduPartitionParam result = new TKuduPartitionParam();

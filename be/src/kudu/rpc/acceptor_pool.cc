@@ -17,17 +17,14 @@
 
 #include "kudu/rpc/acceptor_pool.h"
 
-#include <pthread.h>
-
-#include <cinttypes>
-#include <cstdint>
-#include <iostream>
 #include <string>
+#include <ostream>
 #include <vector>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
@@ -39,6 +36,14 @@
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 
+namespace google {
+namespace protobuf {
+
+class Message;
+
+}
+}
+
 using google::protobuf::Message;
 using std::string;
 
@@ -47,7 +52,7 @@ METRIC_DEFINE_counter(server, rpc_connections_accepted,
                       kudu::MetricUnit::kConnections,
                       "Number of incoming TCP connections made to the RPC server");
 
-DEFINE_int32_hidden(rpc_acceptor_listen_backlog, 128,
+DEFINE_int32(rpc_acceptor_listen_backlog, 128,
              "Socket backlog parameter used when listening for RPC connections. "
              "This defines the maximum length to which the queue of pending "
              "TCP connections inbound to the RPC server may grow. If a connection "
@@ -63,7 +68,7 @@ AcceptorPool::AcceptorPool(Messenger* messenger, Socket* socket,
                            Sockaddr bind_address)
     : messenger_(messenger),
       socket_(socket->Release()),
-      bind_address_(std::move(bind_address)),
+      bind_address_(bind_address),
       rpc_connections_accepted_(METRIC_rpc_connections_accepted.Instantiate(
           messenger->metric_entity())),
       closing_(false) {}
@@ -132,6 +137,10 @@ Sockaddr AcceptorPool::bind_address() const {
 
 Status AcceptorPool::GetBoundAddress(Sockaddr* addr) const {
   return socket_.GetSocketAddress(addr);
+}
+
+int64_t AcceptorPool::num_rpc_connections_accepted() const {
+  return rpc_connections_accepted_->value();
 }
 
 void AcceptorPool::RunThread() {

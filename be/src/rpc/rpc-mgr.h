@@ -29,7 +29,7 @@
 namespace kudu {
 namespace rpc {
 class RpcController;
-class ServiceIf;
+class GeneratedServiceIf;
 } // rpc
 } // kudu
 
@@ -95,18 +95,23 @@ namespace impala {
 /// Inbound connection set-up is handled by a small fixed-size pool of 'acceptor'
 /// threads. The number of threads that accept new TCP connection requests to the service
 /// port is configurable via FLAGS_acceptor_threads.
+///
+/// If 'use_tls' is true, then the underlying messenger is configured with the required
+/// certificates, and encryption is enabled and marked as required.
 class RpcMgr {
  public:
-  /// Initializes the reactor threads, and prepares for sending outbound RPC requests.
-  Status Init() WARN_UNUSED_RESULT;
+  RpcMgr(bool use_tls = false) : use_tls_(use_tls) {}
+
+  /// Initializes the reactor threads, and prepares for sending outbound RPC requests. All
+  /// services will be started on 'address', which must be a resolved IP address.
+  Status Init(const TNetworkAddress& address) WARN_UNUSED_RESULT;
 
   bool is_inited() const { return messenger_.get() != nullptr; }
 
-  /// Start the acceptor threads which listen on 'address', making KRPC services
-  /// available. 'address' has to be a resolved IP address. Before this method is called,
-  /// remote clients will get a 'connection refused' error when trying to invoke an RPC
-  /// on this host.
-  Status StartServices(const TNetworkAddress& address) WARN_UNUSED_RESULT;
+  /// Start the acceptor threads which listen on 'address_', making KRPC services
+  /// available. Before this method is called, remote clients will get a 'connection
+  /// refused' error when trying to invoke an RPC on this host.
+  Status StartServices() WARN_UNUSED_RESULT;
 
   /// Register a new service.
   ///
@@ -120,16 +125,31 @@ class RpcMgr {
   /// the service name has to be unique within an Impala instance or the registration will
   /// fail.
   ///
+  /// 'service_mem_tracker' is the MemTracker for tracking the memory usage of RPC
+  /// payloads in the service queue.
+  ///
   /// It is an error to call this after StartServices() has been called.
   Status RegisterService(int32_t num_service_threads, int32_t service_queue_depth,
-      std::unique_ptr<kudu::rpc::ServiceIf> service_ptr) WARN_UNUSED_RESULT;
-
-  /// Creates a new proxy for a remote service of type P at location 'address', and places
-  /// it in 'proxy'. 'P' must descend from kudu::rpc::ServiceIf. Note that 'address' must
-  /// be a resolved IP address.
-  template <typename P>
-  Status GetProxy(const TNetworkAddress& address, std::unique_ptr<P>* proxy)
+      kudu::rpc::GeneratedServiceIf* service_ptr, MemTracker* service_mem_tracker)
       WARN_UNUSED_RESULT;
+
+  /// Returns true if the given 'remote_user' in RpcContext 'context' is authorized to
+  /// access 'service_name' registered with this RpcMgr. Authorization is only enforced
+  /// when Kerberos is enabled.
+  ///
+  /// If authorization is denied, the RPC is responded to with an error message. Memory
+  /// of RPC payloads accounted towards 'mem_tracker', the service's MemTracker, is also
+  /// released.
+  bool Authorize(const string& service_name, kudu::rpc::RpcContext* context,
+      MemTracker* mem_tracker) const;
+
+  /// Creates a new proxy of type P to a host with IP address 'address' and hostname
+  /// 'hostname'. Please note that 'address' has to be a resolved IP address and
+  /// 'hostname' has to match the hostname used in the Kerberos principal of the
+  /// destination host if Kerberos is enabled. 'P' must descend from kudu::rpc::Proxy.
+  template <typename P>
+  Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+      std::unique_ptr<P>* proxy) WARN_UNUSED_RESULT;
 
   /// Shut down all previously registered services. All service pools are shut down.
   /// All acceptor and reactor threads within the messenger are also shut down.
@@ -151,6 +171,26 @@ class RpcMgr {
 
   std::shared_ptr<kudu::rpc::Messenger> messenger() { return messenger_; }
 
+  /// Writes a JSON representation of the RpcMgr's metrics to a value named 'services' in
+  /// 'document'. It will include the number of RPCs accepted so far, the number of calls
+  /// in flight, and metrics and histograms for each service and their methods.
+  void ToJson(rapidjson::Document* document);
+
+  /// Retry the Rpc 'rpc_call' on the 'proxy' object up to 'times_to_try' times.
+  /// The 'rpc_call' must be idempotent as it may be called multiple times.
+  /// Each Rpc has a timeout of 'timeout_ms' milliseconds.
+  /// If the service is busy then sleep 'server_busy_backoff_ms' milliseconds before
+  /// retrying.
+  /// Pass 'debug_action' to DebugAction() to potentially inject errors.
+  /// TODO: Clean up this interface. Replace the debug action with fault injection in RPC
+  /// callbacks or other places.
+  template <typename Proxy, typename ProxyMethod, typename Request, typename Response>
+  static Status DoRpcWithRetry(const std::unique_ptr<Proxy>& proxy,
+      const ProxyMethod& rpc_call, const Request& request, Response* response,
+      const TQueryCtx& query_ctx, const char* error_msg, const int times_to_try,
+      const int64_t timeout_ms, const int64_t server_busy_backoff_ms = 0,
+      const char* debug_action = nullptr);
+
   ~RpcMgr() {
     DCHECK_EQ(service_pools_.size(), 0)
         << "Must call Shutdown() before destroying RpcMgr";
@@ -169,6 +209,9 @@ class RpcMgr {
   /// track results for idempotent RPC calls.
   const scoped_refptr<kudu::rpc::ResultTracker> tracker_;
 
+  /// Holds a reference to the acceptor pool. Shared ownership with messenger_.
+  std::shared_ptr<kudu::rpc::AcceptorPool> acceptor_pool_;
+
   /// Container for reactor threads which run event loops for RPC services, plus acceptor
   /// threads which manage connection setup. Has to be a shared_ptr as required by
   /// MessangerBuilder::Build().
@@ -176,6 +219,13 @@ class RpcMgr {
 
   /// True after StartServices() completes.
   bool services_started_ = false;
+
+  /// True if TLS is configured for communication between Impala backends. messenger_ will
+  /// be configured to use TLS if this is set.
+  const bool use_tls_;
+
+  /// The host/port the rpc services are run on.
+  TNetworkAddress address_;
 };
 
 } // namespace impala

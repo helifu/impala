@@ -27,8 +27,8 @@
 namespace impala {
 
 /// ProcessStateInfo is an interface to query for process state information
-/// at runtime. This contains information about I/O, Cgroup, Scheduler,
-/// Process status, as well as the file descriptors that belong to the process.
+/// at runtime. This contains information about I/O, Scheduler, Process status,
+/// as well as the file descriptors that belong to the process.
 /// Below are some of the I/O information will be read from /proc/self/io.
 /// io/rchar[int64]: Number of bytes which this task has caused to be read from storage.
 /// io/wchar[int64]: Number of bytes which this task has caused to be written to storage.
@@ -38,12 +38,6 @@ namespace impala {
 /// io/write_bytes[int64]: Number of bytes which this process wrote to storage.
 /// io/cancelled_write_bytes[int64]: Number of bytes which this process did not write,
 /// by truncating pagecache.
-
-/// Below are some of the Cgroup information that will be read from /proc/self/cgroup.
-/// cgroup/hierarchy_id[int]: Hierarchy ID number.
-/// cgroup/subsystems[string]: Set of subsystems bound to the hierarchy.
-/// cgroup/control_group[string]: Control group in the hierarchy to which the
-/// process belongs.
 
 /// Below are some of the Scheduler information that will be read from /proc/self/sched.
 /// sched/se.sum_exec_runtime[string]: Sum of execute time.
@@ -81,8 +75,9 @@ namespace impala {
 class ProcessStateInfo {
  public:
   /// Read the current process state info when constructed. There is no need
-  /// to be thread safe.
-  ProcessStateInfo();
+  /// to be thread safe. If 'get_extended_metrics' is false, only the contents
+  /// of /status are collected. It it is true, all metrics are collected.
+  ProcessStateInfo(bool get_extended_metrics=true);
 
   std::string DebugString() const;
 
@@ -92,15 +87,20 @@ class ProcessStateInfo {
 
   /// Original data's unit is B or KB.
   int64_t GetBytes(const std::string& state_key) const;
+
+  /// Return the virtual memory size in bytes.
+  int64_t GetVmSize() const { return GetBytes("status/VmSize"); }
+
+  //// Return the process RSS in bytes.
+  int64_t GetRss() const { return GetBytes("status/VmRSS"); }
  private:
   typedef std::map<std::string, std::string> ProcessStateMap;
   ProcessStateMap process_state_map_;
 
+  const bool have_extended_metrics_;
+
   /// Read I/O info from /proc/self/io.
   void ReadProcIO();
-
-  /// Read cgroup info from /proc/self/cgroup.
-  void ReadProcCgroup();
 
   /// Read schedule info from /proc/self/sched.
   void ReadProcSched();

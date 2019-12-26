@@ -16,8 +16,9 @@
 # under the License.
 
 import os
-import string
 import pytest
+import requests
+import string
 from contextlib import contextmanager
 from kudu.schema import (
     BOOL,
@@ -36,8 +37,31 @@ from random import choice, sample
 from string import ascii_lowercase, digits
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIf
 from tests.common.test_dimensions import create_uncompressed_text_dimension
+
+DEFAULT_KUDU_MASTER_WEBUI_PORT = os.getenv('KUDU_MASTER_WEBUI_PORT', '8051')
+
+
+def get_kudu_master_webpage(page_name):
+  kudu_master = pytest.config.option.kudu_master_hosts
+
+  if "," in kudu_master:
+    raise NotImplementedError("Multi-master not supported yet")
+  if ":" in kudu_master:
+    kudu_master_host = kudu_master.split(":")[0]
+  else:
+    kudu_master_host = kudu_master
+  url = "http://%s:%s/%s" % (kudu_master_host, DEFAULT_KUDU_MASTER_WEBUI_PORT, page_name)
+  return requests.get(url).text
+
+
+def get_kudu_master_flag(flag):
+  varz = get_kudu_master_webpage("varz")
+  for line in varz.split("\n"):
+    split = line.split("=")
+    if len(split) == 2 and split[0] == flag:
+      return split[1]
+  assert False, "Failed to find Kudu master flag: %s" % flag
 
 class KuduTestSuite(ImpalaTestSuite):
 
@@ -74,13 +98,16 @@ class KuduTestSuite(ImpalaTestSuite):
   def get_db_name(cls):
     # When py.test runs with the xdist plugin, several processes are started and each
     # process runs some partition of the tests. It's possible that multiple processes
-    # will call this method. A random value is generated so the processes won't try
-    # to use the same database at the same time. The value is cached so within a single
+    # will call this method. To avoid multiple processes using the same database at the
+    # same time, the database name is formed by concatenating the test class name, the pid
+    # and a random value. The class name distinguishes classes and the pid distinguishes
+    # the same class run in different processes. The value is cached so within a single
     # process the same database name is always used for the class. This doesn't need to
     # be thread-safe since multi-threading is never used.
     if not cls.__DB_NAME:
-      cls.__DB_NAME = \
-          choice(ascii_lowercase) + "".join(sample(ascii_lowercase + digits, 5))
+      salt = choice(ascii_lowercase) + "".join(sample(ascii_lowercase + digits, 5))
+      cls.__DB_NAME = cls.__name__.lower() + "_" + str(os.getpid()) + "_" + salt
+
     return cls.__DB_NAME
 
   @classmethod
@@ -90,9 +117,12 @@ class KuduTestSuite(ImpalaTestSuite):
   @classmethod
   def to_kudu_table_name(cls, db_name, tbl_name):
     """Return the name of the underlying Kudu table, from the Impala database and table
-    name. This must be kept in sync with KuduUtil.getDefaultCreateKuduTableName() in the
+    name. This must be kept in sync with KuduUtil.getDefaultKuduTableName() in the
     FE."""
-    return "impala::%s.%s" % (db_name, tbl_name)
+    if get_kudu_master_flag("--hive_metastore_uris") != "":
+      return "%s.%s" % (db_name, tbl_name)
+    else:
+      return "impala::%s.%s" % (db_name, tbl_name)
 
   @classmethod
   def get_kudu_table_base_name(cls, name):

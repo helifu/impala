@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.HashSet;
 import java.util.Set;
 
 import org.apache.impala.catalog.ArrayType;
@@ -30,12 +31,13 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Sets;
+
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 
 /**
  * Represents an anonymous type definition, e.g., used in DDL and CASTs.
  */
-public class TypeDef implements ParseNode {
+public class TypeDef extends StmtNode {
   private boolean isAnalyzed_;
   private final Type parsedType_;
 
@@ -124,7 +126,7 @@ public class TypeDef implements ParseNode {
   private void analyzeStructType(StructType structType, Analyzer analyzer)
       throws AnalysisException {
     // Check for duplicate field names.
-    Set<String> fieldNames = Sets.newHashSet();
+    Set<String> fieldNames = new HashSet<>();
     for (StructField f: structType.getFields()) {
       analyze(f.getType(), analyzer);
       if (!fieldNames.add(f.getName().toLowerCase())) {
@@ -154,5 +156,12 @@ public class TypeDef implements ParseNode {
   public String toString() { return parsedType_.toSql(); }
 
   @Override
-  public String toSql() { return parsedType_.toSql(); }
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
+    return parsedType_.toSql();
+  }
 }

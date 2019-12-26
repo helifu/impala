@@ -22,8 +22,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Class to parse and store query plan hints, which can occur in various places inside SQL
@@ -38,7 +36,7 @@ public class PlanHint {
 
   public PlanHint(String name) {
     name_ = name;
-    args_ = Lists.newArrayList();
+    args_ = new ArrayList<>();
   }
 
   public PlanHint(String name, List<String> args) {

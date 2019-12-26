@@ -24,7 +24,7 @@ import string
 import subprocess
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon
 
 class TestParquetMaxPageHeader(CustomClusterTestSuite):
   '''This tests large page headers in parquet files. Parquet page header size can
@@ -32,6 +32,16 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
   adjust --max_page_header_size, which is the maximum bytes of header data that the
   scanner reads before it bails out.
   '''
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def setup_class(cls):
+    if cls.exploration_strategy() != 'exhaustive':
+      pytest.skip('runs only in exhaustive')
+    super(TestParquetMaxPageHeader, cls).setup_class()
+
 
   TEXT_TABLE_NAME = "parquet_test_data_text"
   PARQUET_TABLE_NAME = "large_page_header"
@@ -73,8 +83,7 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
         .format(self.PARQUET_TABLE_NAME, self.TEXT_TABLE_NAME)
     # Impala parquet-writer doesn't write/use page statistics. So we use hive
     # to write these files
-    hive_cmd = "hive -e " + insert_cmd
-    subprocess.call(hive_cmd, shell=True)
+    self.run_stmt_in_hive(insert_cmd)
 
   def __generate_test_data(self, dir, file):
     """Creates a file in HDFS containing two MAX_STRING_LENGTH lines."""
@@ -84,7 +93,7 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
         for i in xrange(self.MAX_STRING_LENGTH)])
     random_text2 = "".join([random.choice(string.letters)
         for i in xrange(self.MAX_STRING_LENGTH)])
-    put = subprocess.Popen(["hadoop", "fs", "-put", "-f", "-", file_name],
+    put = subprocess.Popen(["hdfs", "dfs", "-put", "-d", "-f", "-", file_name],
         stdin=subprocess.PIPE, bufsize=-1)
     put.stdin.write(random_text1 + "\n")
     put.stdin.write(random_text2)
@@ -92,6 +101,7 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
     put.wait()
 
   @SkipIfS3.hive
+  @SkipIfABFS.hive
   @SkipIfADLS.hive
   @SkipIfIsilon.hive
   @pytest.mark.execute_serially

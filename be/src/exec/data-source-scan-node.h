@@ -22,6 +22,7 @@
 #include <string>
 #include <boost/scoped_ptr.hpp>
 
+#include "common/global-types.h"
 #include "exec/scan-node.h"
 #include "exec/external-data-source-executor.h"
 #include "runtime/descriptors.h"
@@ -40,28 +41,29 @@ class Tuple;
 /// closed in Close().
 class DataSourceScanNode : public ScanNode {
  public:
-  DataSourceScanNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  DataSourceScanNode(
+      ObjectPool* pool, const ScanPlanNode& pnode, const DescriptorTbl& descs);
 
   ~DataSourceScanNode();
 
   /// Load the data source library and create the ExternalDataSourceExecutor.
-  virtual Status Prepare(RuntimeState* state);
+  virtual Status Prepare(RuntimeState* state) override;
 
   /// Open the data source and initialize the first row batch.
-  virtual Status Open(RuntimeState* state);
+  virtual Status Open(RuntimeState* state) override;
 
   /// Fill the next row batch, calls GetNext() on the external scanner.
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
 
   /// NYI
-  virtual Status Reset(RuntimeState* state);
+  virtual Status Reset(RuntimeState* state, RowBatch* row_batch) override;
 
   /// Close the scanner, and report errors.
-  virtual void Close(RuntimeState* state);
+  virtual void Close(RuntimeState* state) override;
 
  protected:
   /// Write debug string of this into out.
-  virtual void DebugString(int indentation_level, std::stringstream* out) const;
+  virtual void DebugString(int indentation_level, std::stringstream* out) const override;
 
  private:
   /// Used to call the external data source.
@@ -96,8 +98,9 @@ class DataSourceScanNode : public ScanNode {
   /// the next row batch.
   std::vector<int> cols_next_val_idx_;
 
-  /// Materializes the next row (next_row_idx_) into tuple.
-  Status MaterializeNextRow(MemPool* mem_pool, Tuple* tuple);
+  /// Materializes the next row (next_row_idx_) into tuple. 'local_tz' is used as the
+  /// local time-zone for materializing 'TYPE_TIMESTAMP' slots.
+  Status MaterializeNextRow(const Timezone& local_tz, MemPool* mem_pool, Tuple* tuple);
 
   /// Gets the next batch from the data source, stored in input_batch_.
   Status GetNextInputBatch();

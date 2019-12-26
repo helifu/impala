@@ -18,12 +18,24 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 DIR=$(dirname "$0")
 echo Stopping Hbase
-# Kill region server first, then hmaster, and zookeeper.
+# First, use the stop-hbase.sh script provided by HBase. This does a more graceful
+# shutdown than using our kill-java-service.sh script.
+${HBASE_HOME}/bin/stop-hbase.sh
+
+# Second, also do a harder shutdown in case there is anything that is not covered
+# by the stop-hbase.sh script. Kill region server first, then hmaster, and zookeeper.
 "$DIR"/kill-java-service.sh -c HRegionServer -c HMaster -c HQuorumPeer -s 2
 
 # Clear up data so that zookeeper/hbase won't do recovery when it starts.
+# TODO: is this still needed when using bin/stop-hbase.sh?
 rm -rf /tmp/hbase-*
+
+# HACK: Some jobs have seen the HBase master fail to initialize with mesages like:
+# "Master startup cannot progress, in holding-pattern until region onlined."
+# Anecdotally, removing the MasterProcWALs directory avoids the issue.
+hdfs dfs -rm /hbase/MasterProcWALs/* || true

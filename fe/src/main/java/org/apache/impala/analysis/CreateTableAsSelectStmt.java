@@ -17,24 +17,26 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.Db;
-import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.THdfsFileFormat;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Represents a CREATE TABLE AS SELECT (CTAS) statement
@@ -66,30 +68,55 @@ public class CreateTableAsSelectStmt extends StatementBase {
       EnumSet.of(THdfsFileFormat.PARQUET, THdfsFileFormat.TEXT, THdfsFileFormat.KUDU);
 
   /**
+   * Helper class for parsing.
+   * Contains every parameter of the constructor with the exception of hints. This is
+   * needed to keep the production rules that check for optional hints separate from the
+   * rules that check for optional partition info. Merging these independent rules would
+   * make it necessary to create rules for every combination of them.
+   */
+  public static class CtasParams {
+    public CreateTableStmt createStmt;
+    public QueryStmt queryStmt;
+    public List<String> partitionKeys;
+
+    public CtasParams(CreateTableStmt createStmt, QueryStmt queryStmt,
+        List<String> partitionKeys) {
+      this.createStmt = Preconditions.checkNotNull(createStmt);
+      this.queryStmt = Preconditions.checkNotNull(queryStmt);
+      this.partitionKeys = partitionKeys;
+    }
+  }
+
+  /**
    * Builds a CREATE TABLE AS SELECT statement
    */
-  public CreateTableAsSelectStmt(CreateTableStmt createStmt, QueryStmt queryStmt,
-      List<String> partitionKeys) {
-    Preconditions.checkNotNull(queryStmt);
-    Preconditions.checkNotNull(createStmt);
-    createStmt_ = createStmt;
-    partitionKeys_ = partitionKeys;
+  public CreateTableAsSelectStmt(CtasParams params, List<PlanHint> planHints) {
+    createStmt_ = params.createStmt;
+    partitionKeys_ = params.partitionKeys;
     List<PartitionKeyValue> pkvs = null;
-    if (partitionKeys != null) {
-      pkvs = Lists.newArrayList();
-      for (String key: partitionKeys) {
+    if (partitionKeys_ != null) {
+      pkvs = new ArrayList<>();
+      for (String key: partitionKeys_) {
         pkvs.add(new PartitionKeyValue(key, null));
       }
     }
-    insertStmt_ = InsertStmt.createInsert(
-        null, createStmt.getTblName(), false, pkvs, null, null, queryStmt, null);
+    insertStmt_ = InsertStmt.createInsert(null, createStmt_.getTblName(), false, pkvs,
+        planHints, null, params.queryStmt, null);
   }
 
   public QueryStmt getQueryStmt() { return insertStmt_.getQueryStmt(); }
   public InsertStmt getInsertStmt() { return insertStmt_; }
   public CreateTableStmt getCreateStmt() { return createStmt_; }
   @Override
-  public String toSql() { return ToSqlUtils.getCreateTableSql(this); }
+  public String toSql(ToSqlOptions options) {
+    return ToSqlUtils.getCreateTableSql(this, options);
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    createStmt_.collectTableRefs(tblRefs);
+    insertStmt_.collectTableRefs(tblRefs);
+  }
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
@@ -113,19 +140,14 @@ public class CreateTableAsSelectStmt extends StatementBase {
     // query portion of the insert statement. If this passes, analysis will be run
     // over the full INSERT statement. To avoid duplicate registrations of table/colRefs,
     // create a new root analyzer and clone the query statement for this initial pass.
-    Analyzer dummyRootAnalyzer = new Analyzer(analyzer.getCatalog(),
-        analyzer.getQueryCtx(), analyzer.getAuthzConfig());
+    Analyzer dummyRootAnalyzer = new Analyzer(analyzer.getStmtTableCache(),
+        analyzer.getQueryCtx(), analyzer.getAuthzFactory());
     QueryStmt tmpQueryStmt = insertStmt_.getQueryStmt().clone();
-    try {
-      Analyzer tmpAnalyzer = new Analyzer(dummyRootAnalyzer);
-      tmpAnalyzer.setUseHiveColLabels(true);
-      tmpQueryStmt.analyze(tmpAnalyzer);
-      // Subqueries need to be rewritten by the StmtRewriter first.
-      if (analyzer.containsSubquery()) return;
-    } finally {
-      // Record missing tables in the original analyzer.
-      analyzer.getMissingTbls().addAll(dummyRootAnalyzer.getMissingTbls());
-    }
+    Analyzer tmpAnalyzer = new Analyzer(dummyRootAnalyzer);
+    tmpAnalyzer.setUseHiveColLabels(true);
+    tmpQueryStmt.analyze(tmpAnalyzer);
+    // Subqueries need to be rewritten by the StmtRewriter first.
+    if (analyzer.containsSubquery()) return;
 
     // Add the columns from the partition clause to the create statement.
     if (partitionKeys_ != null) {
@@ -162,6 +184,11 @@ public class CreateTableAsSelectStmt extends StatementBase {
       ColumnDef colDef = new ColumnDef(tmpQueryStmt.getColLabels().get(i), null,
           Collections.<ColumnDef.Option, Object>emptyMap());
       colDef.setType(tmpQueryStmt.getBaseTblResultExprs().get(i).getType());
+      if (colDef.getType() == Type.NULL) {
+        throw new AnalysisException(String.format("Unable to infer the column type " +
+            "for column '%s'. Use cast() to explicitly specify the column type for " +
+            "column '%s'.", colDef.getColName(), colDef.getColName()));
+      }
       createStmt_.getColumnDefs().add(colDef);
     }
     createStmt_.analyze(analyzer);
@@ -169,7 +196,7 @@ public class CreateTableAsSelectStmt extends StatementBase {
 
     // The full privilege check for the database will be done as part of the INSERT
     // analysis.
-    Db db = analyzer.getDb(createStmt_.getDb(), Privilege.ANY);
+    FeDb db = analyzer.getDb(createStmt_.getDb(), Privilege.ANY);
     if (db == null) {
       throw new AnalysisException(
           Analyzer.DB_DOES_NOT_EXIST_ERROR_MSG + createStmt_.getDb());
@@ -183,24 +210,24 @@ public class CreateTableAsSelectStmt extends StatementBase {
     org.apache.hadoop.hive.metastore.api.Table msTbl =
         CatalogOpExecutor.createMetaStoreTable(createStmt_.toThrift());
 
-    try (MetaStoreClient client = analyzer.getCatalog().getMetaStoreClient()) {
-      // Set a valid location of this table using the same rules as the metastore. If the
-      // user specified a location for the table this will be a no-op.
-      msTbl.getSd().setLocation(analyzer.getCatalog().getTablePath(msTbl).toString());
+    try {
+      // Set a valid location of this table using the same rules as the metastore, unless
+      // the user specified a path.
+      if (msTbl.getSd().getLocation() == null || msTbl.getSd().getLocation().isEmpty()) {
+        msTbl.getSd().setLocation(
+            MetastoreShim.getPathForNewTable(db.getMetaStoreDb(), msTbl));
+      }
 
-      Table tmpTable = null;
+      FeTable tmpTable = null;
       if (KuduTable.isKuduTable(msTbl)) {
-        tmpTable = KuduTable.createCtasTarget(db, msTbl, createStmt_.getColumnDefs(),
-            createStmt_.getTblPrimaryKeyColumnNames(),
+        tmpTable = db.createKuduCtasTarget(msTbl, createStmt_.getColumnDefs(),
+            createStmt_.getPrimaryKeyColumnDefs(),
             createStmt_.getKuduPartitionParams());
-      } else {
-        // TODO: Creating a tmp table using load() is confusing.
-        // Refactor it to use a 'createCtasTarget()' function similar to Kudu table.
-        tmpTable = Table.fromMetastoreTable(db, msTbl);
-        tmpTable.load(true, client.getHiveClient(), msTbl);
+      } else if (HdfsFileFormat.isHdfsInputFormatClass(msTbl.getSd().getInputFormat())) {
+        tmpTable = db.createFsCtasTarget(msTbl);
       }
       Preconditions.checkState(tmpTable != null &&
-          (tmpTable instanceof HdfsTable || tmpTable instanceof KuduTable));
+          (tmpTable instanceof FeFsTable || tmpTable instanceof FeKuduTable));
 
       insertStmt_.setTargetTable(tmpTable);
     } catch (Exception e) {
@@ -237,6 +264,9 @@ public class CreateTableAsSelectStmt extends StatementBase {
   public void reset() {
     super.reset();
     createStmt_.reset();
+    // This is populated for CTAS in analyze(), so it needs to be cleared here. For other
+    // types of CreateTableStmts it is set by the parser and should not be reset.
+    createStmt_.getPartitionColumnDefs().clear();
     insertStmt_.reset();
   }
 }

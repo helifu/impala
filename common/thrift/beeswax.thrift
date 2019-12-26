@@ -37,12 +37,12 @@ struct Query {
 typedef string LogContextId
 
 enum QueryState {
-  CREATED,
-  INITIALIZED,
-  COMPILED,
-  RUNNING,
-  FINISHED,
-  EXCEPTION
+  CREATED = 0
+  INITIALIZED = 1
+  COMPILED = 2
+  RUNNING = 3
+  FINISHED = 4
+  EXCEPTION = 5
 }
 
 struct QueryHandle {
@@ -96,12 +96,14 @@ exception QueryNotFoundException {
 }
 
 // Impala extension:
-// Levels to use when displaying query options from Impala shell
+// Levels to use when displaying query options from Impala shell. REMOVED options should
+// not be displayed in the shell, but setting them is a warning rather than an error.
 enum TQueryOptionLevel {
-  REGULAR,
-  ADVANCED,
-  DEVELOPMENT,
-  DEPRECATED
+  REGULAR = 0
+  ADVANCED = 1
+  DEVELOPMENT = 2
+  DEPRECATED = 3
+  REMOVED = 4
 }
 
 /** Represents a Hadoop-style configuration variable. */

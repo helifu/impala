@@ -28,15 +28,20 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "gen-cpp/Types_types.h" // for TUniqueId
-#include "runtime/io/request-ranges.h"
-#include "util/collection-metrics.h"
 #include "util/condition-variable.h"
 #include "util/mem-range.h"
+#include "util/metrics-fwd.h"
 #include "util/openssl-util.h"
 #include "util/runtime-profile.h"
 #include "util/spinlock.h"
 
 namespace impala {
+namespace io {
+  class DiskIoMgr;
+  class RequestContext;
+  class ScanRange;
+  class WriteRange;
+}
 
 /// TmpFileMgr provides an abstraction for management of temporary (a.k.a. scratch) files
 /// on the filesystem and I/O to and from them. TmpFileMgr manages multiple scratch
@@ -84,7 +89,24 @@ class TmpFileMgr {
   /// Needs to be public for TmpFileMgrTest.
   typedef int DeviceId;
 
+  /// Same typedef as io::WriteRange::WriteDoneCallback.
   typedef std::function<void(const Status&)> WriteDoneCallback;
+
+  /// A configured temporary directory that TmpFileMgr allocates files in.
+  struct TmpDir {
+    TmpDir(const std::string& path, int64_t bytes_limit, IntGauge* bytes_used_metric)
+      : path(path), bytes_limit(bytes_limit), bytes_used_metric(bytes_used_metric) {}
+
+    /// Path to the temporary directory.
+    const std::string path;
+
+    /// Limit on bytes that should be written to this path. Set to maximum value
+    /// of int64_t if there is no limit.
+    int64_t const bytes_limit;
+
+    /// The current bytes of scratch used for this temporary directory.
+    IntGauge* const bytes_used_metric;
+  };
 
   /// Represents a group of temporary files - one per disk with a scratch directory. The
   /// total allocated bytes of the group can be bound by setting the space allocation
@@ -194,6 +216,14 @@ class TmpFileMgr {
     Status RecoverWriteError(
         WriteHandle* handle, const Status& write_status) WARN_UNUSED_RESULT;
 
+    /// Return a SCRATCH_ALLOCATION_FAILED error with the appropriate information,
+    /// including scratch directories, the amount of scratch allocated and previous
+    /// errors that caused this failure. If some directories were at capacity,
+    /// but had not encountered an error, the indices of these directories in
+    /// tmp_file_mgr_->tmp_dir_ should be included in 'at_capacity_dirs'.
+    /// 'lock_' must be held by caller.
+    Status ScratchAllocationFailedStatus(const std::vector<int>& at_capacity_dirs);
+
     /// The TmpFileMgr it is associated with.
     TmpFileMgr* const tmp_file_mgr_;
 
@@ -277,10 +307,7 @@ class TmpFileMgr {
    public:
     /// The write must be destroyed by passing it to FileGroup - destroying it before
     /// the write completes is an error.
-    ~WriteHandle() {
-      DCHECK(!write_in_flight_);
-      DCHECK(read_range_ == nullptr);
-    }
+    ~WriteHandle();
 
     /// Cancel any in-flight read synchronously.
     void CancelRead();
@@ -290,7 +317,7 @@ class TmpFileMgr {
     std::string TmpFilePath() const;
 
     /// The length of the write range in bytes.
-    int64_t len() const { return write_range_->len(); }
+    int64_t len() const;
 
     std::string DebugString();
 
@@ -303,14 +330,14 @@ class TmpFileMgr {
     /// Starts a write of 'buffer' to 'offset' of 'file'. 'write_in_flight_' must be false
     /// before calling. After returning, 'write_in_flight_' is true on success or false on
     /// failure and 'is_cancelled_' is set to true on failure.
-    Status Write(io::DiskIoMgr* io_mgr, io::RequestContext* io_ctx, File* file,
+    Status Write(io::RequestContext* io_ctx, File* file,
         int64_t offset, MemRange buffer,
-        io::WriteRange::WriteDoneCallback callback) WARN_UNUSED_RESULT;
+        WriteDoneCallback callback) WARN_UNUSED_RESULT;
 
     /// Retry the write after the initial write failed with an error, instead writing to
     /// 'offset' of 'file'. 'write_in_flight_' must be true before calling.
     /// After returning, 'write_in_flight_' is true on success or false on failure.
-    Status RetryWrite(io::DiskIoMgr* io_mgr, io::RequestContext* io_ctx, File* file,
+    Status RetryWrite(io::RequestContext* io_ctx, File* file,
         int64_t offset) WARN_UNUSED_RESULT;
 
     /// Called when the write has completed successfully or not. Sets 'write_in_flight_'
@@ -319,8 +346,8 @@ class TmpFileMgr {
 
     /// Cancels any in-flight writes or reads. Reads are cancelled synchronously and
     /// writes are cancelled asynchronously. After Cancel() is called, writes are not
-    /// retried. The write callback may be called with a CANCELLED status (unless
-    /// it succeeded or encountered a different error first).
+    /// retried. The write callback may be called with a CANCELLED_INTERNALLY status
+    /// (unless it succeeded or encountered a different error first).
     void Cancel();
 
     /// Blocks until the write completes either successfully or unsuccessfully.
@@ -382,9 +409,13 @@ class TmpFileMgr {
 
   /// Custom initialization - initializes with the provided list of directories.
   /// If one_dir_per_device is true, only use one temporary directory per device.
-  /// This interface is intended for testing purposes.
-  Status InitCustom(const std::vector<std::string>& tmp_dirs, bool one_dir_per_device,
+  /// This interface is intended for testing purposes. 'tmp_dir_specifiers'
+  /// use the command-line syntax, i.e. <path>[:<limit>]. The first variant takes
+  /// a comma-separated list, the second takes a vector.
+  Status InitCustom(const std::string& tmp_dirs_spec, bool one_dir_per_device,
       MetricGroup* metrics) WARN_UNUSED_RESULT;
+  Status InitCustom(const std::vector<std::string>& tmp_dir_specifiers,
+      bool one_dir_per_device, MetricGroup* metrics) WARN_UNUSED_RESULT;
 
   /// Return the scratch directory path for the device.
   std::string GetTmpDirPath(DeviceId device_id) const;
@@ -405,17 +436,20 @@ class TmpFileMgr {
   /// directory on the specified device id. The caller owns the returned handle and is
   /// responsible for deleting it. The file is not created - creation is deferred until
   /// the file is written.
-  Status NewFile(FileGroup* file_group, DeviceId device_id,
-      std::unique_ptr<File>* new_file) WARN_UNUSED_RESULT;
+  void NewFile(FileGroup* file_group, DeviceId device_id,
+    std::unique_ptr<File>* new_file);
 
   bool initialized_;
 
   /// The paths of the created tmp directories.
-  std::vector<std::string> tmp_dirs_;
+  std::vector<TmpDir> tmp_dirs_;
 
   /// Metrics to track active scratch directories.
   IntGauge* num_active_scratch_dirs_metric_;
   SetMetric<std::string>* active_scratch_dirs_metric_;
+
+  /// Metrics to track the scratch space HWM.
+  AtomicHighWaterMarkGauge* scratch_bytes_used_metric_;
 };
 
 }

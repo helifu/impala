@@ -20,38 +20,32 @@ package org.apache.impala.service;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.commons.lang.exception.ExceptionUtils;
 import org.apache.hive.service.rpc.thrift.TGetCatalogsReq;
 import org.apache.hive.service.rpc.thrift.TGetColumnsReq;
 import org.apache.hive.service.rpc.thrift.TGetFunctionsReq;
 import org.apache.hive.service.rpc.thrift.TGetInfoReq;
 import org.apache.hive.service.rpc.thrift.TGetSchemasReq;
 import org.apache.hive.service.rpc.thrift.TGetTablesReq;
-import org.junit.Test;
-import org.apache.impala.analysis.AuthorizationTest;
-import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.Db;
-import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.PrimitiveType;
+import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
-import org.apache.impala.common.AnalysisException;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
-import org.apache.impala.testutil.ImpaladTestCatalog;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TMetadataOpcode;
-import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
+import org.junit.Assume;
+import org.junit.Test;
 
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -75,10 +69,27 @@ public class FrontendTest extends FrontendTestBase {
     // DatabaseMetaData.getTypeInfo has 18 columns.
     assertEquals(18, resp.schema.columns.size());
     assertEquals(18, resp.rows.get(0).colVals.size());
-    // All primitives types, except INVALID_TYPE, DATE, DATETIME, DECIMAL, CHAR,
-    // VARCHAR, and FIXED_UDA_INTERMEDIATE should be returned.
-    // Therefore #supported types =  PrimitiveType.values().length - 7.
-    assertEquals(PrimitiveType.values().length - 7, resp.rows.size());
+    // Validate the supported types
+    List<String> supportedTypes = new ArrayList<>();
+    for (ScalarType stype : Type.getSupportedTypes()) {
+      if (stype.isSupported() && !stype.isInternalType()) {
+        supportedTypes.add(stype.getPrimitiveType().name());
+      }
+    }
+    supportedTypes.add("ARRAY");
+    supportedTypes.add("MAP");
+    supportedTypes.add("STRUCT");
+    assertEquals(supportedTypes.size(), resp.rows.size());
+    for (TResultRow row : resp.rows) {
+      boolean foundType = false;
+      String typeName = row.colVals.get(0).getString_val();
+      if (supportedTypes.contains(typeName)) {
+        supportedTypes.remove(typeName);
+        foundType = true;
+      }
+      assertTrue(foundType);
+    }
+    assertEquals(supportedTypes.size(), 0);
   }
 
   @Test
@@ -114,6 +125,12 @@ public class FrontendTest extends FrontendTestBase {
 
   @Test
   public void TestGetTablesTypeTable() throws ImpalaException {
+    // Make sure these views are loaded so they can be distinguished from tables.
+    AnalyzesOk("select * from functional.alltypes_hive_view");
+    AnalyzesOk("select * from functional.alltypes_parens");
+    AnalyzesOk("select * from functional.alltypes_view");
+    AnalyzesOk("select * from functional.alltypes_view_sub");
+
     TMetadataOpRequest req = new TMetadataOpRequest();
     req.opcode = TMetadataOpcode.GET_TABLES;
     req.get_tables_req = new TGetTablesReq();
@@ -125,12 +142,13 @@ public class FrontendTest extends FrontendTestBase {
     assertEquals(5, resp.schema.columns.size());
     assertEquals(5, resp.rows.get(0).colVals.size());
     assertEquals(1, resp.rows.size());
-    assertEquals("alltypes_datasource", resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_datasource",
+        resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
   }
 
   @Test
   public void TestGetTablesTypeView() throws ImpalaException {
-    // Issue the statements to make sure all the views are loaded
+    // Make sure these views are loaded so they can be distinguished from tables.
     AnalyzesOk("select * from functional.alltypes_hive_view");
     AnalyzesOk("select * from functional.alltypes_parens");
     AnalyzesOk("select * from functional.alltypes_view");
@@ -147,10 +165,14 @@ public class FrontendTest extends FrontendTestBase {
     assertEquals(5, resp.schema.columns.size());
     assertEquals(5, resp.rows.get(0).colVals.size());
     assertEquals(4, resp.rows.size());
-    assertEquals("alltypes_hive_view", resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypes_parens", resp.rows.get(1).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypes_view", resp.rows.get(2).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypes_view_sub", resp.rows.get(3).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_hive_view",
+        resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_parens",
+        resp.rows.get(1).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_view",
+        resp.rows.get(2).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_view_sub",
+        resp.rows.get(3).colVals.get(2).string_val.toLowerCase());
   }
 
   @Test
@@ -204,16 +226,26 @@ public class FrontendTest extends FrontendTestBase {
         assertEquals(null, row.colVals.get(11).string_val);
       }
     }
+  }
 
-    // Make sure tables that can't be loaded don't result in errors in the GetTables
-    // request (see IMPALA-5579)
+  @Test
+  public void TestGetTablesWithCommentsOnHive2() throws ImpalaException {
+    // run the test only when it is running against Hive-2 since index tables are
+    // skipped during data-load against Hive-3
+    Assume.assumeTrue(
+        "Skipping this test since it is only supported when running against Hive-2",
+        TestUtils.getHiveMajorVersion() == 2);
+
+    // IMPALA-5579: GetTables() should succeed and display the available information for
+    // tables that cannot be loaded.
+    TMetadataOpRequest req = new TMetadataOpRequest();
     req = new TMetadataOpRequest();
     req.opcode = TMetadataOpcode.GET_TABLES;
     req.get_tables_req = new TGetTablesReq();
     req.get_tables_req.setSchemaName("functional");
     req.get_tables_req.setTableName("hive_index_tbl");
-    resp = execMetadataOp(req);
-    assertEquals(0, resp.rows.size());
+    TResultSet resp = execMetadataOp(req);
+    assertEquals(1, resp.rows.size());
   }
 
   @Test

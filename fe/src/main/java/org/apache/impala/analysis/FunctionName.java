@@ -17,12 +17,13 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
+import java.util.List;
 
-import org.apache.impala.catalog.Catalog;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TFunctionName;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 
@@ -32,7 +33,7 @@ import com.google.common.base.Preconditions;
  */
 public class FunctionName {
   // Only set for parsed function names.
-  private final ArrayList<String> fnNamePath_;
+  private final List<String> fnNamePath_;
 
   // Set/validated during analysis.
   private String db_;
@@ -44,7 +45,7 @@ public class FunctionName {
    * C'tor for parsed function names. The function names could be invalid. The validity
    * is checked during analysis.
    */
-  public FunctionName(ArrayList<String> fnNamePath) {
+  public FunctionName(List<String> fnNamePath) {
     fnNamePath_ = fnNamePath;
   }
 
@@ -74,7 +75,7 @@ public class FunctionName {
   public String getFunction() { return fn_; }
   public boolean isFullyQualified() { return db_ != null; }
   public boolean isBuiltin() { return isBuiltin_; }
-  public ArrayList<String> getFnNamePath() { return fnNamePath_; }
+  public List<String> getFnNamePath() { return fnNamePath_; }
 
   @Override
   public String toString() {
@@ -85,6 +86,24 @@ public class FunctionName {
   }
 
   public void analyze(Analyzer analyzer) throws AnalysisException {
+    analyze(analyzer, true);
+  }
+
+  /**
+   * Path resolution happens as follows.
+   *
+   * Fully-qualified function name:
+   * - Set the database name to the database name specified.
+   *
+   * Non-fully-qualified function name:
+   * - When preferBuiltinsDb is true:
+   *   - If the function name specified has the same name as a built-in function,
+   *     set the database name to _impala_builtins.
+   *   - Else, set the database name to the current session DB name.
+   * - When preferBuiltinsDb is false: set the database name to current session DB name.
+   */
+  public void analyze(Analyzer analyzer, boolean preferBuiltinsDb)
+      throws AnalysisException {
     if (isAnalyzed_) return;
     analyzeFnNamePath();
     if (fn_.isEmpty()) throw new AnalysisException("Function name cannot be empty.");
@@ -100,20 +119,16 @@ public class FunctionName {
     }
 
     // Resolve the database for this function.
+    Db builtinDb = BuiltinsDb.getInstance();
     if (!isFullyQualified()) {
-      Db builtinDb = analyzer.getCatalog().getBuiltinsDb();
-      if (builtinDb.containsFunction(fn_)) {
-        // If it isn't fully qualified and is the same name as a builtin, use
-        // the builtin.
-        db_ = Catalog.BUILTINS_DB;
-        isBuiltin_ = true;
-      } else {
-        db_ = analyzer.getDefaultDb();
-        isBuiltin_ = false;
+      db_ = analyzer.getDefaultDb();
+      if (preferBuiltinsDb && builtinDb.containsFunction(fn_)) {
+        db_ = BuiltinsDb.NAME;
       }
-    } else {
-      isBuiltin_ = db_.equals(Catalog.BUILTINS_DB);
     }
+    Preconditions.checkNotNull(db_);
+    isBuiltin_ = db_.equals(BuiltinsDb.NAME) &&
+        builtinDb.containsFunction(fn_);
     isAnalyzed_ = true;
   }
 
@@ -124,7 +139,7 @@ public class FunctionName {
           String.format("Invalid function name: '%s'. Expected [dbname].funcname.",
               Joiner.on(".").join(fnNamePath_)));
     } else if (fnNamePath_.size() > 1) {
-      db_ = fnNamePath_.get(0);
+      db_ = fnNamePath_.get(0).toLowerCase();
       fn_ = fnNamePath_.get(1).toLowerCase();
     } else {
       Preconditions.checkState(fnNamePath_.size() == 1);

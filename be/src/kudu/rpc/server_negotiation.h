@@ -20,10 +20,15 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 #include <sasl/sasl.h>
 
+#include "kudu/gutil/port.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/negotiation.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/rpc_header.pb.h"
@@ -37,7 +42,8 @@
 
 namespace kudu {
 
-class Slice;
+class Sockaddr;
+class faststring;
 
 namespace security {
 class TlsContext;
@@ -59,7 +65,7 @@ class ServerNegotiation {
   ServerNegotiation(std::unique_ptr<Socket> socket,
                     const security::TlsContext* tls_context,
                     const security::TokenVerifier* token_verifier,
-                    security::RpcEncryption encryption,
+                    RpcEncryption encryption,
                     std::string sasl_proto_name);
 
   // Enable PLAIN authentication.
@@ -221,7 +227,7 @@ class ServerNegotiation {
   // TLS state.
   const security::TlsContext* tls_context_;
   security::TlsHandshake tls_handshake_;
-  const security::RpcEncryption encryption_;
+  const RpcEncryption encryption_;
   bool tls_negotiated_;
 
   // TSK state.

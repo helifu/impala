@@ -22,6 +22,7 @@
 #include "exec/hdfs-scan-node-base.h"
 #include "exec/hdfs-scan-node.h"
 #include "runtime/io/disk-io-mgr.h"
+#include "runtime/io/request-context.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-pool.h"
 #include "runtime/row-batch.h"
@@ -40,19 +41,27 @@ static const int64_t INIT_READ_PAST_SIZE_BYTES = 64 * 1024;
 
 const int64_t ScannerContext::Stream::OUTPUT_BUFFER_BYTES_LEFT_INIT;
 
+static const Status& CONTEXT_CANCELLED = Status::CancelledInternal("ScannerContext");
+
 ScannerContext::ScannerContext(RuntimeState* state, HdfsScanNodeBase* scan_node,
-    HdfsPartitionDescriptor* partition_desc, ScanRange* scan_range,
-    const vector<FilterContext>& filter_ctxs, MemPool* expr_results_pool)
+    BufferPool::ClientHandle* bp_client, int64_t total_reservation,
+    HdfsPartitionDescriptor* partition_desc, const vector<FilterContext>& filter_ctxs,
+    MemPool* expr_results_pool)
   : state_(state),
     scan_node_(scan_node),
+    bp_client_(bp_client),
+    total_reservation_(total_reservation),
     partition_desc_(partition_desc),
     filter_ctxs_(filter_ctxs),
-    expr_results_pool_(expr_results_pool) {
-  AddStream(scan_range);
-}
+    expr_results_pool_(expr_results_pool) {}
 
 ScannerContext::~ScannerContext() {
   DCHECK(streams_.empty());
+}
+
+void ScannerContext::TryIncreaseReservation(int64_t ideal_reservation) {
+  total_reservation_ = scan_node_->IncreaseReservationIncrementally(
+      total_reservation_, ideal_reservation);
 }
 
 void ScannerContext::ReleaseCompletedResources(bool done) {
@@ -66,26 +75,27 @@ void ScannerContext::ClearStreams() {
 }
 
 ScannerContext::Stream::Stream(ScannerContext* parent, ScanRange* scan_range,
-    const HdfsFileDesc* file_desc)
+    int64_t reservation, const HdfsFileDesc* file_desc)
   : parent_(parent),
     scan_range_(scan_range),
     file_desc_(file_desc),
+    reservation_(reservation),
     file_len_(file_desc->file_length),
     next_read_past_size_bytes_(INIT_READ_PAST_SIZE_BYTES),
     boundary_pool_(new MemPool(parent->scan_node_->mem_tracker())),
     boundary_buffer_(new StringBuffer(boundary_pool_.get())) {
 }
 
-ScannerContext::Stream* ScannerContext::AddStream(ScanRange* range) {
-  streams_.emplace_back(new Stream(
-      this, range, scan_node_->GetFileDesc(partition_desc_->id(), range->file())));
+ScannerContext::Stream* ScannerContext::AddStream(ScanRange* range, int64_t reservation) {
+  streams_.emplace_back(new Stream(this, range, reservation,
+      scan_node_->GetFileDesc(partition_desc_->id(), range->file())));
   return streams_.back().get();
 }
 
 void ScannerContext::Stream::ReleaseCompletedResources(bool done) {
   if (done) {
     // Cancel the underlying scan range to clean up any queued buffers there
-    scan_range_->Cancel(Status::CANCELLED);
+    scan_range_->Cancel(CONTEXT_CANCELLED);
     boundary_pool_->FreeAll();
 
     // Reset variables - the stream is no longer valid.
@@ -101,7 +111,8 @@ void ScannerContext::Stream::ReleaseCompletedResources(bool done) {
 
 Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
   DCHECK_EQ(0, io_buffer_bytes_left_);
-  if (UNLIKELY(parent_->cancelled())) return Status::CANCELLED;
+  DiskIoMgr* io_mgr = ExecEnv::GetInstance()->disk_io_mgr();
+  if (UNLIKELY(parent_->cancelled())) return CONTEXT_CANCELLED;
   if (io_buffer_ != nullptr) ReturnIoBuffer();
 
   // Nothing to do if we're at the end of the file - return leaving io_buffer_ == nullptr.
@@ -111,17 +122,19 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
 
   if (!scan_range_eosr_) {
     // Get the next buffer from 'scan_range_'.
-    SCOPED_TIMER(parent_->state_->total_storage_wait_timer());
+    SCOPED_TIMER2(parent_->state_->total_storage_wait_timer(),
+        parent_->scan_node_->scanner_io_wait_time());
     Status status = scan_range_->GetNext(&io_buffer_);
     DCHECK(!status.ok() || io_buffer_ != nullptr);
     RETURN_IF_ERROR(status);
     scan_range_eosr_ = io_buffer_->eosr();
   } else {
     // Already got all buffers from 'scan_range_' - reading past end.
-    SCOPED_TIMER(parent_->state_->total_storage_wait_timer());
+    SCOPED_TIMER2(parent_->state_->total_storage_wait_timer(),
+        parent_->scan_node_->scanner_io_wait_time());
 
     int64_t read_past_buffer_size = 0;
-    int64_t max_buffer_size = parent_->state_->io_mgr()->max_read_buffer_size();
+    int64_t max_buffer_size = io_mgr->max_buffer_size();
     if (!read_past_size_cb_.empty()) read_past_buffer_size = read_past_size_cb_(offset);
     if (read_past_buffer_size <= 0) {
       // Either no callback was set or the callback did not return an estimate. Use
@@ -133,6 +146,7 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
     read_past_buffer_size = ::max(read_past_buffer_size, read_past_size);
     read_past_buffer_size = ::min(read_past_buffer_size, file_bytes_remaining);
     read_past_buffer_size = ::min(read_past_buffer_size, max_buffer_size);
+    read_past_buffer_size = ::min(read_past_buffer_size, reservation_);
     // We're reading past the scan range. Be careful not to read past the end of file.
     DCHECK_GE(read_past_buffer_size, 0);
     if (read_past_buffer_size == 0) {
@@ -140,11 +154,29 @@ Status ScannerContext::Stream::GetNextBuffer(int64_t read_past_size) {
       return Status::OK();
     }
     int64_t partition_id = parent_->partition_descriptor()->id();
+    bool expected_local = false;
+    // Disable HDFS caching as we are reading past the end.
+    int cache_options = scan_range_->cache_options() & ~BufferOpts::USE_HDFS_CACHE;
     ScanRange* range = parent_->scan_node_->AllocateScanRange(
         scan_range_->fs(), filename(), read_past_buffer_size, offset, partition_id,
-        scan_range_->disk_id(), false, BufferOpts::Uncached());
-    RETURN_IF_ERROR(parent_->state_->io_mgr()->Read(
-        parent_->scan_node_->reader_context(), range, &io_buffer_));
+        scan_range_->disk_id(), expected_local, scan_range_->is_erasure_coded(),
+        scan_range_->mtime(), BufferOpts(cache_options));
+    bool needs_buffers;
+    RETURN_IF_ERROR(
+        parent_->scan_node_->reader_context()->StartScanRange(range, &needs_buffers));
+    if (needs_buffers) {
+      // Allocate fresh buffers. The buffers for 'scan_range_' should be released now
+      // since we hit EOS.
+      if (reservation_ < io_mgr->min_buffer_size()) {
+        return Status(Substitute("Could not read past end of scan range in file '$0'. "
+            "Reservation provided $1 was < the minimum I/O buffer size",
+            reservation_, io_mgr->min_buffer_size()));
+      }
+      RETURN_IF_ERROR(io_mgr->AllocateBuffersForRange(
+          parent_->bp_client_, range, reservation_));
+    }
+    RETURN_IF_ERROR(range->GetNext(&io_buffer_));
+    DCHECK(io_buffer_->eosr());
   }
 
   DCHECK(io_buffer_ != nullptr);
@@ -175,7 +207,7 @@ Status ScannerContext::Stream::GetBuffer(bool peek, uint8_t** out_buffer, int64_
 
   if (UNLIKELY(parent_->cancelled())) {
     DCHECK(*out_buffer == nullptr);
-    return Status::CANCELLED;
+    return CONTEXT_CANCELLED;
   }
 
   if (boundary_buffer_bytes_left_ > 0) {
@@ -239,7 +271,7 @@ Status ScannerContext::Stream::GetBytesInternal(int64_t requested_len,
     }
     int64_t remaining_requested_len = requested_len - boundary_buffer_bytes_left_;
     RETURN_IF_ERROR(GetNextBuffer(remaining_requested_len));
-    if (UNLIKELY(parent_->cancelled())) return Status::CANCELLED;
+    if (UNLIKELY(parent_->cancelled())) return CONTEXT_CANCELLED;
     // No more bytes (i.e. EOF).
     if (io_buffer_bytes_left_ == 0) break;
   }
@@ -324,12 +356,14 @@ Status ScannerContext::Stream::CopyIoToBoundary(int64_t num_bytes) {
 
 void ScannerContext::Stream::ReturnIoBuffer() {
   DCHECK(io_buffer_ != nullptr);
-  ExecEnv::GetInstance()->disk_io_mgr()->ReturnBuffer(move(io_buffer_));
+  ScanRange* range = io_buffer_->scan_range();
+  range->ReturnBuffer(move(io_buffer_));
   io_buffer_pos_ = nullptr;
   io_buffer_bytes_left_ = 0;
 }
 
 bool ScannerContext::cancelled() const {
+  if (state_->is_cancelled()) return true;
   if (!scan_node_->HasRowBatchQueue()) return false;
   return static_cast<HdfsScanNode*>(scan_node_)->done();
 }

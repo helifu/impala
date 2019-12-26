@@ -21,13 +21,13 @@ import pytest
 
 from testdata.common import widetable
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIfS3
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
+    create_exec_option_dimension_from_dict,
     create_uncompressed_text_dimension)
 from tests.common.test_result_verifier import (
     assert_codegen_enabled,
-    parse_column_types,
-    parse_column_labels,
     QueryTestResult,
     parse_result_rows)
 from tests.common.test_vector import ImpalaTestDimension
@@ -117,6 +117,7 @@ class TestAggregation(ImpalaTestSuite):
       return False
     return True
 
+  @SkipIfS3.eventually_consistent
   def test_aggregation(self, vector):
     exec_option = vector.get_value('exec_option')
     disable_codegen = exec_option['disable_codegen']
@@ -198,14 +199,6 @@ class TestAggregationQueries(ImpalaTestSuite):
       pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
     self.run_test_case('QueryTest/aggregation', vector)
 
-  def test_distinct(self, vector):
-    if vector.get_value('table_format').file_format == 'hbase':
-      pytest.xfail("HBase returns columns in alphabetical order for select distinct *, "
-                   "making the result verication to fail.")
-    if vector.get_value('table_format').file_format == 'kudu':
-      pytest.xfail("IMPALA-4042: count(distinct NULL) fails on a view, needed for kudu")
-    self.run_test_case('QueryTest/distinct', vector)
-
   def test_group_concat(self, vector):
     """group_concat distinct tests
        Required to run directly in python because the order in which results will be
@@ -275,6 +268,15 @@ class TestAggregationQueries(ImpalaTestSuite):
     vector.get_value('exec_option')['batch_size'] = 1
     self.run_test_case('QueryTest/parquet-stats-agg', vector, unique_database)
 
+  def test_kudu_count_star_optimization(self, vector, unique_database):
+    if (vector.get_value('table_format').file_format != 'text' or
+       vector.get_value('table_format').compression_codec != 'none'):
+      # No need to run this test on all file formats
+      pytest.skip()
+    self.run_test_case('QueryTest/kudu-stats-agg', vector, unique_database)
+    vector.get_value('exec_option')['batch_size'] = 1
+    self.run_test_case('QueryTest/kudu-stats-agg', vector, unique_database)
+
   def test_sampled_ndv(self, vector, unique_database):
     """The SAMPLED_NDV() function is inherently non-deterministic and cannot be
     reasonably made deterministic with existing options so we test it separately.
@@ -297,10 +299,10 @@ class TestAggregationQueries(ImpalaTestSuite):
                ndv(smallint_col), ndv(int_col),
                ndv(bigint_col), ndv(float_col),
                ndv(double_col), ndv(string_col),
-               ndv(cast(double_col as decimal(3, 0))),
+               ndv(cast(double_col as decimal(5, 0))),
                ndv(cast(double_col as decimal(10, 5))),
                ndv(cast(double_col as decimal(20, 10))),
-               ndv(cast(double_col as decimal(38, 35))),
+               ndv(cast(double_col as decimal(38, 33))),
                ndv(cast(string_col as varchar(20))),
                ndv(cast(string_col as char(10))),
                ndv(timestamp_col), ndv(id)
@@ -314,10 +316,10 @@ class TestAggregationQueries(ImpalaTestSuite):
                  sampled_ndv(smallint_col, {0}), sampled_ndv(int_col, {0}),
                  sampled_ndv(bigint_col, {0}), sampled_ndv(float_col, {0}),
                  sampled_ndv(double_col, {0}), sampled_ndv(string_col, {0}),
-                 sampled_ndv(cast(double_col as decimal(3, 0)), {0}),
+                 sampled_ndv(cast(double_col as decimal(5, 0)), {0}),
                  sampled_ndv(cast(double_col as decimal(10, 5)), {0}),
                  sampled_ndv(cast(double_col as decimal(20, 10)), {0}),
-                 sampled_ndv(cast(double_col as decimal(38, 35)), {0}),
+                 sampled_ndv(cast(double_col as decimal(38, 33)), {0}),
                  sampled_ndv(cast(string_col as varchar(20)), {0}),
                  sampled_ndv(cast(string_col as char(10)), {0}),
                  sampled_ndv(timestamp_col, {0}), sampled_ndv(id, {0})
@@ -338,6 +340,42 @@ class TestAggregationQueries(ImpalaTestSuite):
       # with a sampling percent of 0.1 to be approximately 10x of the NDV().
       for i in xrange(14, 16):
         self.appx_equals(int(sampled_ndv_vals[i]) * sample_perc, int(ndv_vals[i]), 2.0)
+
+
+class TestDistinctAggregation(ImpalaTestSuite):
+  """Run the distinct aggregation test suite, with codegen and shuffle_distinct_exprs
+  enabled and disabled."""
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestDistinctAggregation, cls).add_test_dimensions()
+
+    cls.ImpalaTestMatrix.add_dimension(
+      create_exec_option_dimension_from_dict({
+        'disable_codegen': [False, True],
+        'shuffle_distinct_exprs': [False, True]
+      }))
+
+    if cls.exploration_strategy() == 'core':
+      cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('table_format').file_format == 'text' and
+        v.get_value('table_format').compression_codec == 'none')
+
+  def test_distinct(self, vector):
+    if vector.get_value('table_format').file_format == 'hbase':
+      pytest.xfail("HBase returns columns in alphabetical order for select distinct *, "
+                   "making the result verication to fail.")
+    self.run_test_case('QueryTest/distinct', vector)
+
+  def test_multiple_distinct(self, vector):
+    if vector.get_value('table_format').file_format == 'hbase':
+      pytest.xfail("HBase returns columns in alphabetical order for select distinct *, "
+                   "making the result verication to fail.")
+    self.run_test_case('QueryTest/multiple-distinct-aggs', vector)
+
 
 class TestWideAggregationQueries(ImpalaTestSuite):
   """Test that aggregations with many grouping columns work"""
@@ -368,8 +406,8 @@ class TestWideAggregationQueries(ImpalaTestSuite):
     # All rows should be distinct.
     expected_result = widetable.get_data(1000, 10, quote_strings=True)
 
-    types = parse_column_types(result.schema)
-    labels = parse_column_labels(result.schema)
+    types = result.column_types
+    labels = result.column_labels
     expected = QueryTestResult(expected_result, types, labels, order_matters=False)
     actual = QueryTestResult(parse_result_rows(result), types, labels,
         order_matters=False)
@@ -394,3 +432,6 @@ class TestTPCHAggregationQueries(ImpalaTestSuite):
 
   def test_tpch_passthrough_aggregations(self, vector):
     self.run_test_case('tpch-passthrough-aggregations', vector)
+
+  def test_tpch_stress(self, vector):
+    self.run_test_case('tpch-stress-aggregations', vector)

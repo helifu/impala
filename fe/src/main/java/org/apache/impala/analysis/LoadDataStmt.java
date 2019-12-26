@@ -19,26 +19,24 @@ package org.apache.impala.analysis;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.List;
 
-import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.adl.AdlFileSystem;
+import org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem;
+import org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
-import org.apache.hadoop.fs.adl.AdlFileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
-import org.apache.impala.thrift.ImpalaInternalServiceConstants;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.FsPermissionChecker;
-import org.apache.impala.util.TAccessLevelUtil;
 
 import com.google.common.base.Preconditions;
 
@@ -89,23 +87,30 @@ public class LoadDataStmt extends StatementBase {
    * @see org.apache.impala.parser.ParseNode#toSql()
    */
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("LOAD DATA INPATH '");
     sb.append(sourceDataPath_ + "' ");
     if (overwrite_) sb.append("OVERWRITE ");
     sb.append("INTO TABLE " + tableName_.toString());
-    if (partitionSpec_ != null) sb.append(" " + partitionSpec_.toSql());
+    if (partitionSpec_ != null) sb.append(" " + partitionSpec_.toSql(options));
     return sb.toString();
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
   }
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     dbName_ = analyzer.getTargetDbName(tableName_);
-    Table table = analyzer.getTable(tableName_, Privilege.INSERT);
-    if (!(table instanceof HdfsTable)) {
+    FeTable table = analyzer.getTable(tableName_, Privilege.INSERT);
+    if (!(table instanceof FeFsTable)) {
       throw new AnalysisException("LOAD DATA only supported for HDFS tables: " +
           dbName_ + "." + getTbl());
     }
+    analyzer.checkTableCapability(table, Analyzer.OperationType.WRITE);
+    analyzer.ensureTableNotTransactional(table, "LOAD DATA");
 
     // Analyze the partition spec, if one was specified.
     if (partitionSpec_ != null) {
@@ -119,7 +124,7 @@ public class LoadDataStmt extends StatementBase {
             "specified: " + dbName_ + "." + getTbl());
       }
     }
-    analyzePaths(analyzer, (HdfsTable) table);
+    analyzePaths(analyzer, (FeFsTable) table);
   }
 
   /**
@@ -131,7 +136,7 @@ public class LoadDataStmt extends StatementBase {
    * We don't check permissions for the S3AFileSystem and the AdlFileSystem due to
    * limitations with thier getAclStatus() API. (see HADOOP-13892 and HADOOP-14437)
    */
-  private void analyzePaths(Analyzer analyzer, HdfsTable hdfsTable)
+  private void analyzePaths(Analyzer analyzer, FeFsTable table)
       throws AnalysisException {
     // The user must have permission to access the source location. Since the files will
     // be moved from this location, the user needs to have all permission.
@@ -142,9 +147,11 @@ public class LoadDataStmt extends StatementBase {
       Path source = sourceDataPath_.getPath();
       FileSystem fs = source.getFileSystem(FileSystemUtil.getConfiguration());
       if (!(fs instanceof DistributedFileSystem) && !(fs instanceof S3AFileSystem) &&
+          !(fs instanceof AzureBlobFileSystem) &&
+          !(fs instanceof SecureAzureBlobFileSystem) &&
           !(fs instanceof AdlFileSystem)) {
         throw new AnalysisException(String.format("INPATH location '%s' " +
-            "must point to an HDFS, S3A or ADL filesystem.", sourceDataPath_));
+            "must point to an HDFS, S3A, ADL or ABFS filesystem.", sourceDataPath_));
       }
       if (!fs.exists(source)) {
         throw new AnalysisException(String.format(
@@ -156,7 +163,8 @@ public class LoadDataStmt extends StatementBase {
       // its parent directory (in order to delete the file as part of the move operation).
       FsPermissionChecker checker = FsPermissionChecker.getInstance();
       // TODO: Disable permission checking for S3A as well (HADOOP-13892)
-      boolean shouldCheckPerms = !(fs instanceof AdlFileSystem);
+      boolean shouldCheckPerms = !(fs instanceof AdlFileSystem ||
+        fs instanceof AzureBlobFileSystem || fs instanceof SecureAzureBlobFileSystem);
 
       if (fs.isDirectory(source)) {
         if (FileSystemUtil.getTotalNumVisibleFiles(source) == 0) {
@@ -195,39 +203,9 @@ public class LoadDataStmt extends StatementBase {
         }
       }
 
-      String noWriteAccessErrorMsg = String.format("Unable to LOAD DATA into " +
-          "target table (%s) because Impala does not have WRITE access to HDFS " +
-          "location: ", hdfsTable.getFullName());
-
-      HdfsPartition partition;
-      String location;
-      if (partitionSpec_ != null) {
-        partition = hdfsTable.getPartition(partitionSpec_.getPartitionSpecKeyValues());
-        location = partition.getLocation();
-        if (!TAccessLevelUtil.impliesWriteAccess(partition.getAccessLevel())) {
-          throw new AnalysisException(noWriteAccessErrorMsg + location);
-        }
-      } else {
-        // "default" partition
-        partition = hdfsTable.getPartitionMap().get(
-            ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID);
-        location = hdfsTable.getLocation();
-        if (!hdfsTable.hasWriteAccess()) {
-          throw new AnalysisException(noWriteAccessErrorMsg + hdfsTable.getLocation());
-        }
-      }
-      Preconditions.checkNotNull(partition);
-
-      // Verify the files being loaded are supported.
-      for (FileStatus fStatus: fs.listStatus(source)) {
-        if (fs.isDirectory(fStatus.getPath())) continue;
-        StringBuilder errorMsg = new StringBuilder();
-        HdfsFileFormat fileFormat = partition.getInputFormatDescriptor().getFileFormat();
-        if (!fileFormat.isFileCompressionTypeSupported(fStatus.getPath().toString(),
-          errorMsg)) {
-          throw new AnalysisException(errorMsg.toString());
-        }
-      }
+      FeFsTable.Utils.checkWriteAccess(table,
+          partitionSpec_ != null ? partitionSpec_.getPartitionSpecKeyValues() : null,
+          "LOAD DATA");
     } catch (FileNotFoundException e) {
       throw new AnalysisException("File not found: " + e.getMessage(), e);
     } catch (IOException e) {

@@ -17,22 +17,21 @@
 
 #include "kudu/rpc/reactor.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
+#include <cerrno>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
+#include <utility>
 
+#include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/intrusive/list.hpp>
 #include <boost/optional.hpp>
 #include <ev++.h>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/gutil/bind.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -40,16 +39,17 @@
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/negotiation.h"
-#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/server_negotiation.h"
-#include "kudu/rpc/transfer.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/debug/sanitizer_scopes.h"
-#include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/random_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 #include "kudu/util/thread_restrictions.h"
@@ -70,7 +70,7 @@ using std::shared_ptr;
 using std::unique_ptr;
 using strings::Substitute;
 
-DEFINE_bool_hidden(rpc_reopen_outbound_connections, false,
+DEFINE_bool(rpc_reopen_outbound_connections, false,
             "Open a new connection to the server for every RPC call. "
             "If not enabled, an already existing connection to a "
             "server is reused upon making another call to the same server. "
@@ -80,6 +80,38 @@ DEFINE_bool_hidden(rpc_reopen_outbound_connections, false,
             "Used by tests only.");
 TAG_FLAG(rpc_reopen_outbound_connections, unsafe);
 TAG_FLAG(rpc_reopen_outbound_connections, runtime);
+
+DEFINE_int32(tcp_keepalive_probe_period_s, 60,
+             "The duration in seconds after an outbound connection has gone idle "
+             "before a TCP keepalive probe is sent to the peer. Set to 0 to disable "
+             "TCP keepalive probes from being sent.");
+DEFINE_int32(tcp_keepalive_retry_period_s, 3,
+             "The duration in seconds between successive keepalive probes from an "
+             "outbound connection if the previous probes are not acknowledged. "
+             "Effective only if --tcp_keepalive_probe_period_s is not 0.");
+DEFINE_int32(tcp_keepalive_retry_count, 10,
+             "The maximum number of keepalive probes sent before declaring the remote "
+             "end as dead. Effective only if --tcp_keepalive_probe_period_s is not 0.");
+TAG_FLAG(tcp_keepalive_probe_period_s, advanced);
+TAG_FLAG(tcp_keepalive_retry_period_s, advanced);
+TAG_FLAG(tcp_keepalive_retry_count, advanced);
+
+METRIC_DEFINE_histogram(server, reactor_load_percent,
+                        "Reactor Thread Load Percentage",
+                        kudu::MetricUnit::kUnits,
+                        "The percentage of time that the reactor is busy "
+                        "(not blocked awaiting network activity). If this metric "
+                        "shows significant samples nears 100%, increasing the "
+                        "number of reactors may be beneficial.", 100, 2);
+
+METRIC_DEFINE_histogram(server, reactor_active_latency_us,
+                        "Reactor Thread Active Latency",
+                        kudu::MetricUnit::kMicroseconds,
+                        "Histogram of the wall clock time for reactor thread wake-ups. "
+                        "The reactor thread is responsible for all network I/O and "
+                        "therefore outliers in this latency histogram directly contribute "
+                        "to the latency of both inbound and outbound RPCs.",
+                        1000000, 2);
 
 namespace kudu {
 namespace rpc {
@@ -91,6 +123,22 @@ Status ShutdownError(bool aborted) {
       Status::Aborted(msg, "", ESHUTDOWN) :
       Status::ServiceUnavailable(msg, "", ESHUTDOWN);
 }
+
+// Callback for libev fatal errors (eg running out of file descriptors).
+// Unfortunately libev doesn't plumb these back through to the caller, but
+// instead just expects the callback to abort.
+//
+// This implementation is slightly preferable to the built-in one since
+// it uses a FATAL log message instead of printing to stderr, which might
+// not end up anywhere useful in a daemonized context.
+void LibevSysErr(const char* msg) throw() {
+  PLOG(FATAL) << "LibEV fatal error: " << msg;
+}
+
+void DoInitLibEv() {
+  ev::set_syserr_cb(LibevSysErr);
+}
+
 } // anonymous namespace
 
 ReactorThread::ReactorThread(Reactor *reactor, const MessengerBuilder& bld)
@@ -101,7 +149,15 @@ ReactorThread::ReactorThread(Reactor *reactor, const MessengerBuilder& bld)
     connection_keepalive_time_(bld.connection_keepalive_time_),
     coarse_timer_granularity_(bld.coarse_timer_granularity_),
     total_client_conns_cnt_(0),
-    total_server_conns_cnt_(0) {
+    total_server_conns_cnt_(0),
+    rng_(GetRandomSeed32()) {
+
+  if (bld.metric_entity_) {
+    invoke_us_histogram_ =
+        METRIC_reactor_active_latency_us.Instantiate(bld.metric_entity_);
+    load_percent_histogram_ =
+        METRIC_reactor_load_percent.Instantiate(bld.metric_entity_);
+  }
 }
 
 Status ReactorThread::Init() {
@@ -109,7 +165,7 @@ Status ReactorThread::Init() {
   DVLOG(6) << "Called ReactorThread::Init()";
   // Register to get async notifications in our epoll loop.
   async_.set(loop_);
-  async_.set<ReactorThread, &ReactorThread::AsyncHandler>(this);
+  async_.set<ReactorThread, &ReactorThread::AsyncHandler>(this); // NOLINT(*)
   async_.start();
 
   // Register the timer watcher.
@@ -120,15 +176,62 @@ Status ReactorThread::Init() {
   timer_.start(coarse_timer_granularity_.ToSeconds(),
                coarse_timer_granularity_.ToSeconds());
 
+  // Register our callbacks. ev++ doesn't provide handy wrappers for these.
+  ev_set_userdata(loop_, this);
+  ev_set_loop_release_cb(loop_, &ReactorThread::AboutToPollCb, &ReactorThread::PollCompleteCb);
+  ev_set_invoke_pending_cb(loop_, &ReactorThread::InvokePendingCb);
+
   // Create Reactor thread.
   return kudu::Thread::Create("reactor", "rpc reactor", &ReactorThread::RunThread, this, &thread_);
 }
 
-void ReactorThread::Shutdown() {
+void ReactorThread::InvokePendingCb(struct ev_loop* loop) {
+  // Calculate the number of cycles spent calling our callbacks.
+  // This is called quite frequently so we use CycleClock rather than MonoTime
+  // since it's a bit faster.
+  int64_t start = CycleClock::Now();
+  ev_invoke_pending(loop);
+  int64_t dur_cycles = CycleClock::Now() - start;
+
+  // Contribute this to our histogram.
+  ReactorThread* thr = static_cast<ReactorThread*>(ev_userdata(loop));
+  if (thr->invoke_us_histogram_) {
+    thr->invoke_us_histogram_->Increment(dur_cycles * 1000000 / base::CyclesPerSecond());
+  }
+}
+
+void ReactorThread::AboutToPollCb(struct ev_loop* loop) noexcept {
+  // Store the current time in a member variable to be picked up below
+  // in PollCompleteCb.
+  ReactorThread* thr = static_cast<ReactorThread*>(ev_userdata(loop));
+  thr->cycle_clock_before_poll_ = CycleClock::Now();
+}
+
+void ReactorThread::PollCompleteCb(struct ev_loop* loop) noexcept {
+  // First things first, capture the time, so that this is as accurate as possible
+  int64_t cycle_clock_after_poll = CycleClock::Now();
+
+  // Record it in our accounting.
+  ReactorThread* thr = static_cast<ReactorThread*>(ev_userdata(loop));
+  DCHECK_NE(thr->cycle_clock_before_poll_, -1)
+      << "PollCompleteCb called without corresponding AboutToPollCb";
+
+  int64_t poll_cycles = cycle_clock_after_poll - thr->cycle_clock_before_poll_;
+  thr->cycle_clock_before_poll_ = -1;
+  thr->total_poll_cycles_ += poll_cycles;
+}
+
+void ReactorThread::Shutdown(Messenger::ShutdownMode mode) {
   CHECK(reactor_->closing()) << "Should be called after setting closing_ flag";
 
   VLOG(1) << name() << ": shutting down Reactor thread.";
   WakeThread();
+
+  if (mode == Messenger::ShutdownMode::SYNC) {
+    // Join() will return a bad status if asked to join on the currently
+    // running thread.
+    CHECK_OK(ThreadJoiner(thread_.get()).Join());
+  }
 }
 
 void ReactorThread::ShutdownInternal() {
@@ -157,13 +260,20 @@ void ReactorThread::ShutdownInternal() {
   // These won't be found in the ReactorThread's list of pending tasks
   // because they've been "run" (that is, they've been scheduled).
   Status aborted = ShutdownError(true); // aborted
-  for (DelayedTask* task : scheduled_tasks_) {
-    task->Abort(aborted); // should also free the task.
+  while (!scheduled_tasks_.empty()) {
+    DelayedTask* t = &scheduled_tasks_.front();
+    scheduled_tasks_.pop_front();
+    t->Abort(aborted); // should also free the task.
   }
-  scheduled_tasks_.clear();
 
   // Remove the OpenSSL thread state.
+  //
+  // As of OpenSSL 1.1, this [1] is a no-op and can be ignored.
+  //
+  // 1. https://www.openssl.org/docs/man1.1.0/crypto/ERR_remove_thread_state.html
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   ERR_remove_thread_state(nullptr);
+#endif
 }
 
 ReactorTask::ReactorTask() {
@@ -180,8 +290,8 @@ Status ReactorThread::GetMetrics(ReactorMetrics* metrics) {
   return Status::OK();
 }
 
-Status ReactorThread::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
-                                      DumpRunningRpcsResponsePB* resp) {
+Status ReactorThread::DumpConnections(const DumpConnectionsRequestPB& req,
+                                      DumpConnectionsResponsePB* resp) {
   DCHECK(IsCurrentThread());
   for (const scoped_refptr<Connection>& conn : server_conns_) {
     RETURN_NOT_OK(conn->DumpPB(req, resp->add_inbound_connections()));
@@ -237,7 +347,7 @@ void ReactorThread::RegisterConnection(scoped_refptr<Connection> conn) {
   server_conns_.emplace_back(std::move(conn));
 }
 
-void ReactorThread::AssignOutboundCall(const shared_ptr<OutboundCall>& call) {
+void ReactorThread::AssignOutboundCall(shared_ptr<OutboundCall> call) {
   DCHECK(IsCurrentThread());
 
   // Skip if the outbound has been cancelled already.
@@ -250,11 +360,11 @@ void ReactorThread::AssignOutboundCall(const shared_ptr<OutboundCall>& call) {
                                    call->controller()->credentials_policy(),
                                    &conn);
   if (PREDICT_FALSE(!s.ok())) {
-    call->SetFailed(s, OutboundCall::Phase::CONNECTION_NEGOTIATION);
+    call->SetFailed(std::move(s), OutboundCall::Phase::CONNECTION_NEGOTIATION);
     return;
   }
 
-  conn->QueueOutboundCall(call);
+  conn->QueueOutboundCall(std::move(call));
 }
 
 void ReactorThread::CancelOutboundCall(const shared_ptr<OutboundCall>& call) {
@@ -290,6 +400,20 @@ void ReactorThread::TimerHandler(ev::timer& /*watcher*/, int revents) {
     return;
   }
   cur_time_ = MonoTime::Now();
+
+  // Compute load percentage.
+  int64_t now_cycles = CycleClock::Now();
+  if (last_load_measurement_.time_cycles != -1) {
+    int64_t cycles_delta = (now_cycles - last_load_measurement_.time_cycles);
+    int64_t poll_cycles_delta = total_poll_cycles_ - last_load_measurement_.poll_cycles;
+    double poll_fraction = static_cast<double>(poll_cycles_delta) / cycles_delta;
+    double active_fraction = 1 - poll_fraction;
+    if (load_percent_histogram_) {
+      load_percent_histogram_->Increment(static_cast<int>(active_fraction * 100));
+    }
+  }
+  last_load_measurement_.time_cycles = now_cycles;
+  last_load_measurement_.poll_cycles = total_poll_cycles_;
 
   ScanIdleConnections();
 }
@@ -501,6 +625,20 @@ void ReactorThread::CompleteConnectionNegotiation(
     return;
   }
 
+  if (FLAGS_tcp_keepalive_probe_period_s > 0) {
+    // Try spreading out the idle poll period to avoid thundering herd in case connections
+    // are all created at the same time (e.g. after a cluster is restarted).
+    Status keepalive_status = conn->SetTcpKeepAlive(
+        FLAGS_tcp_keepalive_probe_period_s + rng_.Uniform32(4),
+        FLAGS_tcp_keepalive_retry_period_s, FLAGS_tcp_keepalive_retry_count);
+    if (PREDICT_FALSE(!keepalive_status.ok())) {
+      LOG(DFATAL) << "Unable to set TCP keepalive for connection: "
+                  << keepalive_status.ToString();
+      DestroyConnection(conn.get(), keepalive_status, std::move(rpc_error));
+      return;
+    }
+  }
+
   conn->MarkNegotiationComplete();
   conn->EpollRegister(loop_);
 }
@@ -575,14 +713,15 @@ DelayedTask::DelayedTask(boost::function<void(const Status&)> func,
 void DelayedTask::Run(ReactorThread* thread) {
   DCHECK(thread_ == nullptr) << "Task has already been scheduled";
   DCHECK(thread->IsCurrentThread());
+  DCHECK(!is_linked()) << "Should not be linked on pending_tasks_ anymore";
 
   // Schedule the task to run later.
   thread_ = thread;
   timer_.set(thread->loop_);
-  timer_.set<DelayedTask, &DelayedTask::TimerHandler>(this);
+  timer_.set<DelayedTask, &DelayedTask::TimerHandler>(this); // NOLINT(*)
   timer_.start(when_.ToSeconds(), // after
                0);                // repeat
-  thread_->scheduled_tasks_.insert(this);
+  thread_->scheduled_tasks_.push_back(*this);
 }
 
 void DelayedTask::Abort(const Status& abort_status) {
@@ -590,9 +729,10 @@ void DelayedTask::Abort(const Status& abort_status) {
   delete this;
 }
 
-void DelayedTask::TimerHandler(ev::timer& watcher, int revents) {
+void DelayedTask::TimerHandler(ev::timer& /*watcher*/, int revents) {
+  DCHECK(is_linked()) << "should be linked on scheduled_tasks_";
   // We will free this task's memory.
-  thread_->scheduled_tasks_.erase(this);
+  thread_->scheduled_tasks_.erase(thread_->scheduled_tasks_.iterator_to(*this));
 
   if (EV_ERROR & revents) {
     string msg = "Delayed task got an error in its timer handler";
@@ -610,6 +750,8 @@ Reactor::Reactor(shared_ptr<Messenger> messenger,
       name_(StringPrintf("%s_R%03d", messenger_->name().c_str(), index)),
       closing_(false),
       thread_(this, bld) {
+  static std::once_flag libev_once;
+  std::call_once(libev_once, DoInitLibEv);
 }
 
 Status Reactor::Init() {
@@ -617,7 +759,7 @@ Status Reactor::Init() {
   return thread_.Init();
 }
 
-void Reactor::Shutdown() {
+void Reactor::Shutdown(Messenger::ShutdownMode mode) {
   {
     std::lock_guard<LockType> l(lock_);
     if (closing_) {
@@ -626,7 +768,7 @@ void Reactor::Shutdown() {
     closing_ = true;
   }
 
-  thread_.Shutdown();
+  thread_.Shutdown(mode);
 
   // Abort all pending tasks. No new tasks can get scheduled after this
   // because ScheduleReactorTask() tests the closing_ flag set above.
@@ -639,7 +781,7 @@ void Reactor::Shutdown() {
 }
 
 Reactor::~Reactor() {
-  Shutdown();
+  Shutdown(Messenger::ShutdownMode::ASYNC);
 }
 
 const std::string& Reactor::name() const {
@@ -689,10 +831,10 @@ Status Reactor::RunOnReactorThread(const boost::function<Status()>& f) {
   return task.Wait();
 }
 
-Status Reactor::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
-                                DumpRunningRpcsResponsePB* resp) {
-  return RunOnReactorThread(boost::bind(&ReactorThread::DumpRunningRpcs, &thread_,
-                                        boost::ref(req), resp));
+Status Reactor::DumpConnections(const DumpConnectionsRequestPB& req,
+                                DumpConnectionsResponsePB* resp) {
+  return RunOnReactorThread(boost::bind(&ReactorThread::DumpConnections,
+                                        &thread_, boost::ref(req), resp));
 }
 
 class RegisterConnectionTask : public ReactorTask {
@@ -733,7 +875,7 @@ class AssignOutboundCallTask : public ReactorTask {
       : call_(std::move(call)) {}
 
   void Run(ReactorThread* reactor) override {
-    reactor->AssignOutboundCall(call_);
+    reactor->AssignOutboundCall(std::move(call_));
     delete this;
   }
 

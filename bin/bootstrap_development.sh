@@ -18,7 +18,7 @@
 # under the License.
 
 # This script bootstraps a development environment from almost nothing; it is known to
-# work on Ubuntu 14.04 and 16.04. It clobbers some local environment and system
+# work on Ubuntu 16.04. It clobbers some local environment and system
 # configurations, so it is best to run this in a fresh install. It also sets up the
 # ~/.bashrc for the calling user and impala-config-local.sh with some environment
 # variables to make Impala compile and run after this script is complete.
@@ -46,7 +46,7 @@ source "${BINDIR}/bootstrap_system.sh"
 export MAX_PYTEST_FAILURES=0
 source bin/impala-config.sh
 export NUM_CONCURRENT_TESTS=$(nproc)
-time -p ./buildall.sh -noclean -format -testdata -skiptests
+time -p ./buildall.sh -format -testdata -skiptests
 
 # To then run the tests:
 # time -p bin/run-all-tests.sh

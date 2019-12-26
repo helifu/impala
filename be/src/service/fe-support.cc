@@ -20,7 +20,9 @@
 #include "service/fe-support.h"
 
 #include <boost/scoped_ptr.hpp>
+#include <catalog/catalog-util.h>
 
+#include "catalog/catalog-server.h"
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/logging.h"
@@ -42,6 +44,7 @@
 #include "runtime/runtime-state.h"
 #include "service/impala-server.h"
 #include "service/query-options.h"
+#include "util/bloom-filter.h"
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
 #include "util/disk-info.h"
@@ -49,6 +52,7 @@
 #include "util/jni-util.h"
 #include "util/mem-info.h"
 #include "util/scope-exit-trigger.h"
+#include "util/string-parser.h"
 #include "util/symbols-util.h"
 
 #include "common/names.h"
@@ -64,7 +68,7 @@ static bool fe_support_disable_codegen = true;
 extern "C"
 JNIEXPORT void JNICALL
 Java_org_apache_impala_service_FeSupport_NativeFeTestInit(
-    JNIEnv* env, jclass caller_class) {
+    JNIEnv* env, jclass fe_support_class) {
   DCHECK(ExecEnv::GetInstance() == NULL) << "This should only be called once from the FE";
   char* env_logs_dir_str = std::getenv("IMPALA_FE_TEST_LOGS_DIR");
   if (env_logs_dir_str != nullptr) FLAGS_log_dir = env_logs_dir_str;
@@ -147,6 +151,12 @@ static void SetTColumnValue(
       col_val->__isset.string_val = true;
       break;
     }
+    case TYPE_DATE: {
+      col_val->__set_int_val(*reinterpret_cast<const int32_t*>(value));
+      RawValue::PrintValue(value, type, -1, &col_val->string_val);
+      col_val->__isset.string_val = true;
+      break;
+    }
     default:
       DCHECK(false) << "bad GetValue() type: " << type.DebugString();
   }
@@ -157,11 +167,13 @@ static void SetTColumnValue(
 // a predicate evaluation. It requires JniUtil::Init() to have been
 // called. Throws a Java exception if an error or warning is encountered during
 // the expr evaluation.
+// We also reject the expression rewrite if the size of the returned rewritten result
+// is too large.
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
     JNIEnv* env, jclass caller_class, jbyteArray thrift_expr_batch,
-    jbyteArray thrift_query_ctx_bytes) {
+    jbyteArray thrift_query_ctx_bytes, jlong max_result_size) {
   Status status;
   jbyteArray result_bytes = NULL;
   TQueryCtx query_ctx;
@@ -213,12 +225,12 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
   }
 
   // UDFs which cannot be interpreted need to be handled by codegen.
-  if (state.ScalarFnNeedsCodegen()) {
+  if (state.ScalarExprNeedsCodegen()) {
     status = state.CreateCodegen();
     if (!status.ok()) goto error;
     LlvmCodeGen* codegen = state.codegen();
     DCHECK(codegen != NULL);
-    status = state.CodegenScalarFns();
+    status = state.CodegenScalarExprs();
     if (!status.ok()) goto error;
     codegen->EnableOptimizations(false);
     status = codegen->FinalizeModule();
@@ -234,9 +246,22 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
     void* result = eval->GetValue(nullptr);
     status = eval->GetError();
     if (!status.ok()) goto error;
+
+    const ColumnType& type = eval->root().type();
+    // reject the expression rewrite if the returned string greater than
+    if (type.IsVarLenStringType()) {
+      const StringValue* string_val = reinterpret_cast<const StringValue*>(result);
+      if (string_val != nullptr) {
+        if (string_val->len > max_result_size) {
+          status = Status(TErrorCode::EXPR_REWRITE_RESULT_LIMIT_EXCEEDED,
+              string_val->len, max_result_size);
+          goto error;
+        }
+      }
+    }
+
     // 'output_scale' should only be set for MathFunctions::RoundUpTo()
     // with return type double.
-    const ColumnType& type = eval->root().type();
     DCHECK(eval->output_scale() == -1 || type.type == TYPE_DOUBLE);
     TColumnValue val;
     SetTColumnValue(result, type, &val);
@@ -292,11 +317,15 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
 
   // Builtin functions are loaded directly from the running process
   if (params.fn_binary_type != TFunctionBinaryType::BUILTIN) {
-    // Refresh the library if necessary since we're creating a new function
-    LibCache::instance()->SetNeedsRefresh(params.location);
+    // Use the latest version of the file from the file system if specified.
+    if (params.needs_refresh) {
+      // Refresh the library if necessary.
+      LibCache::instance()->SetNeedsRefresh(params.location);
+    }
+    LibCacheEntryHandle handle;
     string dummy_local_path;
-    Status status = LibCache::instance()->GetLocalLibPath(
-        params.location, type, &dummy_local_path);
+    Status status = LibCache::instance()->GetLocalPath(
+        params.location, type, -1, &handle, &dummy_local_path);
     if (!status.ok()) {
       result->__set_result_code(TSymbolLookupResultCode::BINARY_NOT_FOUND);
       result->__set_error_msg(status.GetDetail());
@@ -307,11 +336,13 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   // Check if the FE-specified symbol exists as-is.
   // Set 'quiet' to true so we don't flood the log with unfound builtin symbols on
   // startup.
-  Status status =
-      LibCache::instance()->CheckSymbolExists(params.location, type, params.symbol, true);
+  time_t mtime = -1;
+  Status status = LibCache::instance()->CheckSymbolExists(
+      params.location, type, params.symbol, true, &mtime);
   if (status.ok()) {
     result->__set_result_code(TSymbolLookupResultCode::SYMBOL_FOUND);
     result->__set_symbol(params.symbol);
+    result->__set_last_modified_time(mtime);
     return;
   }
 
@@ -345,7 +376,8 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   }
 
   // Look up the mangled symbol
-  status = LibCache::instance()->CheckSymbolExists(params.location, type, symbol);
+  status = LibCache::instance()->CheckSymbolExists(
+      params.location, type, symbol, false, &mtime);
   if (!status.ok()) {
     result->__set_result_code(TSymbolLookupResultCode::SYMBOL_NOT_FOUND);
     stringstream ss;
@@ -376,20 +408,23 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
   // We were able to resolve the symbol.
   result->__set_result_code(TSymbolLookupResultCode::SYMBOL_FOUND);
   result->__set_symbol(symbol);
+  result->__set_last_modified_time(mtime);
 }
 
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_org_apache_impala_service_FeSupport_NativeCacheJar(
-    JNIEnv* env, jclass caller_class, jbyteArray thrift_struct) {
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
   TCacheJarParams params;
   THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &params), env,
       JniUtil::internal_exc_class(), nullptr);
 
   TCacheJarResult result;
+  LibCacheEntryHandle handle;
   string local_path;
-  Status status = LibCache::instance()->GetLocalLibPath(params.hdfs_location,
-      LibCache::TYPE_JAR, &local_path);
+  // TODO(IMPALA-6727): used for external data sources; add proper mtime.
+  Status status = LibCache::instance()->GetLocalPath(
+      params.hdfs_location, LibCache::TYPE_JAR, -1, &handle, &local_path);
   status.ToThrift(&result.status);
   if (status.ok()) result.__set_local_path(local_path);
 
@@ -402,7 +437,7 @@ Java_org_apache_impala_service_FeSupport_NativeCacheJar(
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_org_apache_impala_service_FeSupport_NativeLookupSymbol(
-    JNIEnv* env, jclass caller_class, jbyteArray thrift_struct) {
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
   TSymbolLookupParams lookup;
   THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &lookup), env,
       JniUtil::internal_exc_class(), nullptr);
@@ -421,12 +456,76 @@ Java_org_apache_impala_service_FeSupport_NativeLookupSymbol(
   return result_bytes;
 }
 
+// Add a catalog update to pending_topic_updates_.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_apache_impala_service_FeSupport_NativeAddPendingTopicItem(JNIEnv* env,
+    jclass fe_support_class, jlong native_catalog_server_ptr, jstring key, jlong version,
+    jbyteArray serialized_object, jboolean deleted) {
+  std::string key_string;
+  {
+    JniUtfCharGuard key_str;
+    if (!JniUtfCharGuard::create(env, key, &key_str).ok()) {
+      return static_cast<jboolean>(false);
+    }
+    key_string.assign(key_str.get());
+  }
+  JniScopedArrayCritical obj_buf;
+  if (!JniScopedArrayCritical::Create(env, serialized_object, &obj_buf)) {
+    return static_cast<jboolean>(false);
+  }
+  reinterpret_cast<CatalogServer*>(native_catalog_server_ptr)->
+      AddPendingTopicItem(std::move(key_string), version, obj_buf.get(),
+      static_cast<uint32_t>(obj_buf.size()), deleted);
+  return static_cast<jboolean>(true);
+}
+
+// Get the next catalog update pointed by 'callback_ctx'.
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_apache_impala_service_FeSupport_NativeGetNextCatalogObjectUpdate(JNIEnv* env,
+    jclass fe_support_class, jlong native_iterator_ptr) {
+  return reinterpret_cast<JniCatalogCacheUpdateIterator*>(native_iterator_ptr)->next(env);
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_apache_impala_service_FeSupport_NativeLibCacheSetNeedsRefresh(JNIEnv* env,
+    jclass fe_support_class, jstring hdfs_location) {
+  string str;
+  {
+    JniUtfCharGuard hdfs_location_data;
+    if (!JniUtfCharGuard::create(env, hdfs_location, &hdfs_location_data).ok()) {
+      return static_cast<jboolean>(false);
+    }
+    str.assign(hdfs_location_data.get());
+  }
+  LibCache::instance()->SetNeedsRefresh(str);
+  return static_cast<jboolean>(true);
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_apache_impala_service_FeSupport_NativeLibCacheRemoveEntry(JNIEnv* env,
+    jclass fe_support_class, jstring hdfs_lib_file) {
+  string str;
+  {
+    JniUtfCharGuard hdfs_lib_file_data;
+    if (!JniUtfCharGuard::create(env, hdfs_lib_file, &hdfs_lib_file_data).ok()) {
+      return static_cast<jboolean>(false);
+    }
+    str.assign(hdfs_lib_file_data.get());
+  }
+  LibCache::instance()->RemoveEntry(str);
+  return static_cast<jboolean>(true);
+}
+
 // Calls in to the catalog server to request prioritizing the loading of metadata for
 // specific catalog objects.
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_org_apache_impala_service_FeSupport_NativePrioritizeLoad(
-    JNIEnv* env, jclass caller_class, jbyteArray thrift_struct) {
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
   TPrioritizeLoadRequest request;
   THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
       JniUtil::internal_exc_class(), nullptr);
@@ -436,6 +535,7 @@ Java_org_apache_impala_service_FeSupport_NativePrioritizeLoad(
   Status status = catalog_op_executor.PrioritizeLoad(request, &result);
   if (!status.ok()) {
     LOG(ERROR) << status.GetDetail();
+    // TODO: remove the wrapping; DoRPC's wrapping is sufficient.
     status.AddDetail("Error making an RPC call to Catalog server.");
     status.ToThrift(&result.status);
   }
@@ -446,12 +546,103 @@ Java_org_apache_impala_service_FeSupport_NativePrioritizeLoad(
   return result_bytes;
 }
 
+// Calls in to the catalog server to report recently used table names and the number of
+// their usages in this impalad.
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeUpdateTableUsage(
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
+  TUpdateTableUsageRequest request;
+  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
+      JniUtil::internal_exc_class(), nullptr);
+
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
+  TUpdateTableUsageResponse result;
+  Status status = catalog_op_executor.UpdateTableUsage(request, &result);
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetDetail();
+    status.AddDetail("Error making an RPC call to Catalog server.");
+    status.SetTStatus(&result);
+  }
+
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
+                     JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+// Calls the catalog server to to check if the given user is a Sentry admin.
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeSentryAdminCheck(
+    JNIEnv* env, jclass caller_class, jbyteArray thrift_struct) {
+  TSentryAdminCheckRequest request;
+  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
+      JniUtil::internal_exc_class(), nullptr);
+
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
+  TSentryAdminCheckResponse result;
+  Status status = catalog_op_executor.SentryAdminCheck(request, &result);
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetDetail();
+    status.AddDetail("Error making an RPC call to Catalog server.");
+    status.SetTStatus(&result);
+  }
+
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+// Calls in to the catalog server to request partial information about a
+// catalog object.
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeGetPartialCatalogObject(
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
+  TGetPartialCatalogObjectRequest request;
+  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
+      JniUtil::internal_exc_class(), nullptr);
+
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
+  TGetPartialCatalogObjectResponse result;
+  Status status = catalog_op_executor.GetPartialCatalogObject(request, &result);
+  THROW_IF_ERROR_RET(status, env, JniUtil::internal_exc_class(), nullptr);
+
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+// Used to call native code from the FE to make a request to catalogd
+// for per-partition statistics.
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeGetPartitionStats(
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
+  TGetPartitionStatsRequest request;
+  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
+      JniUtil::internal_exc_class(), nullptr);
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
+  TGetPartitionStatsResponse result;
+  Status status = catalog_op_executor.GetPartitionStats(request, &result);
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetDetail();
+    status.SetTStatus(&result);
+  }
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
 // Used to call native code from the FE to parse and set comma-delimited key=value query
 // options.
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions(
-    JNIEnv* env, jclass caller_class, jstring csv_query_options,
+    JNIEnv* env, jclass fe_support_class, jstring csv_query_options,
     jbyteArray tquery_options) {
   TQueryOptions options;
   THROW_IF_ERROR_RET(DeserializeThriftMsg(env, tquery_options, &options), env,
@@ -471,42 +662,135 @@ Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions(
   return result_bytes;
 }
 
+// Returns the log (base 2) of the minimum number of bytes we need for a Bloom filter
+// with 'ndv' unique elements and a false positive probability of less than 'fpp'.
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_apache_impala_service_FeSupport_MinLogSpaceForBloomFilter(
+    JNIEnv* env, jclass fe_support_class, jlong ndv, jdouble fpp) {
+  return BloomFilter::MinLogSpace(ndv, fpp);
+}
+
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_nativeParseDateString(JNIEnv* env,
+    jclass fe_support_class, jstring date) {
+  string date_string;
+  {
+    JniUtfCharGuard date_str_guard;
+    THROW_IF_ERROR_RET(
+        JniUtfCharGuard::create(env, date, &date_str_guard), env,
+        JniUtil::internal_exc_class(), nullptr);
+    date_string.assign(date_str_guard.get());
+  }
+
+  StringParser::ParseResult res;
+  DateValue dv = StringParser::StringToDate(date_string.data(), date_string.length(),
+      &res);
+
+  TParseDateStringResult parse_str_result;
+  int32_t days_since_epoch;
+  parse_str_result.__set_valid(dv.ToDaysSinceEpoch(&days_since_epoch));
+  if (parse_str_result.valid) {
+    parse_str_result.__set_days_since_epoch(days_since_epoch);
+    // If date is not yet in canonical form (yyyy-MM-dd), convert it to string again.
+    if (date_string.length() != 10) {
+      const string canonical_date_string = dv.ToString();
+      parse_str_result.__set_canonical_date_string(canonical_date_string);
+    }
+  }
+
+  jbyteArray result_bytes = NULL;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &parse_str_result, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
 namespace impala {
 
 static JNINativeMethod native_methods[] = {
   {
-    (char*)"NativeFeTestInit", (char*)"()V",
-    (void*)::Java_org_apache_impala_service_FeSupport_NativeFeTestInit
+      const_cast<char*>("NativeFeTestInit"), const_cast<char*>("()V"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeFeTestInit
   },
   {
-    (char*)"NativeEvalExprsWithoutRow", (char*)"([B[B)[B",
-    (void*)::Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow
+      const_cast<char*>("NativeEvalExprsWithoutRow"), const_cast<char*>("([B[BJ)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow
   },
   {
-    (char*)"NativeCacheJar", (char*)"([B)[B",
-    (void*)::Java_org_apache_impala_service_FeSupport_NativeCacheJar
+      const_cast<char*>("NativeCacheJar"), const_cast<char*>("([B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeCacheJar
   },
   {
-    (char*)"NativeLookupSymbol", (char*)"([B)[B",
-    (void*)::Java_org_apache_impala_service_FeSupport_NativeLookupSymbol
+      const_cast<char*>("NativeLookupSymbol"), const_cast<char*>("([B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeLookupSymbol
   },
   {
-    (char*)"NativePrioritizeLoad", (char*)"([B)[B",
-    (void*)::Java_org_apache_impala_service_FeSupport_NativePrioritizeLoad
+      const_cast<char*>("NativePrioritizeLoad"), const_cast<char*>("([B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativePrioritizeLoad
   },
   {
-    (char*)"NativeParseQueryOptions", (char*)"(Ljava/lang/String;[B)[B",
-    (void*)::Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions
+      const_cast<char*>("NativeGetPartialCatalogObject"),
+      const_cast<char*>("([B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeGetPartialCatalogObject
+  },
+  {
+      const_cast<char*>("NativeGetPartitionStats"), const_cast<char*>("([B)[B"),
+     (void*) ::Java_org_apache_impala_service_FeSupport_NativeGetPartitionStats
+  },
+  {
+      const_cast<char*>("NativeUpdateTableUsage"),
+      const_cast<char*>("([B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeUpdateTableUsage
+  },
+  {
+      const_cast<char*>("NativeSentryAdminCheck"),
+      const_cast<char*>("([B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeSentryAdminCheck
+  },
+  {
+      const_cast<char*>("NativeParseQueryOptions"),
+      const_cast<char*>("(Ljava/lang/String;[B)[B"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions
+  },
+  {
+      const_cast<char*>("NativeAddPendingTopicItem"),
+      const_cast<char*>("(JLjava/lang/String;J[BZ)Z"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeAddPendingTopicItem
+  },
+  {
+      const_cast<char*>("NativeGetNextCatalogObjectUpdate"),
+      const_cast<char*>("(J)Lorg/apache/impala/common/Pair;"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeGetNextCatalogObjectUpdate
+  },
+  {
+      const_cast<char*>("NativeLibCacheSetNeedsRefresh"),
+      const_cast<char*>("(Ljava/lang/String;)Z"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeLibCacheSetNeedsRefresh
+  },
+  {
+      const_cast<char*>("NativeLibCacheRemoveEntry"),
+      const_cast<char*>("(Ljava/lang/String;)Z"),
+      (void*)::Java_org_apache_impala_service_FeSupport_NativeLibCacheRemoveEntry
+  },
+  {
+    const_cast<char*>("MinLogSpaceForBloomFilter"), const_cast<char*>("(JD)I"),
+    (void*)::Java_org_apache_impala_service_FeSupport_MinLogSpaceForBloomFilter
+  },
+  {
+    const_cast<char*>("nativeParseDateString"),
+    const_cast<char*>("(Ljava/lang/String;)[B"),
+    (void*)::Java_org_apache_impala_service_FeSupport_nativeParseDateString
   },
 };
 
 void InitFeSupport(bool disable_codegen) {
   fe_support_disable_codegen = disable_codegen;
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   jclass native_backend_cl = env->FindClass("org/apache/impala/service/FeSupport");
   env->RegisterNatives(native_backend_cl, native_methods,
       sizeof(native_methods) / sizeof(native_methods[0]));
-  EXIT_IF_EXC(env);
+  ABORT_IF_EXC(env);
 }
 
 }

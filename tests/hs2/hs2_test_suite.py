@@ -26,31 +26,62 @@ from thrift.protocol import TBinaryProtocol
 from tests.common.impala_test_suite import ImpalaTestSuite, IMPALAD_HS2_HOST_PORT
 from time import sleep, time
 
+
+def add_session_helper(self, protocol_version, conf_overlay, close_session, fn):
+  """Helper function used in the various needs_session decorators before to set up
+  a session, call fn(), then optionally tear down the session."""
+  open_session_req = TCLIService.TOpenSessionReq()
+  open_session_req.username = getuser()
+  open_session_req.configuration = dict()
+  if conf_overlay is not None:
+    open_session_req.configuration = conf_overlay
+  open_session_req.client_protocol = protocol_version
+  resp = self.hs2_client.OpenSession(open_session_req)
+  HS2TestSuite.check_response(resp)
+  self.session_handle = resp.sessionHandle
+  assert protocol_version <= resp.serverProtocolVersion
+  try:
+    fn()
+  finally:
+    if close_session:
+      close_session_req = TCLIService.TCloseSessionReq()
+      close_session_req.sessionHandle = resp.sessionHandle
+      HS2TestSuite.check_response(self.hs2_client.CloseSession(close_session_req))
+    self.session_handle = None
+
 def needs_session(protocol_version=
                   TCLIService.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6,
-                  conf_overlay=None):
+                  conf_overlay=None,
+                  close_session=True,
+                  cluster_properties=None):
   def session_decorator(fn):
     """Decorator that establishes a session and sets self.session_handle. When the test is
     finished, the session is closed.
     """
     def add_session(self):
-      open_session_req = TCLIService.TOpenSessionReq()
-      open_session_req.username = getuser()
-      open_session_req.configuration = dict()
-      if conf_overlay is not None:
-        open_session_req.configuration = conf_overlay
-      open_session_req.client_protocol = protocol_version
-      resp = self.hs2_client.OpenSession(open_session_req)
-      HS2TestSuite.check_response(resp)
-      self.session_handle = resp.sessionHandle
-      assert protocol_version <= resp.serverProtocolVersion
-      try:
-        fn(self)
-      finally:
-        close_session_req = TCLIService.TCloseSessionReq()
-        close_session_req.sessionHandle = resp.sessionHandle
-        HS2TestSuite.check_response(self.hs2_client.CloseSession(close_session_req))
-        self.session_handle = None
+      add_session_helper(self, protocol_version, conf_overlay, close_session,
+          lambda: fn(self))
+    return add_session
+
+  return session_decorator
+
+
+# same as needs_session but takes in a cluster_properties as a argument
+# cluster_properties is defined as a fixture in conftest.py which allows us
+# to pass it as an argument to a test. However, it does not work well with
+# decorators without installing new modules.
+# Ref: https://stackoverflow.com/questions/19614658
+def needs_session_cluster_properties(protocol_version=
+                  TCLIService.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6,
+                  conf_overlay=None,
+                  close_session=True):
+  def session_decorator(fn):
+    """Decorator that establishes a session and sets self.session_handle. When the test is
+    finished, the session is closed.
+    """
+    def add_session(self, cluster_properties, unique_database):
+      add_session_helper(self, protocol_version, conf_overlay, close_session,
+          lambda: fn(self, cluster_properties, unique_database))
     return add_session
 
   return session_decorator
@@ -61,14 +92,27 @@ def operation_id_to_query_id(operation_id):
   hi = ''.join(['%0.2X' % ord(c) for c in hi[::-1]])
   return "%s:%s" % (lo, hi)
 
-class HS2TestSuite(ImpalaTestSuite):
-  TEST_DB = 'hs2_db'
 
+def create_session_handle_without_secret(session_handle):
+  """Create a HS2 session handle with the same session ID as 'session_handle' but a
+  bogus secret of the right length, i.e. 16 bytes."""
+  return TCLIService.TSessionHandle(TCLIService.THandleIdentifier(
+      session_handle.sessionId.guid, r"xxxxxxxxxxxxxxxx"))
+
+
+def create_op_handle_without_secret(op_handle):
+  """Create a HS2 operation handle with same parameters as 'op_handle' but with a bogus
+  secret of the right length, i.e. 16 bytes."""
+  op_id = TCLIService.THandleIdentifier(op_handle.operationId.guid, r"xxxxxxxxxxxxxxxx")
+  return TCLIService.TOperationHandle(
+      op_id, op_handle.operationType, op_handle.hasResultSet)
+
+
+class HS2TestSuite(ImpalaTestSuite):
   HS2_V6_COLUMN_TYPES = ['boolVal', 'stringVal', 'byteVal', 'i16Val', 'i32Val', 'i64Val',
                          'doubleVal', 'binaryVal']
 
   def setup(self):
-    self.cleanup_db(self.TEST_DB)
     host, port = IMPALAD_HS2_HOST_PORT.split(":")
     self.socket = TSocket(host, port)
     self.transport = TBufferedTransport(self.socket)
@@ -77,7 +121,6 @@ class HS2TestSuite(ImpalaTestSuite):
     self.hs2_client = ImpalaHiveServer2Service.Client(self.protocol)
 
   def teardown(self):
-    self.cleanup_db(self.TEST_DB)
     if self.socket:
       self.socket.close()
 
@@ -90,13 +133,43 @@ class HS2TestSuite(ImpalaTestSuite):
        and expected_error_prefix is not None:
       assert response.status.errorMessage.startswith(expected_error_prefix)
 
+  @staticmethod
+  def check_invalid_session(response):
+    """Checks that the HS2 API response is the correct response if the session is invalid,
+    i.e. the session doesn't exist or the secret is invalid."""
+    HS2TestSuite.check_response(response, TCLIService.TStatusCode.ERROR_STATUS,
+                                "Invalid session id:")
+
+  @staticmethod
+  def check_invalid_query(response, expect_legacy_err=False):
+    """Checks that the HS2 API response is the correct response if the query is invalid,
+    i.e. the query doesn't exist, doesn't match the session provided, or the secret is
+    invalid. """
+    if expect_legacy_err:
+      # Some operations return non-standard errors like "Query id ... not found".
+      expected_err = "Query id"
+    else:
+      # We should standardise on this error message.
+      expected_err = "Invalid query handle:"
+    HS2TestSuite.check_response(response, TCLIService.TStatusCode.ERROR_STATUS,
+                                expected_err)
+
+  @staticmethod
+  def check_profile_access_denied(response, user):
+    """Checks that the HS2 API response is the correct response if the user is not
+    authorised to access the query's profile."""
+    HS2TestSuite.check_response(response, TCLIService.TStatusCode.ERROR_STATUS,
+                                "User {0} is not authorized to access the runtime "
+                                "profile or execution summary".format(user))
+
   def close(self, op_handle):
     close_op_req = TCLIService.TCloseOperationReq()
     close_op_req.operationHandle = op_handle
     close_op_resp = self.hs2_client.CloseOperation(close_op_req)
     assert close_op_resp.status.statusCode == TCLIService.TStatusCode.SUCCESS_STATUS
 
-  def get_num_rows(self, result_set):
+  @staticmethod
+  def get_num_rows(result_set):
     # rows will always be set, so the only way to tell if we should use it is to see if
     # any columns are set
     if result_set.columns is None or len(result_set.columns) == 0:
@@ -110,6 +183,21 @@ class HS2TestSuite(ImpalaTestSuite):
 
     assert False
 
+  def fetch(self, fetch_results_req):
+    """Wrapper around ImpalaHiveServer2Service.FetchResults(fetch_results_req) that
+    issues the given fetch request until the TCLIService.TStatusCode transitions from
+    STILL_EXECUTING_STATUS to SUCCESS_STATUS. If a fetch response contains the
+    STILL_EXECUTING_STATUS then rows are not yet available for consumption (e.g. the
+    query is still running and has not produced any rows yet). This status may be
+    returned to the client if the FETCH_ROWS_TIMEOUT_MS is hit."""
+    fetch_results_resp = None
+    while fetch_results_resp is None or \
+        fetch_results_resp.status.statusCode == \
+          TCLIService.TStatusCode.STILL_EXECUTING_STATUS:
+      fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
+    HS2TestSuite.check_response(fetch_results_resp)
+    return fetch_results_resp
+
   def fetch_at_most(self, handle, orientation, size, expected_num_rows = None):
     """Fetches at most size number of rows from the query identified by the given
     operation handle. Uses the given fetch orientation. Asserts that the fetch returns a
@@ -122,8 +210,7 @@ class HS2TestSuite(ImpalaTestSuite):
     fetch_results_req.operationHandle = handle
     fetch_results_req.orientation = orientation
     fetch_results_req.maxRows = size
-    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-    HS2TestSuite.check_response(fetch_results_resp)
+    fetch_results_resp = self.fetch(fetch_results_req)
     if expected_num_rows is not None:
       assert self.get_num_rows(fetch_results_resp.results) == expected_num_rows
     return fetch_results_resp
@@ -140,16 +227,14 @@ class HS2TestSuite(ImpalaTestSuite):
     fetch_results_req.operationHandle = handle
     fetch_results_req.orientation = orientation
     fetch_results_req.maxRows = size
-    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-    HS2TestSuite.check_response(fetch_results_resp)
+    fetch_results_resp = self.fetch(fetch_results_req)
     num_rows_fetched = self.get_num_rows(fetch_results_resp.results)
     if expected_num_rows is None: expected_num_rows = size
     while num_rows_fetched < expected_num_rows:
       # Always try to fetch at most 'size'
       fetch_results_req.maxRows = size - num_rows_fetched
       fetch_results_req.orientation = TCLIService.TFetchOrientation.FETCH_NEXT
-      fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
-      HS2TestSuite.check_response(fetch_results_resp)
+      fetch_results_resp = self.fetch(fetch_results_req)
       last_fetch_size = self.get_num_rows(fetch_results_resp.results)
       assert last_fetch_size > 0
       num_rows_fetched += last_fetch_size
@@ -227,6 +312,22 @@ class HS2TestSuite(ImpalaTestSuite):
       sleep(interval)
     assert False, 'Did not reach expected operation state %s in time, actual state was ' \
         '%s' % (expected_state, get_operation_status_resp.operationState)
+
+  def wait_for_admission_control(self, operation_handle, timeout = 10):
+    """Waits for the admission control processing of the query to complete by polling
+      GetOperationStatus every interval seconds, returning the TGetOperationStatusResp,
+      or raising an assertion after timeout seconds."""
+    start_time = time()
+    while (time() - start_time < timeout):
+      get_operation_status_resp = self.get_operation_status(operation_handle)
+      HS2TestSuite.check_response(get_operation_status_resp)
+      if TCLIService.TOperationState.INITIALIZED_STATE < \
+          get_operation_status_resp.operationState < \
+          TCLIService.TOperationState.PENDING_STATE:
+        return get_operation_status_resp
+      sleep(0.05)
+    assert False, 'Did not complete admission control processing in time, current ' \
+        'operation state of query: %s' % (get_operation_status_resp.operationState)
 
   def execute_statement(self, statement, conf_overlay=None,
                         expected_status_code=TCLIService.TStatusCode.SUCCESS_STATUS,

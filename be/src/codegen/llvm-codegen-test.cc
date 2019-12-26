@@ -104,12 +104,37 @@ class LlvmCodeGenTest : public testing:: Test {
   }
 
   static Status LinkModuleFromHdfs(LlvmCodeGen* codegen, const string& hdfs_file) {
-    return codegen->LinkModuleFromHdfs(hdfs_file);
+    return codegen->LinkModuleFromHdfs(hdfs_file, -1);
   }
 
   static bool ContainsHandcraftedFn(LlvmCodeGen* codegen, llvm::Function* function) {
     const auto& hf = codegen->handcrafted_functions_;
     return find(hf.begin(), hf.end(), function) != hf.end();
+  }
+
+  // Helper function to enable and disable LlvmCodeGen's cpu_attrs_.
+  static void EnableCodeGenCPUFeature(int64_t flag, bool enable) {
+    DCHECK(LlvmCodeGen::llvm_initialized_);
+    auto enable_flag_it = LlvmCodeGen::cpu_flag_mappings_.find(flag);
+    auto disable_flag_it = LlvmCodeGen::cpu_flag_mappings_.find(~flag);
+    DCHECK(enable_flag_it != LlvmCodeGen::cpu_flag_mappings_.end());
+    DCHECK(disable_flag_it != LlvmCodeGen::cpu_flag_mappings_.end());
+    const std::string& enable_feature = enable_flag_it->second;
+    const std::string& disable_feature = disable_flag_it->second;
+    if (enable) {
+      auto attr_it = LlvmCodeGen::cpu_attrs_.find(disable_feature);
+      if (attr_it != LlvmCodeGen::cpu_attrs_.end()) {
+        LlvmCodeGen::cpu_attrs_.erase(attr_it);
+      }
+      LlvmCodeGen::cpu_attrs_.insert(enable_feature);
+    } else {
+      auto attr_it = LlvmCodeGen::cpu_attrs_.find(enable_feature);
+      // Disable feature if currently enabled.
+      if (attr_it != LlvmCodeGen::cpu_attrs_.end()) {
+        LlvmCodeGen::cpu_attrs_.erase(attr_it);
+        LlvmCodeGen::cpu_attrs_.insert(disable_feature);
+      }
+    }
   }
 };
 
@@ -160,9 +185,9 @@ llvm::Function* CodegenInnerLoop(
   codegen->CodegenDebugTrace(&builder, "Jitted\n");
 
   // Store &jitted_counter as a constant.
-  llvm::Value* const_delta = llvm::ConstantInt::get(context, llvm::APInt(64, delta));
+  llvm::Value* const_delta = codegen->GetI64Constant(delta);
   llvm::Value* counter_ptr =
-      codegen->CastPtrToLlvmPtr(codegen->GetPtrType(TYPE_BIGINT), jitted_counter);
+      codegen->CastPtrToLlvmPtr(codegen->i64_ptr_type(), jitted_counter);
   llvm::Value* loaded_counter = builder.CreateLoad(counter_ptr);
   llvm::Value* incremented_value = builder.CreateAdd(loaded_counter, const_delta);
   builder.CreateStore(incremented_value, counter_ptr);
@@ -284,10 +309,11 @@ TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
 //   ret i32 %len
 // }
 llvm::Function* CodegenStringTest(LlvmCodeGen* codegen) {
-  llvm::PointerType* string_val_ptr_type = codegen->GetPtrType(TYPE_STRING);
+  llvm::PointerType* string_val_ptr_type =
+      codegen->GetSlotPtrType(TYPE_STRING);
   EXPECT_TRUE(string_val_ptr_type != NULL);
 
-  LlvmCodeGen::FnPrototype prototype(codegen, "StringTest", codegen->GetType(TYPE_INT));
+  LlvmCodeGen::FnPrototype prototype(codegen, "StringTest", codegen->i32_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("str", string_val_ptr_type));
   LlvmBuilder builder(codegen->context());
 
@@ -297,15 +323,15 @@ llvm::Function* CodegenStringTest(LlvmCodeGen* codegen) {
   // strval->ptr[0] = 'A'
   llvm::Value* str_ptr = builder.CreateStructGEP(NULL, str, 0, "str_ptr");
   llvm::Value* ptr = builder.CreateLoad(str_ptr, "ptr");
-  llvm::Value* first_char_offset[] = {codegen->GetIntConstant(TYPE_INT, 0)};
+  llvm::Value* first_char_offset[] = {codegen->GetI32Constant(0)};
   llvm::Value* first_char_ptr =
       builder.CreateGEP(ptr, first_char_offset, "first_char_ptr");
-  builder.CreateStore(codegen->GetIntConstant(TYPE_TINYINT, 'A'), first_char_ptr);
+  builder.CreateStore(codegen->GetI8Constant('A'), first_char_ptr);
 
   // Update and return old len
   llvm::Value* len_ptr = builder.CreateStructGEP(NULL, str, 1, "len_ptr");
   llvm::Value* len = builder.CreateLoad(len_ptr, "len");
-  builder.CreateStore(codegen->GetIntConstant(TYPE_INT, 1), len_ptr);
+  builder.CreateStore(codegen->GetI32Constant(1), len_ptr);
   builder.CreateRet(len);
 
   return codegen->FinalizeFunction(interop_fn);
@@ -347,10 +373,10 @@ TEST_F(LlvmCodeGenTest, StringValue) {
   EXPECT_EQ(1, str_val.len);
   EXPECT_EQ(static_cast<void*>(str_val.ptr), static_cast<const void*>(str.c_str()));
 
-  // Validate padding bytes are unchanged
+  // After IMPALA-7367 removed the padding from the StringValue struct, validate the
+  // length byte alone.
   int32_t* bytes = reinterpret_cast<int32_t*>(&str_val);
   EXPECT_EQ(1, bytes[2]);   // str_val.len
-  EXPECT_EQ(0, bytes[3]);   // padding
   codegen->Close();
 }
 
@@ -363,7 +389,7 @@ TEST_F(LlvmCodeGenTest, MemcpyTest) {
   LlvmCodeGen::FnPrototype prototype(codegen.get(), "MemcpyTest", codegen->void_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("dest", codegen->ptr_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("src", codegen->ptr_type()));
-  prototype.AddArgument(LlvmCodeGen::NamedVariable("n", codegen->GetType(TYPE_INT)));
+  prototype.AddArgument(LlvmCodeGen::NamedVariable("n", codegen->i32_type()));
 
   LlvmBuilder builder(codegen->context());
 
@@ -412,8 +438,8 @@ TEST_F(LlvmCodeGenTest, HashTest) {
         codegen->CastPtrToLlvmPtr(codegen->ptr_type(), const_cast<char*>(data1));
     llvm::Value* llvm_data2 =
         codegen->CastPtrToLlvmPtr(codegen->ptr_type(), const_cast<char*>(data2));
-    llvm::Value* llvm_len1 = codegen->GetIntConstant(TYPE_INT, strlen(data1));
-    llvm::Value* llvm_len2 = codegen->GetIntConstant(TYPE_INT, strlen(data2));
+    llvm::Value* llvm_len1 = codegen->GetI32Constant(strlen(data1));
+    llvm::Value* llvm_len2 = codegen->GetI32Constant(strlen(data2));
 
     uint32_t expected_hash = 0;
     expected_hash = HashUtil::Hash(data1, strlen(data1), expected_hash);
@@ -423,7 +449,7 @@ TEST_F(LlvmCodeGenTest, HashTest) {
     // Create a codegen'd function that hashes all the types and returns the results.
     // The tuple/values to hash are baked into the codegen for simplicity.
     LlvmCodeGen::FnPrototype prototype(
-        codegen.get(), "HashTest", codegen->GetType(TYPE_INT));
+        codegen.get(), "HashTest", codegen->i32_type());
     LlvmBuilder builder(codegen->context());
 
     // Test both byte-size specific hash functions and the generic loop hash function
@@ -436,7 +462,7 @@ TEST_F(LlvmCodeGenTest, HashTest) {
     ASSERT_TRUE(data2_hash_fn != NULL);
     ASSERT_TRUE(generic_hash_fn != NULL);
 
-    llvm::Value* seed = codegen->GetIntConstant(TYPE_INT, 0);
+    llvm::Value* seed = codegen->GetI32Constant(0);
     seed = builder.CreateCall(
         data1_hash_fn, llvm::ArrayRef<llvm::Value*>({llvm_data1, llvm_len1, seed}));
     seed = builder.CreateCall(
@@ -459,9 +485,12 @@ TEST_F(LlvmCodeGenTest, HashTest) {
     uint32_t result = test_fn();
 
     // Validate that the hashes are identical
-    EXPECT_EQ(result, expected_hash) << CpuInfo::IsSupported(CpuInfo::SSE4_2);
+    EXPECT_EQ(result, expected_hash) << LlvmCodeGen::IsCPUFeatureEnabled(CpuInfo::SSE4_2);
 
-    if (i == 0 && CpuInfo::IsSupported(CpuInfo::SSE4_2)) {
+    if (i == 0 && LlvmCodeGen::IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
+      // Modify both CpuInfo and LlvmCodeGen::cpu_attrs_ to ensure that they have the
+      // same view of the underlying hardware while generating the hash.
+      EnableCodeGenCPUFeature(CpuInfo::SSE4_2, false);
       CpuInfo::EnableFeature(CpuInfo::SSE4_2, false);
       restore_sse_support = true;
       LlvmCodeGenTest::ClearHashFns(codegen.get());
@@ -472,6 +501,7 @@ TEST_F(LlvmCodeGenTest, HashTest) {
   }
 
   // Restore hardware feature for next test
+  EnableCodeGenCPUFeature(CpuInfo::SSE4_2, restore_sse_support);
   CpuInfo::EnableFeature(CpuInfo::SSE4_2, restore_sse_support);
 }
 
@@ -494,19 +524,17 @@ TEST_F(LlvmCodeGenTest, CpuAttrWhitelist) {
   // Non-existent attributes should be disabled regardless of initial states.
   // Whitelisted attributes like sse2 and lzcnt should retain their initial
   // state.
-  EXPECT_EQ(vector<string>(
-          {"-dummy1", "-dummy2", "-dummy3", "-dummy4", "+sse2", "-lzcnt"}),
+  EXPECT_EQ(std::unordered_set<string>(
+                {"-dummy1", "-dummy2", "-dummy3", "-dummy4", "+sse2", "-lzcnt"}),
       LlvmCodeGen::ApplyCpuAttrWhitelist(
-          {"+dummy1", "+dummy2", "-dummy3", "+dummy4", "+sse2", "-lzcnt"}));
+                {"+dummy1", "+dummy2", "-dummy3", "+dummy4", "+sse2", "-lzcnt"}));
 
   // IMPALA-6291: Test that all AVX512 attributes are disabled.
   vector<string> avx512_attrs;
-  EXPECT_EQ(vector<string>(
-        {"-avx512ifma", "-avx512dqavx512er", "-avx512f", "-avx512bw", "-avx512vl",
-         "-avx512cd", "-avx512vbmi", "-avx512pf"}),
-      LlvmCodeGen::ApplyCpuAttrWhitelist(
-        {"+avx512ifma", "+avx512dqavx512er", "+avx512f", "+avx512bw", "+avx512vl",
-         "+avx512cd", "+avx512vbmi", "+avx512pf"}));
+  EXPECT_EQ(std::unordered_set<string>({"-avx512ifma", "-avx512dqavx512er", "-avx512f",
+                "-avx512bw", "-avx512vl", "-avx512cd", "-avx512vbmi", "-avx512pf"}),
+      LlvmCodeGen::ApplyCpuAttrWhitelist({"+avx512ifma", "+avx512dqavx512er", "+avx512f",
+          "+avx512bw", "+avx512vl", "+avx512cd", "+avx512vbmi", "+avx512pf"}));
 }
 
 // Test that exercises the code path that deletes non-finalized methods before it

@@ -27,6 +27,7 @@
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
 #include "util/debug-util.h"
+#include "util/pretty-printer.h"
 
 #include "common/names.h"
 
@@ -41,10 +42,13 @@ InitialReservations::InitialReservations(ObjectPool* obj_pool,
     ReservationTracker* query_reservation, MemTracker* query_mem_tracker,
     int64_t initial_reservation_total_claims)
   : initial_reservation_mem_tracker_(obj_pool->Add(
-      new MemTracker(-1, "Unclaimed reservations", query_mem_tracker, false))),
-      remaining_initial_reservation_claims_(initial_reservation_total_claims) {
+        new MemTracker(-1, "Unclaimed reservations", query_mem_tracker, false))),
+    remaining_initial_reservation_claims_(initial_reservation_total_claims) {
+  // Soft mem_limits should not apply to the initial reservation because we don't want
+  // to fail the query in the case where the initial reservation exceeds the soft
+  // limit.
   initial_reservations_.InitChildTracker(nullptr, query_reservation,
-      initial_reservation_mem_tracker_, numeric_limits<int64_t>::max());
+      initial_reservation_mem_tracker_, numeric_limits<int64_t>::max(), MemLimit::HARD);
 }
 
 Status InitialReservations::Init(
@@ -57,9 +61,9 @@ Status InitialReservations::Init(
         PrettyPrinter::Print(query_min_reservation, TUnit::BYTES), FLAGS_hostname,
         FLAGS_be_port, PrintId(query_id), reservation_status.GetDetail());
   }
-  VLOG_QUERY << "Successfully claimed initial reservations ("
-            << PrettyPrinter::Print(query_min_reservation, TUnit::BYTES) << ") for"
-            << " query " << PrintId(query_id);
+  VLOG(2) << "Successfully claimed initial reservations ("
+          << PrettyPrinter::Print(query_min_reservation, TUnit::BYTES) << ") for"
+          << " query " << PrintId(query_id);
   return Status::OK();
 }
 

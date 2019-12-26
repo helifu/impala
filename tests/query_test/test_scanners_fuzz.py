@@ -48,6 +48,12 @@ class TestScannersFuzzing(ImpalaTestSuite):
   # Test a range of batch sizes to exercise different corner cases.
   BATCH_SIZES = [0, 1, 16, 10000]
 
+  # Test with denial of reservations at varying frequency. This will affect the number
+  # of scanner threads that can be spun up.
+  DEBUG_ACTION_VALUES = [None,
+    '-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@0.5',
+    '-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@1.0']
+
   @classmethod
   def get_workload(cls):
     return 'functional-query'
@@ -59,8 +65,11 @@ class TestScannersFuzzing(ImpalaTestSuite):
         create_exec_option_dimension_from_dict({
           'abort_on_error' : cls.ABORT_ON_ERROR_VALUES,
           'num_nodes' : cls.NUM_NODES_VALUES,
-          'mem_limit' : cls.MEM_LIMITS}))
+          'mem_limit' : cls.MEM_LIMITS,
+          'debug_action' : cls.DEBUG_ACTION_VALUES}))
     # TODO: enable for more table formats once they consistently pass the fuzz test.
+    # TODO(IMPALA-6772): enable for ORC formats once a new version after release-1.4.3
+    # of ORC library is released.
     cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format in ('avro', 'parquet') or
         (v.get_value('table_format').file_format == 'text' and
@@ -80,6 +89,9 @@ class TestScannersFuzzing(ImpalaTestSuite):
       table_name = "avro_decimal_tbl"
       if table_format.compression_codec != 'snap' or \
           table_format.compression_type != 'block':
+        pytest.skip()
+    elif table_format.file_format == 'rc' or \
+      table_format.file_format == 'seq':
         pytest.skip()
     elif table_format.file_format == 'text' and \
         table_format.compression_codec != 'none':
@@ -164,7 +176,7 @@ class TestScannersFuzzing(ImpalaTestSuite):
     # Copy all of the local files and directories to hdfs.
     to_copy = ["%s/%s" % (tmp_table_dir, file_or_dir)
                for file_or_dir in os.listdir(tmp_table_dir)]
-    check_call(['hdfs', 'dfs', '-copyFromLocal'] + to_copy + [fuzz_table_location])
+    self.filesystem_client.copy_from_local(to_copy, fuzz_table_location)
 
     if "SCANNER_FUZZ_KEEP_FILES" not in os.environ:
       shutil.rmtree(tmp_table_dir)
@@ -199,8 +211,10 @@ class TestScannersFuzzing(ImpalaTestSuite):
         # (IMPALA-4013).
         table_format = vector.get_value('table_format')
         if table_format.file_format != 'parquet' \
-            and not (table_format.file_format == 'text' and
-            table_format.compression_codec != 'none'):
+            and not (table_format.file_format == 'text' and \
+            table_format.compression_codec != 'none') \
+            and not table_format.file_format == 'rc' \
+            and not table_format.file_format == 'seq':
           raise
 
   def walk_and_corrupt_table_data(self, tmp_table_dir, num_copies, rng):

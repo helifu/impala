@@ -18,12 +18,18 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 # run buildall.sh -help to see options
-
 ROOT=`dirname "$0"`
 ROOT=`cd "$ROOT" >/dev/null; pwd`
+
+if [[ "'$ROOT'" =~ [[:blank:]] ]]
+then
+   echo "IMPALA_HOME cannot have spaces in the path"
+   exit 1
+fi
 
 # Grab this *before* we source impala-config.sh to see if the caller has
 # kerberized environment variables already or not.
@@ -49,21 +55,25 @@ TESTS_ACTION=1
 FORMAT_CLUSTER=0
 FORMAT_METASTORE=0
 FORMAT_SENTRY_POLICY_DB=0
+FORMAT_RANGER_POLICY_DB=0
 NEED_MINICLUSTER=0
 START_IMPALA_CLUSTER=0
 IMPALA_KERBERIZE=0
 SNAPSHOT_FILE=
 METASTORE_SNAPSHOT_FILE=
-MAKE_IMPALA_ARGS=""
 CODE_COVERAGE=0
 BUILD_ASAN=0
 BUILD_FE_ONLY=0
+BUILD_TESTS=1
+GEN_CMAKE_ONLY=0
+BUILD_RELEASE_AND_DEBUG=0
 BUILD_TIDY=0
 BUILD_UBSAN=0
+BUILD_UBSAN_FULL=0
 BUILD_TSAN=0
+BUILD_SHARED_LIBS=0
 # Export MAKE_CMD so it is visible in scripts that invoke make, e.g. copy-udfs-udas.sh
 export MAKE_CMD=make
-LZO_CMAKE_ARGS=
 
 # Defaults that can be picked up from the environment, but are overridable through the
 # commandline.
@@ -84,16 +94,17 @@ do
       TESTS_ACTION=0
       ;;
     -build_shared_libs|-so)
-      MAKE_IMPALA_ARGS="${MAKE_IMPALA_ARGS} -build_shared_libs"
+      BUILD_SHARED_LIBS=1
       ;;
     -notests)
       TESTS_ACTION=0
-      MAKE_IMPALA_ARGS="${MAKE_IMPALA_ARGS} -notests"
+      BUILD_TESTS=0
       ;;
     -format)
       FORMAT_CLUSTER=1
       FORMAT_METASTORE=1
       FORMAT_SENTRY_POLICY_DB=1
+      FORMAT_RANGER_POLICY_DB=1
       ;;
     -format_cluster)
       FORMAT_CLUSTER=1
@@ -104,8 +115,14 @@ do
     -format_sentry_policy_db)
       FORMAT_SENTRY_POLICY_DB=1
       ;;
+    -format_ranger_policy_db)
+      FORMAT_RANGER_POLICY_DB=1
+      ;;
     -release)
       CMAKE_BUILD_TYPE=Release
+      ;;
+    -release_and_debug)
+      BUILD_RELEASE_AND_DEBUG=1
       ;;
     -codecoverage)
       CODE_COVERAGE=1
@@ -118,6 +135,9 @@ do
       ;;
     -ubsan)
       BUILD_UBSAN=1
+      ;;
+    -full_ubsan)
+      BUILD_UBSAN_FULL=1
       ;;
     -tsan)
       BUILD_TSAN=1
@@ -173,9 +193,10 @@ do
       BUILD_FE_ONLY=1
       ;;
     -ninja)
-      MAKE_IMPALA_ARGS+=" -ninja"
-      LZO_CMAKE_ARGS+=" -GNinja"
       MAKE_CMD=ninja
+      ;;
+    -cmake_only)
+      GEN_CMAKE_ONLY=1
       ;;
     -help|*)
       echo "buildall.sh - Builds Impala and runs all tests."
@@ -186,11 +207,17 @@ do
       echo "[-format_cluster] : Format the minicluster [Default: False]"
       echo "[-format_metastore] : Format the metastore db [Default: False]"
       echo "[-format_sentry_policy_db] : Format the Sentry policy db [Default: False]"
+      echo "[-format_ranger_policy_db] : Format the Ranger policy db [Default: False]"
+      echo "[-release_and_debug] : Build both release and debug binaries. Overrides "\
+           "other build types [Default: false]"
       echo "[-release] : Release build [Default: debug]"
       echo "[-codecoverage] : Build with code coverage [Default: False]"
       echo "[-asan] : Address sanitizer build [Default: False]"
       echo "[-tidy] : clang-tidy build [Default: False]"
-      echo "[-ubsan] : Undefined behavior build [Default: False]"
+      echo "[-ubsan] : Undefined behavior sanitizer build [Default: False]"
+      echo "[-full_ubsan] : Undefined behavior sanitizer build, including code generated"\
+           " by cross-compilation to LLVM IR. Much slower queries than plain -ubsan "\
+           " [Default: False]"
       echo "[-skiptests] : Skips execution of all tests"
       echo "[-notests] : Skips building and execution of all tests"
       echo "[-start_minicluster] : Start test cluster including Impala and all"\
@@ -211,6 +238,8 @@ do
       echo "[-so|-build_shared_libs] : Dynamically link executables (default is static)"
       echo "[-kerberize] : Enable kerberos on the cluster"
       echo "[-fe_only] : Build just the frontend"
+      echo "[-ninja] : Use ninja instead of make"
+      echo "[-cmake_only] : Generate makefiles only, instead of doing a full build"
       echo "-----------------------------------------------------------------------------
 Examples of common tasks:
 
@@ -246,14 +275,15 @@ Examples of common tasks:
   shift;
 done
 
+declare -a CMAKE_BUILD_TYPE_LIST
 # Adjust CMAKE_BUILD_TYPE for ASAN and code coverage, if necessary.
 if [[ ${CODE_COVERAGE} -eq 1 ]]; then
   case ${CMAKE_BUILD_TYPE} in
     Debug)
-      CMAKE_BUILD_TYPE=CODE_COVERAGE_DEBUG
+      CMAKE_BUILD_TYPE_LIST+=(CODE_COVERAGE_DEBUG)
       ;;
     Release)
-      CMAKE_BUILD_TYPE=CODE_COVERAGE_RELEASE
+      CMAKE_BUILD_TYPE_LIST+=(CODE_COVERAGE_RELEASE)
       ;;
   esac
 fi
@@ -264,19 +294,27 @@ if [[ ${BUILD_ASAN} -eq 1 ]]; then
     echo "Address sanitizer build not supported for build type: ${CMAKE_BUILD_TYPE}"
     exit 1
   fi
-  CMAKE_BUILD_TYPE=ADDRESS_SANITIZER
+  CMAKE_BUILD_TYPE_LIST+=(ADDRESS_SANITIZER)
 fi
 if [[ ${BUILD_TIDY} -eq 1 ]]; then
-  CMAKE_BUILD_TYPE=TIDY
+  CMAKE_BUILD_TYPE_LIST+=(TIDY)
 fi
 if [[ ${BUILD_UBSAN} -eq 1 ]]; then
-  CMAKE_BUILD_TYPE=UBSAN
+  CMAKE_BUILD_TYPE_LIST+=(UBSAN)
+fi
+if [[ ${BUILD_UBSAN_FULL} -eq 1 ]]; then
+  CMAKE_BUILD_TYPE_LIST+=(UBSAN_FULL)
 fi
 if [[ ${BUILD_TSAN} -eq 1 ]]; then
-  CMAKE_BUILD_TYPE=TSAN
+  CMAKE_BUILD_TYPE_LIST+=(TSAN)
 fi
-
-MAKE_IMPALA_ARGS+=" -build_type=${CMAKE_BUILD_TYPE}"
+if [[ -n "${CMAKE_BUILD_TYPE_LIST:+1}" ]]; then
+  if [[ ${#CMAKE_BUILD_TYPE_LIST[@]} -gt 1 ]]; then
+    echo "ERROR: more than one CMake build type defined: ${CMAKE_BUILD_TYPE_LIST[@]}"
+    exit 1
+  fi
+  CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE_LIST[0]}
+fi
 
 # If we aren't kerberized then we certainly don't need to talk about
 # re-sourcing impala-config.
@@ -300,7 +338,8 @@ if [[ -z "$METASTORE_SNAPSHOT_FILE" && "${TARGET_FILESYSTEM}" != "hdfs" &&
 fi
 
 if [[ $TESTS_ACTION -eq 1 || $TESTDATA_ACTION -eq 1 || $FORMAT_CLUSTER -eq 1 ||
-      $FORMAT_METASTORE -eq 1 || $FORMAT_SENTRY_POLICY_DB -eq 1 || -n "$SNAPSHOT_FILE" ||
+      $FORMAT_METASTORE -eq 1 || $FORMAT_SENTRY_POLICY_DB -eq 1 ||
+      $FORMAT_RANGER_POLICY_DB -eq 1 || -n "$SNAPSHOT_FILE" ||
       -n "$METASTORE_SNAPSHOT_FILE" ]]; then
   NEED_MINICLUSTER=1
 fi
@@ -328,7 +367,7 @@ bootstrap_dependencies() {
     echo "SKIP_TOOLCHAIN_BOOTSTRAP is true, skipping download of Python dependencies."
     echo "SKIP_TOOLCHAIN_BOOTSTRAP is true, skipping toolchain bootstrap."
   else
-    echo "Downloading Python dependencies"
+    echo ">>> Downloading Python dependencies"
     # Download all the Python dependencies we need before doing anything
     # of substance. Does not re-download anything that is already present.
     if ! "$IMPALA_HOME/infra/python/deps/download_requirements"; then
@@ -338,7 +377,7 @@ bootstrap_dependencies() {
       echo "Finished downloading Python dependencies"
     fi
 
-    echo "Downloading and extracting toolchain dependencies."
+    echo ">>> Downloading and extracting toolchain dependencies."
     "$IMPALA_HOME/bin/bootstrap_toolchain.py"
     echo "Toolchain bootstrap complete."
   fi
@@ -346,20 +385,67 @@ bootstrap_dependencies() {
 
 # Build the Impala frontend and its dependencies.
 build_fe() {
-  "$IMPALA_HOME/bin/make_impala.sh" ${MAKE_IMPALA_ARGS} -fe_only
+  generate_cmake_files $CMAKE_BUILD_TYPE
+  ${MAKE_CMD} ${IMPALA_MAKE_FLAGS} fe
 }
 
-# Build all components.
+# Build all components. The build type is specified as the first argument, and the
+# second argument is 0 if targets that are independent of the build type (like the
+# frontend) should not be built or non-zero otherwise. E.g. to build DEBUG including
+# build-type-independent artifacts.
+#   build_all_components DEBUG 1
 build_all_components() {
-  # Build the Impala frontend, backend and external data source API.
-  MAKE_IMPALA_ARGS+=" -fe -cscope -tarballs"
-  if [[ -e "$IMPALA_LZO" ]]
-  then
-    MAKE_IMPALA_ARGS+=" -impala-lzo"
-  fi
+  build_type=$1
+  build_independent_targets=$2
+  echo ">>> Building all components"
+  generate_cmake_files $build_type
 
-  echo "Running make_impala.sh ${MAKE_IMPALA_ARGS}"
-  "$IMPALA_HOME/bin/make_impala.sh" ${MAKE_IMPALA_ARGS}
+  # Force regenerating the build version and timestamp (this doesn't happen automatically
+  # in incremental builds).
+  $IMPALA_HOME/bin/gen_build_version.py
+
+  # If we skip specifying targets, everything we need gets built.
+  local MAKE_TARGETS=""
+  if [[ $BUILD_TESTS -eq 0 ]]; then
+    # Specify all the non-test targets
+    MAKE_TARGETS="impalad statestored catalogd fesupport loggingsupport ImpalaUdf \
+        udasample udfsample"
+    if (( build_independent_targets )); then
+      MAKE_TARGETS+=" cscope fe tarballs"
+    fi
+    if [[ -e "$IMPALA_LZO" ]]; then
+      MAKE_TARGETS+=" impala-lzo"
+    fi
+  fi
+  ${MAKE_CMD} -j${IMPALA_BUILD_THREADS:-4} ${IMPALA_MAKE_FLAGS} ${MAKE_TARGETS}
+}
+
+
+# Called with the CMAKE_BUILD_TYPE as the first argument, e.g.
+#   generate_cmake_files DEBUG
+generate_cmake_files() {
+  local build_type=$1
+  echo ">>> Generating CMake files" "CMAKE_BUILD_TYPE=$build_type"\
+       "BUILD_SHARED_LIBS=$BUILD_SHARED_LIBS" "MAKE_CMD=$MAKE_CMD"
+  # Remove cache to ensure that any changes to cmake arguments take effect.
+  rm -f ./CMakeCache.txt
+  local CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=${build_type})
+  if [[ $BUILD_SHARED_LIBS -eq 1 ]]; then
+    CMAKE_ARGS+=(-DBUILD_SHARED_LIBS=ON)
+  fi
+  if [[ "${MAKE_CMD}" = "ninja" ]]; then
+    CMAKE_ARGS+=(-GNinja)
+  fi
+  if [[ ("$build_type" == "ADDRESS_SANITIZER") \
+            || ("$build_type" == "TIDY") \
+            || ("$build_type" == "UBSAN") \
+            || ("$build_type" == "UBSAN_FULL") \
+            || ("$build_type" == "TSAN") ]]; then
+    CMAKE_ARGS+=(-DCMAKE_TOOLCHAIN_FILE=$IMPALA_HOME/cmake_modules/clang_toolchain.cmake)
+  else
+    CMAKE_ARGS+=(-DCMAKE_TOOLCHAIN_FILE=$IMPALA_HOME/cmake_modules/toolchain.cmake)
+  fi
+  cmake . ${CMAKE_ARGS[@]}
 }
 
 # Do any configuration of the test cluster required by the script arguments.
@@ -370,7 +456,8 @@ reconfigure_test_cluster() {
   "${IMPALA_HOME}/bin/start-impala-cluster.py" --kill --force
 
   if [[ "$FORMAT_METASTORE" -eq 1 || "$FORMAT_CLUSTER" -eq 1 ||
-        "$FORMAT_SENTRY_POLICY_DB" -eq 1 || -n "$METASTORE_SNAPSHOT_FILE" ]]
+        "$FORMAT_SENTRY_POLICY_DB" -eq 1 || "$FORMAT_RANGER_POLICY_DB" -eq 1 ||
+        -n "$METASTORE_SNAPSHOT_FILE" ]]
   then
     # Kill any processes that may be accessing postgres metastore. To be safe, this is
     # done before we make any changes to the config files.
@@ -385,6 +472,10 @@ reconfigure_test_cluster() {
   local CREATE_TEST_CONFIG_ARGS=""
   if [[ "$FORMAT_SENTRY_POLICY_DB" -eq 1 ]]; then
     CREATE_TEST_CONFIG_ARGS+=" -create_sentry_policy_db"
+  fi
+
+  if [[ "$FORMAT_RANGER_POLICY_DB" -eq 1 ]]; then
+    CREATE_TEST_CONFIG_ARGS+=" -create_ranger_policy_db"
   fi
 
   if [[ "$FORMAT_METASTORE" -eq 1 && -z "$METASTORE_SNAPSHOT_FILE" ]]; then
@@ -415,6 +506,7 @@ start_test_cluster_dependencies() {
 # This does all data loading, except for the metastore snapshot which must be loaded
 # earlier before the cluster is running.
 load_test_data() {
+  echo ">>> Loading test data"
   "$IMPALA_HOME/bin/create_testdata.sh"
   # We have 4 cases:
   # - test-warehouse and metastore snapshots exists.
@@ -449,12 +541,39 @@ create_log_dirs
 
 bootstrap_dependencies
 
+# Create .cdh and .cdp files that contains the CDH_BUILD_NUMBER and CDP_BUILD_NUMBER
+# respectively. If the content of the files are different than the ones in the
+# environment variable, append -U into IMPALA_MAVEN_OPTION to force Maven to update its
+# local cache.
+CDH_FILE="${IMPALA_HOME}/.cdh"
+CDP_FILE="${IMPALA_HOME}/.cdp"
+if [[ ! -f ${CDH_FILE} || ! -f ${CDP_FILE} || \
+      $(cat ${CDH_FILE}) != ${CDH_BUILD_NUMBER} || \
+      $(cat ${CDP_FILE}) != ${CDP_BUILD_NUMBER} ]]; then
+  export IMPALA_MAVEN_OPTIONS="${IMPALA_MAVEN_OPTIONS} -U"
+fi
+echo "${CDH_BUILD_NUMBER}" > ${CDH_FILE}
+echo "${CDP_BUILD_NUMBER}" > ${CDP_FILE}
+
 if [[ "$BUILD_FE_ONLY" -eq 1 ]]; then
   build_fe
   exit 0
 fi
 
-build_all_components
+if [[ "$GEN_CMAKE_ONLY" -eq 1 ]]; then
+  generate_cmake_files $CMAKE_BUILD_TYPE
+  exit 0
+fi
+if [[ "$BUILD_RELEASE_AND_DEBUG" -eq 1 ]]; then
+  # Build the standard release and debug builds. We can't do this for arbitrary build
+  # types because many build types reuse the same be/build/debug and be/build/release
+  # trees.
+  build_all_components RELEASE 1
+  # Avoid rebuilding targets that are independent of the build type.
+  build_all_components DEBUG 0
+else
+  build_all_components $CMAKE_BUILD_TYPE 1
+fi
 
 if [[ $NEED_MINICLUSTER -eq 1 ]]; then
   reconfigure_test_cluster

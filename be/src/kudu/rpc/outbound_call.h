@@ -17,11 +17,17 @@
 #ifndef KUDU_RPC_CLIENT_CALL_H
 #define KUDU_RPC_CLIENT_CALL_H
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ostream>
 #include <set>
 #include <string>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <gtest/gtest_prod.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
@@ -30,8 +36,8 @@
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/rpc/transfer.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/slice.h"
@@ -49,9 +55,7 @@ namespace kudu {
 namespace rpc {
 
 class CallResponse;
-class Connection;
-class DumpRunningRpcsRequestPB;
-class InboundTransfer;
+class DumpConnectionsRequestPB;
 class RpcCallInProgressPB;
 class RpcController;
 class RpcSidecar;
@@ -124,11 +128,10 @@ class OutboundCall {
 
   // Mark the call as failed. This also triggers the callback to notify
   // the caller. If the call failed due to a remote error, then err_pb
-  // should be set to the error returned by the remote server. Takes
-  // ownership of 'err_pb'.
-  void SetFailed(const Status& status,
+  // should be set to the error returned by the remote server.
+  void SetFailed(Status status,
                  Phase phase = Phase::REMOTE_CALL,
-                 ErrorStatusPB* err_pb = nullptr);
+                 std::unique_ptr<ErrorStatusPB> err_pb = nullptr);
 
   // Mark the call as timed out. This also triggers the callback to notify
   // the caller.
@@ -151,7 +154,7 @@ class OutboundCall {
 
   std::string ToString() const;
 
-  void DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp);
+  void DumpPB(const DumpConnectionsRequestPB& req, RpcCallInProgressPB* resp);
 
   ////////////////////////////////////////////////////////////
   // Getters
@@ -234,7 +237,7 @@ class OutboundCall {
   mutable simple_spinlock lock_;
   State state_;
   Status status_;
-  gscoped_ptr<ErrorStatusPB> error_pb_;
+  std::unique_ptr<ErrorStatusPB> error_pb_;
 
   // Call the user-provided callback. Note that entries in 'sidecars_' are cleared
   // prior to invoking the callback so the client can assume that the call doesn't
@@ -271,7 +274,8 @@ class OutboundCall {
   std::vector<std::unique_ptr<RpcSidecar>> sidecars_;
 
   // Total size in bytes of all sidecars in 'sidecars_'. Set in SetRequestPayload().
-  int64_t sidecar_byte_size_ = -1;
+  // This cannot exceed TransferLimits::kMaxTotalSidecarBytes.
+  int32_t sidecar_byte_size_ = -1;
 
   // True if cancellation was requested on this call.
   bool cancellation_requested_;

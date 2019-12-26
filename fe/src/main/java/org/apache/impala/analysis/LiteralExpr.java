@@ -26,6 +26,8 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.common.SqlCastException;
+import org.apache.impala.common.UnsupportedFeatureException;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TExprNode;
@@ -41,10 +43,13 @@ import com.google.common.base.Preconditions;
  */
 public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr> {
   private final static Logger LOG = LoggerFactory.getLogger(LiteralExpr.class);
+  public static final int MAX_STRING_LITERAL_SIZE = 64 * 1024;
 
   public LiteralExpr() {
+    // Literals start analyzed: there is nothing more to check.
     evalCost_ = LITERAL_COST;
     numDistinctValues_ = 1;
+    // Subclass is responsible for setting the type
   }
 
   /**
@@ -59,7 +64,9 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
    * LiteralExpr subclass, e.g. TIMESTAMP.
    */
   public static LiteralExpr create(String value, Type type) throws AnalysisException {
-    Preconditions.checkArgument(type.isValid());
+    if (!type.isValid()) {
+      throw new UnsupportedFeatureException("Invalid literal type: " + type.toSql());
+    }
     LiteralExpr e = null;
     switch (type.getPrimitiveType()) {
       case NULL_TYPE:
@@ -83,12 +90,14 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         e = new StringLiteral(value);
         break;
       case DATE:
+        e = new DateLiteral(value);
+        break;
       case DATETIME:
       case TIMESTAMP:
         // TODO: we support TIMESTAMP but no way to specify it in SQL.
-        return null;
+        throw new UnsupportedFeatureException("Literal unsupported: " + type.toSql());
       default:
-        Preconditions.checkState(false,
+        throw new UnsupportedFeatureException(
             String.format("Literals of type '%s' not supported.", type.toSql()));
     }
     e.analyze(null);
@@ -125,6 +134,10 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
           // We store the decimal as the unscaled bytes. Need to adjust for the scale.
           val = val.movePointLeft(decimalType.decimalScale());
           result = new NumericLiteral(val, colType);
+          break;
+        case DATE_LITERAL:
+          result = new DateLiteral(exprNode.date_literal.days_since_epoch,
+              exprNode.date_literal.date_string);
           break;
         case INT_LITERAL:
           result = LiteralExpr.create(
@@ -165,6 +178,17 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
   }
 
   /**
+   * If it is known that the size of the rewritten expression is fixed, e.g.,
+   * the size of an integer, then this method will be called to perform the rewrite.
+   * Otherwise, the method createBounded that takes an additional argument specifying
+   * the upper bound on the size of rewritten expression should be invoked.
+   */
+  public static LiteralExpr create(Expr constExpr, TQueryCtx queryCtx)
+    throws AnalysisException {
+    return createBounded(constExpr, queryCtx, 0);
+  }
+
+  /**
    * Evaluates the given constant expr and returns its result as a LiteralExpr.
    * Assumes expr has been analyzed. Returns constExpr if is it already a LiteralExpr.
    * Returns null for types that do not have a LiteralExpr subclass, e.g. TIMESTAMP, or
@@ -173,17 +197,17 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
    * or warnings in the BE.
    * TODO: Support non-scalar types.
    */
-  public static LiteralExpr create(Expr constExpr, TQueryCtx queryCtx)
-      throws AnalysisException {
+  public static LiteralExpr createBounded(Expr constExpr, TQueryCtx queryCtx,
+    int maxResultSize) throws AnalysisException {
     Preconditions.checkState(constExpr.isConstant());
     Preconditions.checkState(constExpr.getType().isValid());
     if (constExpr instanceof LiteralExpr) return (LiteralExpr) constExpr;
 
     TColumnValue val = null;
     try {
-      val = FeSupport.EvalExprWithoutRow(constExpr, queryCtx);
+      val = FeSupport.EvalExprWithoutRowBounded(constExpr, queryCtx, maxResultSize);
     } catch (InternalException e) {
-      LOG.error(String.format("Failed to evaluate expr '%s'",
+      LOG.error(String.format("Failed to evaluate expr '%s': %s",
           constExpr.toSql(), e.getMessage()));
       return null;
     }
@@ -219,9 +243,15 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
       case FLOAT:
       case DOUBLE:
         if (val.isSetDouble_val()) {
+          // Create using double directly, at extreme ranges the BigDecimal
+          // value overflows a double due to conversion issues.
           // A NumericLiteral cannot represent NaN, infinity or negative zero.
-          if (!NumericLiteral.isValidLiteral(val.double_val)) return null;
-          result = new NumericLiteral(new BigDecimal(val.double_val), constExpr.getType());
+          // SqlCastException thrown for these cases.
+          try {
+            result = new NumericLiteral(val.double_val, constExpr.getType());
+          } catch (SqlCastException e) {
+            return null;
+          }
         }
         break;
       case DECIMAL:
@@ -258,6 +288,12 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         }
         break;
       case DATE:
+        // Expects both the int and string fields to be set, so we get the raw
+        // representation and the string representation.
+        if (val.isSetInt_val() && val.isSetString_val()) {
+          result = new DateLiteral(val.int_val, val.getString_val());
+        }
+        break;
       case DATETIME:
         return null;
       default:
@@ -269,15 +305,15 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     if (result == null) result = new NullLiteral();
 
     result.analyzeNoThrow(null);
-    return (LiteralExpr)result;
+    return result;
   }
 
   // Order NullLiterals based on the SQL ORDER BY default behavior: NULLS LAST.
   @Override
   public int compareTo(LiteralExpr other) {
-    if (this instanceof NullLiteral && other instanceof NullLiteral) return 0;
-    if (this instanceof NullLiteral) return -1;
-    if (other instanceof NullLiteral) return 1;
+    if (Expr.IS_NULL_LITERAL.apply(this) && Expr.IS_NULL_LITERAL.apply(other)) return 0;
+    if (Expr.IS_NULL_LITERAL.apply(this)) return -1;
+    if (Expr.IS_NULL_LITERAL.apply(other)) return 1;
     if (getClass() != other.getClass()) return -1;
     return 0;
   }

@@ -4,6 +4,7 @@
 create external table t1 (i int)
 location '$FILESYSTEM_PREFIX/test-warehouse/$DATABASE.db/t1_tmp1'
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 describe t1
@@ -16,6 +17,58 @@ string,string,string
 # Add some columns
 alter table t1 add columns (t tinyint, s string comment 'Str Col')
 ---- RESULTS
+'New column(s) have been added to the table.'
+---- TYPES
+string
+====
+---- QUERY
+# Add columns that already exist with "if not exists" clause.
+alter table t1 add if not exists columns (t tinyint, s string comment 'Str Col')
+---- RESULTS
+'No new column(s) have been added to the table.'
+---- TYPES
+string
+====
+---- QUERY
+# Add columns that do not exist with "if not exists" clause.
+alter table t1 add if not exists columns (t2 tinyint, s2 string comment 'Str Col')
+---- RESULTS
+'New column(s) have been added to the table.'
+---- TYPES
+string
+====
+---- QUERY
+# Add a column that already exists and a new column that does not exist with
+# "if not exists" clause.
+alter table t1 add if not exists columns (t3 tinyint, s2 string comment 'Str Col')
+---- RESULTS
+'New column(s) have been added to the table.'
+---- TYPES
+string
+====
+---- QUERY
+# Add a new column that does not exist.
+alter table t1 add column t4 tinyint
+---- RESULTS
+'New column(s) have been added to the table.'
+---- TYPES
+string
+====
+---- QUERY
+# Add a new column that does not exist with "if not exists" clause.
+alter table t1 add column if not exists t5 tinyint
+---- RESULTS
+'New column(s) have been added to the table.'
+---- TYPES
+string
+====
+---- QUERY
+# Add a new column that already exists with "if not exists" clause.
+alter table t1 add column if not exists t5 tinyint
+---- RESULTS
+'No new column(s) have been added to the table.'
+---- TYPES
+string
 ====
 ---- QUERY
 describe t1
@@ -23,12 +76,18 @@ describe t1
 'i','int',''
 't','tinyint',''
 's','string','Str Col'
+'t2','tinyint',''
+'s2','string','Str Col'
+'t3','tinyint',''
+'t4','tinyint',''
+'t5','tinyint',''
 ---- TYPES
 string,string,string
 ====
 ---- QUERY
 alter table t1 rename to t2
 ---- RESULTS
+'Renaming was successful.'
 ====
 ---- QUERY
 show tables
@@ -42,6 +101,7 @@ string
 # Move the table to a different database
 alter table t2 rename to $DATABASE2.t1_inotherdb
 ---- RESULTS
+'Renaming was successful.'
 ====
 ---- QUERY
 # No longer appears in this database
@@ -63,6 +123,7 @@ string
 # Move the table back to this database
 alter table $DATABASE2.t1_inotherdb rename to t2
 ---- RESULTS
+'Renaming was successful.'
 ====
 ---- QUERY
 # make sure the new table shows the same columns as the old table
@@ -71,12 +132,18 @@ describe t2
 'i','int',''
 't','tinyint',''
 's','string','Str Col'
+'t2','tinyint',''
+'s2','string','Str Col'
+'t3','tinyint',''
+'t4','tinyint',''
+'t5','tinyint',''
 ---- TYPES
 string,string,string
 ====
 ---- QUERY
 alter table t2 drop column t
 ---- RESULTS
+'Column has been dropped.'
 ====
 ---- QUERY
 # The dropped column no longer shows up
@@ -84,6 +151,11 @@ describe t2
 ---- RESULTS
 'i','int',''
 's','string','Str Col'
+'t2','tinyint',''
+'s2','string','Str Col'
+'t3','tinyint',''
+'t4','tinyint',''
+'t5','tinyint',''
 ---- TYPES
 string,string,string
 ====
@@ -91,6 +163,7 @@ string,string,string
 # Replace the columns with new values
 alter table t2 replace columns (c1 bigint comment 'id col', c2 string, c3 int)
 ---- RESULTS
+'Table columns have been replaced.'
 ====
 ---- QUERY
 describe t2
@@ -118,14 +191,17 @@ bigint,string,int
 ---- QUERY
 alter table t2 change column c2 int_col int comment 'changed to int col'
 ---- RESULTS
+'Column has been altered.'
 ====
 ---- QUERY
 alter table t2 change column c1 id_col bigint
 ---- RESULTS
+'Column has been altered.'
 ====
 ---- QUERY
 alter table t2 change column c3 c3 int comment 'added a comment'
 ---- RESULTS
+'Column has been altered.'
 ====
 ---- QUERY
 describe t2
@@ -151,6 +227,7 @@ x array<int>,
 y map<string,float> comment 'Map Col',
 z struct<f1:boolean,f2:bigint>)
 ---- RESULTS
+'New column(s) have been added to the table.'
 ====
 ---- QUERY
 describe t2
@@ -171,6 +248,7 @@ a int comment 'Int Col',
 b struct<f1:array<int>,f2:map<string,struct<f1:bigint>>>,
 c double)
 ---- RESULTS
+'Table columns have been replaced.'
 ====
 ---- QUERY
 describe t2
@@ -217,6 +295,7 @@ string,string,string
 ---- QUERY
 create external table jointbl_test like functional.jointbl
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 # Expect new table to be empty
@@ -282,6 +361,7 @@ alter table t_part add if not exists partition (j=1, s='2012');
 alter table t_part add if not exists partition (j=1, s='2012/withslash');
 alter table t_part add partition (j=1, s=substring('foo2013bar', 4, 8));
 ---- RESULTS
+'New partition has been added to the table.'
 ====
 ---- QUERY
 # Add another partition that points to the same location as another partition.
@@ -289,6 +369,7 @@ alter table t_part add partition (j=1, s=substring('foo2013bar', 4, 8));
 alter table t_part add partition (j=100, s='same_location')
 location '$FILESYSTEM_PREFIX/test-warehouse/$DATABASE.db/t_part_tmp/j=1/s=2012'
 ---- RESULTS
+'New partition has been added to the table.'
 ====
 ---- QUERY
 # Add another partition that points to an existing data location that does not
@@ -296,6 +377,7 @@ location '$FILESYSTEM_PREFIX/test-warehouse/$DATABASE.db/t_part_tmp/j=1/s=2012'
 alter table t_part add partition (j=101, s='different_part_dir')
 location '$FILESYSTEM_PREFIX/test-warehouse/$DATABASE.db/part_data/'
 ---- RESULTS
+'New partition has been added to the table.'
 ====
 ---- QUERY
 insert overwrite table t_part partition(j=1, s='2012') select 2 from functional.alltypes limit 2
@@ -337,10 +419,12 @@ int,int,string
 ---- QUERY
 alter table t_part add partition (j=NULL, s='2013')
 ---- RESULTS
+'New partition has been added to the table.'
 ====
 ---- QUERY
 alter table t_part add partition (j=NULL, s=NULL)
 ---- RESULTS
+'New partition has been added to the table.'
 ====
 ---- QUERY
 # Drop the partition that points to a duplication location. The data will no longer
@@ -527,6 +611,7 @@ int,int,string
 # rename a partitioned table
 alter table t_part rename to t_part2
 ---- RESULTS
+'Renaming was successful.'
 ====
 ---- QUERY
 # only the new table shows up
@@ -558,6 +643,7 @@ int
 alter table alltypes_test partition(month=4, year=2009)
 set location '$FILESYSTEM_PREFIX/test-warehouse/alltypes_seq_snap/year=2009/month=4'
 ---- RESULTS
+'New location has been set for the specified partition.'
 ====
 ---- QUERY
 alter table alltypes_test partition(month=4, year=2009)
@@ -590,6 +676,7 @@ int,bigint
 alter table alltypes_test partition(month=cast(1+4 as int), year=cast(100*20+9 as int))
 set location '$FILESYSTEM_PREFIX/test-warehouse/alltypes_rc/year=2009/month=5'
 ---- RESULTS
+'New location has been set for the specified partition.'
 ====
 ---- QUERY
 alter table alltypes_test partition(month=cast(2+3 as int), year=2009)
@@ -661,6 +748,7 @@ STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
 # IMPALA-1016: Testing scanning newly added columns
 CREATE TABLE imp1016 (string1 string)
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 INSERT INTO imp1016 VALUES ('test')
@@ -670,6 +758,7 @@ INSERT INTO imp1016 VALUES ('test')
 ---- QUERY
 ALTER TABLE imp1016 ADD COLUMNS (string2 string)
 ---- RESULTS
+'New column(s) have been added to the table.'
 ====
 ---- QUERY
 DESCRIBE imp1016
@@ -718,6 +807,7 @@ bigint
 # Create a larger table to test scanning newly added columns
 CREATE TABLE imp1016Large (string1 string)
 ---- RESULTS
+'Table has been created.'
 ====
 ---- QUERY
 # There is a codepath that operates on chunks of 1024 tuples, inserting
@@ -729,6 +819,7 @@ INSERT INTO imp1016Large SELECT 'test' FROM functional.alltypes LIMIT 2000
 ---- QUERY
 ALTER TABLE imp1016Large ADD COLUMNS (string2 string)
 ---- RESULTS
+'New column(s) have been added to the table.'
 ====
 ---- QUERY
 DESCRIBE imp1016Large
@@ -793,14 +884,15 @@ BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
 ---- QUERY
 show column stats $DATABASE2.mv2
 ---- RESULTS
-'x','INT',2,-1,4,4
-'y','STRING',2,-1,1,1
+'x','INT',2,1,4,4
+'y','STRING',2,1,1,1
 ---- TYPES
 STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
 ====
 ---- QUERY
 drop table $DATABASE2.mv2
 ---- RESULTS
+'Table has been dropped.'
 ====
 ---- QUERY
 show tables in $DATABASE2 like '*mv*'
@@ -808,10 +900,14 @@ show tables in $DATABASE2 like '*mv*'
 ---- TYPES
 STRING
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 # Tests that renaming a partitioned table with column stats across databases
 # succeeds and preserves table and column stats, and allows the renamed table
 # to be dropped (IMPALA-2810).
+#
+# Skip in Hive 3, see HIVE-21806 for details.
 create table $DATABASE.mv (x int) partitioned by (y string);
 insert into $DATABASE.mv partition(y='a') values(1);
 insert into $DATABASE.mv partition(y='b') values(2);
@@ -821,12 +917,16 @@ alter table $DATABASE.mv rename to $DATABASE2.mv2;
 invalidate metadata $DATABASE2.mv2
 ---- RESULTS
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 show tables in $DATABASE like '*mv*'
 ---- RESULTS
 ---- TYPES
 STRING
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 show tables in $DATABASE2 like '*mv*'
 ---- RESULTS
@@ -834,6 +934,8 @@ show tables in $DATABASE2 like '*mv*'
 ---- TYPES
 STRING
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 show table stats $DATABASE2.mv2
 ---- RESULTS: VERIFY_IS_EQUAL_SORTED
@@ -844,18 +946,25 @@ show table stats $DATABASE2.mv2
 ---- TYPES
 STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 show column stats $DATABASE2.mv2
 ---- RESULTS: VERIFY_IS_EQUAL_SORTED
-'x','INT',2,-1,4,4
+'x','INT',2,1,4,4
 'y','STRING',3,1,-1,-1
 ---- TYPES
 STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 drop table $DATABASE2.mv2
 ---- RESULTS
+'Table has been dropped.'
 ====
+---- HIVE_MAJOR_VERSION
+2
 ---- QUERY
 show tables in $DATABASE2 like '*mv*'
 ---- RESULTS

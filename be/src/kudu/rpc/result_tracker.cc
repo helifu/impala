@@ -18,19 +18,27 @@
 #include "kudu/rpc/result_tracker.h"
 
 #include <algorithm>
-#include <limits>
+#include <mutex>
+#include <ostream>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/thread.h"
 #include "kudu/util/trace.h"
+// IWYU pragma: no_include <deque>
 
-DEFINE_int64_hidden(remember_clients_ttl_ms, 3600 * 1000 /* 1 hour */,
+DEFINE_int64(remember_clients_ttl_ms, 3600 * 1000 /* 1 hour */,
     "Maximum amount of time, in milliseconds, the server \"remembers\" a client for the "
     "purpose of caching its responses. After this period without hearing from it, the "
     "client is no longer remembered and the memory occupied by its responses is reclaimed. "
@@ -38,14 +46,14 @@ DEFINE_int64_hidden(remember_clients_ttl_ms, 3600 * 1000 /* 1 hour */,
     "ones.");
 TAG_FLAG(remember_clients_ttl_ms, advanced);
 
-DEFINE_int64_hidden(remember_responses_ttl_ms, 600 * 1000 /* 10 mins */,
+DEFINE_int64(remember_responses_ttl_ms, 600 * 1000 /* 10 mins */,
     "Maximum amount of time, in milliseconds, the server \"remembers\" a response to a "
     "specific request for a client. After this period has elapsed, the response may have "
     "been garbage collected and the client might get a response indicating the request is "
     "STALE.");
 TAG_FLAG(remember_responses_ttl_ms, advanced);
 
-DEFINE_int64_hidden(result_tracker_gc_interval_ms, 1000,
+DEFINE_int64(result_tracker_gc_interval_ms, 1000,
     "Interval at which the result tracker will look for entries to GC.");
 TAG_FLAG(result_tracker_gc_interval_ms, hidden);
 
@@ -54,12 +62,17 @@ namespace rpc {
 
 using google::protobuf::Message;
 using kudu::MemTracker;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
 using rpc::InboundCall;
+using std::make_pair;
 using std::move;
 using std::lock_guard;
+using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
 
@@ -348,7 +361,7 @@ void ResultTracker::RecordCompletionAndRespond(const RequestIdPB& request_id,
 }
 
 void ResultTracker::FailAndRespondInternal(const RequestIdPB& request_id,
-                                           HandleOngoingRpcFunc func) {
+                                           const HandleOngoingRpcFunc& func) {
   vector<OnGoingRpcInfo> to_handle;
   {
     lock_guard<simple_spinlock> l(lock_);

@@ -39,6 +39,9 @@ table_name:bad_seq_snap, constraint:restrict_to, table_format:seq/snap/block
 table_name:bad_avro_snap_strings, constraint:restrict_to, table_format:avro/snap/block
 table_name:bad_avro_snap_floats, constraint:restrict_to, table_format:avro/snap/block
 table_name:bad_avro_decimal_schema, constraint:restrict_to, table_format:avro/snap/block
+table_name:bad_avro_date_out_of_range, constraint:restrict_to, table_format:avro/snap/block
+table_name:hive2_bad_avro_date_pre_gregorian, constraint:restrict_to, table_format:avro/snap/block
+table_name:hive3_avro_date_pre_gregorian, constraint:restrict_to, table_format:avro/snap/block
 table_name:bad_parquet, constraint:restrict_to, table_format:parquet/none/none
 table_name:bad_parquet_strings_negative_len, constraint:restrict_to, table_format:parquet/none/none
 table_name:bad_parquet_strings_out_of_bounds, constraint:restrict_to, table_format:parquet/none/none
@@ -66,10 +69,14 @@ table_name:complextypes_fileformat, constraint:restrict_to, table_format:parquet
 table_name:complextypes_fileformat, constraint:restrict_to, table_format:avro/snap/block
 table_name:complextypes_fileformat, constraint:restrict_to, table_format:rc/snap/block
 table_name:complextypes_fileformat, constraint:restrict_to, table_format:seq/snap/block
+table_name:complextypes_fileformat, constraint:restrict_to, table_format:orc/def/block
 table_name:complextypes_multifileformat, constraint:restrict_to, table_format:text/none/none
 
 # TODO: Avro
 table_name:complextypestbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:complextypestbl, constraint:restrict_to, table_format:orc/def/block
+table_name:complextypestbl_medium, constraint:restrict_to, table_format:parquet/none/none
+table_name:complextypestbl_medium, constraint:restrict_to, table_format:orc/def/block
 
 table_name:alltypeserror, constraint:exclude, table_format:parquet/none/none
 table_name:alltypeserrornonulls, constraint:exclude, table_format:parquet/none/none
@@ -101,10 +108,11 @@ table_name:view_view, constraint:restrict_to, table_format:seq/snap/block
 table_name:subquery_view, constraint:restrict_to, table_format:seq/snap/block
 table_name:subquery_view, constraint:restrict_to, table_format:rc/none/none
 
-# liketbl and tblwithraggedcolumns all have
+# liketbl, tblwithraggedcolumns and manynulls all have
 # NULLs in primary key columns. hbase does not support
 # writing NULLs to primary key columns.
 table_name:liketbl, constraint:exclude, table_format:hbase/none/none
+table_name:manynulls, constraint:exclude, table_format:hbase/none/none
 table_name:tblwithraggedcolumns, constraint:exclude, table_format:hbase/none/none
 
 # Tables with only one column are not supported in hbase.
@@ -132,11 +140,26 @@ table_name:decimal_tbl, constraint:restrict_to, table_format:text/none/none
 table_name:decimal_tiny, constraint:restrict_to, table_format:text/none/none
 table_name:decimal_tbl, constraint:restrict_to, table_format:parquet/none/none
 table_name:decimal_tiny, constraint:restrict_to, table_format:parquet/none/none
+table_name:decimal_tbl, constraint:restrict_to, table_format:kudu/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:kudu/none/none
+table_name:decimal_tbl, constraint:restrict_to, table_format:orc/def/block
+table_name:decimal_tiny, constraint:restrict_to, table_format:orc/def/block
+
+table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:text/none/none
+table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:kudu/none/none
+table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:orc/def/block
+
+table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:text/none/none
+table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:kudu/none/none
+table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:orc/def/block
 
 table_name:avro_decimal_tbl, constraint:restrict_to, table_format:avro/snap/block
 
-# TODO first set of tests are for text/none/none
-table_name:chars_tiny, constraint:restrict_to, table_format:text/none/none
+# CHAR is not supported by HBase.
+table_name:chars_tiny, constraint:exclude, table_format:hbase/none/none
+table_name:chars_medium, constraint:exclude, table_format:hbase/none/none
 
 # invalid_decimal_part_tbl[1,2,3] tables are used for testing invalid decimal
 # partition key values (see IMPALA-1040)
@@ -185,7 +208,14 @@ table_name:tinytable, constraint:only, table_format:kudu/none/none
 table_name:tinyinttable, constraint:only, table_format:kudu/none/none
 table_name:zipcode_incomes, constraint:only, table_format:kudu/none/none
 table_name:nulltable, constraint:only, table_format:kudu/none/none
+table_name:nullrows, constraint:only, table_format:kudu/none/none
 table_name:nullescapedtable, constraint:only, table_format:kudu/none/none
+table_name:decimal_tbl, constraint:only, table_format:kudu/none/none
+table_name:decimal_rtf_tbl, constraint:only, table_format:kudu/none/none
+table_name:decimal_rtf_tiny_tbl, constraint:only, table_format:kudu/none/none
+table_name:decimal_tiny, constraint:only, table_format:kudu/none/none
+table_name:strings_with_quotes, constraint:only, table_format:kudu/none/none
+table_name:manynulls, constraint:only, table_format:kudu/none/none
 
 # Skipping header lines is only effective with text tables
 table_name:table_with_header, constraint:restrict_to, table_format:text/none/none
@@ -198,3 +228,49 @@ table_name:table_with_header_insert, constraint:restrict_to, table_format:text/g
 # Inserting into parquet tables should not be affected by the 'skip.header.line.count'
 # property, so we test parquet format as well.
 table_name:table_with_header_insert, constraint:restrict_to, table_format:parquet/none/none
+
+# IMPALA-7368/IMPALA-7370/IMPALA-8198 adds DATE support for text, hbase, parquet and avro.
+# Other file-formats will be introduced later.
+table_name:date_tbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:date_tbl, constraint:restrict_to, table_format:avro/snap/block
+table_name:date_tbl, constraint:restrict_to, table_format:hbase/none/none
+table_name:date_tbl, constraint:restrict_to, table_format:text/none/none
+table_name:date_tbl, constraint:restrict_to, table_format:text/lzo/block
+table_name:date_tbl, constraint:restrict_to, table_format:text/bzip/block
+table_name:date_tbl, constraint:restrict_to, table_format:text/gzip/block
+table_name:date_tbl, constraint:restrict_to, table_format:text/snap/block
+table_name:date_tbl, constraint:restrict_to, table_format:text/def/block
+table_name:date_tbl_error, constraint:restrict_to, table_format:text/none/none
+table_name:date_tbl_error, constraint:restrict_to, table_format:text/lzo/block
+table_name:date_tbl_error, constraint:restrict_to, table_format:text/bzip/block
+table_name:date_tbl_error, constraint:restrict_to, table_format:text/gzip/block
+table_name:date_tbl_error, constraint:restrict_to, table_format:text/snap/block
+table_name:date_tbl_error, constraint:restrict_to, table_format:text/def/block
+table_name:insert_date_tbl, constraint:restrict_to, table_format:hbase/none/none
+
+# Full transactional table is only supported for ORC
+table_name:full_transactional_table, constraint:restrict_to, table_format:orc/def/block
+
+# Insert-only transactional tables only work for file-format based tables
+table_name:insert_only_transactional_table, constraint:exclude, table_format:hbase/none/none
+table_name:insert_only_transactional_table, constraint:exclude, table_format:kudu/none/none
+table_name:insertonly_nopart_insert, constraint:restrict_to, table_format:text/none/none
+table_name:insertonly_nopart_insert, constraint:restrict_to, table_format:parquet/none/none
+table_name:insertonly_part_insert, constraint:restrict_to, table_format:text/none/none
+table_name:insertonly_part_insert, constraint:restrict_to, table_format:parquet/none/none
+
+# 'materialized_view' is based on 'insert_only_transactional_table' from the same
+# database, so it needs to be excluded where 'insert_only_transactional_table' is
+# excluded.
+table_name:materialized_view, constraint:exclude, table_format:hbase/none/none
+table_name:materialized_view, constraint:exclude, table_format:kudu/none/none
+
+table_name:insert_only_transactional_bucketed_table, constraint:exclude, table_format:hbase/none/none
+table_name:insert_only_transactional_bucketed_table, constraint:exclude, table_format:kudu/none/none
+
+# Bucketed tables only work for file-format based tables
+table_name:bucketed_ext_table, constraint:exclude, table_format:hbase/none/none
+table_name:bucketed_ext_table, constraint:exclude, table_format:kudu/none/none
+table_name:bucketed_table, constraint:exclude, table_format:hbase/none/none
+table_name:bucketed_table, constraint:exclude, table_format:kudu/none/none
+table_name:bucketed_table, constraint:exclude, table_format:text/lzo/block

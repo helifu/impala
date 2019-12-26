@@ -15,48 +15,79 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <atomic>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
+#include <ostream>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <boost/bind.hpp>
+#include <boost/core/ref.hpp>
+#include <boost/function.hpp>
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
-#include <boost/bind.hpp>
 
+#include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/rpc/proxy.h"
+#include "kudu/rpc/rpc-test-base.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/rpcz_store.h"
+#include "kudu/rpc/rtest.pb.h"
 #include "kudu/rpc/rtest.proxy.h"
-#include "kudu/rpc/rtest.service.h"
-#include "kudu/rpc/rpc-test-base.h"
+#include "kudu/rpc/service_pool.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/env.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/random.h"
+#include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/thread_restrictions.h"
 #include "kudu/util/user.h"
 
-DEFINE_bool_hidden(is_panic_test_child, false, "Used by TestRpcPanic");
+DEFINE_bool(is_panic_test_child, false, "Used by TestRpcPanic");
 DECLARE_bool(socket_inject_short_recvs);
 
+using kudu::pb_util::SecureDebugString;
 using std::shared_ptr;
+using std::string;
 using std::unique_ptr;
 using std::vector;
+using base::subtle::NoBarrier_Load;
 
 namespace kudu {
 namespace rpc {
 
 class RpcStubTest : public RpcTestBase {
  public:
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     RpcTestBase::SetUp();
     // Use a shorter queue length since some tests below need to start enough
     // threads to saturate the queue.
     service_queue_length_ = 10;
-    StartTestServerWithGeneratedCode(&server_addr_);
-    client_messenger_ = CreateMessenger("Client");
+    ASSERT_OK(StartTestServerWithGeneratedCode(&server_addr_));
+    ASSERT_OK(CreateMessenger("Client", &client_messenger_));
   }
  protected:
   void SendSimpleCall() {
@@ -342,8 +373,8 @@ TEST_F(RpcStubTest, TestRpcPanic) {
     string executable_path;
     CHECK_OK(env_->GetExecutablePath(&executable_path));
     argv.push_back(executable_path);
-    argv.push_back("--is_panic_test_child");
-    argv.push_back("--gtest_filter=RpcStubTest.TestRpcPanic");
+    argv.emplace_back("--is_panic_test_child");
+    argv.emplace_back("--gtest_filter=RpcStubTest.TestRpcPanic");
     Subprocess subp(argv);
     subp.ShareParentStderr(false);
     CHECK_OK(subp.Start());
@@ -405,7 +436,7 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
   for (int i = 0; i < n_worker_threads_; i++) {
     gscoped_ptr<AsyncSleep> sleep(new AsyncSleep);
     sleep->rpc.set_timeout(MonoDelta::FromSeconds(1));
-    sleep->req.set_sleep_micros(100*1000); // 100ms
+    sleep->req.set_sleep_micros(1000*1000); // 1sec
     p.SleepAsync(sleep->req, &sleep->resp, &sleep->rpc,
                  boost::bind(&CountDownLatch::CountDown, &sleep->latch));
     sleeps.push_back(sleep.release());
@@ -423,21 +454,34 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
 
   // Send another call with a short timeout. This shouldn't get processed, because
   // it'll get stuck in the queue for longer than its timeout.
-  RpcController rpc;
-  SleepRequestPB req;
-  SleepResponsePB resp;
-  req.set_sleep_micros(1000);
-  rpc.set_timeout(MonoDelta::FromMilliseconds(1));
-  Status s = p.Sleep(req, &resp, &rpc);
-  ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+  ASSERT_EVENTUALLY([&]() {
+    RpcController rpc;
+    SleepRequestPB req;
+    SleepResponsePB resp;
+    req.set_sleep_micros(1); // unused but required.
+    rpc.set_timeout(MonoDelta::FromMilliseconds(5));
+    Status s = p.Sleep(req, &resp, &rpc);
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+    // Since our timeout was short, it's possible in rare circumstances
+    // that we time out the RPC on the outbound queue, in which case
+    // we won't trigger the desired behavior here. In that case, the
+    // timeout error status would have the string 'ON_OUTBOUND_QUEUE'
+    // instead of 'SENT', so this assertion would fail and cause the
+    // ASSERT_EVENTUALLY to loop.
+    ASSERT_STR_CONTAINS(s.ToString(), "SENT");
+  });
 
   for (AsyncSleep* s : sleeps) {
     s->latch.Wait();
   }
 
   // Verify that the timedout call got short circuited before being processed.
+  // We may need to loop a short amount of time as we are racing with the reactor
+  // thread to process the remaining elements of the queue.
   const Counter* timed_out_in_queue = service_pool_->RpcsTimedOutInQueueMetricForTests();
-  ASSERT_EQ(1, timed_out_in_queue->value());
+  ASSERT_EVENTUALLY([&]{
+    ASSERT_EQ(1, timed_out_in_queue->value());
+  });
 }
 
 // Test which ensures that the RPC queue accepts requests with the earliest
@@ -527,11 +571,11 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
                boost::bind(&CountDownLatch::CountDown, &sleep.latch));
 
   // Check the running RPC status on the client messenger.
-  DumpRunningRpcsRequestPB dump_req;
-  DumpRunningRpcsResponsePB dump_resp;
+  DumpConnectionsRequestPB dump_req;
+  DumpConnectionsResponsePB dump_resp;
   dump_req.set_include_traces(true);
 
-  ASSERT_OK(client_messenger_->DumpRunningRpcs(dump_req, &dump_resp));
+  ASSERT_OK(client_messenger_->DumpConnections(dump_req, &dump_resp));
   LOG(INFO) << "client messenger: " << SecureDebugString(dump_resp);
   ASSERT_EQ(1, dump_resp.outbound_connections_size());
   ASSERT_EQ(1, dump_resp.outbound_connections(0).calls_in_flight_size());
@@ -544,7 +588,7 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   // asynchronously off of the main thread (ie the server may not be handling it yet)
   for (int i = 0; i < 100; i++) {
     dump_resp.Clear();
-    ASSERT_OK(server_messenger_->DumpRunningRpcs(dump_req, &dump_resp));
+    ASSERT_OK(server_messenger_->DumpConnections(dump_req, &dump_resp));
     if (dump_resp.inbound_connections_size() > 0 &&
         dump_resp.inbound_connections(0).calls_in_flight_size() > 0) {
       break;

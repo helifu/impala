@@ -15,6 +15,8 @@ bigint,bigint,bigint,bigint
 select * from chars_tiny where cs = cast('6a' as CHAR(2))
 ---- TYPES
 char,char,string
+---- HS2_TYPES
+char,char,varchar
 ---- RESULTS
 '6a   ','6b                                                                                                                                          ','6c'
 '6a   ','6b                                                                                                                                          ','6c'
@@ -75,6 +77,8 @@ char
 select A.vc from chars_tiny as A join chars_tiny using (vc) order by A.vc
 ---- TYPES
 string
+---- HS2_TYPES
+varchar
 ---- RESULTS
 '1cccc'
 '2cccccc'
@@ -109,6 +113,8 @@ string, string, bigint, bigint, string, string
 select t1.vc, COUNT(1) FROM chars_tiny t1 GROUP BY 1 ORDER BY t1.vc
 ---- TYPES
 string, bigint
+---- HS2_TYPES
+varchar, bigint
 ---- RESULTS
 '1cccc',1
 '2cccccc',1
@@ -150,4 +156,84 @@ char, string
 '6a   ','6a   '
 'a    ','a    '
 'NULL','NULL'
+====
+---- QUERY
+# Test returning mix of nulls and non-nulls.
+WITH numbered AS (
+  SELECT *, row_number() over (order by cs) as rn
+  FROM chars_tiny)
+SELECT *
+FROM (
+  SELECT CASE WHEN rn % 2 = 0 THEN cs END cs,
+    CASE WHEN rn % 2 = 1 THEN cl END cl,
+    CASE WHEN rn % 3 = 0 THEN vc END vc
+  FROM numbered
+  UNION ALL
+  SELECT CASE WHEN rn % 2 = 1 THEN cs END cs,
+    CASE WHEN rn % 2 = 0 THEN cl END cl,
+    CASE WHEN rn % 3 = 1 THEN vc END vc
+  FROM numbered) v
+---- TYPES
+char, char, string
+---- HS2_TYPES
+char, char, varchar
+---- RESULTS
+'NULL','1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','NULL'
+'2aaaa','NULL','NULL'
+'NULL','3bbbbb                                                                                                                                      ','3ccc'
+'4aa  ','NULL','NULL'
+'NULL','5bbb                                                                                                                                        ','NULL'
+'6a   ','NULL','6c'
+'NULL','6b                                                                                                                                          ','NULL'
+'a    ','NULL','NULL'
+'NULL','NULL','NULL'
+'1aaaa','NULL','1cccc'
+'NULL','2bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','NULL'
+'3aaa ','NULL','NULL'
+'NULL','4bbbb                                                                                                                                       ','4cc'
+'5a   ','NULL','NULL'
+'NULL','6b                                                                                                                                          ','NULL'
+'6a   ','NULL','6c'
+'NULL','b                                                                                                                                           ','NULL'
+'NULL','NULL','NULL'
+====
+---- QUERY
+# Scan non-NULL CHAR and VARCHAR from larger table.
+select date_char_col, date_varchar_col, count(*)
+from chars_medium
+group by 1, 2
+---- TYPES
+char, string, bigint
+---- HS2_TYPES
+char, varchar, bigint
+---- RESULTS
+'01/01/10','01/01/10',1100
+'01/02/10','01/02/10',1100
+'01/03/10','01/03/10',1100
+'01/10/10','01/10/10',1100
+'01/08/10','01/08/10',1100
+'01/07/10','01/07/10',1100
+'01/04/10','01/04/10',1100
+'01/09/10','01/09/10',1100
+'01/06/10','01/06/10',1100
+'01/05/10','01/05/10',1100
+====
+---- QUERY
+# Scan CHAR and VARCHAR with NULLs from larger table.
+select id, char_col, varchar_col
+from chars_medium
+where id in (3, 1000, 1234, 5678, 1111, 2222, 3333)
+---- TYPES
+int, char, string
+---- HS2_TYPES
+int, char, varchar
+---- RESULTS
+3,'3  ','3'
+1000,'0  ','NULL'
+1111,'111','NULL'
+1234,'234','NULL'
+2222,'NULL','NULL'
+3333,'333','333'
+5678,'NULL','NULL'
+1000,'0  ','NULL'
 ====

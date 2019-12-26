@@ -33,8 +33,21 @@
 namespace impala {
 
 class BufferPool;
+class MemTracker;
 class ReservationTracker;
 class Thread;
+
+/// Each names one of the fields in TJvmMemoryPool.
+enum JvmMemoryMetricType {
+  MAX,
+  INIT,
+  COMMITTED,
+  CURRENT,
+  PEAK_MAX,
+  PEAK_INIT,
+  PEAK_COMMITTED,
+  PEAK_CURRENT
+};
 
 /// Memory metrics including TCMalloc and BufferPool memory.
 class AggregateMemoryMetrics {
@@ -151,45 +164,100 @@ class SanitizerMallocMetric : public IntGauge {
   }
 };
 
-/// A JvmMetric corresponds to one value drawn from one 'memory pool' in the JVM. A memory
-/// pool is an area of memory assigned for one particular aspect of memory management. For
-/// example Hotspot has pools for the permanent generation, the old generation, survivor
-/// space, code cache and permanently tenured objects.
-class JvmMetric : public IntGauge {
+// A singleton for caching the gathering of JVM Metrics for 1 second, to amortize
+// the cost of getting all the JVM metrics.
+//
+// Clients should get the singleton via GetInstance() and call the
+// Get* methods. Internally, the Get* methods are synchronized with
+// lock_.
+class JvmMetricCache {
+  public:
+    /// Retrieves a metric for a given pool.
+    long GetPoolMetric(const std::string& mempool_name, JvmMemoryMetricType type);
+    /// Retrieves a single counter metric from the response.
+    long GetCounterMetric(int64_t(*accessor)(const TGetJvmMemoryMetricsResponse&));
+    /// Returns all pool names.
+    vector<string> GetPoolNames();
+    /// Returns singleton instance.
+    static JvmMetricCache* GetInstance();
+
+  private:
+    /// Updates metrics if over CACHE_PERIOD_MILLIS has elapsed.
+    void GrabMetricsIfNecessary();
+
+    boost::mutex lock_;
+    /// Time when metrics were last fetched, using MonotonicMillis().
+    /// Protected by lock_.
+    int64_t last_fetch_ = 0;
+    /// Last available metrics.
+    /// Protected by lock_.
+    TGetJvmMemoryMetricsResponse last_response_;
+
+    static const int64_t CACHE_PERIOD_MILLIS = 1000;
+    JvmMetricCache() { }
+    DISALLOW_COPY_AND_ASSIGN(JvmMetricCache);
+};
+
+/// A JvmMemoryMetric corresponds to one value drawn from one 'memory pool' in the JVM. A
+/// memory pool is an area of memory assigned for one particular aspect of memory
+/// management. For example Hotspot has pools for the permanent generation, the old
+/// generation, survivor space, code cache and permanently tenured objects.
+class JvmMemoryMetric : public IntGauge {
  public:
-  /// Registers many Jvm memory metrics: one for every member of JvmMetricType for each
-  /// pool (usually ~5 pools plus a synthetic 'total' pool).
-  static Status InitMetrics(MetricGroup* metrics) WARN_UNUSED_RESULT;
+  /// Adds a "jvm" child group to 'parent' and registers many Jvm memory metrics: one
+  /// for every member of JvmMemoryMetricType for each pool (usually ~5 pools plus a
+  /// synthetic 'total' pool).
+  /// Idempotent but not thread-safe - can be safely called multiple times from the same
+  /// thread.
+  static void InitMetrics(MetricGroup* parent);
 
   /// Searches through jvm_metrics_response_ for a matching memory pool and pulls out the
   /// right value from that structure according to metric_type_.
   virtual int64_t GetValue() override;
 
+  // Expose the total memory metrics that may be counted against process memory limit.
+  // Initialised by InitMetrics().
+
+  // The jvm.heap.max-usage-bytes metric.
+  static JvmMemoryMetric* HEAP_MAX_USAGE;
+
+  // The jvm.non-heap.committed-usage-bytes metric.
+  static JvmMemoryMetric* NON_HEAP_COMMITTED;
+
  private:
-  /// Each names one of the fields in TJvmMemoryPool.
-  enum JvmMetricType {
-    MAX,
-    INIT,
-    COMMITTED,
-    CURRENT,
-    PEAK_MAX,
-    PEAK_INIT,
-    PEAK_COMMITTED,
-    PEAK_CURRENT
-  };
+  static JvmMemoryMetric* CreateAndRegister(MetricGroup* metrics, const std::string& key,
+      const std::string& pool_name, JvmMemoryMetricType type);
 
-  static JvmMetric* CreateAndRegister(MetricGroup* metrics, const std::string& key,
-      const std::string& pool_name, JvmMetric::JvmMetricType type);
-
-  /// Private constructor to ensure only InitMetrics() can create JvmMetrics.
-  JvmMetric(const TMetricDef& def, const std::string& mempool_name, JvmMetricType type);
+  /// Private constructor to ensure only InitMetrics() can create JvmMemoryMetrics.
+  JvmMemoryMetric(
+      const TMetricDef& def, const std::string& mempool_name, JvmMemoryMetricType type);
 
   /// The name of the memory pool, defined by the Jvm.
   std::string mempool_name_;
 
   /// Each metric corresponds to one value; this tells us which value from the memory pool
   /// that is.
-  JvmMetricType metric_type_;
+  JvmMemoryMetricType metric_type_;
+
+  /// Set the first time that InitMetrics() is called.
+  static bool initialized_;
+};
+
+// A counter that represents metrics about JVM Memory. It acesses the underlying
+// data via JniUtil::GetJvmMemoryMetrics() via JvmMetricCache.
+class JvmMemoryCounterMetric : public IntCounter {
+  virtual int64_t GetValue() override;
+
+  private:
+    friend class JvmMemoryMetric;
+    static JvmMemoryCounterMetric* CreateAndRegister(MetricGroup* metrics,
+        const string& key,
+        int64_t(*accessor)(const TGetJvmMemoryMetricsResponse&));
+    /// Private constructor; used via CreateAndRegister
+    JvmMemoryCounterMetric(const TMetricDef& def,
+      int64_t(*accessor)(const TGetJvmMemoryMetricsResponse&));
+
+    int64_t(*accessor_)(const TGetJvmMemoryMetricsResponse&);
 };
 
 /// Metric that reports information about the buffer pool.
@@ -198,7 +266,7 @@ class BufferPoolMetric : public IntGauge {
   static Status InitMetrics(MetricGroup* metrics, ReservationTracker* global_reservations,
       BufferPool* buffer_pool) WARN_UNUSED_RESULT;
 
-  /// Global metrics, initialized by CreateAndRegisterMetrics().
+  /// Global metrics, initialized by InitMetrics().
   static BufferPoolMetric* LIMIT;
   static BufferPoolMetric* SYSTEM_ALLOCATED;
   static BufferPoolMetric* RESERVED;
@@ -238,6 +306,30 @@ class BufferPoolMetric : public IntGauge {
   BufferPoolMetricType type_;
   ReservationTracker* global_reservations_;
   BufferPool* buffer_pool_;
+};
+
+/// Metric that reports information about a MemTracker.
+class MemTrackerMetric : public IntGauge {
+ public:
+  // Creates two new metrics tracking the current and peak usages of 'mem_tracker' in
+  // the metrics group 'metrics'. The caller must make sure that 'mem_tracker' is not
+  // destructed before 'metrics'.
+  static void CreateMetrics(MetricGroup* metrics, MemTracker* mem_tracker,
+      const std::string& name);
+
+  virtual int64_t GetValue() override;
+
+ private:
+  enum class MemTrackerMetricType {
+    CURRENT, // Current usage of the MemTracker
+    PEAK, // Peak usage of the MemTracker
+  };
+
+  MemTrackerMetric(const TMetricDef& def, MemTrackerMetricType type,
+      MemTracker* mem_tracker);
+
+  const MemTrackerMetricType type_;
+  const MemTracker* mem_tracker_;
 };
 
 /// Registers common tcmalloc memory metrics. If 'register_jvm_metrics' is true, the JVM

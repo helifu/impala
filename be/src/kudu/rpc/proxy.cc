@@ -17,25 +17,22 @@
 
 #include "kudu/rpc/proxy.h"
 
-#include <boost/bind.hpp>
-#include <glog/logging.h>
-#include <inttypes.h>
-#include <memory>
-#include <stdint.h>
-
 #include <iostream>
-#include <sstream>
-#include <vector>
+#include <memory>
+#include <utility>
 
-#include "kudu/gutil/stringprintf.h"
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <boost/core/ref.hpp>
+#include <glog/logging.h>
+
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/response_callback.h"
-#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/util/net/sockaddr.h"
-#include "kudu/util/net/socket.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/status.h"
 #include "kudu/util/user.h"
@@ -105,10 +102,16 @@ Status Proxy::SyncRequest(const string& method,
   return controller->status();
 }
 
-void Proxy::set_user_credentials(const UserCredentials& user_credentials) {
+void Proxy::set_user_credentials(UserCredentials user_credentials) {
   CHECK(base::subtle::NoBarrier_Load(&is_started_) == false)
     << "It is illegal to call set_user_credentials() after request processing has started";
-  conn_id_.set_user_credentials(user_credentials);
+  conn_id_.set_user_credentials(std::move(user_credentials));
+}
+
+void Proxy::set_network_plane(string network_plane) {
+  CHECK(base::subtle::NoBarrier_Load(&is_started_) == false)
+    << "It is illegal to call set_network_plane() after request processing has started";
+  conn_id_.set_network_plane(std::move(network_plane));
 }
 
 std::string Proxy::ToString() const {

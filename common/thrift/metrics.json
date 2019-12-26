@@ -50,6 +50,106 @@
     "key": "admission-controller.pool-max-queued.$0"
   },
   {
+    "description": "Resource Pool $0 Queue Timeout",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Queue Timeout",
+    "units": "TIME_MS",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-queue-timeout.$0"
+  },
+  {
+    "description": "Resource Pool $0 Max Query Memory Limit",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Query Memory Limit",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-query-mem-limit.$0"
+  },
+  {
+    "description": "Resource Pool $0 Min Query Memory Limit",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Min Query Memory Limit",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-min-query-mem-limit.$0"
+  },
+  {
+    "description": "If false, the mem_limit query option will not be bounded by the max/min query mem limits specified for the pool",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Clamp 'MEM_LIMIT' Query Option Flag",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "admission-controller.pool-clamp-mem-limit-query-option.$0"
+  },
+  {
+    "description": "This floating point number is multiplied by the current total number of executors at runtime to give the maximum number of concurrently running queries allowed in the pool.",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Running Queries Multiple",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-running-queries-multiple.$0"
+  },
+  {
+    "description": "This floating point number is multiplied by the current total number of executors at runtime to give the maximum number of queries that can be queued in the pool.",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Queued Queries Multiple",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-queued-queries-multiple.$0"
+  },
+  {
+    "description": "This number of bytes is multiplied by the current total number of executors at runtime to give the maximum memory available across the cluster for the pool.",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Memory Multiple",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-memory-multiple.$0"
+  },
+  {
+    "description": "The maximum number of concurrently running queries allowed in the pool. If pool-max-running-queries-multiple is set then the metric is derived by multiplying that value by the current total number of executors.",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Running Queries Derived",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-running-queries-derived.$0"
+  },
+  {
+    "description": "The maximum number of queries that can be queued in the pool. If pool-max-queued-queries-multiple is set then the metric is derived by multiplying that value by the current total number of executors.",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Queued Queries Derived",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "admission-controller.max-queued-queries-derived.$0"
+  },
+  {
+    "description": "The maximum memory available across the cluster for the pool. If pool-max-memory-multiple is set then the metric is derived by multiplying that value by the current total number of executors.",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Memory Derived",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "admission-controller.max-memory-derived.$0"
+  },
+  {
     "description": "Resource Pool $0 Aggregate Queue Size",
     "contexts": [
       "RESOURCE_POOL"
@@ -230,6 +330,46 @@
     "key": "catalog.num-tables"
   },
   {
+    "description": "Catalog topic update version.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog topic update version",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.curr-version"
+  },
+  {
+    "description": "Lower bound of catalog object version in local catalog cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog object version lower bound",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.catalog-object-version-lower-bound"
+  },
+  {
+    "description": "Statestore topic update version.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Statestore topic update version",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.curr-topic"
+  },
+  {
+    "description": "Catalog service id.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog service id",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "catalog.curr-serviceid"
+  },
+  {
     "description": "Indicates if the catalog is ready.",
     "contexts": [
       "IMPALAD"
@@ -300,16 +440,6 @@
     "key": "impala-server.backends.client-cache.total-clients"
   },
   {
-    "description": "The current size of all allocated hash tables.",
-    "contexts": [
-      "IMPALAD"
-    ],
-    "label": "Hash Tables Size",
-    "units": "BYTES",
-    "kind": "GAUGE",
-    "key": "impala-server.hash-table.total-bytes"
-  },
-  {
     "description": "The total number of bytes read by the IO manager.",
     "contexts": [
       "IMPALAD"
@@ -348,6 +478,46 @@
     "units": "BYTES",
     "kind": "COUNTER",
     "key": "impala-server.io-mgr.local-bytes-read"
+  },
+  {
+    "description": "Total number of bytes of hits in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Hit In Bytes",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-hit-bytes"
+  },
+  {
+    "description": "Total number of bytes of misses in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Miss In Bytes",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-miss-bytes"
+  },
+  {
+    "description": "Current byte size of the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Bytes Size",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "impala-server.io-mgr.remote-data-cache-total-bytes"
+  },
+  {
+    "description": "Total number of bytes not inserted in remote data cache due to concurrency limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Bytes Not Inserted Due To Concurrency limit",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-dropped-bytes"
   },
   {
     "description": "The number of allocated IO buffers. IO buffers are shared by all queries.",
@@ -400,14 +570,34 @@
     "key": "impala-server.io-mgr.total-bytes"
   },
   {
-    "description": "The current size of the memory pool shared by all queries",
+    "description": "IO Manager device name.",
     "contexts": [
       "IMPALAD"
     ],
-    "label": "Memory Pool Size",
+    "label": "Impala Server Io Mgr Queue Device Name",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "impala-server.io-mgr.queue-$0.device-name"
+  },
+  {
+    "description": "Histogram of read operation times on disk.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Read Latency Histogram",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.queue-$0.read-latency"
+  },
+  {
+    "description": "Histogram of read operation sizes on disk.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Read Size Histogram",
     "units": "BYTES",
-    "kind": "GAUGE",
-    "key": "impala-server.mem-pool.total-bytes"
+    "kind": "HISTOGRAM",
+    "key": "impala-server.io-mgr.queue-$0.read-size"
   },
   {
     "description": "The number of HDFS files currently open for writing.",
@@ -420,21 +610,41 @@
     "key": "impala-server.num-files-open-for-insert"
   },
   {
+    "description": "The total number of queries that executed on this backend over the life of the process.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Queries Executed On Backend",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.backend-num-queries-executed"
+  },
+  {
+    "description": "The number of queries currently executing on this backend.",
+    "contexts": [
+        "IMPALAD"
+    ],
+    "label": "Queries Executing On Backend",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala-server.backend-num-queries-executing"
+  },
+  {
     "description": "The total number of query fragments processed over the life of the process.",
     "contexts": [
       "IMPALAD"
     ],
-    "label": "Query Fragments",
+    "label": "Query Fragment Instances",
     "units": "UNIT",
     "kind": "COUNTER",
     "key": "impala-server.num-fragments"
   },
   {
-    "description": "The number of query fragments currently executing.",
+    "description": "The number of query fragment instances currently executing.",
     "contexts": [
         "IMPALAD"
     ],
-    "label": "Query Fragments",
+    "label": "Query Fragment Instances Executing",
     "units": "UNIT",
     "kind": "GAUGE",
     "key": "impala-server.num-fragments-in-flight"
@@ -612,6 +822,26 @@
     "key": "impala.thrift-server.CatalogService.connections-in-use"
   },
   {
+    "description": "Amount of time clients of Catalog Service spent waiting for connection to be set up",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Service client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.CatalogService.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of Catalog Service spent waiting for service threads",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Service clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.CatalogService.svc-thread-wait-time"
+  },
+  {
     "description": "The total number of connections made to this Catalog Server's catalog service  over its lifetime.",
     "contexts": [
       "CATALOGSERVER"
@@ -624,7 +854,7 @@
   {
     "description": "The number of connections to the Catalog Service that have been accepted and are waiting to be setup.",
     "contexts": [
-      "IMPALAD"
+      "CATALOGSERVER"
     ],
     "label": "Catalog Service Connections Queued for Setup",
     "units": "NONE",
@@ -632,7 +862,17 @@
     "key": "impala.thrift-server.CatalogService.connection-setup-queue-size"
   },
   {
-    "description": "The number of active connections to this StateStore's StateStore service.",
+    "description": "The number of connection requests to the Catalog Service that have been timed out waiting to be setup.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Service Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.CatalogService.timedout-cnxn-requests"
+  },
+  {
+    "description": "The number of active connections to this StateStore's service.",
     "contexts": [
       "STATESTORE"
     ],
@@ -640,6 +880,26 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.StatestoreService.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of StateStore Service spent waiting for connection to be set up",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "StateStore Service client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.StatestoreService.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of StateStore Service spent waiting for service threads",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "StateStore Service clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.StatestoreService.svc-thread-wait-time"
   },
   {
     "description": "The total number of connections made to this StateStore's StateStore service over its lifetime.",
@@ -662,6 +922,16 @@
     "key": "impala.thrift-server.StatestoreService.connection-setup-queue-size"
   },
   {
+    "description": "The number of connection requests to the Statestore Service that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Statestore Service Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.StatestoreService.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active Impala Backend client connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -670,6 +940,26 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.backend.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of Impala Backend Server spent waiting for connection to be set up",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Backend client connections setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.backend.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of Impala Backend Server spent waiting for service threads",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Backend Server clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.backend.svc-thread-wait-time"
   },
   {
     "description": "The total number of Impala Backend client connections made to this Impala Daemon over its lifetime.",
@@ -692,6 +982,16 @@
     "key": "impala.thrift-server.backend.connection-setup-queue-size"
   },
   {
+    "description": "The number of connection requests to the Impala Backend Server that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Backend Server Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.backend.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active Beeswax API connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -700,6 +1000,26 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.beeswax-frontend.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of Beeswax API spent waiting for connection to be set up",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Beeswax API client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.beeswax-frontend.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of Beeswax API spent waiting for service threads",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Beeswax API clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.beeswax-frontend.svc-thread-wait-time"
   },
   {
     "description": "The total number of Beeswax API connections made to this Impala Daemon over its lifetime.",
@@ -722,6 +1042,16 @@
     "key": "impala.thrift-server.beeswax-frontend.connection-setup-queue-size"
   },
   {
+    "description": "The number of Beeswax API connection requests to this Impala Daemon that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Beeswax API Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.beeswax-frontend.timedout-cnxn-requests"
+  },
+  {
     "description": "The number of active HiveServer2 API connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -730,6 +1060,26 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.hiveserver2-frontend.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of HiveServer2 API spent waiting for connection to be set up",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 API client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.hiveserver2-frontend.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of HiveServer2 API spent waiting for service threads",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 API clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.hiveserver2-frontend.svc-thread-wait-time"
   },
   {
     "description": "The total number of HiveServer2 API connections made to this Impala Daemon over its lifetime.",
@@ -750,6 +1100,136 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.hiveserver2-frontend.connection-setup-queue-size"
+  },
+  {
+    "description": "The number of HiveServer2 API connection requests to this Impala Daemon that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 API Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.hiveserver2-frontend.timedout-cnxn-requests"
+  },
+  {
+    "description": "The number of active HiveServer2 HTTP API connections to this Impala Daemon.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Active Connections",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of HiveServer2 HTTP API spent waiting for connection to be set up",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of HiveServer2 HTTP API spent waiting for service threads",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.svc-thread-wait-time"
+  },
+  {
+    "description": "The total number of HiveServer2 HTTP API connections made to this Impala Daemon over its lifetime.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Total Connections",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-connections"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connections to this Impala Daemon that have been accepted and are waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connections Queued for Setup",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.connection-setup-queue-size"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that have been timed out waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.timedout-cnxn-requests"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated with Basic (username/password) auth.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Basic Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that failed to authenticate with Basic auth due to an invalid username or password.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Basic Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-failure"
+  },
+    {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated using a cookie.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Cookie Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that provided an invalid cookie.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Cookie Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-failure"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated with Kerberos",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Kerberos Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-negotiate-auth-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that attempted to authenticate with Kerberos but were unsuccessful.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection Kerberos Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-negotiate-auth-failure"
   },
   {
     "description": "The amount of memory freed by the last memory tracker garbage collection.",
@@ -865,6 +1345,17 @@
     "key": "statestore-subscriber.connected"
   },
   {
+    "description": "Number of times that the Daemon detected a loss of connectivity to the StateStore.",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "StateStore Connectivity Loss Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore-subscriber.num-connection-failures"
+  },
+  {
     "description": "The time (sec) between Statestore heartbeats.",
     "contexts": [
       "CATALOGSERVER",
@@ -942,7 +1433,18 @@
     "key": "statestore-subscriber.topic-$0.processing-time-s"
   },
   {
-    "description": "The time (sec) taken to process Statestore subcriber topic updates.",
+    "description": "Interval between topic updates for Topic $0",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Statestore Subscriber Topic $0 Update Interval",
+    "units": "TIME_S",
+    "kind": "STATS",
+    "key": "statestore-subscriber.topic-$0.update-interval"
+  },
+  {
+    "description": "The time (sec) taken to process Statestore subscriber topic updates.",
     "contexts": [
       "CATALOGSERVER",
       "IMPALAD"
@@ -994,7 +1496,7 @@
     "key": "statestore.live-backends.list"
   },
   {
-    "description": "The time (sec) spent sending topic update RPCs. Includes subscriber-side processing time and network transmission time.",
+    "description": "The time (sec) spent sending non-priority topic update RPCs. Includes subscriber-side processing time and network transmission time.",
     "contexts": [
       "STATESTORE"
     ],
@@ -1002,6 +1504,16 @@
     "units": "TIME_S",
     "kind": "STATS",
     "key": "statestore.topic-update-durations"
+  },
+  {
+    "description": "The time (sec) spent sending priority topic update RPCs. Includes subscriber-side processing time and network transmission time.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestore Priority Topic Update Durations",
+    "units": "TIME_S",
+    "kind": "STATS",
+    "key": "statestore.priority-topic-update-durations"
   },
   {
     "description": "The sum of the size of all keys for all topics tracked by the StateStore.",
@@ -1246,6 +1758,86 @@
     "key": "buffer-pool.clean-page-bytes"
   },
   {
+    "description": "Total time the buffer pool spent in the system allocator for this arena.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool System Allocation Time.",
+    "units": "TIME_NS",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.system-alloc-time"
+  },
+  {
+    "description": "Number of times a free buffer was recycled from this core's arena to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Local Arena Free Buffer Hit Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.local-arena-free-buffer-hits"
+  },
+  {
+    "description": "Number of times a new buffer was directly allocated from the system allocator to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Direct Allocation Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.direct-alloc-count"
+  },
+  {
+    "description": "Statistics for buffer sizes allocated from the system. Only a subset of allocations are counted in this metric to reduce overhead.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Allocated Buffer Sizes.",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "buffer-pool.$0.allocated-buffer-sizes"
+  },
+  {
+    "description": "Number of times that a recycled buffer within the same NUMA node was used to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Numa Free Buffer Hits.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.numa-arena-free-buffer-hits"
+  },
+  {
+    "description": "Number of times a clean page was evicted to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Clean Page Hits.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.clean-page-hits"
+  },
+  {
+    "description": "Number of times the allocator had to scavenge to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Scavenge Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.num-scavenges"
+  },
+  {
+    "description": "Number of times the allocator had to lock all arenas and scavenge to fulfil an allocation.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Final Scavenge Count.",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "buffer-pool.$0.num-final-scavenges"
+  },
+  {
     "description": "Total memory currently used by TCMalloc and buffer pool.",
     "contexts": [
       "STATESTORE",
@@ -1454,6 +2046,61 @@
     "key": "jvm.$0.peak-max-usage-bytes"
   },
   {
+    "description": "Jvm Garbage Collection Time",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Jvm Garbage Collection Time",
+    "units": "TIME_MS",
+    "kind": "COUNTER",
+    "key": "jvm.gc_time_millis"
+  },
+  {
+    "description": "Jvm Garbage Collection Count",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Jvm Garbage Collection Count",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "jvm.gc_count"
+  },
+  {
+    "description": "Jvm Pause Detection Warning Threshold Exceeded",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Jvm Pause Detector Warn Threshold Exceeded",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "jvm.gc_num_warn_threshold_exceeded"
+  },
+  {
+    "description": "Jvm Pause Detection Info Threshold Exceeded",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Jvm Pause Detector Info Threshold Exceeded",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "jvm.gc_num_info_threshold_exceeded"
+  },
+  {
+    "description": "Jvm Pause Detection Extra Sleep Time",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Jvm Pause Detector Extra Sleep Time",
+    "units": "TIME_MS",
+    "kind": "COUNTER",
+    "key": "jvm.gc_total_extra_sleep_time_millis"
+  },
+  {
     "description": "Distribution of query latencies",
     "contexts": [
         "IMPALAD"
@@ -1524,6 +2171,16 @@
     "key": "impala-server.io.mgr.cached-file-handles-miss-count"
   },
   {
+    "description": "Number of cached HDFS file handles reopened",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HDFS cached file handles reopened",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.io.mgr.cached-file-handles-reopened"
+  },
+  {
     "description": "The number of active scratch directories for spilling to disk.",
     "contexts": [
       "IMPALAD"
@@ -1542,6 +2199,36 @@
     "units": "NONE",
     "kind": "SET",
     "key": "tmp-file-mgr.active-scratch-dirs.list"
+  },
+  {
+    "description": "The current total spilled bytes across all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Spilled bytes for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-space-bytes-used"
+  },
+  {
+    "description": "The high water mark for spilled bytes across all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Spilled bytes HWM for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-space-bytes-used-high-water-mark"
+  },
+  {
+    "description": "The current total spilled bytes for a single scratch directory.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Per-directory scratch space bytes used",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-space-bytes-used.dir-$0"
   },
   {
     "description": "Number of senders waiting for receiving fragment to initialize",
@@ -1584,5 +2271,362 @@
     "units": "NONE",
     "kind": "PROPERTY",
     "key": "kudu-client.version"
+  },
+  {
+    "description": "Service $0: Total number of incoming RPCs that were rejected due to overflow of the service queue.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Service $0 Incoming RPC Queue Overflows",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "rpc.$0.rpcs_queue_overflow"
+  },
+  {
+    "description": "Memtracker $0 Current Usage Bytes",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Memtracker $0 Current Usage Bytes",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "mem-tracker.$0.current_usage_bytes"
+  },
+  {
+    "description": "Memtracker $0 Peak Usage Bytes",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Memtracker $0 Peak Max Bytes",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "mem-tracker.$0.peak_usage_bytes"
+  },
+  {
+    "description": "Path to the time-zone database",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Path to the time-zone database",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "tzdata-path"
+  },
+  {
+    "description": "Average time spent loading new values into the Impalad Catalog Cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Average Impalad catalog cache load time",
+    "units": "TIME_NS",
+    "kind": "GAUGE",
+    "key": "catalog.cache.average-load-time"
+  },
+  {
+    "description": "Total number of evictions from the Impalad Catalog Cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache eviction count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.eviction-count"
+  },
+  {
+    "description": "Total number of Impalad Catalog cache hits.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache hit count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.hit-count"
+  },
+  {
+    "description": "Ratio of Impalad Catalog cache requests that were hits.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache hit rate",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.cache.hit-rate"
+  },
+  {
+    "description": "Total requests to Impalad Catalog cache requests that loaded new values.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache load count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.load-count"
+  },
+  {
+    "description": "Total requests to Impalad Catalog cache requests that threw exceptions loading new values.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache load exception count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.load-exception-count"
+  },
+  {
+    "description": "Ratio of Impalad Catalog cache requests that threw exceptions loading new values.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache load exception rate",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.cache.load-exception-rate"
+  },
+  {
+    "description": "Number of Impalad Catalog cache requests that successfully loaded new values.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache load success count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.load-success-count"
+  },
+  {
+    "description": "Number of Impalad Catalog cache requests that returned uncached values.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache load miss count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.miss-count"
+  },
+  {
+    "description": "Ratio of Impalad Catalog cache requests that were misses.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache load miss rate",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.cache.miss-rate"
+  },
+  {
+    "description": "Total number of Impalad Catalog cache requests.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache request count",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "catalog.cache.request-count"
+  },
+  {
+    "description": "Total time spent in Impalad Catalog cache loading new values.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache time spent in loads",
+    "units": "TIME_NS",
+    "kind": "COUNTER",
+    "key": "catalog.cache.total-load-time"
+  },
+  {
+    "description": "RPC queue length for partial object fetches.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "RPC queue length for partial object fetch requests.",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.partial-fetch-rpc.queue-len"
+  },
+  {
+    "description": "Metastore event processor status",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "The status of Metastore event processor",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "events-processor.status"
+  },
+  {
+    "description": "Total number of metastore events received",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Total number of metastore events received",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "events-processor.events-received"
+  },
+  {
+    "description": "Total number of metastore events skipped",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Total number of metastore events skipped",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "events-processor.events-skipped"
+  },
+  {
+    "description": "Average time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Average duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.avg-events-fetch-duration"
+  },
+  {
+    "description": "Average time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Average duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.avg-events-process-duration"
+  },
+  {
+    "description": "Exponentially weighted moving average (EWMA) of number of events received in last 1 min",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "EWMA of events received in last 1 min",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "events-processor.events-received-1min-rate"
+  },
+  {
+    "description": "Exponentially weighted moving average (EWMA) of number of events received in last 5 min",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "EWMA of number of events received in last 5 min",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "events-processor.events-received-5min-rate"
+  },
+  {
+    "description": "Exponentially weighted moving average (EWMA) of number of events received in last 15 min",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "EWMA of number of events received in last 15 min",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "events-processor.events-received-15min-rate"
+  },
+  {
+    "description": "Last metastore event id that the catalog server processed and synced to",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last Synced Event Id",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.last-synced-event-id"
+  },
+  {
+    "description": "Total number of executor groups that have at least one executor",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Total number of executor groups that have at least one executor",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "cluster-membership.executor-groups.total"
+  },
+  {
+    "description": "Total number of executor groups that are in a healthy state, that is, have at least the configured minimum number of executors to be considered for admission",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Total number of executor groups that are in a healthy state",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "cluster-membership.executor-groups.total-healthy"
+  },{
+    "description": "Total number of backends registered with the statestore",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Total number of backends registered with the statestore",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "cluster-membership.backends.total"
+  },
+  {
+  "description": "Total number of queries running on executor group: $0",
+  "contexts": [
+    "IMPALAD"
+  ],
+  "label": "Total number of queries running on executor group: $0",
+  "units": "UNIT",
+  "kind": "GAUGE",
+  "key": "admission-controller.executor-group.num-queries-executing.$0"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that were successfully authenticated with Kerberos",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection Kerberos Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-negotiate-auth-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that attempted to authenticate with Kerberos but were unsuccessful.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection Kerberos Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-negotiate-auth-failure"
+  },
+    {
+    "description": "The number of HTTP connection requests to this daemon's webserver that were successfully authenticated using a cookie.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection Cookie Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-cookie-auth-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that provided an invalid cookie.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection Cookie Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-cookie-auth-failure"
+  },
+  {
+    "description": "The number of times the FAIL debug action returned an error. For testing only.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "FAIL debug action hits",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.debug_action.fail"
   }
 ]

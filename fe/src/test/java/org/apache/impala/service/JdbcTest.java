@@ -23,12 +23,10 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-import java.io.StringReader;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,17 +34,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
-import org.apache.impala.analysis.CreateTableStmt;
-import org.apache.impala.analysis.SqlParser;
-import org.apache.impala.analysis.SqlScanner;
 import org.apache.impala.testutil.ImpalaJdbcClient;
+import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.util.Metrics;
-
-import com.google.common.collect.Lists;
+import org.junit.AfterClass;
+import org.junit.Before;
+import org.junit.Test;
 
 /**
  * JdbcTest
@@ -55,84 +48,12 @@ import com.google.common.collect.Lists;
  * getTableTypes, getColumnNames.
  *
  */
-public class JdbcTest {
-  private static Connection con_;
+public class JdbcTest extends JdbcTestBase {
+  public JdbcTest(String connectionType) { super(connectionType); }
 
-  // Test-local list of test tables. These are cleaned up in @After.
-  private final List<String> testTableNames_ = Lists.newArrayList();
-
-  @BeforeClass
-  public static void setUp() throws Exception {
-    con_ = createConnection();
-  }
-
-  @AfterClass
-  public static void cleanUp() throws Exception {
-    con_.close();
-    assertTrue("Connection should be closed", con_.isClosed());
-
-    Exception expectedException = null;
-    try {
-      con_.createStatement();
-    } catch (Exception e) {
-      expectedException = e;
-    }
-
-    assertNotNull("createStatement() on closed connection should throw exception",
-        expectedException);
-  }
-
-  private static Connection createConnection() throws Exception {
-    ImpalaJdbcClient client = ImpalaJdbcClient.createClientUsingHiveJdbcDriver();
-    client.connect();
-    Connection connection = client.getConnection();
-
-    assertNotNull("Connection is null", connection);
-    assertFalse("Connection should not be closed", connection.isClosed());
-    Statement stmt = connection.createStatement();
-    assertNotNull("Statement is null", stmt);
-
-    return connection;
-  }
-
-  protected void addTestTable(String createTableSql) throws Exception {
-    // Parse the stmt to extract the table name. We do this first to ensure
-    // that we do not execute arbitrary SQL here and pollute the test setup.
-    SqlScanner input = new SqlScanner(new StringReader(createTableSql));
-    SqlParser parser = new SqlParser(input);
-    Object result = parser.parse().value;
-    if (!(result instanceof CreateTableStmt)) {
-      throw new Exception("Given stmt is not a CREATE TABLE stmt: " + createTableSql);
-    }
-
-    // Execute the stmt.
-    Statement stmt = con_.createStatement();
-    try {
-      stmt.execute(createTableSql);
-    } finally {
-      stmt.close();
-    }
-
-    // Once the stmt was executed successfully, add the fully-qualified table name
-    // for cleanup in @After.
-    CreateTableStmt parsedStmt = (CreateTableStmt) result;
-    testTableNames_.add(parsedStmt.getTblName().toString());
-  }
-
-  protected void dropTestTable(String tableName) throws SQLException {
-    Statement stmt = con_.createStatement();
-    try {
-      stmt.execute("DROP TABLE " + tableName);
-    } finally {
-      stmt.close();
-    }
-  }
-
-  @After
-  public void testCleanUp() throws SQLException {
-    for (String tableName: testTableNames_) {
-      dropTestTable(tableName);
-    }
+  @Before
+  public void setUp() throws Exception {
+    con_ = createConnection(ImpalaJdbcClient.getNoAuthConnectionStr(connectionType_));
   }
 
   @Test
@@ -319,6 +240,18 @@ public class JdbcTest {
     assertEquals(13, numCols);
     rs.close();
 
+    // validate date_col
+    rs = con_.getMetaData().getColumns(null, "functional", "date_tbl",
+        "date_col");
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.DATE, rs.getInt("DATA_TYPE"));
+    assertEquals(10, rs.getInt("COLUMN_SIZE"));
+    assertEquals(0, rs.getInt("DECIMAL_DIGITS"));
+    // Use getString() to check the value is null (and not 0).
+    assertEquals(null, rs.getString("NUM_PREC_RADIX"));
+    assertFalse(rs.next());
+    rs.close();
+
     // validate DECIMAL columns
     rs = con_.getMetaData().getColumns(null, "functional", "decimal_tbl", null);
     assertTrue(rs.next());
@@ -459,15 +392,18 @@ public class JdbcTest {
     addTestTable("create table default.jdbc_column_comments_test (" +
          "a int comment 'column comment') comment 'table comment'");
 
-    // If a table is not yet loaded before getTables(), then the 'remarks' field
-    // is left empty. getColumns() loads the table metadata, so later getTables()
-    // calls will return 'remarks' correctly.
     ResultSet rs = con_.getMetaData().getTables(
         null, "default", "jdbc_column_comments_test", null);
     assertTrue(rs.next());
     assertEquals("Incorrect table name", "jdbc_column_comments_test",
         rs.getString("TABLE_NAME"));
-    assertEquals("Incorrect table comment", "", rs.getString("REMARKS"));
+
+    String remarks = rs.getString("REMARKS");
+    // getTables() won't trigger full meta loading for tables. So for unloaded tables,
+    // the 'remarks' field is left empty. getColumns() loads the table metadata, so later
+    // getTables() calls will return 'remarks' correctly.
+    assertTrue("Incorrect table comment: " + remarks,
+        remarks.equals("") || remarks.equals("table comment"));
 
     rs = con_.getMetaData().getColumns(
         null, "default", "jdbc_column_comments_test", null);
@@ -479,7 +415,60 @@ public class JdbcTest {
     assertTrue(rs.next());
     assertEquals("Incorrect table name", "jdbc_column_comments_test",
         rs.getString("TABLE_NAME"));
-    assertEquals("Incorrect table comment", "table comment", rs.getString("REMARKS"));
+    // if this is a catalog-v2 cluster the getTables call does not load the localTable
+    // since it does not request columns. See IMPALA-8606 for more details
+    if (!TestUtils.isCatalogV2Enabled("localhost", 25020)) {
+      assertEquals("Incorrect table comment", "table comment", rs.getString("REMARKS"));
+    }
+  }
+
+  @Test
+  public void testMetadataGetPrimaryKeys() throws Exception {
+    List<String> pkList = new ArrayList<>(Arrays.asList("id", "year"));
+    ResultSet rs = con_.getMetaData().getPrimaryKeys(null, "functional", "parent_table");
+    ResultSetMetaData md = rs.getMetaData();
+    assertEquals("Incorrect number of columns seen", 6, md.getColumnCount());
+    // TODO (IMPALA-9158): Remove this check.
+    if (!TestUtils.isCatalogV2Enabled("localhost", 25020)) {
+      int pkCount = 0;
+      while (rs.next()) {
+        pkCount++;
+        assertEquals("", rs.getString("TABLE_CAT"));
+        assertEquals("functional", rs.getString("TABLE_SCHEM"));
+        assertEquals("parent_table", rs.getString("TABLE_NAME"));
+        assertTrue(pkList.contains(rs.getString("COLUMN_NAME")));
+        assertTrue(rs.getString("PK_NAME").length() > 0);
+      }
+      assertEquals(2, pkCount);
+    }
+  }
+
+  @Test
+  public void testMetadataGetCrossReference() throws Exception {
+    ResultSet rs = con_.getMetaData().getCrossReference(null, "functional",
+        "parent_table", null,
+        "functional", "child_table");
+    ResultSetMetaData md = rs.getMetaData();
+    assertEquals("Incorrect number of columns seen for primary key.",
+        14, md.getColumnCount());
+    // TODO (IMPALA-9158): Remove this check.
+    if (!TestUtils.isCatalogV2Enabled("localhost", 25020)) {
+      List<String> colList = new ArrayList<>(Arrays.asList("id", "year"));
+      int fkCount = 0;
+      while (rs.next()) {
+        fkCount++;
+        assertEquals("", rs.getString("PKTABLE_CAT"));
+        assertEquals("functional", rs.getString("PKTABLE_SCHEM"));
+        assertEquals("parent_table", rs.getString("PKTABLE_NAME"));
+        assertTrue(colList.contains(rs.getString("PKCOLUMN_NAME")));
+        assertTrue(rs.getString("FK_NAME").length() > 0);
+        assertEquals("", rs.getString("FKTABLE_CAT"));
+        assertEquals("functional", rs.getString("FKTABLE_SCHEM"));
+        assertEquals("child_table", rs.getString("FKTABLE_NAME"));
+        assertTrue(colList.contains(rs.getString("FKCOLUMN_NAME")));
+      }
+      assertEquals(2, fkCount);
+    }
   }
 
   @Test
@@ -511,6 +500,29 @@ public class JdbcTest {
     assertEquals(rs.getMetaData().getColumnType(6), Types.DECIMAL);
     assertEquals(rs.getMetaData().getPrecision(6), 9);
     assertEquals(rs.getMetaData().getScale(6), 0);
+
+    rs.close();
+  }
+
+  @Test
+  public void testDateGetColumnTypes() throws SQLException {
+    // Table has 1 int column and 2 date columns.
+    ResultSet rs = con_.createStatement().executeQuery(
+        "select * from functional.date_tbl");
+
+    assertEquals(rs.getMetaData().getColumnType(1), Types.INTEGER);
+    // Get the designated column's specified column size.
+    assertEquals(rs.getMetaData().getPrecision(1), 10);
+    // Gets the designated column's number of digits to right of the decimal point.
+    assertEquals(rs.getMetaData().getScale(1), 0);
+
+    assertEquals(rs.getMetaData().getColumnType(2), Types.DATE);
+    assertEquals(rs.getMetaData().getPrecision(2), 10);
+    assertEquals(rs.getMetaData().getScale(2), 0);
+
+    assertEquals(rs.getMetaData().getColumnType(3), Types.DATE);
+    assertEquals(rs.getMetaData().getPrecision(3), 10);
+    assertEquals(rs.getMetaData().getScale(3), 0);
 
     rs.close();
   }
@@ -597,7 +609,8 @@ public class JdbcTest {
     List<Long> lastTimeSessionActive = new ArrayList<>();
 
     for (int timeout : timeoutPeriods) {
-      connections.add(createConnection());
+      connections.add(
+          createConnection(ImpalaJdbcClient.getNoAuthConnectionStr(connectionType_)));
     }
 
     Long numOpenSessions = (Long)metrics.getMetric(

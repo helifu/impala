@@ -33,6 +33,7 @@ using impala_udf::DoubleVal;
 using impala_udf::TimestampVal;
 using impala_udf::StringVal;
 using impala_udf::DecimalVal;
+using impala_udf::DateVal;
 
 /// Reference to a single slot of a tuple.
 class SlotRef : public ScalarExpr {
@@ -48,32 +49,22 @@ class SlotRef : public ScalarExpr {
   SlotRef(const ColumnType& type, int offset, const bool nullable = false);
 
   /// Exposed as public so AGG node can initialize its build expressions.
-  virtual Status Init(const RowDescriptor& row_desc, RuntimeState* state)
-      override WARN_UNUSED_RESULT;
+  virtual Status Init(const RowDescriptor& row_desc, bool is_entry_point,
+      RuntimeState* state) override WARN_UNUSED_RESULT;
   virtual std::string DebugString() const override;
-  virtual Status GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn)
-      override WARN_UNUSED_RESULT;
+  virtual Status GetCodegendComputeFnImpl(
+      LlvmCodeGen* codegen, llvm::Function** fn) override WARN_UNUSED_RESULT;
   virtual bool IsSlotRef() const override { return true; }
   virtual int GetSlotIds(std::vector<SlotId>* slot_ids) const override;
   const SlotId& slot_id() const { return slot_id_; }
+  static const char* LLVM_CLASS_NAME;
 
  protected:
   friend class ScalarExpr;
   friend class ScalarExprEvaluator;
 
-  virtual BooleanVal GetBooleanVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual TinyIntVal GetTinyIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual SmallIntVal GetSmallIntVal(
-      ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual IntVal GetIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual BigIntVal GetBigIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual FloatVal GetFloatVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual DoubleVal GetDoubleVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual StringVal GetStringVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual TimestampVal GetTimestampVal(
-      ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual DecimalVal GetDecimalVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual CollectionVal GetCollectionVal(
+  GENERATE_GET_VAL_INTERPRETED_OVERRIDES_FOR_ALL_SCALAR_TYPES
+  virtual CollectionVal GetCollectionValInterpreted(
       ScalarExprEvaluator*, const TupleRow*) const override;
 
  private:

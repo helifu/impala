@@ -18,7 +18,10 @@
 #include <tuple>
 
 #include "runtime/io/handle-cache.h"
+#include "runtime/io/hdfs-monitored-ops.h"
 #include "util/hash-util.h"
+#include "util/impalad-metrics.h"
+#include "util/metrics.h"
 #include "util/time.h"
 
 #ifndef IMPALA_RUNTIME_DISK_IO_MGR_HANDLE_CACHE_INLINE_H
@@ -27,22 +30,25 @@
 namespace impala {
 namespace io {
 
-HdfsFileHandle::HdfsFileHandle(const hdfsFS& fs, const char* fname,
-    int64_t mtime)
-    : fs_(fs), hdfs_file_(hdfsOpenFile(fs, fname, O_RDONLY, 0, 0, 0)), mtime_(mtime) {
-  VLOG_FILE << "hdfsOpenFile() file=" << fname << " fid=" << hdfs_file_;
-}
-
 HdfsFileHandle::~HdfsFileHandle() {
   if (hdfs_file_ != nullptr && fs_ != nullptr) {
     VLOG_FILE << "hdfsCloseFile() fid=" << hdfs_file_;
-    hdfsCloseFile(fs_, hdfs_file_);
+    hdfsCloseFile(fs_, hdfs_file_); // TODO: check return code
   }
   fs_ = nullptr;
+  fname_ = nullptr;
   hdfs_file_ = nullptr;
 }
 
-CachedHdfsFileHandle::CachedHdfsFileHandle(const hdfsFS& fs, const char* fname,
+Status HdfsFileHandle::Init(HdfsMonitor* monitor) {
+  Status status = monitor->OpenHdfsFileWithTimeout(fs_, fname_, O_RDONLY, 0,
+      &hdfs_file_);
+  // fname_ is no longer needed, null it out
+  fname_ = nullptr;
+  return status;
+}
+
+CachedHdfsFileHandle::CachedHdfsFileHandle(const hdfsFS& fs, const string* fname,
     int64_t mtime)
   : HdfsFileHandle(fs, fname, mtime) {
   ImpaladMetrics::IO_MGR_NUM_CACHED_FILE_HANDLES->Increment(1L);
@@ -53,9 +59,10 @@ CachedHdfsFileHandle::~CachedHdfsFileHandle() {
 }
 
 FileHandleCache::FileHandleCache(size_t capacity,
-      size_t num_partitions, uint64_t unused_handle_timeout_secs)
+    size_t num_partitions, uint64_t unused_handle_timeout_secs, HdfsMonitor* hdfs_monitor)
   : cache_partitions_(num_partitions),
-  unused_handle_timeout_secs_(unused_handle_timeout_secs) {
+  unused_handle_timeout_secs_(unused_handle_timeout_secs),
+  hdfs_monitor_(hdfs_monitor) {
   DCHECK_GT(num_partitions, 0);
   size_t remainder = capacity % num_partitions;
   size_t base_capacity = capacity / num_partitions;
@@ -80,22 +87,29 @@ Status FileHandleCache::Init() {
       &FileHandleCache::EvictHandlesLoop, this, &eviction_thread_);
 }
 
-CachedHdfsFileHandle* FileHandleCache::GetFileHandle(
+Status FileHandleCache::GetFileHandle(
     const hdfsFS& fs, std::string* fname, int64_t mtime, bool require_new_handle,
-    bool* cache_hit) {
+    CachedHdfsFileHandle** handle_out, bool* cache_hit) {
+  DCHECK_GT(mtime, 0);
   // Hash the key and get appropriate partition
   int index = HashUtil::Hash(fname->data(), fname->size(), 0) % cache_partitions_.size();
   FileHandleCachePartition& p = cache_partitions_[index];
-  boost::lock_guard<SpinLock> g(p.lock);
-  pair<typename MapType::iterator, typename MapType::iterator> range =
-    p.cache.equal_range(*fname);
 
   // If this requires a new handle, skip to the creation codepath. Otherwise,
   // find an unused entry with the same mtime
-  FileHandleEntry* ret_elem = nullptr;
   if (!require_new_handle) {
+    boost::lock_guard<SpinLock> g(p.lock);
+    pair<typename MapType::iterator, typename MapType::iterator> range =
+      p.cache.equal_range(*fname);
+
+    // When picking a cached entry, always follow the ordering of the map and
+    // pick earlier entries first. This allows excessive entries for a file
+    // to age out. For example, if there are three entries for a file and only
+    // one is used at a time, only the first will be used and the other two
+    // can age out.
     while (range.first != range.second) {
       FileHandleEntry* elem = &range.first->second;
+      DCHECK(elem->fh.get() != nullptr);
       if (!elem->in_use && elem->fh->mtime() == mtime) {
         // This element is currently in the lru_list, which means that lru_entry must
         // be an iterator pointing into the lru_list.
@@ -104,35 +118,42 @@ CachedHdfsFileHandle* FileHandleCache::GetFileHandle(
         // the lru_list by resetting its iterator to point to the end of the list.
         p.lru_list.erase(elem->lru_entry);
         elem->lru_entry = p.lru_list.end();
-        ret_elem = elem;
         *cache_hit = true;
-        break;
+        elem->in_use = true;
+        *handle_out = elem->fh.get();
+        return Status::OK();
       }
       ++range.first;
     }
   }
 
   // There was no entry that was free or caller asked for a new handle
-  if (!ret_elem) {
-    *cache_hit = false;
-    // Create a new entry and move it into the map
-    CachedHdfsFileHandle* new_fh = new CachedHdfsFileHandle(fs, fname->data(), mtime);
-    if (!new_fh->ok()) {
-      delete new_fh;
-      return nullptr;
-    }
-    FileHandleEntry entry(new_fh, p.lru_list);
-    typename MapType::iterator new_it = p.cache.emplace_hint(range.second,
-        *fname, std::move(entry));
-    ret_elem = &new_it->second;
-    ++p.size;
-    if (p.size > p.capacity) EvictHandles(p);
-  }
+  // Opening a file handle requires talking to the NameNode, so construct
+  // the file handle without holding the lock to reduce contention.
+  *cache_hit = false;
+  // Create a new file handle
+  std::unique_ptr<CachedHdfsFileHandle> new_fh;
+  new_fh.reset(new CachedHdfsFileHandle(fs, fname, mtime));
+  RETURN_IF_ERROR(new_fh->Init(hdfs_monitor_));
 
-  DCHECK(ret_elem->fh.get() != nullptr);
-  DCHECK(!ret_elem->in_use);
-  ret_elem->in_use = true;
-  return ret_elem->fh.get();
+  // Get the lock and create/move the new entry into the map
+  // This entry is new and will be immediately used. Place it as the first entry
+  // for this file in the multimap. The ordering is largely unimportant if all the
+  // existing entries are in use. However, if require_new_handle is true, there may be
+  // unused entries, so it would make more sense to insert the new entry at the front.
+  boost::lock_guard<SpinLock> g(p.lock);
+  pair<typename MapType::iterator, typename MapType::iterator> range =
+      p.cache.equal_range(*fname);
+  FileHandleEntry entry(std::move(new_fh), p.lru_list);
+  typename MapType::iterator new_it = p.cache.emplace_hint(range.first,
+      *fname, std::move(entry));
+  ++p.size;
+  if (p.size > p.capacity) EvictHandles(p);
+  FileHandleEntry* new_elem = &new_it->second;
+  DCHECK(!new_elem->in_use);
+  new_elem->in_use = true;
+  *handle_out = new_elem->fh.get();
+  return Status::OK();
 }
 
 void FileHandleCache::ReleaseFileHandle(std::string* fname,

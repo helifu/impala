@@ -18,8 +18,6 @@
 #ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_MGR_H
 #define IMPALA_RUNTIME_KRPC_DATA_STREAM_MGR_H
 
-#include "runtime/data-stream-mgr-base.h"
-
 #include <list>
 #include <queue>
 #include <set>
@@ -30,10 +28,9 @@
 
 #include "common/status.h"
 #include "common/object-pool.h"
-#include "runtime/data-stream-mgr-base.h"
 #include "runtime/descriptors.h"  // for PlanNodeId
 #include "runtime/row-batch.h"
-#include "util/metrics.h"
+#include "util/metrics-fwd.h"
 #include "util/promise.h"
 #include "util/runtime-profile.h"
 #include "util/thread-pool.h"
@@ -225,27 +222,29 @@ struct EndDataStreamCtx {
 ///  time.
 ///  'total-senders-timedout-waiting-for-recvr-creation' - total number of senders that
 ///  timed-out while waiting for a receiver.
-///
-/// TODO: The recv buffers used in KrpcDataStreamRecvr should count against
-/// per-query memory limits.
-class KrpcDataStreamMgr : public DataStreamMgrBase {
+class KrpcDataStreamMgr : public CacheLineAligned {
  public:
   KrpcDataStreamMgr(MetricGroup* metrics);
 
-  /// Initialize the deserialization thread pool and create the maintenance thread.
+  /// Initializes the deserialization thread pool and creates the maintenance thread.
+  /// 'service_mem_tracker' is the DataStreamService's MemTracker for tracking memory
+  /// used for RPC payloads before being handed over to data stream manager / receiver.
   /// Return error status on failure. Return OK otherwise.
-  Status Init();
+  Status Init(MemTracker* service_mem_tracker);
 
   /// Create a receiver for a specific fragment_instance_id/dest_node_id.
   /// If is_merging is true, the receiver maintains a separate queue of incoming row
   /// batches for each sender and merges the sorted streams from each sender into a
-  /// single stream.
+  /// single stream. 'parent_tracker' is the MemTracker of the exchange node which owns
+  /// this receiver. It's the parent of the MemTracker of the newly created receiver.
   /// Ownership of the receiver is shared between this DataStream mgr instance and the
-  /// caller.
-  std::shared_ptr<DataStreamRecvrBase> CreateRecvr(RuntimeState* state,
-      const RowDescriptor* row_desc, const TUniqueId& fragment_instance_id,
-      PlanNodeId dest_node_id, int num_senders, int64_t buffer_size,
-      RuntimeProfile* profile, bool is_merging) override;
+  /// caller. 'client' is the BufferPool's client handle for allocating buffers.
+  /// It's owned by the parent exchange node.
+  std::shared_ptr<KrpcDataStreamRecvr> CreateRecvr(const RowDescriptor* row_desc,
+      const RuntimeState& runtime_state, const TUniqueId& fragment_instance_id,
+      PlanNodeId dest_node_id, int num_senders, int64_t buffer_size, bool is_merging,
+      RuntimeProfile* profile, MemTracker* parent_tracker,
+      BufferPool::ClientHandle* client);
 
   /// Handler for TransmitData() RPC.
   ///
@@ -285,13 +284,26 @@ class KrpcDataStreamMgr : public DataStreamMgrBase {
   /// Cancels all receivers registered for fragment_instance_id immediately. The
   /// receivers will not accept any row batches after being cancelled. Any buffered
   /// row batches will not be freed until Close() is called on the receivers.
-  void Cancel(const TUniqueId& fragment_instance_id) override;
+  void Cancel(const TUniqueId& fragment_instance_id);
 
   /// Waits for maintenance thread and sender response thread pool to finish.
   ~KrpcDataStreamMgr();
 
  private:
   friend class KrpcDataStreamRecvr;
+  friend class DataStreamTest;
+
+  /// MemTracker for memory used for early transmit data RPCs which arrive before the
+  /// receiver is created. The memory of the RPC payload is transferred to the receiver
+  /// once it's created.
+  std::unique_ptr<MemTracker> early_rpcs_tracker_;
+
+  /// MemTracker used by the DataStreamService to track memory for incoming requests.
+  /// Memory for new incoming requests is initially tracked against this tracker before
+  /// the requests are handed over to the data stream manager / receiver. It is the
+  /// responsibility of data stream manager or receiver to release memory from the
+  /// service's tracker and track it in their own trackers. Not owned.
+  MemTracker* service_mem_tracker_ = nullptr;
 
   /// A task for the deserialization threads to work on. The fields identify
   /// the target receiver's sender queue.

@@ -20,8 +20,9 @@
 
 #include <boost/algorithm/string.hpp>
 #include <cmath>
-#include <sstream>
 #include <iomanip>
+#include <limits>
+#include <sstream>
 
 #include "gen-cpp/RuntimeProfile_types.h"
 #include "util/cpu-info.h"
@@ -91,22 +92,12 @@ class PrettyPrinter {
       }
 
       case TUnit::TIME_NS: {
-        ss << std::setprecision(TIME_NS_PRECISION);
-        if (value >= BILLION) {
-          /// If the time is over a second, print it up to ms.
-          value /= MILLION;
-          PrintTimeMs(value, &ss);
-        } else if (value >= MILLION) {
-          /// if the time is over a ms, print it up to microsecond in the unit of ms.
-          ss << DOUBLE_TRUNCATE(static_cast<double>(value) / MILLION, TIME_NS_PRECISION)
-             << "ms";
-        } else if (value > 1000) {
-          /// if the time is over a microsecond, print it using unit microsecond
-          ss << DOUBLE_TRUNCATE(static_cast<double>(value) / 1000, TIME_NS_PRECISION)
-             << "us";
-        } else {
-          ss << DOUBLE_TRUNCATE(value, TIME_NS_PRECISION) << "ns";
-        }
+        PrintTimeNs(value, &ss);
+        break;
+      }
+
+      case TUnit::TIME_US: {
+        PrintTimeNs(value * THOUSAND, &ss);
         break;
       }
 
@@ -116,7 +107,7 @@ class PrettyPrinter {
       }
 
       case TUnit::TIME_S: {
-        PrintTimeMs(value * 1000, &ss);
+        PrintTimeMs(value * THOUSAND, &ss);
         break;
       }
 
@@ -139,10 +130,16 @@ class PrettyPrinter {
         break;
       }
 
-      /// TODO: Remove DOUBLE_VALUE. IMPALA-1649
       case TUnit::DOUBLE_VALUE: {
         double output = *reinterpret_cast<double*>(&value);
         ss << std::setprecision(PRECISION) << output << " ";
+        break;
+      }
+
+      // Printed as integer values
+      case TUnit::BASIS_POINTS: {
+        DCHECK_LE(value, 10000);
+        ss << (value / 100);
         break;
       }
 
@@ -204,13 +201,13 @@ class PrettyPrinter {
     if (value == 0) {
       *unit = "";
       return value;
-    } else if (value >= GIGABYTE || value <= -GIGABYTE) {
+    } else if (value >= GIGABYTE || (value < 0 && value <= -GIGABYTE)) {
       *unit = "GB";
       return value / (double) GIGABYTE;
-    } else if (value >= MEGABYTE || value <= -MEGABYTE ) {
+    } else if (value >= MEGABYTE || (value < 0 && value <= -MEGABYTE)) {
       *unit = "MB";
       return value / (double) MEGABYTE;
-    } else if (value >= KILOBYTE || value <= -KILOBYTE)  {
+    } else if (value >= KILOBYTE || (value < 0 && value <= -KILOBYTE)) {
       *unit = "KB";
       return value / (double) KILOBYTE;
     } else {
@@ -247,7 +244,28 @@ class PrettyPrinter {
     return fmod(value, 1. * modulus);
   }
 
-  /// Print the value (time in ms) to ss
+  /// Pretty print the value (time in ns) to ss.
+  template <typename T>
+  static void PrintTimeNs(T value, std::stringstream* ss) {
+    *ss << std::setprecision(TIME_NS_PRECISION);
+    if (value >= BILLION) {
+      /// If the time is over a second, print it up to ms.
+      value /= MILLION;
+      PrintTimeMs(value, ss);
+    } else if (value >= MILLION) {
+      /// if the time is over a ms, print it up to microsecond in the unit of ms.
+      *ss << DOUBLE_TRUNCATE(static_cast<double>(value) / MILLION, TIME_NS_PRECISION)
+        << "ms";
+    } else if (value > THOUSAND) {
+      /// if the time is over a microsecond, print it using unit microsecond.
+      *ss << DOUBLE_TRUNCATE(static_cast<double>(value) / THOUSAND, TIME_NS_PRECISION)
+        << "us";
+    } else {
+      *ss << DOUBLE_TRUNCATE(value, TIME_NS_PRECISION) << "ns";
+    }
+  }
+
+  /// Print the value (time in ms) to ss.
   template <typename T>
   static void PrintTimeMs(T value, std::stringstream* ss) {
     DCHECK_GE(value, static_cast<T>(0));

@@ -21,18 +21,24 @@
 #define KUDU_UTIL_THREAD_H
 
 #include <pthread.h>
+#if defined(__linux__)
+#include <syscall.h>
+#else
 #include <sys/syscall.h>
-#include <sys/types.h>
+#endif
+#include <unistd.h>
 
+#include <cstdint>
 #include <string>
-#include <vector>
+#include <utility>
 
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
+#include <boost/bind.hpp>     // IWYU pragma: keep
+#include <boost/function.hpp> // IWYU pragma: keep
 
 #include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/util/async_util.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -198,19 +204,18 @@ class Thread : public RefCountedThreadSafe<Thread> {
   // will be unregistered with the ThreadMgr and will not appear in the debug UI.
   void Join() { ThreadJoiner(this).Join(); }
 
-  // Call the given Closure on the thread before it exits. The closures are executed
-  // in the order they are added.
+  // The thread ID assigned to this thread by the operating system. If the thread
+  // has not yet started running, returns INVALID_TID.
   //
-  // NOTE: This must only be called on the currently executing thread, to avoid having
-  // to reason about complicated races (eg registering a callback on an already-dead
-  // thread).
-  //
-  // This callback is guaranteed to be called except in the case of a process crash.
-  void CallAtExit(const Closure& cb);
-
-  // The thread ID assigned to this thread by the operating system. If the OS does not
-  // support retrieving the tid, returns Thread::INVALID_TID.
-  int64_t tid() const { return tid_; }
+  // NOTE: this may block for a short amount of time if the thread has just been
+  // started.
+  int64_t tid() const {
+    int64_t t = base::subtle::Acquire_Load(&tid_);
+    if (t != PARENT_WAITING_TID) {
+      return tid_;
+    }
+    return WaitForTid();
+  }
 
   // Returns the thread's pthread ID.
   pthread_t pthread_id() const { return thread_; }
@@ -272,12 +277,10 @@ class Thread : public RefCountedThreadSafe<Thread> {
  private:
   friend class ThreadJoiner;
 
-  // The various special values for tid_ that describe the various steps
-  // in the parent<-->child handshake.
+  // See 'tid_' docs.
   enum {
     INVALID_TID = -1,
-    CHILD_WAITING_TID = -2,
-    PARENT_WAITING_TID = -3,
+    PARENT_WAITING_TID = -2,
   };
 
   // Function object that wraps the user-supplied function to run in a separate thread.
@@ -287,7 +290,7 @@ class Thread : public RefCountedThreadSafe<Thread> {
       : thread_(0),
         category_(std::move(category)),
         name_(std::move(name)),
-        tid_(CHILD_WAITING_TID),
+        tid_(INVALID_TID),
         functor_(std::move(functor)),
         done_(1),
         joinable_(false) {}
@@ -301,6 +304,13 @@ class Thread : public RefCountedThreadSafe<Thread> {
 
   // OS-specific thread ID. Once the constructor finishes StartThread(),
   // guaranteed to be set either to a non-negative integer, or to INVALID_TID.
+  //
+  // The tid_ member goes through the following states:
+  // 1. INVALID_TID: the thread has not been started, or has already exited.
+  // 2. PARENT_WAITING_TID: the parent has started the thread, but the
+  //    thread has not yet begun running. Therefore the TID is not yet known
+  //    but it will be set once the thread starts.
+  // 3. <positive value>: the thread is running.
   int64_t tid_;
 
   // User function to be executed by this thread.
@@ -319,7 +329,8 @@ class Thread : public RefCountedThreadSafe<Thread> {
   // thread is not a Thread.
   static __thread Thread* tls_;
 
-  std::vector<Closure> exit_callbacks_;
+  // Wait for the running thread to publish its tid.
+  int64_t WaitForTid() const;
 
   // Starts the thread running SuperviseThread(), and returns once that thread has
   // initialised and its TID has been read. Waits for notification from the started

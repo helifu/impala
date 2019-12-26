@@ -27,8 +27,8 @@
 # By default in Python if you divide an int by another int (5 / 2), the result will also
 # be an int (2). The following line changes this behavior so that float will be returned
 # if necessary (2.5).
-from __future__ import division
 
+from __future__ import division
 import difflib
 import json
 import logging
@@ -39,7 +39,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from optparse import OptionParser
 from tests.util.calculation_util import (
-    calculate_tval, calculate_avg, calculate_stddev, calculate_geomean)
+    calculate_tval, calculate_avg, calculate_stddev, calculate_geomean, calculate_mwu)
 
 LOG = logging.getLogger(__name__)
 
@@ -66,6 +66,7 @@ MAX_TIME = 'max_time'
 NAME = 'name'
 NUM_CLIENTS = 'num_clients'
 NUM_HOSTS = 'num_hosts'
+NUM_INSTANCES = 'num_instances'
 NUM_ROWS = 'num_rows'
 OPERATOR = 'operator'
 PEAK_MEM = 'peak_mem'
@@ -78,6 +79,7 @@ RESULT_LIST = 'result_list'
 RSTD = 'rstd'
 RUNTIME_PROFILE = 'runtime_profile'
 SCALE_FACTOR = 'scale_factor'
+SORTED = 'sorted'
 STDDEV = 'stddev'
 STDDEV_TIME = 'stddev_time'
 TEST_VECTOR = 'test_vector'
@@ -113,38 +115,28 @@ parser.add_option("--lab_run_info", dest="lab_run_info", default='UNKNOWN',
                  "the results.")
 parser.add_option("--run_user_name", dest="run_user_name", default='anonymous',
                  help="User name that this run is associated with in the perf database")
-parser.add_option("--tval_threshold", dest="tval_threshold", default=None,
+parser.add_option("--tval_threshold", dest="tval_threshold", default=3.0,
                  type="float", help="The ttest t-value at which a performance change "\
                  "will be flagged as sigificant.")
+parser.add_option("--zval_threshold", dest="zval_threshold", default=3.0, type="float",
+                  help="The Mann-Whitney Z-value at which a performance change will be "
+                  "flagged as sigificant.")
 parser.add_option("--min_percent_change_threshold",
                  dest="min_percent_change_threshold", default=5.0,
                  type="float", help="Any performance changes below this threshold" \
                  " will not be classified as significant. If the user specifies an" \
                  " empty value, the threshold will be set to 0")
 parser.add_option("--max_percent_change_threshold",
-                 dest="max_percent_change_threshold", default=20.0,
+                 dest="max_percent_change_threshold", default=float("inf"),
                  type="float", help="Any performance changes above this threshold"\
                  " will be classified as significant. If the user specifies an" \
-                 " empty value, the threshold will be set to the system's maxint")
+                 " empty value, the threshold will be set to positive infinity")
 parser.add_option("--allowed_latency_diff_secs",
                  dest="allowed_latency_diff_secs", default=0.0, type="float",
                  help="If specified, only a timing change that differs by more than\
                  this value will be considered significant.")
-
-# These parameters are specific to recording results in a database. This is optional
-parser.add_option("--save_to_db", dest="save_to_db", action="store_true",
-                 default=False, help='Saves results to the specified database.')
-parser.add_option("--is_official", dest="is_official", action="store_true",
-                 default=False, help='Indicates this is an official perf run result')
-parser.add_option("--db_host", dest="db_host", default='localhost',
-                 help="Machine hosting the database")
-parser.add_option("--db_port", dest="db_port", default='21050',
-                 help="Port on the machine hosting the database")
-parser.add_option("--db_name", dest="db_name", default='impala_perf_results',
-                 help="Name of the perf database.")
-parser.add_option("--use_secure_connection", dest="use_secure_connection",
-                 action='store_true', default=False, help="Connect using ssl + Kerberos.")
 options, args = parser.parse_args()
+
 
 def get_dict_from_json(filename):
   """Given a JSON file, return a nested dictionary.
@@ -266,8 +258,11 @@ def get_impala_version(grouped):
   return '{0} ({1})'.format(version, commit_date)
 
 def calculate_time_stats(grouped):
-  """Adds statistics to the nested dictionary. We are calculating the average runtime
-     and Standard Deviation for each query type.
+  """
+  Add statistics to the nested dictionary.
+
+  Each query name is supplemented with the average, standard deviation, number of clients,
+  iterations, and a sorted list of the time taken to complete each run.
   """
 
   def remove_first_run(result_list):
@@ -295,6 +290,8 @@ def calculate_time_stats(grouped):
         results[STDDEV] = dev
         results[NUM_CLIENTS] = num_clients
         results[ITERATIONS] = iterations
+        results[SORTED] = [query_results[TIME_TAKEN] for query_results in result_list]
+        results[SORTED].sort()
 
 class Report(object):
 
@@ -341,7 +338,6 @@ class Report(object):
     the report).
     """
     def __init__(self, results, ref_results):
-
       self.workload_name = '{0}({1})'.format(
           results[RESULT_LIST][0][QUERY][WORKLOAD_NAME].upper(),
           results[RESULT_LIST][0][QUERY][SCALE_FACTOR])
@@ -357,58 +353,62 @@ class Report(object):
       self.iters = results[ITERATIONS]
 
       if ref_results is None:
-        self.perf_change, self.is_regression = False, False
+        self.perf_change = False
+        self.zval = 0
+        self.tval = 0
         # If reference results are not present, comparison columns will have inf in them
         self.base_avg = float('-inf')
         self.base_rsd = float('-inf')
         self.delta_avg = float('-inf')
         self.perf_change_str = ''
       else:
-        self.perf_change, self.is_regression = self.__check_perf_change_significance(
-            results, ref_results)
+        median = results[SORTED][int(len(results[SORTED]) / 2)]
+        all_diffs = [x - y for x in results[SORTED] for y in ref_results[SORTED]]
+        all_diffs.sort()
+        self.median_diff = all_diffs[int(len(all_diffs) / 2)] / median
+        self.perf_change, self.zval, self.tval = (
+          self.__check_perf_change_significance(results, ref_results))
         self.base_avg = ref_results[AVG]
         self.base_rsd = ref_results[STDDEV] / self.base_avg if self.base_avg > 0 else 0.0
         self.delta_avg = calculate_change(self.avg, self.base_avg)
         if self.perf_change:
           self.perf_change_str = self.__build_perf_change_str(
-              results, ref_results, self.is_regression)
+              results, ref_results, self.zval, self.tval)
           Report.significant_perf_change = True
         else:
           self.perf_change_str = ''
 
-    if not options.hive_results:
-      try:
-        save_runtime_diffs(results, ref_results, self.perf_change, self.is_regression)
-      except Exception as e:
-        LOG.error('Could not generate an html diff: {0}'.format(e))
+      if not options.hive_results:
+        try:
+          save_runtime_diffs(results, ref_results, self.perf_change, self.zval, self.tval)
+        except Exception as e:
+          LOG.error('Could not generate an html diff: {0}'.format(e))
 
     def __check_perf_change_significance(self, stat, ref_stat):
-      absolute_difference = abs(ref_stat[AVG] - stat[AVG])
+      zval = calculate_mwu(stat[SORTED], ref_stat[SORTED])
+      tval = calculate_tval(stat[AVG], stat[STDDEV], stat[ITERATIONS],
+                            ref_stat[AVG], ref_stat[STDDEV], ref_stat[ITERATIONS])
       try:
         percent_difference = abs(ref_stat[AVG] - stat[AVG]) * 100 / ref_stat[AVG]
       except ZeroDivisionError:
         percent_difference = 0.0
-      stddevs_are_zero = (ref_stat[STDDEV] == 0) and (stat[STDDEV] == 0)
+      absolute_difference = abs(ref_stat[AVG] - stat[AVG])
       if absolute_difference < options.allowed_latency_diff_secs:
-        return False, False
+        return False, zval, tval
       if percent_difference < options.min_percent_change_threshold:
-        return False, False
-      if percent_difference > options.max_percent_change_threshold:
-        return True, ref_stat[AVG] < stat[AVG]
-      if options.tval_threshold and not stddevs_are_zero:
-        tval = calculate_tval(stat[AVG], stat[STDDEV], stat[ITERATIONS],
-            ref_stat[AVG], ref_stat[STDDEV], ref_stat[ITERATIONS])
-        return abs(tval) > options.tval_threshold, tval > options.tval_threshold
-      return False, False
+        return False, zval, tval
+      return (abs(zval) > options.zval_threshold or abs(tval) > options.tval_threshold,
+              zval, tval)
 
-    def __build_perf_change_str(self, result, ref_result, is_regression):
+    def __build_perf_change_str(self, result, ref_result, zval, tval):
       """Build a performance change string.
 
       For example:
       Regression: TPCDS-Q52 [parquet/none/none] (1.390s -> 1.982s [+42.59%])
       """
-
-      perf_change_type = "(R) Regression" if is_regression else "(I) Improvement"
+      perf_change_type = ("(R) Regression" if zval >= 0 and tval >= 0
+                          else "(I) Improvement" if zval <= 0 and tval <= 0
+                          else "(?) Anomoly")
       query = result[RESULT_LIST][0][QUERY]
 
       workload_name = '{0}({1})'.format(
@@ -524,8 +524,8 @@ class Report(object):
     output = str()
 
     #per file format analysis overview table
-    table = prettytable.PrettyTable(['Workload', 'File Format',
-      'Avg (s)', 'Delta(Avg)', 'GeoMean(s)', 'Delta(GeoMean)'])
+    table = prettytable.PrettyTable(['Workload', 'File Format', 'Avg (s)', 'Delta(Avg)',
+                                     'GeoMean(s)', 'Delta(GeoMean)'])
     table.float_format = '.2'
     table.align = 'l'
     self.file_format_comparison_rows.sort(
@@ -545,14 +545,18 @@ class Report(object):
     #main comparison table
     detailed_performance_change_analysis_str = str()
     table = prettytable.PrettyTable(['Workload', 'Query', 'File Format', 'Avg(s)',
-      'Base Avg(s)', 'Delta(Avg)', 'StdDev(%)', 'Base StdDev(%)', 'Num Clients', 'Iters'])
+                                     'Base Avg(s)', 'Delta(Avg)', 'StdDev(%)',
+                                     'Base StdDev(%)', 'Iters', 'Median Diff(%)',
+                                     'MW Zval', 'Tval'])
     table.float_format = '.2'
     table.align = 'l'
     #Sort table from worst to best regression
-    self.query_comparison_rows.sort(key = lambda row: row.delta_avg, reverse = True)
+    self.query_comparison_rows.sort(key=lambda row: row.delta_avg + row.median_diff,
+                                    reverse=True)
     for row in self.query_comparison_rows:
       delta_avg_template = '  {0:+.2%}' if not row.perf_change else (
-          'R {0:+.2%}' if row.is_regression else 'I {0:+.2%}')
+        'R {0:+.2%}' if row.zval >= 0 and row.tval >= 0 else 'I {0:+.2%}' if row.zval <= 0
+        and row.tval <= 0 else '? {0:+.2%}')
 
       table_row = [
           row.workload_name,
@@ -565,8 +569,11 @@ class Report(object):
           ('* {0:.2%} *' if row.rsd > 0.1 else '  {0:.2%}  ').format(row.rsd),
           '  N/A' if row.base_rsd == float('-inf') else (
             '* {0:.2%} *' if row.base_rsd > 0.1 else '  {0:.2%}  ').format(row.base_rsd),
-          row.num_clients,
-          row.iters]
+          row.iters,
+          '   N/A' if row.median_diff == float('-inf') else delta_avg_template.format(
+            row.median_diff),
+          row.zval,
+          row.tval]
       table.add_row(table_row)
       detailed_performance_change_analysis_str += row.perf_change_str
 
@@ -604,6 +611,7 @@ class CombinedExecSummaries(object):
       prefix (str)
       operator (str)
       num_hosts (int)
+      num_instances (int)
       num_rows (int)
       est_num_rows (int)
       detail (str)
@@ -632,7 +640,8 @@ class CombinedExecSummaries(object):
     for row_num, row in enumerate(first_exec_summary):
       combined_row = {}
       # Copy fixed values from the first exec summary
-      for key in [PREFIX, OPERATOR, NUM_HOSTS, NUM_ROWS, EST_NUM_ROWS, DETAIL]:
+      for key in [PREFIX, OPERATOR, NUM_HOSTS, NUM_INSTANCES, NUM_ROWS, EST_NUM_ROWS,
+                  DETAIL]:
         combined_row[key] = row[key]
 
       avg_times = [exec_summary[row_num][AVG_TIME] for exec_summary in exec_summaries]
@@ -679,6 +688,7 @@ class CombinedExecSummaries(object):
     table = prettytable.PrettyTable(
         ["Operator",
           "#Hosts",
+          "#Inst",
           "Avg Time",
           "Std Dev",
           "Max Time",
@@ -690,6 +700,7 @@ class CombinedExecSummaries(object):
     for row in self.rows:
       table_row = [ row[PREFIX] + row[OPERATOR],
           prettyprint_values(row[NUM_HOSTS]),
+          prettyprint_values(row[NUM_INSTANCES]),
           prettyprint_time(row[AVG_TIME]),
           prettyprint_time(row[STDDEV_TIME]),
           prettyprint_time(row[MAX_TIME]),
@@ -728,6 +739,8 @@ class CombinedExecSummaries(object):
       return False, err + 'no exec summaries Found'
 
     first_exec_summary = exec_summaries[0]
+
+    # This check is for Metadata queries which don't have summaries
     if len(first_exec_summary) < 1:
       return False, err + 'exec summary contains no nodes'
 
@@ -742,6 +755,7 @@ class CombinedExecSummaries(object):
 
     return True, str()
 
+
 class ExecSummaryComparison(object):
   """Represents a comparison between two CombinedExecSummaries.
 
@@ -755,6 +769,7 @@ class ExecSummaryComparison(object):
       prefix (str)
       operator (str)
       num_hosts (int)
+      num_instances (int)
       avg_time (float)
       stddev_time (float)
       avg_time_change (float): % change in avg time compared to reference
@@ -794,7 +809,7 @@ class ExecSummaryComparison(object):
         ref_row = self.ref_combined_summary.rows[i]
 
         comparison_row = {}
-        for key in [PREFIX, OPERATOR, NUM_HOSTS, AVG_TIME, STDDEV_TIME,
+        for key in [PREFIX, OPERATOR, NUM_HOSTS, NUM_INSTANCES, AVG_TIME, STDDEV_TIME,
             MAX_TIME, PEAK_MEM, NUM_ROWS, EST_NUM_ROWS, EST_PEAK_MEM, DETAIL]:
           comparison_row[key] = row[key]
 
@@ -848,6 +863,7 @@ class ExecSummaryComparison(object):
             comparison_row[RSTD], comparison_row[REF_RSTD])
 
         comparison_row[NUM_HOSTS] = row[NUM_HOSTS]
+        comparison_row[NUM_INSTANCES] = row[NUM_INSTANCES]
         comparison_row[NUM_ROWS] = row[NUM_ROWS]
         comparison_row[EST_NUM_ROWS] = row[EST_NUM_ROWS]
 
@@ -880,6 +896,7 @@ class ExecSummaryComparison(object):
           'Base StdDev(%)',
           'Delta(StdDev(%))',
           '#Hosts',
+          '#Inst',
           '#Rows',
           'Est #Rows'])
     table.align = 'l'
@@ -892,6 +909,7 @@ class ExecSummaryComparison(object):
           '{0:.2%}'.format(row[REF_RSTD]),
           '{0:+.2%}'.format(row[DELTA_RSTD]),
           prettyprint_values(row[NUM_HOSTS]),
+          prettyprint_values(row[NUM_INSTANCES]),
           prettyprint_values(row[NUM_ROWS]),
           prettyprint_values(row[EST_NUM_ROWS]) ]
 
@@ -932,6 +950,7 @@ class ExecSummaryComparison(object):
           'Base Max',
           'Delta(Max)',
           '#Hosts',
+          '#Inst',
           '#Rows',
           'Est #Rows'])
     table.align = 'l'
@@ -950,6 +969,7 @@ class ExecSummaryComparison(object):
             prettyprint_time(row[BASELINE_MAX]),
             prettyprint_percent(row[DELTA_MAX]),
             prettyprint_values(row[NUM_HOSTS]),
+            prettyprint_values(row[NUM_INSTANCES]),
             prettyprint_values(row[NUM_ROWS]),
             prettyprint_values(row[EST_NUM_ROWS])]
 
@@ -992,7 +1012,8 @@ def prettyprint_time(time_val):
 def prettyprint_percent(percent_val):
   return '{0:+.2%}'.format(percent_val)
 
-def save_runtime_diffs(results, ref_results, change_significant, is_regression):
+
+def save_runtime_diffs(results, ref_results, change_significant, zval, tval):
   """Given results and reference results, generate and output an HTML file
   containing the Runtime Profile diff.
   """
@@ -1012,7 +1033,11 @@ def save_runtime_diffs(results, ref_results, change_significant, is_regression):
   # Neutral - no improvement or regression
   prefix = 'neu'
   if change_significant:
-    prefix = 'reg' if is_regression else 'imp'
+    prefix = '???'
+    if zval >= 0 and tval >= 0:
+      prefix = 'reg'
+    elif zval <= 0 and tval <= 0:
+      prefix = 'imp'
 
   runtime_profile_file_name = template.format(
       prefix = prefix,
@@ -1041,24 +1066,30 @@ def save_runtime_diffs(results, ref_results, change_significant, is_regression):
   with open(runtime_profile_file_path, 'w+') as f:
     f.write(runtime_profile_diff)
 
-def build_exec_summary_str(results, ref_results, for_variability = False):
+
+def build_exec_summary_str(results, ref_results, for_variability=False):
   # There is no summary available for Hive after query execution
-  if options.hive_results:
-    return ""
+  # Metadata queries don't have execution summary
   exec_summaries = [result[EXEC_SUMMARY] for result in results[RESULT_LIST]]
+
+  if options.hive_results or exec_summaries[0] is None:
+    return ""
+
   combined_summary = CombinedExecSummaries(exec_summaries)
 
   if ref_results is None:
     ref_exec_summaries = None
     ref_combined_summary = None
   else:
-    ref_exec_summaries = [result[EXEC_SUMMARY] for result in ref_results[RESULT_LIST]]
+    ref_exec_summaries = [result[EXEC_SUMMARY]
+                          for result in ref_results[RESULT_LIST]]
     ref_combined_summary = CombinedExecSummaries(ref_exec_summaries)
 
   comparison = ExecSummaryComparison(
       combined_summary, ref_combined_summary, for_variability)
 
   return str(comparison) + '\n'
+
 
 def build_summary_header(current_impala_version, ref_impala_version):
   summary = "Report Generated on {0}\n".format(date.today())
@@ -1073,41 +1104,6 @@ def build_summary_header(current_impala_version, ref_impala_version):
     summary += 'Baseline Impala Version: {0}\n'.format(ref_impala_version)
   return summary
 
-def write_results_to_datastore(grouped):
-  """ Saves results to a database """
-
-  from perf_result_datastore import PerfResultDataStore
-
-  LOG.info('Saving perf results to database')
-  run_date = str(datetime.now())
-
-  with PerfResultDataStore(
-      host=options.db_host,
-      port=options.db_port,
-      database_name=options.db_name,
-      use_secure_connection=options.use_secure_connection) as data_store:
-
-    for results in all_query_results(grouped):
-      for query_result in results[RESULT_LIST]:
-
-        data_store.insert_execution_result(
-             query_name=query_result[QUERY][NAME],
-             query_string=query_result[QUERY][QUERY_STR],
-             workload_name=query_result[QUERY][WORKLOAD_NAME],
-             scale_factor=query_result[QUERY][SCALE_FACTOR],
-             file_format=query_result[QUERY][TEST_VECTOR][FILE_FORMAT],
-             compression_codec=query_result[QUERY][TEST_VECTOR][COMPRESSION_CODEC],
-             compression_type=query_result[QUERY][TEST_VECTOR][COMPRESSION_TYPE],
-             num_clients=results[NUM_CLIENTS],
-             num_iterations=results[ITERATIONS],
-             cluster_name=options.cluster_name,
-             executor_name=query_result[EXECUTOR_NAME],
-             exec_time=query_result[TIME_TAKEN],
-             run_date=run_date,
-             version=options.build_version,
-             run_info=options.lab_run_info,
-             user_name=options.run_user_name,
-             runtime_profile = 'N/A' if options.hive_results else query_result[RUNTIME_PROFILE])
 
 if __name__ == "__main__":
   """Workflow:
@@ -1132,7 +1128,6 @@ if __name__ == "__main__":
     LOG.error('Could not read reference result file: {0}'.format(e))
     ref_grouped = None
 
-  if options.save_to_db: write_results_to_datastore(grouped)
   report = Report(grouped, ref_grouped)
 
   ref_impala_version = 'N/A'

@@ -46,7 +46,7 @@
   #include <gflags/gflags.h>
 #endif
 
-/// Define verbose logging levels.  Per-row logging is more verbase than per-file /
+/// Define verbose logging levels.  Per-row logging is more verbose than per-file /
 /// per-rpc logging which is more verbose than per-connection / per-query logging.
 #define VLOG_CONNECTION VLOG(1)
 #define VLOG_RPC        VLOG(2)
@@ -61,6 +61,12 @@
 #define VLOG_FILE_IS_ON VLOG_IS_ON(2)
 #define VLOG_ROW_IS_ON VLOG_IS_ON(3)
 #define VLOG_PROGRESS_IS_ON VLOG_IS_ON(2)
+
+/// Define a wrapper around DCHECK for strongly typed enums that print a useful error
+/// message on failure.
+#define DCHECK_ENUM_EQ(a, b)                                               \
+  DCHECK(a == b) << "[ " #a " = " << static_cast<int>(a) << " , " #b " = " \
+                 << static_cast<int>(b) << " ]"
 
 /// IR modules don't use these methods, and can't see the google namespace used in
 /// GetFullLogFilename()'s prototype.

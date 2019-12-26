@@ -42,25 +42,43 @@ const i32 NUM_NODES_ALL_RACKS = -1
 // constants for TPlanNodeId
 const i32 INVALID_PLAN_NODE_ID = -1
 
-// Constant default partition ID, must be < 0 to avoid collisions
-const i64 DEFAULT_PARTITION_ID = -1;
-
 enum TParquetFallbackSchemaResolution {
-  POSITION,
-  NAME
+  POSITION = 0
+  NAME = 1
 }
 
 // The order of the enum values needs to be kept in sync with
 // ParquetMetadataUtils::ORDERED_ARRAY_ENCODINGS in parquet-metadata-utils.cc.
 enum TParquetArrayResolution {
-  THREE_LEVEL,
-  TWO_LEVEL,
-  TWO_LEVEL_THEN_THREE_LEVEL
+  THREE_LEVEL = 0
+  TWO_LEVEL = 1
+  TWO_LEVEL_THEN_THREE_LEVEL = 2
 }
 
 enum TJoinDistributionMode {
-  BROADCAST,
-  SHUFFLE
+  BROADCAST = 0
+  SHUFFLE = 1
+}
+
+// Consistency level options for Kudu scans.
+enum TKuduReadMode {
+  DEFAULT = 0
+  READ_LATEST = 1
+  READ_AT_SNAPSHOT = 2
+}
+
+// Physical type and unit used when writing timestamps in Parquet.
+enum TParquetTimestampType {
+  INT96_NANOS,
+  INT64_MILLIS,
+  INT64_MICROS,
+  INT64_NANOS
+}
+
+// A table's Hive ACID type.
+enum TTransactionalType {
+  NONE,
+  INSERT_ONLY
 }
 
 // Query options that correspond to ImpalaService.ImpalaQueryOptions, with their
@@ -97,17 +115,9 @@ struct TQueryOptions {
   5: optional i32 num_nodes = NUM_NODES_ALL
   6: optional i64 max_scan_range_length = 0
   7: optional i32 num_scanner_threads = 0
-
-  // TODO: IMPALA-4306: retire at compatibility-breaking version
-  8: optional i32 max_io_buffers = 0              // Deprecated in 1.1
-  9: optional bool allow_unsupported_formats = 0
-  // TODO: IMPALA-4306: retire at compatibility-breaking version
-  10: optional i64 default_order_by_limit = -1    // Deprecated in 1.4
   11: optional string debug_action = ""
   12: optional i64 mem_limit = 0
-  // TODO: IMPALA-4306: retire at compatibility-breaking version
-  13: optional bool abort_on_default_limit_exceeded = 0 // Deprecated in 1.4
-  14: optional CatalogObjects.THdfsCompression compression_codec
+  14: optional CatalogObjects.TCompressionCodec compression_codec
   15: optional i32 hbase_caching = 0
   16: optional bool hbase_cache_blocks = 0
   17: optional i64 parquet_file_size = 0
@@ -118,29 +128,11 @@ struct TQueryOptions {
   // the pool is determined based on the user.
   20: optional string request_pool
 
-  // Per-host virtual CPU cores required for query (only relevant with RM).
-  // TODO: IMPALA-3271: retire at compatibility-breaking version
-  21: optional i16 v_cpu_cores
-
-  // Max time in milliseconds the resource broker should wait for
-  // a resource request to be granted by Llama/Yarn (only relevant with RM).
-  // TODO: IMPALA-3271: retire at compatibility-breaking version
-  22: optional i64 reservation_request_timeout
-
-  // Disables taking advantage of HDFS caching. This has two parts:
-  // 1. disable preferring to schedule to cached replicas
-  // 2. disable the cached read path.
-  23: optional bool disable_cached_reads = 0
-
   // test hook to disable topn on the outermost select block.
   24: optional bool disable_outermost_topn = 0
 
-  // Override for initial memory reservation size if RM is enabled.
-  // TODO: IMPALA-3271: retire at compatibility-breaking version
-  25: optional i64 rm_initial_mem = 0
-
   // Time, in s, before a query will be timed out if it is inactive. May not exceed
-  // --idle_query_timeout if that flag > 0.
+  // --idle_query_timeout if that flag > 0. If 0, falls back to --idle_query_timeout.
   26: optional i32 query_timeout_s = 0
 
   // test hook to cap max memory for spilling operators (to force them to spill).
@@ -153,11 +145,6 @@ struct TQueryOptions {
   // disastrous query plans. Impala will excercise this option if a query
   // has no plan hints, and at least one table is missing relevant stats.
   29: optional bool disable_unsafe_spills = 0
-
-  // Mode for compression; RECORD, or BLOCK
-  // This field only applies for certain file types and is ignored
-  // by all other file types.
-  30: optional CatalogObjects.THdfsSeqCompressionMode seq_compression_mode
 
   // If the number of rows that are processed for a single query is below the
   // threshold, it will be executed on the coordinator only with codegen disabled
@@ -177,10 +164,6 @@ struct TQueryOptions {
   // the same replica for every query or by starting with a new, pseudo-random replica for
   // subsequent queries. The default is to start with the same replica for every query.
   34: optional bool schedule_random_replica = 0
-
-  // For scan nodes with any conjuncts, use codegen to evaluate the conjuncts if
-  // the number of rows * number of operators in the conjuncts exceeds this threshold.
-  35: optional i64 scan_node_codegen_threshold = 1800000
 
   // If true, the planner will not generate plans with streaming preaggregations.
   36: optional bool disable_streaming_preaggregations = 0
@@ -247,14 +230,14 @@ struct TQueryOptions {
   51: optional bool enable_expr_rewrites = true
 
   // Indicates whether to use the new decimal semantics.
-  52: optional bool decimal_v2 = false
+  52: optional bool decimal_v2 = true
 
   // Indicates whether to use dictionary filtering for Parquet files
   53: optional bool parquet_dictionary_filtering = true
 
   // Policy for resolving nested array fields in Parquet files.
   54: optional TParquetArrayResolution parquet_array_resolution =
-    TParquetArrayResolution.TWO_LEVEL_THEN_THREE_LEVEL
+    TParquetArrayResolution.THREE_LEVEL
 
   // Indicates whether to read statistics from Parquet files and use them during query
   // processing. This includes skipping data based on the statistics and computing query
@@ -292,12 +275,144 @@ struct TQueryOptions {
   // running queries cancelled) by Impala. If 0, idle sessions never expire.
   // The default session timeout is set by the command line flag of the same name.
   61: optional i32 idle_session_timeout;
+
+  // Minimum number of bytes that will be scanned in COMPUTE STATS TABLESAMPLE,
+  // regardless of the user-supplied sampling percent. Default value: 1GB
+  62: optional i64 compute_stats_min_sample_size = 1073741824;
+
+  // Time limit, in s, before a query will be timed out after it starts executing. Does
+  // not include time spent in planning, scheduling or admission control. A value of 0
+  // means no time limit.
+  63: optional i32 exec_time_limit_s = 0;
+
+  // When a query has both grouping and distinct exprs, impala can optionally include the
+  // distinct exprs in the hash exchange of the first aggregation phase to spread the data
+  // among more nodes. However, this plan requires another hash exchange on the grouping
+  // exprs in the second phase which is not required when omitting the distinct exprs in
+  // the first phase. Shuffling by both is better if the grouping exprs have low NDVs.
+  64: optional bool shuffle_distinct_exprs = true;
+
+  // See comment in ImpalaService.thrift.
+  65: optional i64 max_mem_estimate_for_admission = 0;
+
+  // See comment in ImpalaService.thrift.
+  // The default values is set fairly high based on empirical data - queries with up to
+  // this number of reserved threads have run successfully as part of production
+  // workloads but with very degraded performance.
+  66: optional i32 thread_reservation_limit = 3000;
+
+  // See comment in ImpalaService.thrift.
+  67: optional i32 thread_reservation_aggregate_limit = 0;
+
+  // See comment in ImpalaService.thrift.
+  68: optional TKuduReadMode kudu_read_mode = TKuduReadMode.DEFAULT;
+
+  // Allow reading of erasure coded files in HDFS.
+  69: optional bool allow_erasure_coded_files = false;
+
+  // See comment in ImpalaService.thrift.
+  70: optional string timezone = ""
+
+  // See comment in ImpalaService.thrift.
+  71: optional i64 scan_bytes_limit = 0;
+
+  // See comment in ImpalaService.thrift.
+  72: optional i64 cpu_limit_s = 0;
+
+  // See comment in ImpalaService.thrift
+  // The default value is set to 512MB based on empirical data
+  73: optional i64 topn_bytes_limit = 536870912;
+
+  // See comment in ImpalaService.thrift
+  74: optional string client_identifier;
+
+  75: optional double resource_trace_ratio = 0;
+
+  // See comment in ImpalaService.thrift.
+  // The default value is set to 3 as this is the default value of HDFS replicas.
+  76: optional i32 num_remote_executor_candidates = 3;
+
+  // See comment in ImpalaService.thrift.
+  77: optional i64 num_rows_produced_limit = 0;
+
+  // See comment in ImpalaService.thrift
+  78: optional bool planner_testcase_mode = false;
+
+  // See comment in ImpalaService.thrift.
+  79: optional CatalogObjects.THdfsFileFormat default_file_format =
+      CatalogObjects.THdfsFileFormat.TEXT;
+
+  // See comment in ImpalaService.thrift.
+  80: optional TParquetTimestampType parquet_timestamp_type =
+      TParquetTimestampType.INT96_NANOS;
+
+  // See comment in ImpalaService.thrift.
+  81: optional bool parquet_read_page_index = true;
+
+  // See comment in ImpalaService.thrift.
+  82: optional bool parquet_write_page_index = true;
+
+  // See comment in ImpalaService.thrift.
+  83: optional i32 parquet_page_row_count_limit;
+
+  // Disable the attempt to compute an estimated number of rows in an
+  // hdfs table.
+  84: optional bool disable_hdfs_num_rows_estimate = false;
+
+  // See comment in ImpalaService.thrift.
+  85: optional string default_hints_insert_statement;
+
+  // See comment in ImpalaService.thrift
+  86: optional bool spool_query_results = false;
+
+  // See comment in ImpalaService.thrift
+  87: optional TTransactionalType default_transactional_type = TTransactionalType.NONE;
+
+  // See comment in ImpalaService.thrift.
+  // The default of 250,000 is set to a high value to avoid impacting existing users, but
+  // testing indicates a statement with this number of expressions can run.
+  88: optional i32 statement_expression_limit = 250000
+
+  // See comment in ImpalaService.thrift
+  // The default is set to 16MB. It is likely that a statement of this size would exceed
+  // the statement expression limit. Setting a limit on the total statement size avoids
+  // the cost of parsing and analyzing the statement, which is required to enforce the
+  // statement expression limit.
+  89: optional i32 max_statement_length_bytes = 16777216
+
+  // If true, skip using the data cache for this query session.
+  90: optional bool disable_data_cache = false;
+
+  // See comment in ImpalaService.thrift
+  91: optional i64 max_result_spooling_mem = 104857600;
+
+  // See comment in ImpalaService.thrift
+  92: optional i64 max_spilled_result_spooling_mem = 1073741824;
+
+  // See comment in ImpalaService.thrift
+  93: optional bool disable_hbase_num_rows_estimate = false;
+
+  // See comment in ImpalaService.thrift
+  94: optional i64 fetch_rows_timeout_ms = 10000;
+
+  // For testing purposes
+  95: optional string now_string = "";
+
+  // See comment in ImpalaService.thrift
+  96: optional i64 parquet_object_store_split_size = 268435456;
+
+  // See comment in ImpalaService.thrift
+  97: optional i64 mem_limit_executors = 0;
+
+  // See comment in ImpalaService.thrift
+  // The default value is set to 32 GB
+  98: optional i64 broadcast_bytes_limit = 34359738368;
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
 enum TSessionType {
-  BEESWAX,
-  HIVESERVER2
+  BEESWAX = 0
+  HIVESERVER2 = 1
 }
 
 // Per-client session state
@@ -373,49 +488,91 @@ struct TQueryCtx {
   // TODO: determine whether we can get this somehow via the Thrift rpc mechanism.
   6: optional Types.TNetworkAddress coord_address
 
+  // The initiating coordinator's address of its KRPC based ImpalaInternalService.
+  7: optional Types.TNetworkAddress coord_krpc_address
+
   // List of tables missing relevant table and/or column stats. Used for
   // populating query-profile fields consumed by CM as well as warning messages.
-  7: optional list<CatalogObjects.TTableName> tables_missing_stats
+  8: optional list<CatalogObjects.TTableName> tables_missing_stats
 
   // Internal flag to disable spilling. Used as a guard against potentially
   // disastrous query plans. The rationale is that cancelling queries, e.g.,
   // with a huge join build is preferable over spilling "forever".
-  8: optional bool disable_spilling
+  9: optional bool disable_spilling
 
   // Set if this is a child query (e.g. a child of a COMPUTE STATS request)
-  9: optional Types.TUniqueId parent_query_id
+  10: optional Types.TUniqueId parent_query_id
 
   // List of tables suspected to have corrupt stats
-  10: optional list<CatalogObjects.TTableName> tables_with_corrupt_stats
+  11: optional list<CatalogObjects.TTableName> tables_with_corrupt_stats
 
   // The snapshot timestamp as of which to execute the query
   // When the backing storage engine supports snapshot timestamps (such as Kudu) this
   // allows to select a snapshot timestamp on which to perform the scan, making sure that
   // results returned from multiple scan nodes are consistent.
   // This defaults to -1 when no timestamp is specified.
-  11: optional i64 snapshot_timestamp = -1;
+  12: optional i64 snapshot_timestamp = -1;
 
   // Optional for frontend tests.
-  12: optional Descriptors.TDescriptorTable desc_tbl
+  // The descriptor table can be included in one of two forms:
+  //  - TDescriptorTable - standard Thrift object
+  //  - TDescriptorTableSerialized - binary blob with a serialized TDescriptorTable
+  // Normal end-to-end query execution uses the serialized form to avoid copying a large
+  // number of objects when sending RPCs. For this case, desc_tbl_serialized is set and
+  // desc_tbl_testonly is not set. See IMPALA-8732.
+  // Frontend tests cannot use the serialized form, because some frontend tests deal with
+  // incomplete structures (e.g. THdfsTable without the required nullPartitionKeyValue
+  // field) that cannot be serialized. In this case, desc_tbl_testonly is set and
+  // desc_tbl_serialized is not set. See Frontend.PlanCtx.serializeDescTbl_.
+  13: optional Descriptors.TDescriptorTable desc_tbl_testonly
+  24: optional Descriptors.TDescriptorTableSerialized desc_tbl_serialized
 
   // Milliseconds since UNIX epoch at the start of query execution.
-  13: required i64 start_unix_millis
+  14: required i64 start_unix_millis
 
   // Hint to disable codegen. Set by planner for single-node optimization or by the
   // backend in NativeEvalExprsWithoutRow() in FESupport. This flag is only advisory to
   // avoid the overhead of codegen and can be ignored if codegen is needed functionally.
-  14: optional bool disable_codegen_hint = false;
+  15: optional bool disable_codegen_hint = false;
 
   // List of tables with scan ranges that map to blocks with missing disk IDs.
-  15: optional list<CatalogObjects.TTableName> tables_missing_diskids
+  16: optional list<CatalogObjects.TTableName> tables_missing_diskids
 
-  // The pool to which this request has been submitted. Used to update pool statistics
-  // for admission control.
-  16: optional string request_pool
+  // The resolved admission control pool to which this request will be submitted. May be
+  // unset for statements that aren't subjected to admission control (e.g. USE, SET).
+  17: optional string request_pool
 
   // String containing a timestamp (in UTC) set as the query submission time. It
   // represents the same point in time as now_string
-  17: required string utc_timestamp_string
+  18: required string utc_timestamp_string
+
+  // String containing name of the local timezone.
+  // It is guaranteed to be a valid timezone on the coordinator (but not necessarily on
+  // the executor, since in theory the executor could have a different timezone db).
+  // TODO(Csaba): adding timezone as a query option made this property redundant. It
+  //   still has an effect if TimezoneDatabase::LocalZoneName() cannot find the
+  //   system's local timezone and falls back to UTC. This logic will be removed in
+  //   IMPALA-7359, which will make this member completely obsolete.
+  19: required string local_time_zone
+
+  // Disables the code that estimates HBase scan cardinality from key ranges.
+  // When disabled, scan cardinality is estimated from HMS table row count
+  // stats and key column predicate selectivity. Generally only disabled
+  // for testing.
+  20: optional bool disable_hbase_num_rows_estimate = false;
+
+  // Flag to enable tracing of resource usage consumption for all fragment instances of a
+  // query. Set in ImpalaServer::PrepareQueryContext().
+  21: required bool trace_resource_usage = false
+
+  // Taken from the flags of the same name. The coordinator uses these to decide how long
+  // to wait for a report before cancelling a backend, so we want to ensure that the
+  // coordinator and executors for a given query always agree this value.
+  22: optional i32 status_report_interval_ms
+  23: optional i32 status_report_max_retry_s
+
+  // Stores the transaction id if the query is transactional.
+  25: optional i64 transaction_id
 }
 
 // Specification of one output destination of a plan fragment
@@ -423,11 +580,11 @@ struct TPlanFragmentDestination {
   // the globally unique fragment instance id
   1: required Types.TUniqueId fragment_instance_id
 
-  // IP address + port of the thrift based ImpalaInteralService on the destination
-  2: required Types.TNetworkAddress server
+  // hostname + port of the Thrift based ImpalaInteralService on the destination
+  2: required Types.TNetworkAddress thrift_backend
 
   // IP address + port of the KRPC based ImpalaInternalService on the destination
-  3: optional Types.TNetworkAddress krpc_server
+  3: optional Types.TNetworkAddress krpc_backend
 }
 
 // Context to collect information, which is shared among all instances of that plan
@@ -446,8 +603,14 @@ struct TPlanFragmentCtx {
 struct TScanRangeParams {
   1: required PlanNodes.TScanRange scan_range
   2: optional i32 volume_id = -1
-  3: optional bool is_cached = false
+  3: optional bool try_hdfs_cache = false
   4: optional bool is_remote
+}
+
+// Descriptor that indicates that a runtime filter is produced by a plan node.
+struct TRuntimeFilterSource {
+  1: required Types.TPlanNodeId src_node_id
+  2: required i32 filter_id
 }
 
 // Execution parameters of a single fragment instance.
@@ -481,247 +644,29 @@ struct TPlanFragmentInstanceCtx {
   6: optional i32 sender_id
 
   7: optional TDebugOptions debug_options
+
+  // List of runtime filters produced by nodes in the finstance.
+  8: optional list<TRuntimeFilterSource> filters_produced
 }
 
 
 // Service Protocol Details
 
 enum ImpalaInternalServiceVersion {
-  V1
+  V1 = 0
 }
 
 // The following contains the per-rpc structs for the parameters and the result.
 
-// ExecQueryFInstances
-
-struct TExecQueryFInstancesParams {
-  1: required ImpalaInternalServiceVersion protocol_version
-
-  // this backend's index into Coordinator::backend_states_,
-  // needed for subsequent rpcs to the coordinator
-  // required in V1
-  2: optional i32 coord_state_idx
-
-  // required in V1
-  3: optional TQueryCtx query_ctx
-
-  // required in V1
-  4: optional list<TPlanFragmentCtx> fragment_ctxs
+// Contains info about plan fragment execution needed for the ExecQueryFInstances rpc.
+// Rather than fully coverting this to protobuf, which would be a large change, for now we
+// serialize it ourselves and send it with ExecQueryFInstances as a sidecar.
+// TODO: investigate if it's worth converting this fully to protobuf
+struct TExecPlanFragmentInfo {
+  1: optional list<TPlanFragmentCtx> fragment_ctxs
 
   // the order corresponds to the order of fragments in fragment_ctxs
-  // required in V1
-  5: optional list<TPlanFragmentInstanceCtx> fragment_instance_ctxs
-
-  // The minimum query-wide buffer reservation size (in bytes) required for the backend
-  // executing the instances in fragment_instance_ctxs. This is the peak minimum
-  // reservation that may be required by the concurrently-executing operators at any
-  // point in query execution. It may be less than the initial reservation total claims
-  // (below) if execution of some operators never overlaps, which allows reuse of
-  // reservations. required in V1
-  6: optional i64 min_reservation_bytes
-
-  // Total of the initial buffer reservations that we expect to be claimed on this
-  // backend for all fragment instances in fragment_instance_ctxs. I.e. the sum over all
-  // operators in all fragment instances that execute on this backend. This is used for
-  // an optimization in InitialReservation. Measured in bytes. required in V1
-  7: optional i64 initial_reservation_total_claims
-}
-
-struct TExecQueryFInstancesResult {
-  // required in V1
-  1: optional Status.TStatus status
-}
-
-
-// ReportExecStatus
-
-struct TParquetInsertStats {
-  // For each column, the on disk byte size
-  1: required map<string, i64> per_column_size
-}
-
-struct TKuduDmlStats {
-  // The number of reported per-row errors, i.e. this many rows were not modified.
-  // Note that this aggregate is less useful than a breakdown of the number of errors by
-  // error type, e.g. number of rows with duplicate key conflicts, number of rows
-  // violating nullability constraints, etc., but it isn't possible yet to differentiate
-  // all error types in the KuduTableSink yet.
-  1: optional i64 num_row_errors
-}
-
-// Per partition DML stats
-// TODO: this should include the table stats that we update the metastore with.
-// TODO: Refactor to reflect usage by other DML statements.
-struct TInsertStats {
-  1: required i64 bytes_written
-  2: optional TParquetInsertStats parquet_stats
-  3: optional TKuduDmlStats kudu_stats
-}
-
-const string ROOT_PARTITION_KEY = ''
-
-// Per-partition statistics and metadata resulting from DML statements.
-// TODO: Refactor to reflect usage by other DML statements.
-struct TInsertPartitionStatus {
-  // The id of the partition written to (may be -1 if the partition is created by this
-  // query). See THdfsTable.partitions.
-  1: optional i64 id
-
-  // The number of rows modified in this partition
-  2: optional i64 num_modified_rows
-
-  // Detailed statistics gathered by table writers for this partition
-  3: optional TInsertStats stats
-
-  // Fully qualified URI to the base directory for this partition.
-  4: required string partition_base_dir
-
-  // The latest observed Kudu timestamp reported by the local KuduSession.
-  // This value is an unsigned int64.
-  5: optional i64 kudu_latest_observed_ts
-}
-
-// The results of a DML statement, sent to the coordinator as part of
-// TReportExecStatusParams
-// TODO: Refactor to reflect usage by other DML statements.
-struct TInsertExecStatus {
-  // A map from temporary absolute file path to final absolute destination. The
-  // coordinator performs these updates after the query completes.
-  1: required map<string, string> files_to_move;
-
-  // Per-partition details, used in finalization and reporting.
-  // The keys represent partitions to create, coded as k1=v1/k2=v2/k3=v3..., with the
-  // root's key in an unpartitioned table being ROOT_PARTITION_KEY.
-  // The target table name is recorded in the corresponding TQueryExecRequest
-  2: optional map<string, TInsertPartitionStatus> per_partition_status
-}
-
-// Error message exchange format
-struct TErrorLogEntry {
-
-  // Number of error messages reported using the above identifier
-  1: i32 count = 0
-
-  // Sample messages from the above error code
-  2: list<string> messages
-}
-
-// Represents the states that a fragment instance goes through during its execution. The
-// current state gets sent back to the coordinator and will be presented to users through
-// the debug webpages.
-enum TFInstanceExecState {
-  WAITING_FOR_EXEC,
-  WAITING_FOR_CODEGEN,
-  WAITING_FOR_PREPARE,
-  WAITING_FOR_OPEN,
-  WAITING_FOR_FIRST_BATCH,
-  FIRST_BATCH_PRODUCED,
-  PRODUCING_DATA,
-  LAST_BATCH_SENT,
-  FINISHED
-}
-
-struct TFragmentInstanceExecStatus {
-  // required in V1
-  1: optional Types.TUniqueId fragment_instance_id
-
-  // Status of fragment execution; any error status means it's done.
-  // required in V1
-  2: optional Status.TStatus status
-
-  // If true, fragment finished executing.
-  // required in V1
-  3: optional bool done
-
-  // cumulative profile
-  // required in V1
-  4: optional RuntimeProfile.TRuntimeProfileTree profile
-
-  // The current state of this fragment instance's execution.
-  // required in V1
-  5: optional TFInstanceExecState current_state
-}
-
-struct TReportExecStatusParams {
-  1: required ImpalaInternalServiceVersion protocol_version
-
-  // required in V1
-  2: optional Types.TUniqueId query_id
-
-  // same as TExecQueryFInstancesParams.coord_state_idx
-  // required in V1
-  3: optional i32 coord_state_idx
-
-  4: list<TFragmentInstanceExecStatus> instance_exec_status
-
-  // Cumulative structural changes made by the table sink of any instance
-  // included in instance_exec_status
-  // optional in V1
-  5: optional TInsertExecStatus insert_exec_status;
-
-  // New errors that have not been reported to the coordinator by any of the
-  // instances included in instance_exec_status
-  6: optional map<ErrorCodes.TErrorCode, TErrorLogEntry> error_log;
-
-  // Cumulative status for this backend. A backend can have an error from a specific
-  // fragment instance, or it can have a general error that is independent of any
-  // individual fragment. If reporting a single error, this status is always set to
-  // the error being reported. If reporting multiple errors, the status is set by the
-  // following rules:
-  // 1. A general error takes precedence over any fragment instance error.
-  // 2. Any fragment instance error takes precedence over any cancelled status.
-  // 3. If multiple fragments have errors, prefer the error that comes first in the
-  // 'instance_exec_status' list.
-  // This status is only OK if all fragment instances included are OK.
-  7: optional Status.TStatus status;
-}
-
-struct TReportExecStatusResult {
-  // required in V1
-  1: optional Status.TStatus status
-}
-
-
-// CancelQueryFInstances
-
-struct TCancelQueryFInstancesParams {
-  1: required ImpalaInternalServiceVersion protocol_version
-
-  // required in V1
-  2: optional Types.TUniqueId query_id
-}
-
-struct TCancelQueryFInstancesResult {
-  // required in V1
-  1: optional Status.TStatus status
-}
-
-
-// TransmitData
-
-struct TTransmitDataParams {
-  1: required ImpalaInternalServiceVersion protocol_version
-
-  // required in V1
-  2: optional Types.TUniqueId dest_fragment_instance_id
-
-  // Id of this fragment in its role as a sender.
-  3: optional i32 sender_id
-
-  // required in V1
-  4: optional Types.TPlanNodeId dest_node_id
-
-  // optional in V1
-  5: optional Results.TRowBatch row_batch
-
-  // if set to true, indicates that no more row batches will be sent
-  // for this dest_node_id
-  6: optional bool eos
-}
-
-struct TTransmitDataResult {
-  // required in V1
-  1: optional Status.TStatus status
+  2: optional list<TPlanFragmentInstanceCtx> fragment_instance_ctxs
 }
 
 // Parameters for RequestPoolService.resolveRequestPool()
@@ -778,20 +723,49 @@ struct TPoolConfig {
 
   // Default query options that are applied to requests mapped to this pool.
   5: required string default_query_options;
+
+  // Maximum amount of memory that can be assigned to a query (in bytes).
+  // 0 indicates no limit. If both max_query_mem_limit and min_query_mem_limit are zero
+  // then the admission controller will fall back on old behavior, which is to not set
+  // any backend mem limit if mem_limit is not set in the query options.
+  6: required i64 max_query_mem_limit = 0;
+
+  // Minimum amount of memory that can be assigned to a query (in bytes).
+  // 0 indicates no limit.
+  7: required i64 min_query_mem_limit = 0;
+
+  // If false, the mem_limit query option will not be bounded by the max/min query mem
+  // limits specified for the pool. Default is true.
+  8: required bool clamp_mem_limit_query_option = true;
+
+  // This floating point number is multiplied by the current total number of executors at
+  // runtime to give the maximum number of concurrently running queries allowed in the
+  // pool. If this value is zero then it is ignored.
+  9: required double max_running_queries_multiple = 0;
+
+  // This floating point number is multiplied by the current total number of executors at
+  // runtime to give the maximum number of queries that can be queued in the pool.  If
+  // this value is zero then it is ignored.
+  10: required double max_queued_queries_multiple = 0;
+
+  // This number of bytes is multiplied by the current total number of executors at
+  // runtime to give the maximum memory available across the cluster for the pool.  If
+  // this value is zero then it is ignored.
+  11: required i64 max_memory_multiple = 0;
 }
 
 struct TBloomFilter {
-  // Log_2 of the heap space required for this filter. See BloomFilter::BloomFilter() for
-  // details.
-  1: required i32 log_heap_space
+  // Log_2 of the bufferpool space required for this filter.
+  // See BloomFilter::BloomFilter() for details.
+  1: required i32 log_bufferpool_space
 
   // List of buckets representing the Bloom Filter contents, laid out contiguously in one
   // string for efficiency of (de)serialisation. See BloomFilter::Bucket and
   // BloomFilter::directory_.
   2: binary directory
 
-  // If always_true or always_false is true, 'directory' and 'log_heap_space' are not
-  // meaningful.
+  // If always_true or always_false is true, 'directory' and 'log_bufferpool_space' are
+  // not meaningful.
   3: required bool always_true
   4: required bool always_false
 }
@@ -856,26 +830,17 @@ struct TPublishFilterParams {
 struct TPublishFilterResult {
 }
 
+struct TParseDateStringResult {
+  // True iff date string was successfully parsed
+  1: required bool valid
+  // Number of days since 1970-01-01. Used only if 'valid' is true.
+  2: optional i32 days_since_epoch
+  // Canonical date string (formed as 'yyyy-MM-dd'). Used only if 'valid' is true and the
+  // parsed date string was not in a canonical form.
+  3: optional string canonical_date_string
+}
 
 service ImpalaInternalService {
-  // Called by coord to start asynchronous execution of a query's fragment instances in
-  // backend.
-  // Returns as soon as all incoming data streams have been set up.
-  TExecQueryFInstancesResult ExecQueryFInstances(1:TExecQueryFInstancesParams params);
-
-  // Periodically called by backend to report status of fragment instance execution
-  // back to coord; also called when execution is finished, for whatever reason.
-  TReportExecStatusResult ReportExecStatus(1:TReportExecStatusParams params);
-
-  // Called by coord to cancel execution of a single query's fragment instances, which
-  // the coordinator initiated with a prior call to ExecQueryFInstances.
-  // Cancellation is asynchronous.
-  TCancelQueryFInstancesResult CancelQueryFInstances(
-      1:TCancelQueryFInstancesParams params);
-
-  // Called by sender to transmit single row batch. Returns error indication
-  // if params.fragmentId or params.destNodeId are unknown or if data couldn't be read.
-  TTransmitDataResult TransmitData(1:TTransmitDataParams params);
 
   // Called by fragment instances that produce local runtime filters to deliver them to
   // the coordinator for aggregation and broadcast.

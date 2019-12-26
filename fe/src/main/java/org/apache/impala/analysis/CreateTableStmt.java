@@ -17,18 +17,25 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaParseException;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
+import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
+import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
+import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.RowFormat;
+import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TCreateTableParams;
 import org.apache.impala.thrift.THdfsFileFormat;
+import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.AvroSchemaConverter;
 import org.apache.impala.util.AvroSchemaParser;
@@ -37,11 +44,11 @@ import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.MetaStoreUtil;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
-import com.google.common.primitives.Ints;
 import com.google.common.collect.Maps;
+import com.google.common.primitives.Ints;
 
 /**
  * Represents a CREATE TABLE statement.
@@ -63,6 +70,9 @@ public class CreateTableStmt extends StatementBase {
 
   // Table owner. Set during analysis
   private String owner_;
+
+  // Server name needed for privileges. Set during analysis.
+  private String serverName_;
 
   public CreateTableStmt(TableDef tableDef) {
     Preconditions.checkNotNull(tableDef);
@@ -94,9 +104,11 @@ public class CreateTableStmt extends StatementBase {
     getColumnDefs().clear();
     getColumnDefs().addAll(colDefs);
   }
-  private List<ColumnDef> getPrimaryKeyColumnDefs() {
+  public List<ColumnDef> getPrimaryKeyColumnDefs() {
     return tableDef_.getPrimaryKeyColumnDefs();
   }
+  public List<SQLPrimaryKey> getPrimaryKeys() { return tableDef_.getSqlPrimaryKeys(); }
+  public List<SQLForeignKey> getForeignKeys() { return tableDef_.getSqlForeignKeys(); }
   public boolean isExternal() { return tableDef_.isExternal(); }
   public List<ColumnDef> getPartitionColumnDefs() {
     return tableDef_.getPartitionColumnDefs();
@@ -105,6 +117,7 @@ public class CreateTableStmt extends StatementBase {
     return tableDef_.getKuduPartitionParams();
   }
   public List<String> getSortColumns() { return tableDef_.getSortColumns(); }
+  public TSortingOrder getSortingOrder() { return tableDef_.getSortingOrder(); }
   public String getComment() { return tableDef_.getComment(); }
   Map<String, String> getTblProperties() { return tableDef_.getTblProperties(); }
   private HdfsCachingOp getCachingOp() { return tableDef_.getCachingOp(); }
@@ -112,11 +125,11 @@ public class CreateTableStmt extends StatementBase {
   Map<String, String> getSerdeProperties() { return tableDef_.getSerdeProperties(); }
   public THdfsFileFormat getFileFormat() { return tableDef_.getFileFormat(); }
   RowFormat getRowFormat() { return tableDef_.getRowFormat(); }
-  private String getGeneratedKuduTableName() {
-    return tableDef_.getGeneratedKuduTableName();
+  private void putGeneratedKuduProperty(String key, String value) {
+    tableDef_.putGeneratedKuduProperty(key, value);
   }
-  private void setGeneratedKuduTableName(String tableName) {
-    tableDef_.setGeneratedKuduTableName(tableName);
+  public Map<String, String> getGeneratedKuduProperties() {
+    return tableDef_.getGeneratedKuduProperties();
   }
 
   // Only exposed for ToSqlUtils. Returns the list of primary keys declared by the user
@@ -124,6 +137,27 @@ public class CreateTableStmt extends StatementBase {
   // definitions, those are not included here (they are stored in the ColumnDefs).
   List<String> getTblPrimaryKeyColumnNames() {
     return tableDef_.getPrimaryKeyColumnNames();
+  }
+
+  /**
+   * Get foreign keys information as strings. Useful for toSqlUtils.
+   * @return List of strings of the form "(col1, col2,..) REFERENCES [pk_db].pk_table
+   * (colA, colB,..)".
+   */
+  List<String> getForeignKeysSql() {
+    List<TableDef.ForeignKey> fkList = tableDef_.getForeignKeysList();
+    List<String> foreignKeysSql = new ArrayList<>();
+    if (fkList != null && !fkList.isEmpty()) {
+      for (TableDef.ForeignKey fk : fkList) {
+        StringBuilder sb = new StringBuilder("(");
+        Joiner.on(", ").appendTo(sb, fk.getForeignKeyColNames()).append(")");
+        sb.append(" REFERENCES ");
+        sb.append(fk.getFullyQualifiedPkTableName() + "(");
+        Joiner.on(", ").appendTo(sb, fk.getPrimaryKeyColNames()).append(")");
+        foreignKeysSql.add(sb.toString());
+      }
+    }
+    return foreignKeysSql;
   }
 
   /**
@@ -145,12 +179,14 @@ public class CreateTableStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() { return ToSqlUtils.getCreateTableSql(this); }
+  public String toSql(ToSqlOptions options) {
+    return ToSqlUtils.getCreateTableSql(this);
+  }
 
   public TCreateTableParams toThrift() {
     TCreateTableParams params = new TCreateTableParams();
     params.setTable_name(new TTableName(getDb(), getTbl()));
-    List<org.apache.impala.thrift.TColumn> tColumns = Lists.newArrayList();
+    List<org.apache.impala.thrift.TColumn> tColumns = new ArrayList<>();
     for (ColumnDef col: getColumnDefs()) tColumns.add(col.toThrift());
     params.setColumns(tColumns);
     for (ColumnDef col: getPartitionColumnDefs()) {
@@ -165,11 +201,9 @@ public class CreateTableStmt extends StatementBase {
     params.setFile_format(getFileFormat());
     params.setIf_not_exists(getIfNotExists());
     params.setSort_columns(getSortColumns());
+    params.setSorting_order(getSortingOrder());
     params.setTable_properties(Maps.newHashMap(getTblProperties()));
-    if (!getGeneratedKuduTableName().isEmpty()) {
-      params.getTable_properties().put(KuduTable.KEY_TABLE_NAME,
-          getGeneratedKuduTableName());
-    }
+    params.getTable_properties().putAll(Maps.newHashMap(getGeneratedKuduProperties()));
     params.setSerde_properties(getSerdeProperties());
     for (KuduPartitionParam d: getKuduPartitionParams()) {
       params.addToPartition_by(d.toThrift());
@@ -177,14 +211,33 @@ public class CreateTableStmt extends StatementBase {
     for (ColumnDef pkColDef: getPrimaryKeyColumnDefs()) {
       params.addToPrimary_key_column_names(pkColDef.getColName());
     }
-
+    for(SQLPrimaryKey pk: getPrimaryKeys()){
+      params.addToPrimary_keys(pk);
+    }
+    for(SQLForeignKey fk: getForeignKeys()){
+      params.addToForeign_keys(fk);
+    }
+    params.setServer_name(serverName_);
     return params;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableDef_.getTblName().toPath(), null));
+    // When foreign keys are specified, we need to add all the tables the foreign keys are
+    // referring to.
+    for(TableDef.ForeignKey fk: tableDef_.getForeignKeysList()){
+      tblRefs.add(new TableRef(fk.getPkTableName().toPath(), null));
+    }
   }
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    owner_ = analyzer.getUser().getName();
+    owner_ = analyzer.getUserShortName();
+    // Set the servername here if authorization is enabled because analyzer_ is not
+    // available in the toThrift() method.
+    serverName_ = analyzer.getServerName();
     tableDef_.analyze(analyzer);
     analyzeKuduFormat(analyzer);
     // Avro tables can have empty column defs because they can infer them from the Avro
@@ -201,6 +254,21 @@ public class CreateTableStmt extends StatementBase {
       }
       AvroSchemaUtils.setFromSerdeComment(getColumnDefs());
     }
+
+    // If lineage logging is enabled, compute minimal lineage graph.
+    if (BackendConfig.INSTANCE.getComputeLineage() || RuntimeEnv.INSTANCE.isTestEnv()) {
+       computeLineageGraph(analyzer);
+    }
+  }
+
+  /**
+   * Computes a minimal column lineage graph for create statement. This will just
+   * populate a few fields of the graph including query text. If this is a CTAS,
+   * the graph is enhanced during the "insert" phase of CTAS.
+   */
+  protected void computeLineageGraph(Analyzer analyzer) {
+    ColumnLineageGraph graph = analyzer.getColumnLineageGraph();
+    graph.computeLineageGraph(new ArrayList(), analyzer);
   }
 
   /**
@@ -209,23 +277,24 @@ public class CreateTableStmt extends StatementBase {
    */
   private void analyzeKuduFormat(Analyzer analyzer) throws AnalysisException {
     if (getFileFormat() != THdfsFileFormat.KUDU) {
-      if (KuduTable.KUDU_STORAGE_HANDLER.equals(
-          getTblProperties().get(KuduTable.KEY_STORAGE_HANDLER))) {
+      String handler = getTblProperties().get(KuduTable.KEY_STORAGE_HANDLER);
+      if (KuduTable.isKuduStorageHandler(handler)) {
         throw new AnalysisException(KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
       }
       AnalysisUtils.throwIfNotEmpty(getKuduPartitionParams(),
           "Only Kudu tables can use the PARTITION BY clause.");
-      if (hasPrimaryKey()) {
-        throw new AnalysisException("Only Kudu tables can specify a PRIMARY KEY.");
-      }
       return;
     }
 
     analyzeKuduTableProperties(analyzer);
-    if (isExternal()) {
+    if (isExternal() && !Boolean.parseBoolean(getTblProperties().get(
+        Table.TBL_PROP_EXTERNAL_TABLE_PURGE))) {
+      // this is an external table
       analyzeExternalKuduTableParams(analyzer);
     } else {
-      analyzeManagedKuduTableParams(analyzer);
+      // this is either a managed table or an external table with external.table.purge
+      // property set to true
+      analyzeSynchronizedKuduTableParams(analyzer);
     }
   }
 
@@ -234,7 +303,8 @@ public class CreateTableStmt extends StatementBase {
    * Kudu tables.
    */
   private void analyzeKuduTableProperties(Analyzer analyzer) throws AnalysisException {
-    if (analyzer.getAuthzConfig().isEnabled()) {
+    AuthorizationConfig authzConfig = analyzer.getAuthzConfig();
+    if (authzConfig.isEnabled()) {
       // Today there is no comprehensive way of enforcing a Sentry authorization policy
       // against tables stored in Kudu. This is why only users with ALL privileges on
       // SERVER may create external Kudu tables or set the master addresses.
@@ -243,31 +313,28 @@ public class CreateTableStmt extends StatementBase {
           MetaStoreUtil.findTblPropKeyCaseInsensitive(
               getTblProperties(), "EXTERNAL") != null;
       if (getTblProperties().containsKey(KuduTable.KEY_MASTER_HOSTS) || isExternal) {
-        String authzServer = analyzer.getAuthzConfig().getServerName();
+        String authzServer = authzConfig.getServerName();
         Preconditions.checkNotNull(authzServer);
-        analyzer.registerPrivReq(new PrivilegeRequestBuilder().onServer(
-            authzServer).all().toRequest());
+        analyzer.registerPrivReq(builder -> builder.onServer(authzServer).all().build());
       }
     }
 
     // Only the Kudu storage handler may be specified for Kudu tables.
     String handler = getTblProperties().get(KuduTable.KEY_STORAGE_HANDLER);
-    if (handler != null && !handler.equals(KuduTable.KUDU_STORAGE_HANDLER)) {
+    if (handler != null && !KuduTable.isKuduStorageHandler(handler)) {
       throw new AnalysisException("Invalid storage handler specified for Kudu table: " +
           handler);
     }
-    getTblProperties().put(KuduTable.KEY_STORAGE_HANDLER, KuduTable.KUDU_STORAGE_HANDLER);
+    putGeneratedKuduProperty(KuduTable.KEY_STORAGE_HANDLER,
+        KuduTable.KUDU_STORAGE_HANDLER);
 
-    String masterHosts = getTblProperties().get(KuduTable.KEY_MASTER_HOSTS);
-    if (Strings.isNullOrEmpty(masterHosts)) {
-      masterHosts = analyzer.getCatalog().getDefaultKuduMasterHosts();
-      if (masterHosts.isEmpty()) {
-        throw new AnalysisException(String.format(
-            "Table property '%s' is required when the impalad startup flag " +
-            "-kudu_master_hosts is not used.", KuduTable.KEY_MASTER_HOSTS));
-      }
-      getTblProperties().put(KuduTable.KEY_MASTER_HOSTS, masterHosts);
+    String kuduMasters = getKuduMasters(analyzer);
+    if (kuduMasters.isEmpty()) {
+      throw new AnalysisException(String.format(
+          "Table property '%s' is required when the impalad startup flag " +
+          "-kudu_master_hosts is not used.", KuduTable.KEY_MASTER_HOSTS));
     }
+    putGeneratedKuduProperty(KuduTable.KEY_MASTER_HOSTS, kuduMasters);
 
     // TODO: Find out what is creating a directory in HDFS and stop doing that. Kudu
     //       tables shouldn't have HDFS dirs: IMPALA-3570
@@ -277,6 +344,21 @@ public class CreateTableStmt extends StatementBase {
         "Kudu table.");
     AnalysisUtils.throwIfNotEmpty(tableDef_.getPartitionColumnDefs(),
         "PARTITIONED BY cannot be used in Kudu tables.");
+    AnalysisUtils.throwIfNotNull(getTblProperties().get(KuduTable.KEY_TABLE_ID),
+        String.format("Table property %s should not be specified when creating a " +
+            "Kudu table.", KuduTable.KEY_TABLE_ID));
+  }
+
+  /**
+   *  Populates Kudu master addresses either from table property or
+   *  the -kudu_master_hosts flag.
+   */
+  private String getKuduMasters(Analyzer analyzer) {
+    String kuduMasters = getTblProperties().get(KuduTable.KEY_MASTER_HOSTS);
+    if (Strings.isNullOrEmpty(kuduMasters)) {
+      kuduMasters = analyzer.getCatalog().getDefaultKuduMasterHosts();
+    }
+    return kuduMasters;
   }
 
   /**
@@ -284,6 +366,9 @@ public class CreateTableStmt extends StatementBase {
    */
   private void analyzeExternalKuduTableParams(Analyzer analyzer)
       throws AnalysisException {
+    Preconditions.checkState(!Boolean
+        .parseBoolean(getTblProperties().get(KuduTable.TBL_PROP_EXTERNAL_TABLE_PURGE)));
+    // this is just a regular external table. Kudu table name must be specified
     AnalysisUtils.throwIfNull(getTblProperties().get(KuduTable.KEY_TABLE_NAME),
         String.format("Table property %s must be specified when creating " +
             "an external Kudu table.", KuduTable.KEY_TABLE_NAME));
@@ -302,10 +387,17 @@ public class CreateTableStmt extends StatementBase {
   }
 
   /**
-   * Analyzes and checks parameters specified for managed Kudu tables.
+   * Analyzes and checks parameters specified for synchronized Kudu tables.
    */
-  private void analyzeManagedKuduTableParams(Analyzer analyzer) throws AnalysisException {
-    analyzeManagedKuduTableName();
+  private void analyzeSynchronizedKuduTableParams(Analyzer analyzer)
+      throws AnalysisException {
+    // A managed table cannot have 'external.table.purge' property set
+    if (!isExternal() && Boolean.parseBoolean(
+        getTblProperties().get(KuduTable.TBL_PROP_EXTERNAL_TABLE_PURGE))) {
+      throw new AnalysisException(String.format("Table property '%s' cannot be set to " +
+          "true with an managed Kudu table.", KuduTable.TBL_PROP_EXTERNAL_TABLE_PURGE));
+    }
+    analyzeSynchronizedKuduTableName(analyzer);
 
     // Check column types are valid Kudu types
     for (ColumnDef col: getColumnDefs()) {
@@ -334,13 +426,7 @@ public class CreateTableStmt extends StatementBase {
             "zero. Given number of replicas is: " + r.toString());
       }
     }
-
-    if (!getKuduPartitionParams().isEmpty()) {
-      analyzeKuduPartitionParams(analyzer);
-    } else {
-      analyzer.addWarning(
-          "Unpartitioned Kudu tables are inefficient for large data sizes.");
-    }
+    analyzeKuduPartitionParams(analyzer);
   }
 
   /**
@@ -348,18 +434,37 @@ public class CreateTableStmt extends StatementBase {
    * it in TableDef.generatedKuduTableName_. Throws if the Kudu table
    * name was given manually via TBLPROPERTIES.
    */
-  private void analyzeManagedKuduTableName() throws AnalysisException {
+  private void analyzeSynchronizedKuduTableName(Analyzer analyzer)
+      throws AnalysisException {
     AnalysisUtils.throwIfNotNull(getTblProperties().get(KuduTable.KEY_TABLE_NAME),
-        String.format("Not allowed to set '%s' manually for managed Kudu tables .",
+        String.format("Not allowed to set '%s' manually for synchronized Kudu tables.",
             KuduTable.KEY_TABLE_NAME));
-    setGeneratedKuduTableName(KuduUtil.getDefaultCreateKuduTableName(getDb(), getTbl()));
+    String kuduMasters = getKuduMasters(analyzer);
+    boolean isHMSIntegrationEnabled;
+    try {
+      // Check if Kudu's integration with the Hive Metastore is enabled. Validation
+      // of whether Kudu is configured to use the same Hive Metstore as Impala is skipped
+      // and is not necessary for syntax parsing.
+      isHMSIntegrationEnabled = KuduTable.isHMSIntegrationEnabled(kuduMasters);
+    } catch (ImpalaRuntimeException e) {
+      throw new AnalysisException(String.format("Cannot analyze Kudu table '%s': %s",
+          getTbl(), e.getMessage()));
+    }
+    putGeneratedKuduProperty(KuduTable.KEY_TABLE_NAME,
+        KuduUtil.getDefaultKuduTableName(getDb(), getTbl(), isHMSIntegrationEnabled));
   }
 
   /**
-   * Analyzes the partitioning schemes specified in the CREATE TABLE statement.
+   * Analyzes the partitioning schemes specified in the CREATE TABLE statement. Also,
+   * adds primary keys to the partitioning scheme if no partitioning keys are provided
    */
   private void analyzeKuduPartitionParams(Analyzer analyzer) throws AnalysisException {
     Preconditions.checkState(getFileFormat() == THdfsFileFormat.KUDU);
+    if (getKuduPartitionParams().isEmpty()) {
+      analyzer.addWarning(
+          "Unpartitioned Kudu tables are inefficient for large data sizes.");
+      return;
+    }
     Map<String, ColumnDef> pkColDefsByName =
         ColumnDef.mapByColumnNames(getPrimaryKeyColumnDefs());
     for (KuduPartitionParam partitionParam: getKuduPartitionParams()) {
@@ -391,7 +496,7 @@ public class CreateTableStmt extends StatementBase {
     Preconditions.checkState(getFileFormat() == THdfsFileFormat.AVRO);
     // Look for the schema in TBLPROPERTIES and in SERDEPROPERTIES, with latter
     // taking precedence.
-    List<Map<String, String>> schemaSearchLocations = Lists.newArrayList();
+    List<Map<String, String>> schemaSearchLocations = new ArrayList<>();
     schemaSearchLocations.add(getSerdeProperties());
     schemaSearchLocations.add(getTblProperties());
     String avroSchema;

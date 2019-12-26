@@ -40,12 +40,10 @@ public class GrantRevokeRoleStmt extends AuthorizationStmt {
   }
 
   @Override
-  public String toSql() {
-    if (isGrantStmt_) {
-      return String.format("GRANT ROLE %s TO %s", roleName_, groupName_);
-    } else {
-      return String.format("REVOKE ROLE %s FROM %s", roleName_, groupName_);
-    }
+  public String toSql(ToSqlOptions options) {
+    return String.format("%s ROLE %s %s GROUP %s",
+        isGrantStmt_ ? "GRANT" : "REVOKE", roleName_,
+        isGrantStmt_ ? "TO" : "FROM", groupName_);
   }
 
   public TGrantRevokeRoleParams toThrift() {
@@ -59,9 +57,6 @@ public class GrantRevokeRoleStmt extends AuthorizationStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    if (analyzer.getCatalog().getAuthPolicy().getRole(roleName_) == null) {
-      throw new AnalysisException(String.format("Role '%s' does not exist.", roleName_));
-    }
     if (Strings.isNullOrEmpty(roleName_)) {
       throw new AnalysisException("Role name in GRANT/REVOKE ROLE cannot be empty.");
     }

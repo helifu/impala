@@ -18,27 +18,35 @@
 package org.apache.impala.planner;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Set;
 
+import org.apache.impala.analysis.AggregateInfo;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.BoolLiteral;
 import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.ExprSubstitutionMap;
+import org.apache.impala.analysis.FunctionCallExpr;
+import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.analysis.FunctionParams;
 import org.apache.impala.analysis.InPredicate;
 import org.apache.impala.analysis.IsNullPredicate;
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.NumericLiteral;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.KuduColumn;
-import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TKuduScanNode;
 import org.apache.impala.thrift.TNetworkAddress;
@@ -48,6 +56,7 @@ import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TScanRange;
 import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
+import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.util.KuduUtil;
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
@@ -64,7 +73,6 @@ import com.google.common.base.Charsets;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Scan of a single Kudu table.
@@ -85,27 +93,36 @@ import com.google.common.collect.Sets;
 public class KuduScanNode extends ScanNode {
   private final static Logger LOG = LoggerFactory.getLogger(KuduScanNode.class);
 
-  private final KuduTable kuduTable_;
+  private final FeKuduTable kuduTable_;
 
   // True if this scan node should use the MT implementation in the backend.
+  // Set in computeNodeResourceProfile().
   private boolean useMtScanNode_;
 
   // Indexes for the set of hosts that will be used for the query.
   // From analyzer.getHostIndex().getIndex(address)
-  private final Set<Integer> hostIndexSet_ = Sets.newHashSet();
+  private final Set<Integer> hostIndexSet_ = new HashSet<>();
 
   // List of conjuncts that can be pushed down to Kudu. Used for computing stats and
   // explain strings.
-  private final List<Expr> kuduConjuncts_ = Lists.newArrayList();
+  private final List<Expr> kuduConjuncts_ = new ArrayList<>();
 
   // Exprs in kuduConjuncts_ converted to KuduPredicates.
-  private final List<KuduPredicate> kuduPredicates_ = Lists.newArrayList();
+  private final List<KuduPredicate> kuduPredicates_ = new ArrayList<>();
 
-  public KuduScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts) {
+  // Slot that is used to record the Kudu metadata for the count(*) aggregation if
+  // this scan node has the count(*) optimization enabled.
+  private SlotDescriptor countStarSlot_ = null;
+
+  public KuduScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts,
+      AggregateInfo aggInfo) {
     super(id, desc, "SCAN KUDU");
-    kuduTable_ = (KuduTable) desc_.getTable();
+    kuduTable_ = (FeKuduTable) desc_.getTable();
     conjuncts_ = conjuncts;
+    aggInfo_ = aggInfo;
   }
+
+  public ExprSubstitutionMap getOptimizedAggSmap() { return optimizedAggSmap_; }
 
   @Override
   public void init(Analyzer analyzer) throws ImpalaRuntimeException {
@@ -116,6 +133,12 @@ public class KuduScanNode extends ScanNode {
       org.apache.kudu.client.KuduTable rpcTable =
           client.openTable(kuduTable_.getKuduTableName());
       validateSchema(rpcTable);
+
+      if (canApplyCountStarOptimization(analyzer)) {
+        Preconditions.checkState(desc_.getPath().destTable() != null);
+        Preconditions.checkState(kuduConjuncts_.isEmpty());
+        countStarSlot_ = applyCountStarOptimization(analyzer);
+      }
 
       // Extract predicates that can be evaluated by Kudu.
       extractKuduConjuncts(analyzer, client, rpcTable);
@@ -132,15 +155,6 @@ public class KuduScanNode extends ScanNode {
     } catch (Exception e) {
       throw new ImpalaRuntimeException("Unable to initialize the Kudu scan node", e);
     }
-
-    // Determine backend scan node implementation to use.
-    if (analyzer.getQueryOptions().isSetMt_dop() &&
-        analyzer.getQueryOptions().mt_dop > 0) {
-      useMtScanNode_ = true;
-    } else {
-      useMtScanNode_ = false;
-    }
-
     computeStats(analyzer);
   }
 
@@ -151,6 +165,7 @@ public class KuduScanNode extends ScanNode {
       throws ImpalaRuntimeException {
     Schema tableSchema = rpcTable.getSchema();
     for (SlotDescriptor desc: getTupleDesc().getSlots()) {
+      if (!desc.isScanSlot()) continue;
       String colName = ((KuduColumn) desc.getColumn()).getKuduName();
       Type colType = desc.getColumn().getType();
       ColumnSchema kuduCol = null;
@@ -162,7 +177,8 @@ public class KuduScanNode extends ScanNode {
             "outdated and need to be refreshed.");
       }
 
-      Type kuduColType = KuduUtil.toImpalaType(kuduCol.getType());
+      Type kuduColType =
+          KuduUtil.toImpalaType(kuduCol.getType(), kuduCol.getTypeAttributes());
       if (!colType.equals(kuduColType)) {
         throw new ImpalaRuntimeException("Column '" + colName + "' is type " +
             kuduColType.toSql() + " but Impala expected " + colType.toSql() +
@@ -192,12 +208,12 @@ public class KuduScanNode extends ScanNode {
   private void computeScanRangeLocations(Analyzer analyzer,
       KuduClient client, org.apache.kudu.client.KuduTable rpcTable)
       throws ImpalaRuntimeException {
-    scanRanges_ = Lists.newArrayList();
+    scanRangeSpecs_ = new TScanRangeSpec();
 
     List<KuduScanToken> scanTokens = createScanTokens(client, rpcTable);
     for (KuduScanToken token: scanTokens) {
       LocatedTablet tablet = token.getTablet();
-      List<TScanRangeLocation> locations = Lists.newArrayList();
+      List<TScanRangeLocation> locations = new ArrayList<>();
       if (tablet.getReplicas().isEmpty()) {
         throw new ImpalaRuntimeException(String.format(
             "At least one tablet does not have any replicas. Tablet ID: %s",
@@ -223,8 +239,8 @@ public class KuduScanNode extends ScanNode {
 
       TScanRangeLocationList locs = new TScanRangeLocationList();
       locs.setScan_range(scanRange);
-      locs.locations = locations;
-      scanRanges_.add(locs);
+      locs.setLocations(locations);
+      scanRangeSpecs_.addToConcrete_ranges(locs);
     }
   }
 
@@ -235,9 +251,11 @@ public class KuduScanNode extends ScanNode {
    */
   private List<KuduScanToken> createScanTokens(KuduClient client,
       org.apache.kudu.client.KuduTable rpcTable) {
-    List<String> projectedCols = Lists.newArrayList();
+    List<String> projectedCols = new ArrayList<>();
     for (SlotDescriptor desc: getTupleDesc().getSlotsOrderedByOffset()) {
-      projectedCols.add(((KuduColumn) desc.getColumn()).getKuduName());
+      if (!isCountStarOptimizationDescriptor(desc)) {
+        projectedCols.add(((KuduColumn) desc.getColumn()).getKuduName());
+      }
     }
     KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(rpcTable);
     tokenBuilder.setProjectedColumnNames(projectedCols);
@@ -260,9 +278,8 @@ public class KuduScanNode extends ScanNode {
 
     // Update the cardinality
     inputCardinality_ = cardinality_ = kuduTable_.getNumRows();
-    cardinality_ *= computeSelectivity();
-    cardinality_ = Math.min(Math.max(1, cardinality_), kuduTable_.getNumRows());
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = applyConjunctsSelectivity(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats KuduScan: cardinality=" + Long.toString(cardinality_));
     }
@@ -270,7 +287,29 @@ public class KuduScanNode extends ScanNode {
 
   @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    nodeResourceProfile_ = ResourceProfile.noReservation(0);
+    // The bulk of memory used by Kudu scan node is generally utilized by the
+    // RowbatchQueue plus the row batches filled in by the scanner threads and
+    // waiting to be queued into the RowbatchQueue. Due to a number of factors
+    // like variable length string columns, mem pool usage pattern,
+    // variability of the number of scanner threads being spawned and the
+    // variability of the average RowbatchQueue size, it is increasingly
+    // difficult to precisely estimate the memory usage. Therefore, we fall back
+    // to a more simpler approach of using empirically derived estimates.
+    int numOfScanRanges = scanRangeSpecs_.getConcrete_rangesSize();
+    int perHostScanRanges = estimatePerHostScanRanges(numOfScanRanges);
+    int maxScannerThreads = computeMaxNumberOfScannerThreads(queryOptions,
+        perHostScanRanges);
+    int num_cols = desc_.getSlots().size();
+    long estimated_bytes_per_column_per_thread = BackendConfig.INSTANCE.getBackendCfg().
+        kudu_scanner_thread_estimated_bytes_per_column;
+    long max_estimated_bytes_per_thread = BackendConfig.INSTANCE.getBackendCfg().
+        kudu_scanner_thread_max_estimated_bytes;
+    long mem_estimate_per_thread = Math.min(num_cols *
+        estimated_bytes_per_column_per_thread, max_estimated_bytes_per_thread);
+    useMtScanNode_ = queryOptions.mt_dop > 0;
+    nodeResourceProfile_ = new ResourceProfileBuilder()
+        .setMemEstimateBytes(mem_estimate_per_thread * maxScannerThreads)
+        .setThreadReservation(useMtScanNode_ ? 0 : 1).build();
   }
 
   @Override
@@ -288,12 +327,12 @@ public class KuduScanNode extends ScanNode {
       case EXTENDED: // Fallthrough intended.
       case VERBOSE: {
         if (!conjuncts_.isEmpty()) {
-          result.append(detailPrefix + "predicates: " + getExplainString(conjuncts_)
-              + "\n");
+          result.append(detailPrefix
+              + "predicates: " + Expr.getExplainString(conjuncts_, detailLevel) + "\n");
         }
         if (!kuduConjuncts_.isEmpty()) {
-          result.append(detailPrefix + "kudu predicates: " + getExplainString(
-              kuduConjuncts_) + "\n");
+          result.append(detailPrefix + "kudu predicates: "
+              + Expr.getExplainString(kuduConjuncts_, detailLevel) + "\n");
         }
         if (!runtimeFilters_.isEmpty()) {
           result.append(detailPrefix + "runtime filters: ");
@@ -309,6 +348,11 @@ public class KuduScanNode extends ScanNode {
     node.node_type = TPlanNodeType.KUDU_SCAN_NODE;
     node.kudu_scan_node = new TKuduScanNode(desc_.getId().asInt());
     node.kudu_scan_node.setUse_mt_scan_node(useMtScanNode_);
+
+    Preconditions.checkState((optimizedAggSmap_ == null) == (countStarSlot_ == null));
+    if (countStarSlot_ != null) {
+      node.kudu_scan_node.setCount_star_slot_offset(countStarSlot_.getByteOffset());
+    }
   }
 
   /**
@@ -354,7 +398,7 @@ public class KuduScanNode extends ScanNode {
     LiteralExpr literal = (LiteralExpr) predicate.getChild(1);
 
     // Cannot push predicates with null literal values (KUDU-1595).
-    if (literal instanceof NullLiteral) return false;
+    if (Expr.IS_NULL_LITERAL.apply(literal)) return false;
 
     String colName = ((KuduColumn) ref.getDesc().getColumn()).getKuduName();
     ColumnSchema column = table.getSchema().getColumn(colName);
@@ -391,7 +435,7 @@ public class KuduScanNode extends ScanNode {
       case VARCHAR:
       case CHAR: {
         kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
-            ((StringLiteral)literal).getStringValue());
+            ((StringLiteral)literal).getUnescapedValue());
         break;
       }
       case TIMESTAMP: {
@@ -403,6 +447,11 @@ public class KuduScanNode extends ScanNode {
           LOG.info("Exception converting Kudu timestamp predicate: " + expr.toSql(), e);
           return false;
         }
+        break;
+      }
+      case DECIMAL: {
+        kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
+            ((NumericLiteral)literal).getValue());
         break;
       }
       default: break;
@@ -431,13 +480,13 @@ public class KuduScanNode extends ScanNode {
     SlotRef ref = (SlotRef) predicate.getChild(0);
 
     // KuduPredicate takes a list of values as Objects.
-    List<Object> values = Lists.newArrayList();
+    List<Object> values = new ArrayList<>();
     for (int i = 1; i < predicate.getChildren().size(); ++i) {
-      if (!(predicate.getChild(i).isLiteral())) return false;
+      if (!Expr.IS_LITERAL.apply(predicate.getChild(i))) return false;
       LiteralExpr literal = (LiteralExpr) predicate.getChild(i);
 
       // Cannot push predicates with null literal values (KUDU-1595).
-      if (literal instanceof NullLiteral) return false;
+      if (Expr.IS_NULL_LITERAL.apply(literal)) return false;
 
       Object value = getKuduInListValue(analyzer, literal);
       if (value == null) return false;
@@ -494,7 +543,7 @@ public class KuduScanNode extends ScanNode {
       case BIGINT: return ((NumericLiteral) e).getLongValue();
       case FLOAT: return (float) ((NumericLiteral) e).getDoubleValue();
       case DOUBLE: return ((NumericLiteral) e).getDoubleValue();
-      case STRING: return ((StringLiteral) e).getValue();
+      case STRING: return ((StringLiteral) e).getUnescapedValue();
       case TIMESTAMP: {
         try {
           // TODO: Simplify when Impala supports a 64-bit TIMESTAMP type.
@@ -504,6 +553,7 @@ public class KuduScanNode extends ScanNode {
         }
         break;
       }
+      case DECIMAL: return ((NumericLiteral) e).getValue();
       default:
         Preconditions.checkState(false,
             "Unsupported Kudu type considered for predicate: %s", e.getType().toSql());

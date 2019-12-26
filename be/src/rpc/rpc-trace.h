@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_RPC_RPC_TRACE_H
-#define IMPALA_RPC_RPC_TRACE_H
+#pragma once
 
 #include "rpc/thrift-server.h"
-#include "util/histogram-metric.h"
+#include "util/metrics-fwd.h"
 #include "util/internal-queue.h"
 
 #include <thrift/TProcessor.h>
@@ -31,6 +30,7 @@
 namespace impala {
 
 class MetricGroup;
+class RpcMgr;
 class Webserver;
 
 /// An RpcEventHandler is called every time an Rpc is started and completed. There is at
@@ -126,8 +126,6 @@ class RpcEventHandler : public apache::thrift::TProcessorEventHandler {
 };
 
 /// Initialises rpc event tracing, must be called before any RpcEventHandlers are created.
-void InitRpcEventTracing(Webserver* webserver);
+void InitRpcEventTracing(Webserver* webserver, RpcMgr* = nullptr);
 
 }
-
-#endif

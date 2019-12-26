@@ -16,22 +16,32 @@
 # under the License.
 
 import getpass
+import itertools
 import pytest
 import re
 import time
 
 from test_ddl_base import TestDdlBase
+from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
+from tests.common.environ import (HIVE_MAJOR_VERSION)
 from tests.common.impala_test_suite import LOG
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIf, SkipIfADLS, SkipIfLocal
+from tests.common.skip import (SkipIf, SkipIfABFS, SkipIfADLS, SkipIfKudu, SkipIfLocal,
+                               SkipIfCatalogV2, SkipIfHive2)
 from tests.common.test_dimensions import create_single_exec_option_dimension
-from tests.util.filesystem_utils import WAREHOUSE, IS_HDFS, IS_S3, IS_ADLS
+from tests.util.filesystem_utils import (
+    WAREHOUSE,
+    IS_HDFS,
+    IS_S3,
+    IS_ADLS,
+    FILESYSTEM_NAME)
+from tests.common.impala_cluster import ImpalaCluster
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(TestDdlBase):
   @SkipIfLocal.hdfs_client
   def test_drop_table_with_purge(self, unique_database):
-    """This test checks if the table data is permamently deleted in
+    """This test checks if the table data is permanently deleted in
     DROP TABLE <tbl> PURGE queries"""
     self.client.execute("create table {0}.t1(i int)".format(unique_database))
     self.client.execute("create table {0}.t2(i int)".format(unique_database))
@@ -193,6 +203,75 @@ class TestDdlStatements(TestDdlBase):
     self.run_test_case('QueryTest/create-database', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
 
+  def test_comment_on_database(self, vector, unique_database):
+    comment = self._get_db_comment(unique_database)
+    assert '' == comment
+
+    self.client.execute("comment on database {0} is 'comment'".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert 'comment' == comment
+
+    self.client.execute("comment on database {0} is ''".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert '' == comment
+
+    self.client.execute("comment on database {0} is '\\'comment\\''".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert "\\'comment\\'" == comment
+
+    self.client.execute("comment on database {0} is null".format(unique_database))
+    comment = self._get_db_comment(unique_database)
+    assert '' == comment
+
+  def test_alter_database_set_owner(self, vector, unique_database):
+    self.client.execute("alter database {0} set owner user foo_user".format(
+      unique_database))
+    properties = self._get_db_owner_properties(unique_database)
+    assert len(properties) == 1
+    assert {'foo_user': 'USER'} == properties
+
+    self.client.execute("alter database {0} set owner role foo_role".format(
+      unique_database))
+    properties = self._get_db_owner_properties(unique_database)
+    assert len(properties) == 1
+    assert {'foo_role': 'ROLE'} == properties
+
+  def test_metadata_after_alter_database(self, vector, unique_database):
+    self.client.execute("create table {0}.tbl (i int)".format(unique_database))
+    self.client.execute("create function {0}.f() returns int "
+                        "location '{1}/libTestUdfs.so' symbol='NoArgs'"
+                        .format(unique_database, WAREHOUSE))
+    self.client.execute("alter database {0} set owner user foo_user".format(
+      unique_database))
+    table_names = self.client.execute("show tables in {0}".format(
+      unique_database)).get_data()
+    assert "tbl" == table_names
+    func_names = self.client.execute("show functions in {0}".format(
+      unique_database)).get_data()
+    assert "INT\tf()\tNATIVE\ttrue" == func_names
+
+  def test_alter_table_set_owner(self, vector, unique_database):
+    table_name = "{0}.test_owner_tbl".format(unique_database)
+    self.client.execute("create table {0}(i int)".format(table_name))
+    self.client.execute("alter table {0} set owner user foo_user".format(table_name))
+    owner = self._get_table_or_view_owner(table_name)
+    assert ('foo_user', 'USER') == owner
+
+    self.client.execute("alter table {0} set owner role foo_role".format(table_name))
+    owner = self._get_table_or_view_owner(table_name)
+    assert ('foo_role', 'ROLE') == owner
+
+  def test_alter_view_set_owner(self, vector, unique_database):
+    view_name = "{0}.test_owner_tbl".format(unique_database)
+    self.client.execute("create view {0} as select 1".format(view_name))
+    self.client.execute("alter view {0} set owner user foo_user".format(view_name))
+    owner = self._get_table_or_view_owner(view_name)
+    assert ('foo_user', 'USER') == owner
+
+    self.client.execute("alter view {0} set owner role foo_role".format(view_name))
+    owner = self._get_table_or_view_owner(view_name)
+    assert ('foo_role', 'ROLE') == owner
+
   # There is a query in QueryTest/create-table that references nested types, which is not
   # supported if old joins and aggs are enabled. Since we do not get any meaningful
   # additional coverage by running a DDL test under the old aggs and joins, it can be
@@ -223,10 +302,109 @@ class TestDdlStatements(TestDdlBase):
 
   @SkipIf.kudu_not_supported
   @UniqueDatabase.parametrize(sync_ddl=True)
+  @SkipIfKudu.no_hybrid_clock
   def test_create_kudu(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
+    vector.get_value('exec_option')['kudu_read_mode'] = "READ_AT_SNAPSHOT"
     self.run_test_case('QueryTest/kudu_create', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
+
+  def test_comment_on_table(self, vector, unique_database):
+    table = '{0}.comment_table'.format(unique_database)
+    self.client.execute("create table {0} (i int)".format(table))
+
+    comment = self._get_table_or_view_comment(table)
+    assert comment is None
+
+    self.client.execute("comment on table {0} is 'comment'".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "comment" == comment
+
+    self.client.execute("comment on table {0} is ''".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "" == comment
+
+    self.client.execute("comment on table {0} is '\\'comment\\''".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert "\\\\'comment\\\\'" == comment
+
+    self.client.execute("comment on table {0} is null".format(table))
+    comment = self._get_table_or_view_comment(table)
+    assert comment is None
+
+  def test_comment_on_view(self, vector, unique_database):
+    view = '{0}.comment_view'.format(unique_database)
+    self.client.execute("create view {0} as select 1".format(view))
+
+    comment = self._get_table_or_view_comment(view)
+    assert comment is None
+
+    self.client.execute("comment on view {0} is 'comment'".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "comment" == comment
+
+    self.client.execute("comment on view {0} is ''".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "" == comment
+
+    self.client.execute("comment on view {0} is '\\'comment\\''".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert "\\\\'comment\\\\'" == comment
+
+    self.client.execute("comment on view {0} is null".format(view))
+    comment = self._get_table_or_view_comment(view)
+    assert comment is None
+
+  def test_comment_on_column(self, vector, unique_database):
+    table = "{0}.comment_table".format(unique_database)
+    self.client.execute("create table {0} (i int) partitioned by (j int)".format(table))
+
+    comment = self._get_column_comment(table, 'i')
+    assert '' == comment
+
+    # Updating comment on a regular column.
+    self.client.execute("comment on column {0}.i is 'comment 1'".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "comment 1" == comment
+
+    # Updating comment on a partition column.
+    self.client.execute("comment on column {0}.j is 'comment 2'".format(table))
+    comment = self._get_column_comment(table, 'j')
+    assert "comment 2" == comment
+
+    self.client.execute("comment on column {0}.i is ''".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is '\\'comment\\''".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "\\'comment\\'" == comment
+
+    self.client.execute("comment on column {0}.i is null".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    view = "{0}.comment_view".format(unique_database)
+    self.client.execute("create view {0}(i) as select 1".format(view))
+
+    comment = self._get_column_comment(view, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is 'comment'".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "comment" == comment
+
+    self.client.execute("comment on column {0}.i is ''".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is '\\'comment\\''".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "\\'comment\\'" == comment
+
+    self.client.execute("comment on column {0}.i is null".format(view))
+    comment = self._get_column_comment(view, 'i')
+    assert "" == comment
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_sync_ddl_drop(self, vector, unique_database):
@@ -257,11 +435,14 @@ class TestDdlStatements(TestDdlBase):
         file_data='1984')
     self.run_test_case('QueryTest/alter-table', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
-    # The following tests require HDFS caching which is supported only in the HDFS
-    # filesystem.
-    if IS_HDFS:
-      self.run_test_case('QueryTest/alter-table-hdfs-caching', vector,
-          use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
+
+  @SkipIf.not_hdfs
+  @SkipIfLocal.hdfs_client
+  @SkipIfCatalogV2.hdfs_caching_ddl_unsupported()
+  @UniqueDatabase.parametrize(sync_ddl=True, num_dbs=2)
+  def test_alter_table_hdfs_caching(self, vector, unique_database):
+    self.run_test_case('QueryTest/alter-table-hdfs-caching', vector,
+        use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_alter_set_column_stats(self, vector, unique_database):
@@ -350,16 +531,75 @@ class TestDdlStatements(TestDdlBase):
     # Test the plan to make sure hints were applied correctly
     plan = self.execute_query("explain select * from %s.hints_test" % unique_database,
         query_options={'explain_level':0})
-    assert """PLAN-ROOT SINK
+    plan_match = """PLAN-ROOT SINK
 08:EXCHANGE [UNPARTITIONED]
 04:HASH JOIN [INNER JOIN, PARTITIONED]
 |--07:EXCHANGE [HASH(c.id)]
-|  02:SCAN HDFS [functional.alltypessmall c]
+|  02:SCAN {filesystem_name} [functional.alltypessmall c]
 06:EXCHANGE [HASH(b.id)]
 03:HASH JOIN [INNER JOIN, BROADCAST]
 |--05:EXCHANGE [BROADCAST]
-|  01:SCAN HDFS [functional.alltypes b]
-00:SCAN HDFS [functional.alltypestiny a]""" in '\n'.join(plan.data)
+|  01:SCAN {filesystem_name} [functional.alltypes b]
+00:SCAN {filesystem_name} [functional.alltypestiny a]"""
+    assert plan_match.format(filesystem_name=FILESYSTEM_NAME) in '\n'.join(plan.data)
+
+  def _verify_describe_view(self, vector, view_name, expected_substr):
+    """
+    Verify across all impalads that the view 'view_name' has the given substring in its
+    expanded SQL.
+
+    If SYNC_DDL is enabled, the verification should complete immediately. Otherwise,
+    loops waiting for the expected condition to pass.
+    """
+    if vector.get_value('exec_option')['sync_ddl']:
+      num_attempts = 1
+    else:
+      num_attempts = 60
+    for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
+      client = impalad.service.create_beeswax_client()
+      try:
+        for attempt in itertools.count(1):
+          assert attempt <= num_attempts, "ran out of attempts"
+          try:
+            result = self.execute_query_expect_success(
+                client, "describe formatted %s" % view_name)
+            exp_line = [l for l in result.data if 'View Expanded' in l][0]
+          except ImpalaBeeswaxException, e:
+            # In non-SYNC_DDL tests, it's OK to get a "missing view" type error
+            # until the metadata propagates.
+            exp_line = "Exception: %s" % e
+          if expected_substr in exp_line.lower():
+            return
+          time.sleep(1)
+      finally:
+        client.close()
+
+
+  def test_views_describe(self, vector, unique_database):
+    # IMPALA-6896: Tests that altered views can be described by all impalads.
+    impala_cluster = ImpalaCluster.get_e2e_test_cluster()
+    impalads = impala_cluster.impalads
+    view_name = "%s.test_describe_view" % unique_database
+    query_opts = vector.get_value('exec_option')
+    first_client = impalads[0].service.create_beeswax_client()
+    try:
+      # Create a view and verify it's visible.
+      self.execute_query_expect_success(first_client,
+                                        "create view {0} as "
+                                        "select * from functional.alltypes"
+                                        .format(view_name), query_opts)
+      self._verify_describe_view(vector, view_name, "select * from functional.alltypes")
+
+      # Alter the view and verify the alter is visible.
+      self.execute_query_expect_success(first_client,
+                                        "alter view {0} as "
+                                        "select * from functional.alltypesagg"
+                                        .format(view_name), query_opts)
+      self._verify_describe_view(vector, view_name,
+                                 "select * from functional.alltypesagg")
+    finally:
+      first_client.close()
+
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_functions_ddl(self, vector, unique_database):
@@ -438,6 +678,15 @@ class TestDdlStatements(TestDdlBase):
     tblproperties ('p1'='v0', 'p1'='v1')""".format(fq_tbl_name))
     properties = self._get_tbl_properties(fq_tbl_name)
 
+    if HIVE_MAJOR_VERSION > 2:
+      assert properties['OBJCAPABILITIES'] == 'EXTREAD,EXTWRITE'
+      assert properties['TRANSLATED_TO_EXTERNAL'] == 'TRUE'
+      assert properties['external.table.purge'] == 'TRUE'
+      assert properties['EXTERNAL'] == 'TRUE'
+      del properties['OBJCAPABILITIES']
+      del properties['TRANSLATED_TO_EXTERNAL']
+      del properties['external.table.purge']
+      del properties['EXTERNAL']
     assert len(properties) == 2
     # The transient_lastDdlTime is variable, so don't verify the value.
     assert 'transient_lastDdlTime' in properties
@@ -458,11 +707,41 @@ class TestDdlStatements(TestDdlBase):
         "('prop1'='val1', 'p2'='val2', 'p2'='val3', ''='')".format(fq_tbl_name))
     properties = self._get_tbl_properties(fq_tbl_name)
 
+    if HIVE_MAJOR_VERSION > 2:
+      assert 'OBJCAPABILITIES' in properties
     assert 'transient_lastDdlTime' in properties
     assert properties['p1'] == 'v1'
     assert properties['prop1'] == 'val1'
     assert properties['p2'] == 'val3'
     assert properties[''] == ''
+
+  @SkipIfHive2.acid
+  def test_create_insertonly_tbl(self, vector, unique_database):
+    insertonly_tbl = unique_database + ".test_insertonly"
+    self.client.execute("""create table {0} (coli int) stored as parquet tblproperties(
+        'transactional'='true', 'transactional_properties'='insert_only')"""
+        .format(insertonly_tbl))
+    properties = self._get_tbl_properties(insertonly_tbl)
+    assert properties['OBJCAPABILITIES'] == 'HIVEMANAGEDINSERTREAD,HIVEMANAGEDINSERTWRITE'
+
+  def test_alter_tbl_properties_reload(self, vector, unique_database):
+    # IMPALA-8734: Force a table schema reload when setting table properties.
+    tbl_name = "test_tbl"
+    self.execute_query_expect_success(self.client, "create table {0}.{1} (c1 string)"
+                                      .format(unique_database, tbl_name))
+    self.filesystem_client.create_file("test-warehouse/{0}.db/{1}/f".
+                                       format(unique_database, tbl_name),
+                                       file_data="\nfoo\n")
+    self.execute_query_expect_success(self.client,
+                                      "alter table {0}.{1} set tblproperties"
+                                      "('serialization.null.format'='foo')"
+                                      .format(unique_database, tbl_name))
+    result = self.execute_query_expect_success(self.client,
+                                               "select * from {0}.{1}"
+                                               .format(unique_database, tbl_name))
+    assert len(result.data) == 2
+    assert result.data[0] == ''
+    assert result.data[1] == 'NULL'
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_partition_ddl_predicates(self, vector, unique_database):
@@ -471,6 +750,133 @@ class TestDdlStatements(TestDdlBase):
     if IS_HDFS:
       self.run_test_case('QueryTest/partition-ddl-predicates-hdfs-only', vector,
           use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
+
+  def test_create_table_file_format(self, vector, unique_database):
+    # When default_file_format query option is not specified, the default table file
+    # format is TEXT.
+    text_table = "{0}.text_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client, "create table {0}(i int)".format(text_table))
+    result = self.execute_query_expect_success(
+        self.client, "show create table {0}".format(text_table))
+    assert any("TEXTFILE" in x for x in result.data)
+
+    self.execute_query_expect_failure(
+        self.client, "create table {0}.foobar_tbl".format(unique_database),
+        {"default_file_format": "foobar"})
+
+    parquet_table = "{0}.parquet_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client, "create table {0}(i int)".format(parquet_table),
+        {"default_file_format": "parquet"})
+    result = self.execute_query_expect_success(
+        self.client, "show create table {0}".format(parquet_table))
+    assert any("PARQUET" in x for x in result.data)
+
+    # The table created should still be ORC even though the default_file_format query
+    # option is set to parquet.
+    orc_table = "{0}.orc_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client,
+        "create table {0}(i int) stored as orc".format(orc_table),
+        {"default_file_format": "parquet"})
+    result = self.execute_query_expect_success(
+      self.client, "show create table {0}".format(orc_table))
+    assert any("ORC" in x for x in result.data)
+
+  @SkipIfHive2.acid
+  def test_create_table_transactional_type(self, vector, unique_database):
+    # When default_transactional_type query option is not specified, the transaction
+    # related table properties are not set.
+    non_acid_table = "{0}.non_acid_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client, "create table {0}(i int)".format(non_acid_table),
+        {"default_transactional_type": "none"})
+    props = self._get_properties("Table Parameters", non_acid_table)
+    assert "transactional" not in props
+    assert "transactional_properties" not in props
+
+    # Create table as "insert_only" transactional.
+    insert_only_acid_table = "{0}.insert_only_acid_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client, "create table {0}(i int)".format(insert_only_acid_table),
+        {"default_transactional_type": "insert_only"})
+    props = self._get_properties("Table Parameters", insert_only_acid_table)
+    assert props["transactional"] == "true"
+    assert props["transactional_properties"] == "insert_only"
+
+    # default_transactional_type query option should not affect external tables
+    external_table = "{0}.external_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client, "create external table {0}(i int)".format(external_table),
+        {"default_transactional_type": "insert_only"})
+    props = self._get_properties("Table Parameters", external_table)
+    assert "transactional" not in props
+    assert "transactional_properties" not in props
+
+    # default_transactional_type query option should not affect Kudu tables.
+    kudu_table = "{0}.kudu_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client,
+        "create table {0}(i int primary key) stored as kudu".format(kudu_table),
+        {"default_transactional_type": "insert_only"})
+    props = self._get_properties("Table Parameters", kudu_table)
+    assert "transactional" not in props
+    assert "transactional_properties" not in props
+
+    # default_transactional_type query option should have no effect when transactional
+    # table properties are set manually.
+    manual_acid_table = "{0}.manual_acid_tbl".format(unique_database)
+    self.execute_query_expect_success(
+        self.client, "create table {0}(i int) TBLPROPERTIES ('transactional'='false')"
+            .format(manual_acid_table),
+        {"default_transactional_type": "insert_only"})
+    props = self._get_properties("Table Parameters", manual_acid_table)
+    assert "transactional" not in props
+    assert "transactional_properties" not in props
+
+  def test_kudu_column_comment(self, vector, unique_database):
+    table = "{0}.kudu_table0".format(unique_database)
+    self.client.execute("create table {0}(x int comment 'x' primary key) \
+                        stored as kudu".format(table))
+    comment = self._get_column_comment(table, 'x')
+    assert "x" == comment
+
+    table = "{0}.kudu_table".format(unique_database)
+    self.client.execute("create table {0}(i int primary key) stored as kudu"
+                        .format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is 'comment1'".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "comment1" == comment
+
+    self.client.execute("comment on column {0}.i is ''".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    self.client.execute("comment on column {0}.i is 'comment2'".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "comment2" == comment
+
+    self.client.execute("comment on column {0}.i is null".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    self.client.execute("alter table {0} alter column i set comment 'comment3'"
+                        .format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "comment3" == comment
+
+    self.client.execute("alter table {0} alter column i set comment ''".format(table))
+    comment = self._get_column_comment(table, 'i')
+    assert "" == comment
+
+    self.client.execute("alter table {0} add columns (j int comment 'comment4')"
+                        .format(table))
+    comment = self._get_column_comment(table, 'j')
+    assert "comment4" == comment
 
 # IMPALA-2002: Tests repeated adding/dropping of .jar and .so in the lib cache.
 class TestLibCache(TestDdlBase):
@@ -498,6 +904,7 @@ class TestLibCache(TestDdlBase):
   # Run serially because this test inspects global impalad metrics.
   # TODO: The metrics checks could be relaxed to enable running this test in
   # parallel, but that might need a more general wait_for_metric_value().
+  @SkipIfCatalogV2.data_sources_unsupported()
   @pytest.mark.execute_serially
   def test_create_drop_data_src(self, vector, unique_database):
     """This will create, run, and drop the same data source repeatedly, exercising

@@ -24,6 +24,7 @@
 #include "codegen/llvm-codegen.h"
 #include "exprs/scalar-expr-evaluator.h"
 #include "gen-cpp/Exprs_types.h"
+#include "runtime/date-parse-util.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/timestamp-parse-util.h"
@@ -130,6 +131,13 @@ Literal::Literal(const TExprNode& node)
       memcpy(&value_.timestamp_val, ts_val.data(), type_.GetSlotSize());
       break;
     }
+    case TYPE_DATE: {
+      DCHECK_EQ(node.node_type, TExprNodeType::DATE_LITERAL);
+      DCHECK(node.__isset.date_literal);
+      value_.date_val = *reinterpret_cast<const DateValue*>(
+          &node.date_literal.days_since_epoch);
+      break;
+    }
     default:
       DCHECK(false) << "Invalid type: " << TypeToString(type_.type);
   }
@@ -176,8 +184,6 @@ Literal::Literal(ColumnType type, double v)
   : ScalarExpr(type, true) {
   if (type.type == TYPE_DOUBLE) {
     value_.double_val = v;
-  } else if (type.type == TYPE_TIMESTAMP) {
-    value_.timestamp_val = TimestampValue::FromSubsecondUnixTime(v);
   } else if (type.type == TYPE_DECIMAL) {
     bool overflow = false;
     switch (type.GetByteSize()) {
@@ -216,49 +222,55 @@ Literal::Literal(ColumnType type, const TimestampValue& v)
   value_.timestamp_val = v;
 }
 
-BooleanVal Literal::GetBooleanVal(
+Literal::Literal(ColumnType type, const DateValue& v)
+  : ScalarExpr(type, true) {
+  DCHECK_EQ(type.type, TYPE_DATE) << type;
+  value_.date_val = v;
+}
+
+BooleanVal Literal::GetBooleanValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_BOOLEAN) << type_;
   return BooleanVal(value_.bool_val);
 }
 
-TinyIntVal Literal::GetTinyIntVal(
+TinyIntVal Literal::GetTinyIntValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_TINYINT) << type_;
   return TinyIntVal(value_.tinyint_val);
 }
 
-SmallIntVal Literal::GetSmallIntVal(
+SmallIntVal Literal::GetSmallIntValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_SMALLINT) << type_;
   return SmallIntVal(value_.smallint_val);
 }
 
-IntVal Literal::GetIntVal(
+IntVal Literal::GetIntValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_INT) << type_;
   return IntVal(value_.int_val);
 }
 
-BigIntVal Literal::GetBigIntVal(
+BigIntVal Literal::GetBigIntValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_BIGINT) << type_;
   return BigIntVal(value_.bigint_val);
 }
 
-FloatVal Literal::GetFloatVal(
+FloatVal Literal::GetFloatValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_FLOAT) << type_;
   return FloatVal(value_.float_val);
 }
 
-DoubleVal Literal::GetDoubleVal(
+DoubleVal Literal::GetDoubleValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_DOUBLE) << type_;
   return DoubleVal(value_.double_val);
 }
 
-StringVal Literal::GetStringVal(
+StringVal Literal::GetStringValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK(type_.IsStringType()) << type_;
   StringVal result;
@@ -266,7 +278,7 @@ StringVal Literal::GetStringVal(
   return result;
 }
 
-DecimalVal Literal::GetDecimalVal(
+DecimalVal Literal::GetDecimalValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_DECIMAL) << type_;
   switch (type().GetByteSize()) {
@@ -283,7 +295,7 @@ DecimalVal Literal::GetDecimalVal(
   return DecimalVal();
 }
 
-TimestampVal Literal::GetTimestampVal(
+TimestampVal Literal::GetTimestampValInterpreted(
     ScalarExprEvaluator* eval, const TupleRow* row) const {
   DCHECK_EQ(type_.type, TYPE_TIMESTAMP) << type_;
   TimestampVal result;
@@ -291,30 +303,36 @@ TimestampVal Literal::GetTimestampVal(
   return result;
 }
 
+DateVal Literal::GetDateValInterpreted(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
+  DCHECK_EQ(type_.type, TYPE_DATE) << type_;
+  return value_.date_val.ToDateVal();
+}
+
 string Literal::DebugString() const {
   stringstream out;
   out << "Literal(value=";
   switch (type_.type) {
     case TYPE_BOOLEAN:
-      out << value_.bool_val;
+      out << std::to_string(value_.bool_val);
       break;
     case TYPE_TINYINT:
-      out << value_.tinyint_val;
+      out << std::to_string(value_.tinyint_val);
       break;
     case TYPE_SMALLINT:
-      out << value_.smallint_val;
+      out << std::to_string(value_.smallint_val);
       break;
     case TYPE_INT:
-      out << value_.int_val;
+      out << std::to_string(value_.int_val);
       break;
     case TYPE_BIGINT:
-      out << value_.bigint_val;
+      out << std::to_string(value_.bigint_val);
       break;
     case TYPE_FLOAT:
-      out << value_.float_val;
+      out << std::to_string(value_.float_val);
       break;
     case TYPE_DOUBLE:
-      out << value_.double_val;
+      out << std::to_string(value_.double_val);
       break;
     case TYPE_STRING:
       out << value_.string_val;
@@ -335,7 +353,10 @@ string Literal::DebugString() const {
       }
       break;
     case TYPE_TIMESTAMP:
-      out << value_.timestamp_val;
+      out << value_.timestamp_val.ToString();
+      break;
+    case TYPE_DATE:
+      out << value_.date_val;
       break;
     default:
       out << "[bad type! " << type_ << "]";
@@ -350,16 +371,7 @@ string Literal::DebugString() const {
 // entry:
 //   ret { i8, i64 } { i8 0, i64 10 }
 // }
-Status Literal::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) {
-  if (ir_compute_fn_ != nullptr) {
-    *fn = ir_compute_fn_;
-    return Status::OK();
-  }
-
-  if (type_.type == TYPE_CHAR) {
-    return Status::Expected("Codegen not supported for CHAR");
-  }
-
+Status Literal::GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** fn) {
   DCHECK_EQ(GetNumChildren(), 0);
   llvm::Value* args[2];
   *fn = CreateIrFunctionPrototype("Literal", codegen, &args);
@@ -392,6 +404,7 @@ Status Literal::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) 
       break;
     case TYPE_STRING:
     case TYPE_VARCHAR:
+    case TYPE_CHAR:
       v.SetLen(builder.getInt32(value_.string_val.len));
       v.SetPtr(codegen->GetStringConstant(
           &builder, value_.string_val.ptr, value_.string_val.len));
@@ -417,6 +430,9 @@ Status Literal::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) 
       v.SetDate(builder.getInt32(
           *reinterpret_cast<const int32_t*>(&value_.timestamp_val.date())));
       break;
+    case TYPE_DATE:
+      v.SetVal(value_.date_val.Value());
+      break;
     default:
       stringstream ss;
       ss << "Invalid type: " << type_;
@@ -427,7 +443,6 @@ Status Literal::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) 
   builder.CreateRet(v.GetLoweredValue());
   *fn = codegen->FinalizeFunction(*fn);
   if (UNLIKELY(*fn == nullptr)) return Status(TErrorCode::IR_VERIFY_FAILED, "Literal");
-  ir_compute_fn_ = *fn;
   return Status::OK();
 }
 

@@ -23,25 +23,25 @@ under the License.
 <h2>Thread Groups</h2>
 
 {{#total-threads}}
-<h4>{{.}} thread(s) running</h4>
+<h5>{{.}} thread(s) running</h5>
 {{/total-threads}}
 
-<a href="/thread-group?all"><h3>All threads</h3></a>
+<a href="{{ __common__.host-url }}/thread-group?all"><h5>All threads</h5></a>
 
 {{#thread-groups}}
-<a href='/thread-group?group={{name}}'>
-  <h3>{{name}} : (running: {{size}}, total created: {{num_created}})</h3>
+<a href='{{ __common__.host-url }}/thread-group?group={{name}}'>
+  <h5>{{name}} : (running: {{size}}, total created: {{num_created}})</h5>
 </a>
 {{/thread-groups}}
 
 {{#jvm-threads}}
-<a href='/jvm-threadz'>
-  <h3>{{name}} : (Total: {{total}}, Daemon: {{daemon}})</h3>
+<a href='{{ __common__.host-url }}/jvm-threadz'>
+  <h5>{{name}} : (Total: {{total}}, Daemon: {{daemon}})</h5>
 </a>
 {{/jvm-threads}}
 
 <script>
-document.getElementById("overview-tab").className = "active";
+$("#overview-tab").addClass("active");
 </script>
 
 {{> www/common-footer.tmpl }}

@@ -108,12 +108,6 @@ table_reference := { <varname>table_name</varname> | (<varname>subquery</varname
       </li>
 
       <li>
-        By default, one <codeph>DISTINCT</codeph> clause per query. See <xref href="impala_distinct.xml#distinct"/>
-        for details. See <xref href="impala_appx_count_distinct.xml#appx_count_distinct"/> for a query option to
-        allow multiple <codeph>COUNT(DISTINCT)</codeph> impressions in the same query.
-      </li>
-
-      <li>
         Subqueries in a <codeph>FROM</codeph> clause. In <keyword keyref="impala20_full"/> and higher,
         subqueries can also go in the <codeph>WHERE</codeph> clause, for example with the
         <codeph>IN()</codeph>, <codeph>EXISTS</codeph>, and <codeph>NOT EXISTS</codeph> operators.
@@ -129,6 +123,9 @@ table_reference := { <varname>table_name</varname> | (<varname>subquery</varname
         <codeph><xref href="impala_limit.xml#limit">LIMIT</xref></codeph> clause. In Impala 1.4.0 and higher, this
         restriction is lifted; sort operations that would exceed the Impala memory limit automatically use a
         temporary disk work area to perform the sort.
+      </li>
+      <li>
+        <p conref="../shared/impala_common.xml#common/column_ordinals"/>
       </li>
 
       <li>
@@ -216,18 +213,4 @@ table_reference := { <varname>table_name</varname> | (<varname>subquery</varname
       details.
     </p>
   </conbody>
-
-  <concept id="where" audience="hidden">
-
-<!-- WHERE hidden for the moment until there's the chance to add some reasonably comprehensive content
-
-     and make it its own file. -->
-
-    <title>WHERE Clause</title>
-
-    <conbody>
-
-      <p/>
-    </conbody>
-  </concept>
 </concept>

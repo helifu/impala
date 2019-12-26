@@ -19,12 +19,13 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "exec/exec-node-util.h"
 #include "exprs/scalar-expr.h"
-#include "runtime/data-stream-mgr.h"
-#include "runtime/data-stream-recvr.h"
-#include "runtime/runtime-state.h"
-#include "runtime/row-batch.h"
 #include "runtime/exec-env.h"
+#include "runtime/krpc-data-stream-mgr.h"
+#include "runtime/krpc-data-stream-recvr.h"
+#include "runtime/row-batch.h"
+#include "runtime/runtime-state.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
 #include "util/time.h"
@@ -41,32 +42,44 @@ using namespace impala;
 DEFINE_int64(exchg_node_buffer_size_bytes, 1024 * 1024 * 10,
     "(Advanced) Maximum size of per-query receive-side buffer");
 
-ExchangeNode::ExchangeNode(
-    ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
-  : ExecNode(pool, tnode, descs),
-    num_senders_(0),
-    stream_recvr_(),
-    input_row_desc_(descs, tnode.exchange_node.input_row_tuples,
-        vector<bool>(
-          tnode.nullable_tuples.begin(),
-          tnode.nullable_tuples.begin() + tnode.exchange_node.input_row_tuples.size())),
-    next_row_idx_(0),
-    is_merging_(tnode.exchange_node.__isset.sort_info),
-    offset_(tnode.exchange_node.__isset.offset ? tnode.exchange_node.offset : 0),
-    num_rows_skipped_(0) {
-  DCHECK_GE(offset_, 0);
-  DCHECK(is_merging_ || (offset_ == 0));
-}
-
-Status ExchangeNode::Init(const TPlanNode& tnode, RuntimeState* state) {
-  RETURN_IF_ERROR(ExecNode::Init(tnode, state));
-  if (!is_merging_) return Status::OK();
+Status ExchangePlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+  RETURN_IF_ERROR(PlanNode::Init(tnode, state));
+  if (!tnode.exchange_node.__isset.sort_info) return Status::OK();
 
   RETURN_IF_ERROR(ScalarExpr::Create(tnode.exchange_node.sort_info.ordering_exprs,
-      row_descriptor_, state, &ordering_exprs_));
+      *row_descriptor_, state, &ordering_exprs_));
   is_asc_order_ = tnode.exchange_node.sort_info.is_asc_order;
   nulls_first_ = tnode.exchange_node.sort_info.nulls_first;
   return Status::OK();
+}
+
+Status ExchangePlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
+  ObjectPool* pool = state->obj_pool();
+  *node = pool->Add(new ExchangeNode(pool, *this, state->desc_tbl()));
+  return Status::OK();
+}
+
+ExchangeNode::ExchangeNode(
+    ObjectPool* pool, const ExchangePlanNode& pnode, const DescriptorTbl& descs)
+  : ExecNode(pool, pnode, descs),
+    num_senders_(0),
+    stream_recvr_(),
+    input_row_desc_(descs, pnode.tnode_->exchange_node.input_row_tuples,
+        vector<bool>(pnode.tnode_->nullable_tuples.begin(),
+                        pnode.tnode_->nullable_tuples.begin()
+                            + pnode.tnode_->exchange_node.input_row_tuples.size())),
+    next_row_idx_(0),
+    is_merging_(pnode.tnode_->exchange_node.__isset.sort_info),
+    offset_(pnode.tnode_->exchange_node.__isset.offset ?
+            pnode.tnode_->exchange_node.offset :
+            0),
+    num_rows_skipped_(0) {
+  DCHECK_GE(offset_, 0);
+  DCHECK(is_merging_ || (offset_ == 0));
+  if (!is_merging_) return;
+  ordering_exprs_ = pnode.ordering_exprs_;
+  is_asc_order_ = pnode.is_asc_order_;
+  nulls_first_ = pnode.nulls_first_;
 }
 
 Status ExchangeNode::Prepare(RuntimeState* state) {
@@ -79,15 +92,23 @@ Status ExchangeNode::Prepare(RuntimeState* state) {
   }
 #endif
 
+  RETURN_IF_ERROR(ExecEnv::GetInstance()->buffer_pool()->RegisterClient(
+      Substitute("Exchg Recvr (id=$0)", id_), nullptr,
+      ExecEnv::GetInstance()->buffer_reservation(), mem_tracker(),
+      numeric_limits<int64_t>::max(), runtime_profile(), &recvr_buffer_pool_client_,
+      MemLimit::HARD));
+
   // TODO: figure out appropriate buffer size
   DCHECK_GT(num_senders_, 0);
-  stream_recvr_ = ExecEnv::GetInstance()->stream_mgr()->CreateRecvr(state,
-      &input_row_desc_, state->fragment_instance_id(), id_, num_senders_,
-      FLAGS_exchg_node_buffer_size_bytes, runtime_profile(), is_merging_);
+  stream_recvr_ = ExecEnv::GetInstance()->stream_mgr()->CreateRecvr(
+      &input_row_desc_, *state, state->fragment_instance_id(), id_, num_senders_,
+      FLAGS_exchg_node_buffer_size_bytes, is_merging_, runtime_profile(), mem_tracker(),
+      &recvr_buffer_pool_client_);
+
   if (is_merging_) {
     less_than_.reset(
         new TupleRowComparator(ordering_exprs_, is_asc_order_, nulls_first_));
-    AddCodegenDisabledMessage(state);
+    state->CheckAndAddCodegenDisabledMessage(runtime_profile());
   }
   return Status::OK();
 }
@@ -105,6 +126,7 @@ void ExchangeNode::Codegen(RuntimeState* state) {
 
 Status ExchangeNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   if (is_merging_) {
@@ -119,7 +141,7 @@ Status ExchangeNode::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status ExchangeNode::Reset(RuntimeState* state) {
+Status ExchangeNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }
@@ -128,6 +150,7 @@ void ExchangeNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   if (less_than_.get() != nullptr) less_than_->Close(state);
   if (stream_recvr_ != nullptr) stream_recvr_->Close();
+  ExecEnv::GetInstance()->buffer_pool()->DeregisterClient(&recvr_buffer_pool_client_);
   ScalarExpr::Close(ordering_exprs_);
   ExecNode::Close(state);
 }
@@ -142,15 +165,21 @@ Status ExchangeNode::FillInputRowBatch(RuntimeState* state) {
   VLOG_FILE << "exch: has batch=" << (input_batch_ == NULL ? "false" : "true")
             << " #rows=" << (input_batch_ != NULL ? input_batch_->num_rows() : 0)
             << " is_cancelled=" << (ret_status.IsCancelled() ? "true" : "false")
-            << " instance_id=" << state->fragment_instance_id();
+            << " instance_id=" << PrintId(state->fragment_instance_id());
   return ret_status;
 }
 
+void ExchangeNode::ReleaseRecvrResources(RowBatch* output_batch) {
+  stream_recvr_->TransferAllResources(output_batch);
+  stream_recvr_->CancelStream();
+}
+
 Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* eos) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   if (ReachedLimit()) {
-    stream_recvr_->TransferAllResources(output_batch);
+    ReleaseRecvrResources(output_batch);
     *eos = true;
     return Status::OK();
   } else {
@@ -166,7 +195,7 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
       RETURN_IF_ERROR(QueryMaintenance(state));
       // copy rows until we hit the limit/capacity or until we exhaust input_batch_
       while (!ReachedLimit() && !output_batch->AtCapacity()
-          && input_batch_ != NULL && next_row_idx_ < input_batch_->capacity()) {
+          && input_batch_ != NULL && next_row_idx_ < input_batch_->num_rows()) {
         TupleRow* src = input_batch_->GetRow(next_row_idx_);
         ++next_row_idx_;
         int j = output_batch->AddRow();
@@ -178,12 +207,12 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
         // rows in output_batch
         input_batch_->CopyRow(src, dest);
         output_batch->CommitLastRow();
-        ++num_rows_returned_;
+        IncrementNumRowsReturned(1);
       }
-      COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+      COUNTER_SET(rows_returned_counter_, rows_returned());
 
       if (ReachedLimit()) {
-        stream_recvr_->TransferAllResources(output_batch);
+        ReleaseRecvrResources(output_batch);
         *eos = true;
         return Status::OK();
       }
@@ -193,7 +222,9 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
     // we need more rows
     stream_recvr_->TransferAllResources(output_batch);
     RETURN_IF_ERROR(FillInputRowBatch(state));
-    *eos = (input_batch_ == NULL);
+    *eos = (input_batch_ == nullptr);
+    // No need to call CancelStream() on the receiver here as all incoming row batches
+    // have been consumed so we should have replied to all senders already.
     if (*eos) return Status::OK();
     next_row_idx_ = 0;
     DCHECK(input_batch_->row_desc()->LayoutIsPrefixOf(*output_batch->row_desc()));
@@ -212,7 +243,7 @@ Status ExchangeNode::GetNextMerging(RuntimeState* state, RowBatch* output_batch,
   while (num_rows_skipped_ < offset_) {
     num_rows_skipped_ += output_batch->num_rows();
     // Throw away rows in the output batch until the offset is skipped.
-    int rows_to_keep = num_rows_skipped_ - offset_;
+    int64_t rows_to_keep = num_rows_skipped_ - offset_;
     if (rows_to_keep > 0) {
       output_batch->CopyRows(0, output_batch->num_rows() - rows_to_keep, rows_to_keep);
       output_batch->set_num_rows(rows_to_keep);
@@ -223,18 +254,14 @@ Status ExchangeNode::GetNextMerging(RuntimeState* state, RowBatch* output_batch,
     RETURN_IF_ERROR(stream_recvr_->GetNext(output_batch, eos));
   }
 
-  num_rows_returned_ += output_batch->num_rows();
-  if (ReachedLimit()) {
-    output_batch->set_num_rows(output_batch->num_rows() - (num_rows_returned_ - limit_));
-    num_rows_returned_ = limit_;
-    *eos = true;
-  }
+  CheckLimitAndTruncateRowBatchIfNeeded(output_batch, eos);
 
   // On eos, transfer all remaining resources from the input batches maintained
-  // by the merger to the output batch.
-  if (*eos) stream_recvr_->TransferAllResources(output_batch);
+  // by the merger to the output batch. Also cancel the underlying receiver so
+  // the senders' fragments can exit early.
+  if (*eos) ReleaseRecvrResources(output_batch);
 
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 

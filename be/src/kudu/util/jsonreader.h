@@ -17,13 +17,12 @@
 #ifndef KUDU_UTIL_JSONREADER_H_
 #define KUDU_UTIL_JSONREADER_H_
 
-#include <stdint.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include <rapidjson/document.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/util/status.h"
 
@@ -48,6 +47,10 @@ class JsonReader {
   // given object, returning Status::NotFound if it cannot be found. If
   // 'field' is NULL, will try to convert 'object' directly into the
   // desire type.
+
+  Status ExtractBool(const rapidjson::Value* object,
+                     const char* field,
+                     bool* result) const;
 
   Status ExtractInt32(const rapidjson::Value* object,
                       const char* field,

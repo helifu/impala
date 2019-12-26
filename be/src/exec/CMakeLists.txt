@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+add_subdirectory(parquet)
 
 cmake_minimum_required(VERSION 2.6)
 
@@ -25,9 +26,15 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/exec")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/exec")
 
 add_library(Exec
+  aggregation-node.cc
+  aggregation-node-base.cc
+  aggregator.cc
   analytic-eval-node.cc
   base-sequence-scanner.cc
   blocking-join-node.cc
+  blocking-plan-root-sink.cc
+  buffered-plan-root-sink.cc
+  cardinality-check-node.cc
   catalog-op-executor.cc
   data-sink.cc
   data-source-scan-node.cc
@@ -37,6 +44,9 @@ add_library(Exec
   exchange-node.cc
   external-data-source-executor.cc
   filter-context.cc
+  grouping-aggregator.cc
+  grouping-aggregator-ir.cc
+  grouping-aggregator-partition.cc
   hash-table.cc
   hbase-table-sink.cc
   hbase-table-writer.cc
@@ -50,26 +60,21 @@ add_library(Exec
   hdfs-rcfile-scanner.cc
   hdfs-sequence-scanner.cc
   hdfs-avro-scanner.cc
-  hdfs-avro-table-writer.cc
   hdfs-avro-scanner-ir.cc
+  hdfs-plugin-text-scanner.cc
   hdfs-text-scanner.cc
-  hdfs-lzo-text-scanner.cc
   hdfs-text-table-writer.cc
-  hdfs-sequence-table-writer.cc
-  hdfs-parquet-scanner.cc
-  hdfs-parquet-scanner-ir.cc
-  hdfs-parquet-table-writer.cc
+  hdfs-orc-scanner.cc
   hbase-scan-node.cc
   hbase-table-scanner.cc
   incr-stats-util.cc
   nested-loop-join-builder.cc
   nested-loop-join-node.cc
-  parquet-column-readers.cc
-  parquet-column-stats.cc
-  parquet-metadata-utils.cc
+  non-grouping-aggregator.cc
+  non-grouping-aggregator-ir.cc
+  orc-column-readers.cc
+  orc-metadata-utils.cc
   partial-sort-node.cc
-  partitioned-aggregation-node.cc
-  partitioned-aggregation-node-ir.cc
   partitioned-hash-join-builder.cc
   partitioned-hash-join-builder-ir.cc
   partitioned-hash-join-node.cc
@@ -88,6 +93,7 @@ add_library(Exec
   select-node-ir.cc
   singular-row-src-node.cc
   sort-node.cc
+  streaming-aggregation-node.cc
   subplan-node.cc
   text-converter.cc
   topn-node.cc
@@ -99,12 +105,21 @@ add_library(Exec
 
 add_dependencies(Exec gen-deps)
 
-ADD_BE_TEST(zigzag-test)
-ADD_BE_TEST(hash-table-test)
-ADD_BE_TEST(delimited-text-parser-test)
-ADD_BE_TEST(read-write-util-test)
-ADD_BE_TEST(parquet-plain-test)
-ADD_BE_TEST(parquet-version-test)
-ADD_BE_TEST(row-batch-list-test)
-ADD_BE_TEST(incr-stats-util-test)
-ADD_BE_TEST(hdfs-avro-scanner-test)
+add_library(ExecTests STATIC
+  delimited-text-parser-test.cc
+  hash-table-test.cc
+  hdfs-avro-scanner-test.cc
+  incr-stats-util-test.cc
+  read-write-util-test.cc
+  zigzag-test.cc
+)
+add_dependencies(ExecTests gen-deps)
+
+ADD_UNIFIED_BE_LSAN_TEST(zigzag-test ZigzagTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(hash-table-test HashTableTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(delimited-text-parser-test DelimitedTextParser.*)
+ADD_UNIFIED_BE_LSAN_TEST(read-write-util-test ReadWriteUtil.*)
+# Exception to unified be tests: Custom main with global Frontend object
+ADD_BE_LSAN_TEST(row-batch-list-test)
+ADD_UNIFIED_BE_LSAN_TEST(incr-stats-util-test IncrStatsUtilTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(hdfs-avro-scanner-test HdfsAvroScannerTest.*)

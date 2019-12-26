@@ -17,11 +17,12 @@
 
 #include "exec/plan-root-sink.h"
 
-#include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
 #include "runtime/row-batch.h"
 #include "runtime/tuple-row.h"
 #include "service/query-result-set.h"
+#include "util/pretty-printer.h"
 
 #include <memory>
 #include <boost/thread/mutex.hpp>
@@ -32,17 +33,24 @@ using boost::mutex;
 
 namespace impala {
 
-PlanRootSink::PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state)
-  : DataSink(row_desc, "PLAN_ROOT_SINK", state) {}
+PlanRootSink::PlanRootSink(
+    TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state)
+  : DataSink(sink_id, row_desc, "PLAN_ROOT_SINK", state),
+    num_rows_produced_limit_(state->query_options().num_rows_produced_limit) {}
 
-namespace {
+PlanRootSink::~PlanRootSink() {}
 
-/// Validates that all collection-typed slots in the given batch are set to NULL.
-/// See SubplanNode for details on when collection-typed slots are set to NULL.
-/// TODO: This validation will become obsolete when we can return collection values.
-/// We will then need a different mechanism to assert the correct behavior of the
-/// SubplanNode with respect to setting collection-slots to NULL.
-void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch) {
+Status PlanRootSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
+  RETURN_IF_ERROR(DataSink::Prepare(state, parent_mem_tracker));
+  rows_sent_counter_ = ADD_COUNTER(profile_, "RowsSent", TUnit::UNIT);
+  rows_sent_rate_ = profile_->AddDerivedCounter("RowsSentRate", TUnit::UNIT_PER_SECOND,
+      bind<int64_t>(&RuntimeProfile::UnitsPerSecond, rows_sent_counter_,
+                                                    profile_->total_time_counter()));
+  return Status::OK();
+}
+
+void PlanRootSink::ValidateCollectionSlots(
+    const RowDescriptor& row_desc, RowBatch* batch) {
 #ifndef NDEBUG
   if (!row_desc.HasVarlenSlots()) return;
   for (int i = 0; i < batch->num_rows(); ++i) {
@@ -61,96 +69,19 @@ void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch) {
   }
 #endif
 }
-}
 
-Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
-  ValidateCollectionSlots(*row_desc_, batch);
-  int current_batch_row = 0;
-
-  // Don't enter the loop if batch->num_rows() == 0; no point triggering the consumer with
-  // 0 rows to return. Be wary of ever returning 0-row batches to the client; some poorly
-  // written clients may not cope correctly with them. See IMPALA-4335.
-  while (current_batch_row < batch->num_rows()) {
-    unique_lock<mutex> l(lock_);
-    while (results_ == nullptr && !consumer_done_) sender_cv_.Wait(l);
-    if (consumer_done_ || batch == nullptr) {
-      eos_ = true;
-      return Status::OK();
-    }
-
-    // Otherwise the consumer is ready. Fill out the rows.
-    DCHECK(results_ != nullptr);
-    // List of expr values to hold evaluated rows from the query
-    vector<void*> result_row;
-    result_row.resize(output_exprs_.size());
-
-    // List of scales for floating point values in result_row
-    vector<int> scales;
-    scales.resize(result_row.size());
-
-    int num_to_fetch = batch->num_rows() - current_batch_row;
-    if (num_rows_requested_ > 0) num_to_fetch = min(num_to_fetch, num_rows_requested_);
-    for (int i = 0; i < num_to_fetch; ++i) {
-      TupleRow* row = batch->GetRow(current_batch_row);
-      GetRowValue(row, &result_row, &scales);
-      RETURN_IF_ERROR(results_->AddOneRow(result_row, scales));
-      ++current_batch_row;
-    }
-    // Prevent expr result allocations from accumulating.
-    expr_results_pool_->Clear();
-    // Signal the consumer.
-    results_ = nullptr;
-    consumer_cv_.NotifyAll();
+Status PlanRootSink::UpdateAndCheckRowsProducedLimit(
+    RuntimeState* state, RowBatch* batch) {
+  // Since the PlanRootSink has a single producer, the
+  // num_rows_returned_ value can be verified without acquiring any locks.
+  num_rows_produced_ += batch->num_rows();
+  if (num_rows_produced_limit_ > 0 && num_rows_produced_ > num_rows_produced_limit_) {
+    Status err = Status::Expected(TErrorCode::ROWS_PRODUCED_LIMIT_EXCEEDED,
+        PrintId(state->query_id()),
+        PrettyPrinter::Print(num_rows_produced_limit_, TUnit::NONE));
+    VLOG_QUERY << err.msg().msg();
+    return err;
   }
   return Status::OK();
-}
-
-Status PlanRootSink::FlushFinal(RuntimeState* state) {
-  unique_lock<mutex> l(lock_);
-  sender_done_ = true;
-  eos_ = true;
-  consumer_cv_.NotifyAll();
-  return Status::OK();
-}
-
-void PlanRootSink::Close(RuntimeState* state) {
-  unique_lock<mutex> l(lock_);
-  // No guarantee that FlushFinal() has been called, so need to mark sender_done_ here as
-  // well.
-  sender_done_ = true;
-  consumer_cv_.NotifyAll();
-  // Wait for consumer to be done, in case sender tries to tear-down this sink while the
-  // sender is still reading from it.
-  while (!consumer_done_) sender_cv_.Wait(l);
-  DataSink::Close(state);
-}
-
-void PlanRootSink::CloseConsumer() {
-  unique_lock<mutex> l(lock_);
-  consumer_done_ = true;
-  sender_cv_.NotifyAll();
-}
-
-Status PlanRootSink::GetNext(
-    RuntimeState* state, QueryResultSet* results, int num_results, bool* eos) {
-  unique_lock<mutex> l(lock_);
-
-  results_ = results;
-  num_rows_requested_ = num_results;
-  sender_cv_.NotifyAll();
-
-  while (!eos_ && results_ != nullptr && !sender_done_) consumer_cv_.Wait(l);
-
-  *eos = eos_;
-  return state->GetQueryStatus();
-}
-
-void PlanRootSink::GetRowValue(
-    TupleRow* row, vector<void*>* result, vector<int>* scales) {
-  DCHECK_GE(result->size(), output_expr_evals_.size());
-  for (int i = 0; i < output_expr_evals_.size(); ++i) {
-    (*result)[i] = output_expr_evals_[i]->GetValue(row);
-    (*scales)[i] = output_expr_evals_[i]->output_scale();
-  }
 }
 }

@@ -20,7 +20,8 @@
 # Starts up a mini-dfs test cluster and related services
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 # If -format is passed, format the mini-dfs cluster.
 
@@ -35,7 +36,19 @@ fi
 
 # Kill and clean data for a clean start.
 echo "Killing running services..."
+# Create log dir, in case there's nothing to kill.
+mkdir -p ${IMPALA_CLUSTER_LOGS_DIR}
 $IMPALA_HOME/testdata/bin/kill-all.sh &>${IMPALA_CLUSTER_LOGS_DIR}/kill-all.log
+
+# Detect if important configurations are missing and run create-test-configuration.sh
+# if necessary. This is not intended to be a perfect test, but it is enough to
+# detect that bin/clean.sh removed the configurations.
+pushd "${IMPALA_HOME}/fe/src/test/resources/"
+if [ ! -f core-site.xml ] || [ ! -f hbase-site.xml ] || [ ! -f hive-site.xml ]; then
+    echo "Configuration files missing, running bin/create-test-configuration.sh"
+    ${IMPALA_HOME}/bin/create-test-configuration.sh
+fi
+popd
 
 echo "Starting cluster services..."
 $IMPALA_HOME/testdata/bin/run-mini-dfs.sh ${HDFS_FORMAT_CLUSTER-} 2>&1 | \
@@ -45,7 +58,7 @@ $IMPALA_HOME/testdata/bin/run-mini-dfs.sh ${HDFS_FORMAT_CLUSTER-} 2>&1 | \
 # - HDFS with 3 DNs
 # - One Yarn ResourceManager
 # - Multiple Yarn NodeManagers, exactly one per HDFS DN
-if [[ ${DEFAULT_FS} == "hdfs://localhost:20500" ]]; then
+if [[ ${DEFAULT_FS} == "hdfs://${INTERNAL_LISTEN_HOST}:20500" ]]; then
   echo " --> Starting HBase"
   $IMPALA_HOME/testdata/bin/run-hbase.sh 2>&1 | \
       tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hbase.log
@@ -55,8 +68,8 @@ if [[ ${DEFAULT_FS} == "hdfs://localhost:20500" ]]; then
       tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hive-server.log
 
   echo " --> Starting the Sentry Policy Server"
-  $IMPALA_HOME/testdata/bin/run-sentry-service.sh > \
-      ${IMPALA_CLUSTER_LOGS_DIR}/run-sentry-service.log 2>&1
+  $IMPALA_HOME/testdata/bin/run-sentry-service.sh 2>&1 | \
+      tee ${IMPALA_CLUSTER_LOGS_DIR}/run-sentry-service.log
 
 elif [[ ${DEFAULT_FS} == "${LOCAL_FS}" ]]; then
   # When the local file system is used as default, we only start the Hive metastore.
@@ -78,6 +91,10 @@ else
       tee ${IMPALA_CLUSTER_LOGS_DIR}/run-hive-server.log
 
   echo " --> Starting the Sentry Policy Server"
-  $IMPALA_HOME/testdata/bin/run-sentry-service.sh > \
-      ${IMPALA_CLUSTER_LOGS_DIR}/run-sentry-service.log 2>&1
+  $IMPALA_HOME/testdata/bin/run-sentry-service.sh 2>&1 | \
+      tee ${IMPALA_CLUSTER_LOGS_DIR}/run-sentry-service.log
 fi
+
+echo " --> Starting Ranger Server"
+"${IMPALA_HOME}/testdata/bin/run-ranger-server.sh" 2>&1 | \
+    tee "${IMPALA_CLUSTER_LOGS_DIR}/run-ranger-server.log"

@@ -24,6 +24,7 @@
 
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include "common/config.h"
 #include "gen-cpp/JniCatalog_types.h"
 #include "gen-cpp/Descriptors_types.h"
 #include "gen-cpp/Exprs_types.h"
@@ -44,34 +45,39 @@ class Tuple;
 class TupleRow;
 class RowBatch;
 
-std::ostream& operator<<(std::ostream& os, const TFunctionBinaryType::type& op);
-std::ostream& operator<<(std::ostream& os, const TUniqueId& id);
-std::ostream& operator<<(std::ostream& os, const THdfsFileFormat::type& type);
-std::ostream& operator<<(std::ostream& os, const THdfsCompression::type& type);
-std::ostream& operator<<(std::ostream& os, const TStmtType::type& type);
-std::ostream& operator<<(std::ostream& os, const TUnit::type& type);
-std::ostream& operator<<(std::ostream& os, const TMetricKind::type& type);
-std::ostream& operator<<(std::ostream& os, const beeswax::QueryState::type& type);
-std::ostream& operator<<(std::ostream& os, const parquet::Encoding::type& type);
-std::ostream& operator<<(std::ostream& os, const parquet::CompressionCodec::type& type);
-std::ostream& operator<<(std::ostream& os, const parquet::Type::type& type);
+// TODO: remove these functions and use operator << after upgrading to Thrift 0.11.0 or
+// higher.
+std::string PrintThriftEnum(const beeswax::QueryState::type& value);
+std::string PrintThriftEnum(const parquet::Encoding::type& value);
+std::string PrintThriftEnum(const TCatalogObjectType::type& value);
+std::string PrintThriftEnum(const TCatalogOpType::type& value);
+std::string PrintThriftEnum(const TDdlType::type& value);
+std::string PrintThriftEnum(const TExplainLevel::type& value);
+std::string PrintThriftEnum(const THdfsCompression::type& value);
+std::string PrintThriftEnum(const THdfsFileFormat::type& value);
+std::string PrintThriftEnum(const THdfsSeqCompressionMode::type& value);
+std::string PrintThriftEnum(const TImpalaQueryOptions::type& value);
+std::string PrintThriftEnum(const TJoinDistributionMode::type& value);
+std::string PrintThriftEnum(const TKuduReadMode::type& value);
+std::string PrintThriftEnum(const TMetricKind::type& value);
+std::string PrintThriftEnum(const TParquetArrayResolution::type& value);
+std::string PrintThriftEnum(const TParquetFallbackSchemaResolution::type& value);
+std::string PrintThriftEnum(const TPlanNodeType::type& value);
+std::string PrintThriftEnum(const TPrefetchMode::type& value);
+std::string PrintThriftEnum(const TReplicaPreference::type& value);
+std::string PrintThriftEnum(const TRuntimeFilterMode::type& value);
+std::string PrintThriftEnum(const TSessionType::type& value);
+std::string PrintThriftEnum(const TStmtType::type& value);
+std::string PrintThriftEnum(const TUnit::type& value);
+std::string PrintThriftEnum(const TParquetTimestampType::type& value);
+std::string PrintThriftEnum(const TTransactionalType::type& value);
 
 std::string PrintTuple(const Tuple* t, const TupleDescriptor& d);
 std::string PrintRow(TupleRow* row, const RowDescriptor& d);
 std::string PrintBatch(RowBatch* batch);
+/// Converts id to a string represantation. If necessary, the gdb equivalent is:
+///    printf "%lx:%lx\n", id.hi, id.lo
 std::string PrintId(const TUniqueId& id, const std::string& separator = ":");
-std::string PrintPlanNodeType(const TPlanNodeType::type& type);
-std::string PrintTCatalogObjectType(const TCatalogObjectType::type& type);
-std::string PrintTDdlType(const TDdlType::type& type);
-std::string PrintTCatalogOpType(const TCatalogOpType::type& type);
-std::string PrintTReplicaPreference(const TReplicaPreference::type& type);
-std::string PrintTSessionType(const TSessionType::type& type);
-std::string PrintTStmtType(const TStmtType::type& type);
-std::string PrintQueryState(const beeswax::QueryState::type& type);
-std::string PrintEncoding(const parquet::Encoding::type& type);
-std::string PrintTMetricKind(const TMetricKind::type& type);
-std::string PrintTUnit(const TUnit::type& type);
-std::string PrintTImpalaQueryOptions(const TImpalaQueryOptions::type& type);
 
 /// Returns the fully qualified path, e.g. "database.table.array_col.item.field"
 std::string PrintPath(const TableDescriptor& tbl_desc, const SchemaPath& path);
@@ -96,6 +102,24 @@ bool ParseId(const std::string& s, TUniqueId* id);
 /// This is used to set gflags build version
 std::string GetBuildVersion(bool compact = false);
 
+#ifndef IMPALA_CMAKE_BUILD_TYPE
+static_assert(false, "IMPALA_CMAKE_BUILD_TYPE is not defined");
+#endif
+
+/// Returns the value of CMAKE_BUILD_TYPE used to build the code
+constexpr const char* GetCMakeBuildType() {
+  return AS_STRING(IMPALA_CMAKE_BUILD_TYPE);
+}
+
+/// Returns whether the code was dynamically or statically linked, return
+/// value is either STATIC or DYNAMIC.
+constexpr const char* GetLibraryLinkType() {
+  return AS_STRING(IMPALA_BUILD_SHARED_LIBS)[0] == 'O'
+          && AS_STRING(IMPALA_BUILD_SHARED_LIBS)[1] == 'N' ?
+      "DYNAMIC" :
+      "STATIC";
+}
+
 /// Returns "<program short name> version <GetBuildVersion(compact)>"
 std::string GetVersionString(bool compact = false);
 
@@ -106,6 +130,51 @@ std::string GetStackTrace();
 
 /// Returns the backend name in "host:port" form suitable for human consumption.
 std::string GetBackendString();
+
+/// Tokenize 'debug_actions' into a list of tokenized rows, where columns are separated
+/// by ':' and rows by '|'. i.e. if debug_actions="a:b:c|x:y", then the returned
+/// structure is {{"a", "b", "c"}, {"x", "y"}}
+typedef std::list<std::vector<string>> DebugActionTokens;
+DebugActionTokens TokenizeDebugActions(const string& debug_actions);
+
+/// Tokenize 'action' which has an optional parameter separated by '@'. i.e. "x@y"
+/// becomes {"x", "y"} and "x" becomes {"x"}.
+std::vector<std::string> TokenizeDebugActionParams(const string& action);
+
+/// Slow path implementing DebugAction() for the case where 'debug_action' is non-empty.
+Status DebugActionImpl(const string& debug_action, const char* label,
+    const std::vector<string>& args) WARN_UNUSED_RESULT;
+
+/// If debug_action query option has a "global action" (i.e. not exec-node specific)
+/// and matches the given 'label' and 'args', apply the the action. See
+/// ImpalaService.thrift for details of the format and available global actions. For
+/// ExecNode code, use ExecNode::ExecDebugAction() instead. Will return OK unless either
+/// an invalid debug action is specified or the FAIL action is executed.
+WARN_UNUSED_RESULT static inline Status DebugAction(const string& debug_action,
+    const char* label, const std::vector<string>& args = std::vector<string>()) {
+  if (LIKELY(debug_action.empty())) return Status::OK();
+  return DebugActionImpl(debug_action, label, args);
+}
+
+WARN_UNUSED_RESULT static inline Status DebugAction(
+    const TQueryOptions& query_options, const char* label) {
+  return DebugAction(query_options.debug_action, label);
+}
+
+static inline void DebugActionNoFail(const string& debug_action, const char* label) {
+  Status status = DebugAction(debug_action, label);
+  if (!status.ok()) {
+    LOG(ERROR) << "Ignoring debug action failure: " << status.GetDetail();
+  }
+}
+
+/// Like DebugAction() but for use in contexts that can't safely propagate an error
+/// status. Debug action FAIL should not be used in these contexts and will be logged
+/// and ignored.
+static inline void DebugActionNoFail(
+    const TQueryOptions& query_options, const char* label) {
+  DebugActionNoFail(query_options.debug_action, label);
+}
 
 // FILE_CHECKs are conditions that we expect to be true but could fail due to a malformed
 // input file. They differentiate these cases from DCHECKs, which indicate conditions that

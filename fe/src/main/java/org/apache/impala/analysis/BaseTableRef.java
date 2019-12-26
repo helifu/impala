@@ -17,9 +17,10 @@
 
 package org.apache.impala.analysis;
 
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -59,9 +60,11 @@ public class BaseTableRef extends TableRef {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     if (isAnalyzed_) return;
-    analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_);
+    analyzer.registerAuthAndAuditEvent(resolvedPath_.getRootTable(), priv_,
+        requireGrantOption_);
     desc_ = analyzer.registerTableRef(this);
     isAnalyzed_ = true;
+    analyzer.checkTableCapability(getTable(), Analyzer.OperationType.ANY);
     analyzeTableSample(analyzer);
     analyzeHints(analyzer);
     analyzeJoin(analyzer);
@@ -69,15 +72,15 @@ public class BaseTableRef extends TableRef {
   }
 
   @Override
-  protected String tableRefToSql() {
+  protected String tableRefToSql(ToSqlOptions options) {
     // Enclose the alias in quotes if Hive cannot parse it without quotes.
     // This is needed for view compatibility between Impala and Hive.
     String aliasSql = "";
     String alias = getExplicitAlias();
     if (alias != null) aliasSql = " " + ToSqlUtils.getIdentSql(alias);
     String tableSampleSql = "";
-    if (sampleParams_ != null) tableSampleSql = " " + sampleParams_.toSql();
-    String tableHintsSql = ToSqlUtils.getPlanHintsSql(tableHints_);
+    if (sampleParams_ != null) tableSampleSql = " " + sampleParams_.toSql(options);
+    String tableHintsSql = ToSqlUtils.getPlanHintsSql(options, tableHints_);
     return getTable().getTableName().toSql() + aliasSql + tableSampleSql + tableHintsSql;
   }
 
@@ -89,12 +92,12 @@ public class BaseTableRef extends TableRef {
    * Analyze the 'skip.header.line.count' property.
    */
   private void analyzeSkipHeaderLineCount() throws AnalysisException {
-    Table table = getTable();
-    if (!(table instanceof HdfsTable)) return;
-    HdfsTable hdfsTable = (HdfsTable)table;
+    FeTable table = getTable();
+    if (!(table instanceof FeFsTable)) return;
+    FeFsTable fsTable = (FeFsTable)table;
 
     StringBuilder error = new StringBuilder();
-    hdfsTable.parseSkipHeaderLineCount(error);
+    fsTable.parseSkipHeaderLineCount(error);
     if (error.length() > 0) throw new AnalysisException(error.toString());
   }
 }

@@ -18,6 +18,7 @@
 #include "exprs/string-functions.h"
 
 #include <cctype>
+#include <numeric>
 #include <stdint.h>
 #include <re2/re2.h>
 #include <re2/stringpiece.h>
@@ -26,10 +27,12 @@
 
 #include "exprs/anyval-util.h"
 #include "exprs/scalar-expr.h"
+#include "gutil/strings/charset.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/bit-util.h"
 #include "util/coding-util.h"
+#include "util/ubsan.h"
 #include "util/url-parser.h"
 
 #include "common/names.h"
@@ -91,7 +94,21 @@ StringVal StringFunctions::Repeat(
     FunctionContext* context, const StringVal& str, const BigIntVal& n) {
   if (str.is_null || n.is_null) return StringVal::null();
   if (str.len == 0 || n.val <= 0) return StringVal();
-  StringVal result(context, str.len * n.val);
+  if (n.val > StringVal::MAX_LENGTH) {
+    context->SetError("Number of repeats in repeat() call is larger than allowed limit "
+        "of 1 GB character data.");
+    return StringVal::null();
+  }
+  static_assert(numeric_limits<int64_t>::max() / numeric_limits<int>::max()
+      >= StringVal::MAX_LENGTH,
+      "multiplying StringVal::len with positive int fits in int64_t");
+  int64_t out_len = str.len * n.val;
+  if (out_len > StringVal::MAX_LENGTH) {
+    context->SetError(
+        "repeat() result is larger than allowed limit of 1 GB character data.");
+    return StringVal::null();
+  }
+  StringVal result(context, static_cast<int>(out_len));
   if (UNLIKELY(result.is_null)) return StringVal::null();
   uint8_t* ptr = result.ptr;
   for (int64_t i = 0; i < n.val; ++i) {
@@ -307,7 +324,7 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
 
     // Copy in replacement - always safe since we always leave room for one more replace
     DCHECK_LE(ptr - result.ptr + replace.len, buffer_space);
-    memcpy(ptr, replace.ptr, replace.len);
+    Ubsan::MemCpy(ptr, replace.ptr, replace.len);
     ptr += replace.len;
 
     // Don't want to re-match within already replaced pattern
@@ -647,7 +664,7 @@ bool StringFunctions::SetRE2Options(const StringVal& match_parameter,
 
 void StringFunctions::RegexpPrepare(
     FunctionContext* context, FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::FRAGMENT_LOCAL) return;
+  if (scope != FunctionContext::THREAD_LOCAL) return;
   if (!context->IsArgConstant(1)) return;
   DCHECK_EQ(context->GetArgType(1)->type, FunctionContext::TYPE_STRING);
   StringVal* pattern = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
@@ -664,10 +681,32 @@ void StringFunctions::RegexpPrepare(
 
 void StringFunctions::RegexpClose(
     FunctionContext* context, FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::FRAGMENT_LOCAL) return;
+  if (scope != FunctionContext::THREAD_LOCAL) return;
   re2::RE2* re = reinterpret_cast<re2::RE2*>(context->GetFunctionState(scope));
   delete re;
   context->SetFunctionState(scope, nullptr);
+}
+
+StringVal StringFunctions::RegexpEscape(FunctionContext* context, const StringVal& str) {
+  if (str.is_null) return StringVal::null();
+  if (str.len == 0) return str;
+
+  static const strings::CharSet REGEX_ESCAPE_CHARACTERS(".\\+*?[^]$(){}=!<>|:-");
+  const uint8_t* const start_ptr = str.ptr;
+  const uint8_t* const end_ptr = start_ptr + str.len;
+  StringVal result(context, str.len * 2);
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+  uint8_t* dest_ptr = result.ptr;
+  for (const uint8_t* c = start_ptr; c < end_ptr; ++c) {
+    if (REGEX_ESCAPE_CHARACTERS.Test(*c)) {
+      *dest_ptr++ = '\\';
+    }
+    *dest_ptr++ = *c;
+  }
+  result.len = dest_ptr - result.ptr;
+  DCHECK_GE(result.len, str.len);
+
+  return result;
 }
 
 StringVal StringFunctions::RegexpExtract(FunctionContext* context, const StringVal& str,
@@ -676,7 +715,7 @@ StringVal StringFunctions::RegexpExtract(FunctionContext* context, const StringV
   if (index.val < 0) return StringVal();
 
   re2::RE2* re = reinterpret_cast<re2::RE2*>(
-      context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   scoped_ptr<re2::RE2> scoped_re; // destroys re if we have to locally compile it
   if (re == NULL) {
     DCHECK(!context->IsArgConstant(1));
@@ -708,7 +747,7 @@ StringVal StringFunctions::RegexpReplace(FunctionContext* context, const StringV
   if (str.is_null || pattern.is_null || replace.is_null) return StringVal::null();
 
   re2::RE2* re = reinterpret_cast<re2::RE2*>(
-      context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   scoped_ptr<re2::RE2> scoped_re; // destroys re if state->re is NULL
   if (re == NULL) {
     DCHECK(!context->IsArgConstant(1));
@@ -730,7 +769,7 @@ StringVal StringFunctions::RegexpReplace(FunctionContext* context, const StringV
 
 void StringFunctions::RegexpMatchCountPrepare(FunctionContext* context,
     FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::FRAGMENT_LOCAL) return;
+  if (scope != FunctionContext::THREAD_LOCAL) return;
   int num_args = context->GetNumArgs();
   DCHECK(num_args == 2 || num_args == 4);
   if (!context->IsArgConstant(1) || (num_args == 4 && !context->IsArgConstant(3))) return;
@@ -777,7 +816,7 @@ IntVal StringFunctions::RegexpMatchCount4Args(FunctionContext* context,
   }
 
   re2::RE2* re = reinterpret_cast<re2::RE2*>(
-      context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   // Destroys re if we have to locally compile it.
   scoped_ptr<re2::RE2> scoped_re;
   if (re == NULL) {
@@ -815,39 +854,85 @@ IntVal StringFunctions::RegexpMatchCount4Args(FunctionContext* context,
   return IntVal(count);
 }
 
-StringVal StringFunctions::Concat(FunctionContext* context, int num_children,
-    const StringVal* strs) {
-  return ConcatWs(context, StringVal(), num_children, strs);
-}
-
-StringVal StringFunctions::ConcatWs(FunctionContext* context, const StringVal& sep,
-    int num_children, const StringVal* strs) {
+// NULL handling of function Concat and ConcatWs are different.
+// Function concat was reimplemented to keep the original
+// NULL handling.
+StringVal StringFunctions::Concat(
+    FunctionContext* context, int num_children, const StringVal* strs) {
   DCHECK_GE(num_children, 1);
-  DCHECK(strs != NULL);
-  if (sep.is_null) return StringVal::null();
-
-  // Pass through if there's only one argument
+  DCHECK(strs != nullptr);
+  // Pass through if there's only one argument.
   if (num_children == 1) return strs[0];
 
-  if (strs[0].is_null) return StringVal::null();
-  int32_t total_size = strs[0].len;
-
   // Loop once to compute the final size and reserve space.
-  for (int32_t i = 1; i < num_children; ++i) {
+  int32_t total_size = 0;
+  for (int32_t i = 0; i < num_children; ++i) {
     if (strs[i].is_null) return StringVal::null();
-    total_size += sep.len + strs[i].len;
+    total_size += strs[i].len;
   }
+  // If total_size is zero, directly returns empty string
+  if (total_size <= 0) return StringVal();
+
   StringVal result(context, total_size);
   if (UNLIKELY(result.is_null)) return StringVal::null();
 
   // Loop again to append the data.
   uint8_t* ptr = result.ptr;
-  memcpy(ptr, strs[0].ptr, strs[0].len);
-  ptr += strs[0].len;
-  for (int32_t i = 1; i < num_children; ++i) {
-    memcpy(ptr, sep.ptr, sep.len);
+  for (int32_t i = 0; i < num_children; ++i) {
+    Ubsan::MemCpy(ptr, strs[i].ptr, strs[i].len);
+    ptr += strs[i].len;
+  }
+  return result;
+}
+
+StringVal StringFunctions::ConcatWs(FunctionContext* context, const StringVal& sep,
+    int num_children, const StringVal* strs) {
+  DCHECK_GE(num_children, 1);
+  DCHECK(strs != nullptr);
+  if (sep.is_null) return StringVal::null();
+
+  // Loop once to compute valid start index, final string size and valid string object
+  // count.
+  int32_t valid_num_children = 0;
+  int32_t valid_start_index = -1;
+  int32_t total_size = 0;
+  for (int32_t i = 0; i < num_children; ++i) {
+    if (strs[i].is_null) continue;
+
+    if (valid_start_index == -1) {
+      valid_start_index = i;
+      // Calculate the space required by first valid string object.
+      total_size += strs[i].len;
+    } else {
+      // Calculate the space required by subsequent valid string object.
+      total_size += sep.len + strs[i].len;
+    }
+    // Record the count of valid string object.
+    valid_num_children++;
+  }
+
+  // If all data are invalid, or data size is zero, return empty string.
+  if (valid_start_index < 0 || total_size <= 0) {
+    return StringVal();
+  }
+  DCHECK_GT(valid_num_children, 0);
+
+  // Pass through if there's only one argument.
+  if (valid_num_children == 1) return strs[valid_start_index];
+
+  // Reserve space needed by final result.
+  StringVal result(context, total_size);
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+
+  // Loop to append the data.
+  uint8_t* ptr = result.ptr;
+  Ubsan::MemCpy(ptr, strs[valid_start_index].ptr, strs[valid_start_index].len);
+  ptr += strs[valid_start_index].len;
+  for (int32_t i = valid_start_index + 1; i < num_children; ++i) {
+    if (strs[i].is_null) continue;
+    Ubsan::MemCpy(ptr, sep.ptr, sep.len);
     ptr += sep.len;
-    memcpy(ptr, strs[i].ptr, strs[i].len);
+    Ubsan::MemCpy(ptr, strs[i].ptr, strs[i].len);
     ptr += strs[i].len;
   }
   return result;
@@ -979,22 +1064,28 @@ StringVal StringFunctions::Chr(FunctionContext* ctx, const IntVal& val) {
 }
 
 // Similar to strstr() except that the strings are not null-terminated
-static char* LocateSubstring(char* haystack, int hay_len, const char* needle, int needle_len) {
+// Parameter 'direction' controls the direction of searching, can be either 1 or -1
+static char* LocateSubstring(char* haystack, const int hay_len, const char* needle,
+    const int needle_len, const int direction = 1) {
   DCHECK_GT(needle_len, 0);
   DCHECK(needle != NULL);
   DCHECK(hay_len == 0 || haystack != NULL);
+  DCHECK(direction == 1 || direction == -1);
+  if (hay_len < needle_len) return nullptr;
+  char* start = haystack;
+  if (direction == -1) start += hay_len - needle_len;
   for (int i = 0; i < hay_len - needle_len + 1; ++i) {
-    char* possible_needle = haystack + i;
+    char* possible_needle = start + direction * i;
     if (strncmp(possible_needle, needle, needle_len) == 0) return possible_needle;
   }
-  return NULL;
+  return nullptr;
 }
 
 StringVal StringFunctions::SplitPart(FunctionContext* context,
     const StringVal& str, const StringVal& delim, const BigIntVal& field) {
   if (str.is_null || delim.is_null || field.is_null) return StringVal::null();
   int field_pos = field.val;
-  if (field_pos <= 0) {
+  if (field_pos == 0) {
     stringstream ss;
     ss << "Invalid field position: " << field.val;
     context->SetError(ss.str().c_str());
@@ -1002,23 +1093,36 @@ StringVal StringFunctions::SplitPart(FunctionContext* context,
   }
   if (delim.len == 0) return str;
   char* str_start = reinterpret_cast<char*>(str.ptr);
-  char* str_part = str_start;
   char* delimiter = reinterpret_cast<char*>(delim.ptr);
-  for (int cur_pos = 1; ; ++cur_pos) {
-    int remaining_len = str.len - (str_part - str_start);
-    char* delim_ref = LocateSubstring(str_part, remaining_len, delimiter, delim.len);
-    if (delim_ref == NULL) {
+  const int DIRECTION = field_pos > 0 ? 1 : -1;
+  char* window_start = str_start;
+  char* window_end = str_start + str.len;
+  for (int cur_pos = DIRECTION; ; cur_pos += DIRECTION) {
+    int remaining_len = window_end - window_start;
+    char* delim_ref = LocateSubstring(window_start, remaining_len, delimiter, delim.len,
+        DIRECTION);
+    if (delim_ref == nullptr) {
       if (cur_pos == field_pos) {
-        return StringVal(reinterpret_cast<uint8_t*>(str_part), remaining_len);
+        return StringVal(reinterpret_cast<uint8_t*>(window_start), remaining_len);
       }
       // Return empty string if required field position is not found.
       return StringVal();
     }
     if (cur_pos == field_pos) {
-      return StringVal(reinterpret_cast<uint8_t*>(str_part),
-          delim_ref - str_part);
+      if (DIRECTION < 0) {
+        window_start = delim_ref + delim.len;
+      }
+      else {
+        window_end = delim_ref;
+      }
+      return StringVal(reinterpret_cast<uint8_t*>(window_start),
+          window_end - window_start);
     }
-    str_part = delim_ref + delim.len;
+    if (DIRECTION < 0) {
+      window_end = delim_ref;
+    } else {
+      window_start = delim_ref + delim.len;
+    }
   }
   return StringVal();
 }
@@ -1076,5 +1180,323 @@ StringVal StringFunctions::Base64Decode(FunctionContext* ctx, const StringVal& s
   }
   result.len = out_len;
   return result;
+}
+
+StringVal StringFunctions::GetJsonObject(FunctionContext *ctx, const StringVal &json_str,
+    const StringVal &path_str) {
+  return GetJsonObjectImpl(ctx, json_str, path_str);
+}
+
+IntVal StringFunctions::Levenshtein(
+    FunctionContext* ctx, const StringVal& s1, const StringVal& s2) {
+  // Adapted from https://bit.ly/2SbDgN4
+  // under the Creative Commons Attribution-ShareAlike License
+
+  int s1len = s1.len;
+  int s2len = s2.len;
+
+  // error if either input exceeds 255 characters
+  if (s1len > 255 || s2len > 255) {
+    ctx->SetError("levenshtein argument exceeds maximum length of 255 characters");
+    return IntVal(-1);
+  }
+
+  // short cut cases:
+  // - null strings
+  // - zero length strings
+  // - identical length and value strings
+  if (s1.is_null || s2.is_null) return IntVal::null();
+  if (s1len == 0) return IntVal(s2len);
+  if (s2len == 0) return IntVal(s1len);
+  if (s1len == s2len && memcmp(s1.ptr, s2.ptr, s1len) == 0) return IntVal(0);
+
+  int column_start = 1;
+
+  int* column = reinterpret_cast<int*>(ctx->Allocate(sizeof(int) * (s1len + 1)));
+  if (UNLIKELY(column == nullptr)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return IntVal::null();
+  }
+
+  std::iota(column + column_start - 1, column + s1len + 1, column_start - 1);
+
+  for (int x = column_start; x <= s2len; x++) {
+    column[0] = x;
+    int last_diagonal = x - column_start;
+    for (int y = column_start; y <= s1len; y++) {
+      int old_diagonal = column[y];
+      auto possibilities = {column[y] + 1, column[y - 1] + 1,
+          last_diagonal + (s1.ptr[y - 1] == s2.ptr[x - 1] ? 0 : 1)};
+      column[y] = std::min(possibilities);
+      last_diagonal = old_diagonal;
+    }
+  }
+  int result = column[s1len];
+  ctx->Free(reinterpret_cast<uint8_t*>(column));
+
+  return IntVal(result);
+}
+
+// Based on https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance
+// Implements Jaro similarity
+DoubleVal StringFunctions::JaroSimilarity(
+    FunctionContext* ctx, const StringVal& s1, const StringVal& s2) {
+
+  int s1len = s1.len;
+  int s2len = s2.len;
+
+  // error if either input exceeds 255 characters
+  if (s1len > 255 || s2len > 255) {
+    ctx->SetError("jaro argument exceeds maximum length of 255 characters");
+    return DoubleVal(-1.0);
+  }
+
+  // short cut cases:
+  // - null strings
+  // - zero length strings
+  // - identical length and value strings
+  if (s1.is_null || s2.is_null) return DoubleVal::null();
+  if (s1len == 0 && s2len == 0) return DoubleVal(1.0);
+  if (s1len == 0 || s2len == 0) return DoubleVal(0.0);
+  if (s1len == s2len && memcmp(s1.ptr, s2.ptr, s1len) == 0) return DoubleVal(1.0);
+
+  // the window size to search for matches in the other string
+  int max_range = std::max(0, std::max(s1len, s2len) / 2 - 1);
+
+  int* s1_matching = reinterpret_cast<int*>(ctx->Allocate(sizeof(int) * (s1len)));
+  if (UNLIKELY(s1_matching == nullptr)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return DoubleVal::null();
+  }
+
+  int* s2_matching = reinterpret_cast<int*>(ctx->Allocate(sizeof(int) * (s2len)));
+  if (UNLIKELY(s2_matching == nullptr)) {
+    ctx->Free(reinterpret_cast<uint8_t*>(s1_matching));
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return DoubleVal::null();
+  }
+
+  std::fill_n(s1_matching, s1len, -1);
+  std::fill_n(s2_matching, s2len, -1);
+
+  // calculate matching characters
+  int matching_characters = 0;
+  for (int i = 0; i < s1len; i++) {
+    // matching window
+    int min_index = std::max(i - max_range, 0);
+    int max_index = std::min(i + max_range + 1, s2len);
+    if (min_index >= max_index) break;
+
+    for (int j = min_index; j < max_index; j++) {
+      if (s2_matching[j] == -1 && s1.ptr[i] == s2.ptr[j]) {
+        s1_matching[i] = i;
+        s2_matching[j] = j;
+        matching_characters++;
+        break;
+      }
+    }
+  }
+
+  if (matching_characters == 0) {
+    ctx->Free(reinterpret_cast<uint8_t*>(s1_matching));
+    ctx->Free(reinterpret_cast<uint8_t*>(s2_matching));
+    return DoubleVal(0.0);
+  }
+
+  // transpositions (one-way only)
+  double transpositions = 0.0;
+  for (int i = 0, s1i = 0, s2i = 0; i < matching_characters; i++) {
+    while (s1_matching[s1i] == -1) {
+      s1i++;
+    }
+    while (s2_matching[s2i] == -1) {
+      s2i++;
+    }
+    if (s1.ptr[s1i] != s2.ptr[s2i]) transpositions += 0.5;
+    s1i++;
+    s2i++;
+  }
+  double m = static_cast<double>(matching_characters);
+  double jaro_similarity = 1.0 / 3.0  * ( m / static_cast<double>(s1len)
+                                        + m / static_cast<double>(s2len)
+                                        + (m - transpositions) / m );
+
+  ctx->Free(reinterpret_cast<uint8_t*>(s1_matching));
+  ctx->Free(reinterpret_cast<uint8_t*>(s2_matching));
+
+  return DoubleVal(jaro_similarity);
+}
+
+DoubleVal StringFunctions::JaroDistance(
+    FunctionContext* ctx, const StringVal& s1, const StringVal& s2) {
+
+  DoubleVal jaro_similarity = StringFunctions::JaroSimilarity(ctx, s1, s2);
+  if (jaro_similarity.is_null) return DoubleVal::null();
+  if (jaro_similarity.val == -1.0) return DoubleVal(-1.0);
+  return DoubleVal(1.0 - jaro_similarity.val);
+}
+
+DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
+      const StringVal& s1, const StringVal& s2) {
+  return StringFunctions::JaroWinklerDistance(ctx, s1, s2,
+    DoubleVal(0.1), DoubleVal(0.7));
+}
+
+DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
+      const StringVal& s1, const StringVal& s2,
+      const DoubleVal& scaling_factor) {
+  return StringFunctions::JaroWinklerDistance(ctx, s1, s2,
+    scaling_factor, DoubleVal(0.7));
+}
+
+// Based on https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance
+// Implements Jaro-Winkler distance
+// Extended with boost_theshold: Winkler's modification only applies if Jaro exceeds it
+DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
+      const StringVal& s1, const StringVal& s2,
+      const DoubleVal& scaling_factor, const DoubleVal& boost_threshold) {
+
+  DoubleVal jaro_winkler_similarity = StringFunctions::JaroWinklerSimilarity(
+    ctx, s1, s2, scaling_factor, boost_threshold);
+
+  if (jaro_winkler_similarity.is_null) return DoubleVal::null();
+  if (jaro_winkler_similarity.val == -1.0) return DoubleVal(-1.0);
+  return DoubleVal(1.0 - jaro_winkler_similarity.val);
+}
+
+DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
+      const StringVal& s1, const StringVal& s2) {
+  return StringFunctions::JaroWinklerSimilarity(ctx, s1, s2,
+    DoubleVal(0.1), DoubleVal(0.7));
+}
+
+DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
+      const StringVal& s1, const StringVal& s2,
+      const DoubleVal& scaling_factor) {
+  return StringFunctions::JaroWinklerSimilarity(ctx, s1, s2,
+    scaling_factor, DoubleVal(0.7));
+}
+
+// Based on https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance
+// Implements Jaro-Winkler similarity
+// Extended with boost_theshold: Winkler's modification only applies if Jaro exceeds it
+DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
+      const StringVal& s1, const StringVal& s2,
+      const DoubleVal& scaling_factor, const DoubleVal& boost_threshold) {
+
+  constexpr int MAX_PREFIX_LENGTH = 4;
+  int s1len = s1.len;
+  int s2len = s2.len;
+
+  // error if either input exceeds 255 characters
+  if (s1len > 255 || s2len > 255) {
+    ctx->SetError("jaro-winkler argument exceeds maximum length of 255 characters");
+    return DoubleVal(-1.0);
+  }
+  // scaling factor has to be between 0.0 and 0.25
+  if (scaling_factor.val < 0.0 || scaling_factor.val > 0.25) {
+    ctx->SetError("jaro-winkler scaling factor values can range between 0.0 and 0.25");
+    return DoubleVal(-1.0);
+  }
+  // error if boost threshold is out of range 0.0..1.0
+  if (boost_threshold.val < 0.0 || boost_threshold.val > 1.0) {
+    ctx->SetError("jaro-winkler boost threshold values can range between 0.0 and 1.0");
+    return DoubleVal(-1.0);
+  }
+
+  if (s1.is_null || s2.is_null) return DoubleVal::null();
+
+  DoubleVal jaro_similarity = StringFunctions::JaroSimilarity(ctx, s1, s2);
+  if (jaro_similarity.is_null) return DoubleVal::null();
+  if (jaro_similarity.val == -1.0) return DoubleVal(-1.0);
+
+  double jaro_winkler_similarity = jaro_similarity.val;
+
+  if (jaro_similarity.val > boost_threshold.val) {
+    int common_length = std::min(MAX_PREFIX_LENGTH, std::min(s1len, s2len));
+    int common_prefix = 0;
+    while (common_prefix < common_length &&
+           s1.ptr[common_prefix] == s2.ptr[common_prefix]) {
+      common_prefix++;
+    }
+
+    jaro_winkler_similarity += common_prefix * scaling_factor.val *
+      (1.0 - jaro_similarity.val);
+  }
+  return DoubleVal(jaro_winkler_similarity);
+}
+
+IntVal StringFunctions::DamerauLevenshtein(
+    FunctionContext* ctx, const StringVal& s1, const StringVal& s2) {
+  // Based on https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance
+  // Implements restricted Damerau-Levenshtein (optimal string alignment)
+
+  int s1len = s1.len;
+  int s2len = s2.len;
+
+  // error if either input exceeds 255 characters
+  if (s1len > 255 || s2len > 255) {
+    ctx->SetError("damerau-levenshtein argument exceeds maximum length of 255 "
+                  "characters");
+    return IntVal(-1);
+  }
+
+  // short cut cases:
+  // - null strings
+  // - zero length strings
+  // - identical length and value strings
+  if (s1.is_null || s2.is_null) return IntVal::null();
+  if (s1len == 0) return IntVal(s2len);
+  if (s2len == 0) return IntVal(s1len);
+  if (s1len == s2len && memcmp(s1.ptr, s2.ptr, s1len) == 0) return IntVal(0);
+
+  int i;
+  int j;
+  int l_cost;
+  int ptr_array_length = sizeof(int*) * (s1len + 1);
+  int int_array_length = sizeof(int) * (s2len + 1) * (s1len + 1);
+
+  // Allocating a 2D array (with d being an array of pointers to the start of the rows)
+  int** d = reinterpret_cast<int**>(ctx->Allocate(ptr_array_length));
+  if (UNLIKELY(d == nullptr)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return IntVal::null();
+  }
+  int* rows = reinterpret_cast<int*>(ctx->Allocate(int_array_length));
+  if (UNLIKELY(rows == nullptr)) {
+    ctx->Free(reinterpret_cast<uint8_t*>(d));
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return IntVal::null();
+  }
+  // Setting the pointers in the pointer-array to the start of (s2len + 1) length
+  // intervals and initializing its values based on the mentioned algorithm.
+  for (i = 0; i <= s1len; ++i) {
+    d[i] = rows + (s2len + 1) * i;
+    d[i][0] = i;
+  }
+  std::iota(d[0], d[0] + s2len + 1, 0);
+
+  for (i = 1; i <= s1len; ++i) {
+    for (j = 1; j <= s2len; ++j) {
+      if (s1.ptr[i - 1] == s2.ptr[j - 1]) {
+        l_cost = 0;
+      } else {
+        l_cost = 1;
+      }
+      d[i][j] = std::min(d[i - 1][j - 1] + l_cost, // substitution
+                         std::min(d[i][j - 1] + 1, // insertion
+                                  d[i - 1][j] + 1) // deletion
+      );
+      if (i > 1 && j > 1 && s1.ptr[i - 1] == s2.ptr[j - 2]
+          && s1.ptr[i - 2] == s2.ptr[j - 1]) {
+        d[i][j] = std::min(d[i][j], d[i - 2][j - 2] + l_cost); // transposition
+      }
+    }
+  }
+  int result = d[s1len][s2len];
+
+  ctx->Free(reinterpret_cast<uint8_t*>(d));
+  ctx->Free(reinterpret_cast<uint8_t*>(rows));
+  return IntVal(result);
 }
 }

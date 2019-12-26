@@ -17,174 +17,69 @@
 
 package org.apache.impala.authorization;
 
-import java.util.EnumSet;
-import java.util.List;
+import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
+import org.apache.impala.catalog.FeCatalog;
+import org.apache.impala.common.InternalException;
+import org.apache.impala.thrift.TSessionState;
+import org.apache.impala.util.EventSequence;
+
+import java.util.Optional;
 import java.util.Set;
 
-import org.apache.commons.lang.reflect.ConstructorUtils;
-import org.apache.impala.catalog.AuthorizationException;
-import org.apache.impala.catalog.AuthorizationPolicy;
-import org.apache.impala.common.InternalException;
-import org.apache.sentry.core.common.ActiveRoleSet;
-import org.apache.sentry.core.common.Subject;
-import org.apache.sentry.core.model.db.DBModelAction;
-import org.apache.sentry.core.model.db.DBModelAuthorizable;
-import org.apache.sentry.policy.db.SimpleDBPolicyEngine;
-import org.apache.sentry.provider.cache.SimpleCacheProviderBackend;
-import org.apache.sentry.provider.common.ProviderBackend;
-import org.apache.sentry.provider.common.ProviderBackendContext;
-import org.apache.sentry.provider.common.ResourceAuthorizationProvider;
-import org.apache.sentry.provider.file.SimpleFileProviderBackend;
-
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-
 /**
- * Class used to check whether a user has access to a given resource.
+ * An interface used to check whether a user has access to a given resource.
  */
-public class AuthorizationChecker {
-  private final ResourceAuthorizationProvider provider_;
-  private final AuthorizationConfig config_;
-  private final AuthorizeableServer server_;
-
-  /*
-   * Creates a new AuthorizationChecker based on the config values.
-   */
-  public AuthorizationChecker(AuthorizationConfig config, AuthorizationPolicy policy) {
-    Preconditions.checkNotNull(config);
-    config_ = config;
-    if (config.isEnabled()) {
-      server_ = new AuthorizeableServer(config.getServerName());
-      provider_ = createProvider(config, policy);
-      Preconditions.checkNotNull(provider_);
-    } else {
-      provider_ = null;
-      server_ = null;
-    }
-  }
-
-  /*
-   * Creates a new ResourceAuthorizationProvider based on the given configuration.
-   */
-  private static ResourceAuthorizationProvider createProvider(AuthorizationConfig config,
-      AuthorizationPolicy policy) {
-    try {
-      ProviderBackend providerBe;
-      // Create the appropriate backend provider.
-      if (config.isFileBasedPolicy()) {
-        providerBe = new SimpleFileProviderBackend(config.getSentryConfig().getConfig(),
-            config.getPolicyFile());
-      } else {
-        // Note: The second parameter to the ProviderBackend is a "resourceFile" path
-        // which is not used by Impala. We cannot pass 'null' so instead pass an empty
-        // string.
-        providerBe = new SimpleCacheProviderBackend(config.getSentryConfig().getConfig(),
-            "");
-        Preconditions.checkNotNull(policy);
-        ProviderBackendContext context = new ProviderBackendContext();
-        context.setBindingHandle(policy);
-        providerBe.initialize(context);
-      }
-
-      SimpleDBPolicyEngine engine =
-          new SimpleDBPolicyEngine(config.getServerName(), providerBe);
-
-      // Try to create an instance of the specified policy provider class.
-      // Re-throw any exceptions that are encountered.
-      String policyFile = config.getPolicyFile() == null ? "" : config.getPolicyFile();
-      return (ResourceAuthorizationProvider) ConstructorUtils.invokeConstructor(
-          Class.forName(config.getPolicyProviderClassName()),
-          new Object[] {policyFile, engine});
-    } catch (Exception e) {
-      // Re-throw as unchecked exception.
-      throw new IllegalStateException(
-          "Error creating ResourceAuthorizationProvider: ", e);
-    }
-  }
-
-  /*
-   * Returns the configuration used to create this AuthorizationProvider.
-   */
-  public AuthorizationConfig getConfig() { return config_; }
-
+public interface AuthorizationChecker {
   /**
-   * Returns the set of groups this user belongs to. Uses the GroupMappingService
-   * that is in the AuthorizationProvider to properly resolve Hadoop groups or
-   * local group mappings.
-   */
-  public Set<String> getUserGroups(User user) throws InternalException {
-    return provider_.getGroupMapping().getGroups(user.getShortName());
-  }
-
-  /**
-   * Authorizes the PrivilegeRequest, throwing an Authorization exception if
-   * the user does not have sufficient privileges.
-   */
-  public void checkAccess(User user, PrivilegeRequest privilegeRequest)
-      throws AuthorizationException, InternalException {
-    Preconditions.checkNotNull(privilegeRequest);
-
-    if (!hasAccess(user, privilegeRequest)) {
-      if (privilegeRequest.getAuthorizeable() instanceof AuthorizeableFn) {
-        throw new AuthorizationException(String.format(
-            "User '%s' does not have privileges to CREATE/DROP functions.",
-            user.getName()));
-      }
-
-      Privilege privilege = privilegeRequest.getPrivilege();
-      if (EnumSet.of(Privilege.ANY, Privilege.ALL, Privilege.VIEW_METADATA)
-          .contains(privilege)) {
-        throw new AuthorizationException(String.format(
-            "User '%s' does not have privileges to access: %s",
-            user.getName(), privilegeRequest.getName()));
-      } else {
-        throw new AuthorizationException(String.format(
-            "User '%s' does not have privileges to execute '%s' on: %s",
-            user.getName(), privilege, privilegeRequest.getName()));
-      }
-    }
-  }
-
-  /*
    * Returns true if the given user has permission to execute the given
-   * request, false otherwise. Always returns true if authorization is disabled.
+   * request, false otherwise. Always returns true if authorization is disabled or the
+   * given user is an admin user.
    */
-  public boolean hasAccess(User user, PrivilegeRequest request)
-      throws InternalException {
-    Preconditions.checkNotNull(user);
-    Preconditions.checkNotNull(request);
+  boolean hasAccess(User user, PrivilegeRequest request) throws InternalException;
 
-    // If authorization is not enabled the user will always have access. If this is
-    // an internal request, the user will always have permission.
-    if (!config_.isEnabled() || user instanceof ImpalaInternalAdminUser) {
-      return true;
-    }
+  /**
+   * Returns true if the given user has permission to execute any of the given
+   * requests, false otherwise. Always returns true if authorization is disabled or the
+   * given user is an admin user.
+   */
+  boolean hasAnyAccess(User user, Set<PrivilegeRequest> requests)
+      throws InternalException;
 
-    EnumSet<DBModelAction> actions = request.getPrivilege().getHiveActions();
+  /**
+   * Creates a a new {@link AuthorizationContext}. {@link AuthorizationContext} gets
+   * created per authorization execution.
+   *
+   * @param doAudits a flag whether or not to do the audits
+   * @param sqlStmt the SQL statement to be logged for auditing
+   * @param sessionState the client session state
+   * @param timeline optional timeline to mark events in the query profile
+   */
+  AuthorizationContext createAuthorizationContext(boolean doAudits, String sqlStmt,
+      TSessionState sessionState, Optional<EventSequence> timeline)
+      throws InternalException;
 
-    List<DBModelAuthorizable> authorizeables = Lists.newArrayList(
-        server_.getHiveAuthorizeableHierarchy());
-    // If request.getAuthorizeable() is null, the request is for server-level permission.
-    if (request.getAuthorizeable() != null) {
-      authorizeables.addAll(request.getAuthorizeable().getHiveAuthorizeableHierarchy());
-    }
+  /**
+   * Authorize an analyzed statement.
+   *
+   * @throws AuthorizationException thrown if the user doesn't have sufficient privileges
+   *                                to run this statement.
+   */
+  void authorize(AuthorizationContext authzCtx, AnalysisResult analysisResult,
+      FeCatalog catalog) throws AuthorizationException, InternalException;
 
-    // The Hive Access API does not currently provide a way to check if the user
-    // has any privileges on a given resource.
-    if (request.getPrivilege().getAnyOf()) {
-      for (DBModelAction action: actions) {
-        if (provider_.hasAccess(new Subject(user.getShortName()), authorizeables,
-            EnumSet.of(action), ActiveRoleSet.ALL)) {
-          return true;
-        }
-      }
-      return false;
-    } else if (request.getPrivilege() == Privilege.CREATE && authorizeables.size() > 1) {
-      // CREATE on an object requires CREATE on the parent,
-      // so don't check access on the object we're creating.
-      authorizeables.remove(authorizeables.size() - 1);
-    }
-    return provider_.hasAccess(new Subject(user.getShortName()), authorizeables, actions,
-        ActiveRoleSet.ALL);
-  }
+  /**
+   * This method is to be executed after an authorization check has occurred.
+   */
+  void postAuthorize(AuthorizationContext authzCtx)
+      throws AuthorizationException, InternalException;
+
+  /**
+   * Returns a set of groups for a given user.
+   */
+  Set<String> getUserGroups(User user) throws InternalException;
+
+  /**
+   * Invalidates an authorization cache.
+   */
+  void invalidateAuthorizationCache();
 }

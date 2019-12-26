@@ -20,17 +20,13 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TExprNode;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 /**
@@ -45,8 +41,11 @@ public class Subquery extends Expr {
 
   public Analyzer getAnalyzer() { return analyzer_; }
   public QueryStmt getStatement() { return stmt_; }
+
   @Override
-  public String toSqlImpl() { return "(" + stmt_.toSql() + ")"; }
+  public String toSqlImpl(ToSqlOptions options) {
+    return "(" + stmt_.toSql(options) + ")";
+  }
 
   /**
    * C'tor that initializes a Subquery from a QueryStmt.
@@ -80,7 +79,7 @@ public class Subquery extends Expr {
     analyzer_.setIsSubquery();
     stmt_.analyze(analyzer_);
     // Check whether the stmt_ contains an illegal mix of un/correlated table refs.
-    stmt_.getCorrelatedTupleIds(analyzer_);
+    stmt_.getCorrelatedTupleIds();
 
     // Set the subquery type based on the types of the exprs in the
     // result list of the associated SelectStmt.
@@ -92,8 +91,8 @@ public class Subquery extends Expr {
       type_ = createStructTypeFromExprList();
     }
 
-    // If the subquery returns many rows, set its type to ArrayType.
-    if (!((SelectStmt)stmt_).returnsSingleRow()) type_ = new ArrayType(type_);
+    // If the subquery can return many rows, do the cardinality check at runtime.
+    if (!((SelectStmt)stmt_).returnsSingleRow()) stmt_.setIsRuntimeScalar(true);
 
     Preconditions.checkNotNull(type_);
   }
@@ -120,7 +119,7 @@ public class Subquery extends Expr {
    */
   private StructType createStructTypeFromExprList() {
     List<Expr> stmtResultExprs = stmt_.getResultExprs();
-    ArrayList<StructField> structFields = Lists.newArrayList();
+    List<StructField> structFields = new ArrayList<>();
     // Check if we have unique labels
     List<String> labels = stmt_.getColLabels();
     boolean hasUniqueLabels = true;

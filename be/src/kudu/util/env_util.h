@@ -17,13 +17,22 @@
 #ifndef KUDU_UTIL_ENV_UTIL_H
 #define KUDU_UTIL_ENV_UTIL_H
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
-#include "kudu/gutil/macros.h"
-#include "kudu/util/env.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
+
+class Env;
+class RandomAccessFile;
+class SequentialFile;
+class WritableFile;
+struct WritableFileOptions;
+
 namespace env_util {
 
 Status OpenFileForWrite(Env *env, const std::string &path,
@@ -80,28 +89,22 @@ Status DeleteExcessFilesByPattern(Env* env, const std::string& pattern, int max_
 // Deletion errors generate warnings but do not halt the traversal.
 Status DeleteTmpFilesRecursively(Env* env, const std::string& path);
 
-// Deletes a file or directory when this object goes out of scope.
+// Checks if 'path' is an empty directory.
 //
-// The deletion may be cancelled by calling .Cancel().
-// This is typically useful for cleaning up temporary files if the
-// creation of the tmp file may fail.
-class ScopedFileDeleter {
- public:
-  ScopedFileDeleter(Env* env, std::string path);
-  ~ScopedFileDeleter();
+// Returns an error if it's not a directory. Otherwise, sets 'is_empty'
+// accordingly.
+Status IsDirectoryEmpty(Env* env, const std::string& path, bool* is_empty);
 
-  // Do not delete the file when this object goes out of scope.
-  void Cancel() {
-    should_delete_ = false;
-  }
+// Synchronize all of the parent directories belonging to 'dirs' and 'files'
+// to disk.
+Status SyncAllParentDirs(Env* env,
+                         const std::vector<std::string>& dirs,
+                         const std::vector<std::string>& files);
 
- private:
-  Env* const env_;
-  const std::string path_;
-  bool should_delete_;
-
-  DISALLOW_COPY_AND_ASSIGN(ScopedFileDeleter);
-};
+// Return a list of files within the given 'path'.
+Status ListFilesInDir(Env* env,
+                      const std::string& path,
+                      std::vector<std::string>* entries);
 
 } // namespace env_util
 } // namespace kudu

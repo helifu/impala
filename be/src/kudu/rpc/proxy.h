@@ -22,12 +22,9 @@
 #include <string>
 
 #include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/rpc/connection_id.h"
 #include "kudu/rpc/response_callback.h"
-#include "kudu/rpc/rpc_controller.h"
-#include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/util/monotime.h"
-#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
 
 namespace google {
@@ -37,9 +34,14 @@ class Message;
 } // namespace google
 
 namespace kudu {
+
+class Sockaddr;
+
 namespace rpc {
 
 class Messenger;
+class RpcController;
+class UserCredentials;
 
 // Interface to send calls to a remote service.
 //
@@ -47,6 +49,11 @@ class Messenger;
 // connection is not established until the first call, and may be torn down and
 // re-established as necessary by the messenger. Additionally, the messenger is
 // likely to multiplex many Proxy objects on the same connection.
+//
+// A proxy object can optionally specify the "network plane" it uses. This allows
+// proxies of N services to be multiplexed on M TCP connections so that a higher priority
+// service (e.g. a control channel) may use a different connection than other services,
+// avoiding the chance of being blocked by traffic of other services.
 //
 // Proxy objects are thread-safe after initialization only.
 // Setters on the Proxy are not thread-safe, and calling a setter after any RPC
@@ -102,10 +109,16 @@ class Proxy {
                      RpcController* controller) const;
 
   // Set the user credentials which should be used to log in.
-  void set_user_credentials(const UserCredentials& user_credentials);
+  void set_user_credentials(UserCredentials user_credentials);
 
   // Get the user credentials which should be used to log in.
   const UserCredentials& user_credentials() const { return conn_id_.user_credentials(); }
+
+  // Set the network plane which this proxy uses.
+  void set_network_plane(std::string network_plane);
+
+  // Get the network plane which this proxy uses.
+  const std::string& network_plane() const { return conn_id_.network_plane(); }
 
   std::string ToString() const;
 

@@ -23,8 +23,9 @@
 #include "util/hash-util.h"
 #include "util/time.h"
 #include "rpc/thrift-server.h"
-#include "gen-cpp/Types_types.h"
 #include "gen-cpp/Data_types.h"
+#include "gen-cpp/Frontend_types.h"
+#include "gen-cpp/Types_types.h"
 
 // TCompactProtocol requires some #defines to work right.  They also define UNLIKELY
 // so we need to undef this.
@@ -57,23 +58,16 @@ using namespace apache::thrift::server;
 using namespace apache::thrift::protocol;
 using namespace apache::thrift::concurrency;
 
-// IsRecvTimeoutTException() and IsSendFailTException() make assumption about the
-// implementation of read(), write() and write_partial() in TSocket.cpp and those
-// functions may change between different versions of Thrift.
+// IsReadTimeoutTException(), IsPeekTimeoutTException() and IsConnResetTException() make
+// assumption about the implementation of read(), peek(), write() and write_partial() in
+// TSocket.cpp and TSSLSocket.cpp. Those functions may change between different versions
+// of Thrift.
 static_assert(PACKAGE_VERSION[0] == '0', "");
 static_assert(PACKAGE_VERSION[1] == '.', "");
 static_assert(PACKAGE_VERSION[2] == '9', "");
 static_assert(PACKAGE_VERSION[3] == '.', "");
-static_assert(PACKAGE_VERSION[4] == '0', "");
+static_assert(PACKAGE_VERSION[4] == '3', "");
 static_assert(PACKAGE_VERSION[5] == '\0', "");
-
-// Thrift defines operator< but does not implement it. This is a stub
-// implementation so we can link.
-bool Apache::Hadoop::Hive::Partition::operator<(
-    const Apache::Hadoop::Hive::Partition& x) const {
-  DCHECK(false) << "This should not get called.";
-  return false;
-}
 
 namespace impala {
 
@@ -97,26 +91,6 @@ boost::shared_ptr<TProtocol> CreateDeserializeProtocol(
     TBinaryProtocolFactoryT<TMemoryBuffer> tproto_factory;
     return tproto_factory.getProtocol(mem);
   }
-}
-
-// Comparator for THostPorts. Thrift declares this (in gen-cpp/Types_types.h) but
-// never defines it.
-bool TNetworkAddress::operator<(const TNetworkAddress& that) const {
-  if (this->hostname < that.hostname) {
-    return true;
-  } else if ((this->hostname == that.hostname) && (this->port < that.port)) {
-    return true;
-  }
-  return false;
-};
-
-// Comparator for TUniqueIds
-bool TUniqueId::operator<(const TUniqueId& that) const {
-  return (hi < that.hi) || (hi == that.hi &&  lo < that.lo);
-}
-
-bool TAccessEvent::operator<(const TAccessEvent& that) const {
-  return this->name < that.name;
 }
 
 static void ThriftOutputFunction(const char* output) {
@@ -156,7 +130,7 @@ Status WaitForServer(const string& host, int port, int num_retries,
   return Status("Server did not come up");
 }
 
-std::ostream& operator<<(std::ostream& out, const TColumnValue& colval) {
+void PrintTColumnValue(std::ostream& out, const TColumnValue& colval) {
   if (colval.__isset.bool_val) {
     out << ((colval.bool_val) ? "true" : "false");
   } else if (colval.__isset.double_val) {
@@ -170,13 +144,12 @@ std::ostream& operator<<(std::ostream& out, const TColumnValue& colval) {
   } else if (colval.__isset.long_val) {
     out << colval.long_val;
   } else if (colval.__isset.string_val) {
-    out << colval.string_val;
+    out << colval.string_val; // 'string_val' is set for TIMESTAMP and DATE column values.
   } else if (colval.__isset.binary_val) {
     out << colval.binary_val; // Stored as a std::string
   } else {
     out << "NULL";
   }
-  return out;
 }
 
 bool TNetworkAddressComparator(const TNetworkAddress& a, const TNetworkAddress& b) {
@@ -186,12 +159,20 @@ bool TNetworkAddressComparator(const TNetworkAddress& a, const TNetworkAddress& 
   return false;
 }
 
-bool IsRecvTimeoutTException(const TTransportException& e) {
-  // String taken from TSocket::read() Thrift's TSocket.cpp.
+bool IsReadTimeoutTException(const TTransportException& e) {
+  // String taken from TSocket::read() Thrift's TSocket.cpp and TSSLSocket.cpp.
   return (e.getType() == TTransportException::TIMED_OUT &&
              strstr(e.what(), "EAGAIN (timed out)") != nullptr) ||
          (e.getType() == TTransportException::INTERNAL_ERROR &&
              strstr(e.what(), "SSL_read: Resource temporarily unavailable") != nullptr);
+}
+
+bool IsPeekTimeoutTException(const TTransportException& e) {
+  // String taken from TSocket::peek() Thrift's TSocket.cpp and TSSLSocket.cpp.
+  return (e.getType() == TTransportException::UNKNOWN &&
+             strstr(e.what(), "recv(): Resource temporarily unavailable") != nullptr) ||
+         (e.getType() == TTransportException::INTERNAL_ERROR &&
+             strstr(e.what(), "SSL_peek: Resource temporarily unavailable") != nullptr);
 }
 
 bool IsConnResetTException(const TTransportException& e) {

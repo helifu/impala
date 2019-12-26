@@ -31,11 +31,14 @@ add_library(Util
   backend-gflag-util.cc
   benchmark.cc
   bitmap.cc
+  bit-packing.cc
   bit-util.cc
   bloom-filter.cc
   bloom-filter-ir.cc
+  cgroup-util.cc
   coding-util.cc
   codec.cc
+  collection-metrics.cc
   common-metrics.cc
   compress.cc
   cpu-info.cc
@@ -46,15 +49,20 @@ add_library(Util
   default-path-handlers.cc
   disk-info.cc
   error-util.cc
+  event-metrics.cc
   filesystem-util.cc
+  flat_buffer.cc
   hdfs-util.cc
   hdfs-bulk-ops.cc
   hdr-histogram.cc
+  histogram-metric.cc
   impalad-metrics.cc
   jni-util.cc
+  json-util.cc
   logging-support.cc
   mem-info.cc
   memory-metrics.cc
+  memusage-path-handlers.cc
   metrics.cc
   min-max-filter.cc
   min-max-filter-ir.cc
@@ -68,15 +76,15 @@ add_library(Util
   path-builder.cc
   periodic-counter-updater
   pprof-path-handlers.cc
-# TODO: not supported on RHEL 5
-#  perf-counters.cc
   progress-updater.cc
   process-state-info.cc
   redactor.cc
   runtime-profile.cc
   simple-logger.cc
   string-parser.cc
+  string-util.cc
   symbols-util.cc
+  system-state-info.cc
   static-asserts.cc
   summary-util.cc
   table-printer.cc
@@ -87,10 +95,54 @@ add_library(Util
   url-parser.cc
   ${SQUEASEL_SRC_DIR}/squeasel.c
   webserver.cc
+  zip-util.cc
   ${MUSTACHE_SRC_DIR}/mustache.cc
-  ${MPFIT_SRC_DIR}/mpfit.c
-)
+  ${MPFIT_SRC_DIR}/mpfit.c)
 add_dependencies(Util gen-deps gen_ir_descriptions)
+
+add_library(UtilTests STATIC
+  benchmark-test.cc
+  bitmap-test.cc
+  bit-packing-test.cc
+  bit-stream-utils-test.cc
+  bit-util-test.cc
+  blocking-queue-test.cc
+  bloom-filter-test.cc
+  coding-util-test.cc
+  debug-util-test.cc
+  dict-test.cc
+  error-util-test.cc
+  filesystem-util-test.cc
+  fixed-size-hash-table-test.cc
+  hdfs-util-test.cc
+  hdr-histogram-test.cc
+  logging-support-test.cc
+  lru-cache-test.cc
+  metrics-test.cc
+  min-max-filter-test.cc
+  openssl-util-test.cc
+  os-info-test.cc
+  os-util-test.cc
+  parse-util-test.cc
+  pretty-printer-test.cc
+  proc-info-test.cc
+  redactor-config-parser-test.cc
+  redactor-test.cc
+  redactor-test-utils.cc
+  redactor-unconfigured-test.cc
+  rle-test.cc
+  runtime-profile-test.cc
+  string-parser-test.cc
+  string-util-test.cc
+  symbols-util-test.cc
+  sys-info-test.cc
+  system-state-info-test.cc
+  thread-pool-test.cc
+  time-test.cc
+  uid-util-test.cc
+  zip-util-test.cc
+)
+add_dependencies(UtilTests gen-deps gen_ir_descriptions)
 
 # Squeasel requires C99 compatibility to build.
 SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c
@@ -107,39 +159,52 @@ target_link_libraries(parquet-reader ${IMPALA_LINK_LIBS})
 
 target_link_libraries(loggingsupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
 
-ADD_BE_TEST(benchmark-test)
-ADD_BE_TEST(bitmap-test)
-ADD_BE_TEST(bit-packing-test)
-ADD_BE_TEST(bit-util-test)
-ADD_BE_TEST(blocking-queue-test)
-ADD_BE_TEST(bloom-filter-test)
-ADD_BE_TEST(coding-util-test)
-ADD_BE_TEST(debug-util-test)
-ADD_BE_TEST(decompress-test)
-ADD_BE_TEST(dict-test)
-ADD_BE_TEST(error-util-test)
-ADD_BE_TEST(filesystem-util-test)
-ADD_BE_TEST(fixed-size-hash-table-test)
-ADD_BE_TEST(hdfs-util-test)
-ADD_BE_TEST(internal-queue-test)
-ADD_BE_TEST(logging-support-test)
-ADD_BE_TEST(lru-cache-test)
-ADD_BE_TEST(metrics-test)
-ADD_BE_TEST(min-max-filter-test)
-ADD_BE_TEST(openssl-util-test)
-ADD_BE_TEST(parse-util-test)
-#ADD_BE_TEST(perf-counters-test)
-ADD_BE_TEST(pretty-printer-test)
-ADD_BE_TEST(proc-info-test)
-ADD_BE_TEST(promise-test)
-ADD_BE_TEST(redactor-config-parser-test)
-ADD_BE_TEST(redactor-test)
-ADD_BE_TEST(redactor-unconfigured-test)
-ADD_BE_TEST(rle-test)
-ADD_BE_TEST(runtime-profile-test)
-ADD_BE_TEST(string-parser-test)
-ADD_BE_TEST(symbols-util-test)
-ADD_BE_TEST(thread-pool-test)
-ADD_BE_TEST(time-test)
-ADD_BE_TEST(uid-util-test)
-ADD_BE_TEST(webserver-test)
+ADD_UNIFIED_BE_LSAN_TEST(benchmark-test "BenchmarkTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(bitmap-test "Bitmap.*")
+ADD_UNIFIED_BE_LSAN_TEST(bit-packing-test "BitPackingTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(bit-stream-utils-test "BitArray.*:VLQInt.*")
+ADD_UNIFIED_BE_LSAN_TEST(bit-util-test "BitUtil.*")
+ADD_UNIFIED_BE_LSAN_TEST(blocking-queue-test "BlockingQueueTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(bloom-filter-test "BloomFilter.*:BloomFilterTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(coding-util-test "UrlCodingTest.*:Base64Test.*:HtmlEscapingTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(debug-util-test "DebugUtil.*")
+# Decompress-test fails in unified mode (possibly due to missing libs)
+ADD_BE_LSAN_TEST(decompress-test)
+ADD_UNIFIED_BE_LSAN_TEST(dict-test "DictTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(error-util-test "ErrorMsg.*")
+ADD_UNIFIED_BE_LSAN_TEST(filesystem-util-test "FilesystemUtil.*")
+ADD_UNIFIED_BE_LSAN_TEST(fixed-size-hash-table-test "FixedSizeHash.*")
+ADD_UNIFIED_BE_LSAN_TEST(hdfs-util-test HdfsUtilTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(hdr-histogram-test HdrHistogramTest.*)
+# internal-queue-test has a non-standard main(), so it needs a small amount of thought
+# to use a unified executable
+ADD_BE_LSAN_TEST(internal-queue-test)
+ADD_UNIFIED_BE_LSAN_TEST(logging-support-test "LoggingSupport.*")
+ADD_UNIFIED_BE_LSAN_TEST(lru-cache-test "FifoMultimap.*")
+ADD_UNIFIED_BE_LSAN_TEST(metrics-test "MetricsTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(min-max-filter-test "MinMaxFilterTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(openssl-util-test "OpenSSLUtilTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(os-info-test "OsInfo.*")
+ADD_UNIFIED_BE_LSAN_TEST(os-util-test "OsUtil.*")
+ADD_UNIFIED_BE_LSAN_TEST(parse-util-test "ParseMemSpecs.*")
+ADD_UNIFIED_BE_LSAN_TEST(pretty-printer-test "PrettyPrinterTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(proc-info-test "MemInfo.*:ProcessStateInfo.*:MappedMapInfo.*:CGroupInfo.*")
+# IMPALA-4128: promise-test has a non-standard main(), so it can't be unified yet
+ADD_BE_LSAN_TEST(promise-test)
+ADD_UNIFIED_BE_LSAN_TEST(redactor-config-parser-test ParserTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(redactor-test "RedactorTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(redactor-unconfigured-test "RedactorUnconfigTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(rle-test "BitArray.*:RleTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(runtime-profile-test "CountersTest.*:TimerCounterTest.*:TimeSeriesCounterTest.*:VariousNumbers/TimeSeriesCounterResampleTest.*:ToThrift.*:ToJson.*")
+ADD_UNIFIED_BE_LSAN_TEST(string-parser-test "StringToInt.*:StringToIntWithBase.*:StringToFloat.*:StringToBool.*:StringToDate.*")
+ADD_UNIFIED_BE_LSAN_TEST(string-util-test "TruncateDownTest.*:TruncateUpTest.*:CommaSeparatedContainsTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(symbols-util-test "SymbolsUtil.*")
+ADD_UNIFIED_BE_LSAN_TEST(system-state-info-test "SystemStateInfoTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(sys-info-test "CpuInfoTest.*:DiskInfoTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(thread-pool-test "ThreadPoolTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(time-test "TimeTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(uid-util-test "UidUtil.*")
+# Using standalone webserver-test for now, nonstandard main() passes in a port.
+ADD_BE_LSAN_TEST(webserver-test)
+TARGET_LINK_LIBRARIES(webserver-test mini_kdc)
+ADD_UNIFIED_BE_LSAN_TEST(zip-util-test "ZipUtilTest.*")

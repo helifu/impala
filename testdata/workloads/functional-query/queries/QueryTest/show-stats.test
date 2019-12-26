@@ -86,7 +86,8 @@ YEAR, MONTH, #ROWS, #FILES, SIZE, BYTES CACHED, CACHE REPLICATION, FORMAT, INCRE
 '2009','1',-1,1,regex:.+KB,'NOT CACHED','NOT CACHED','TEXT','false','$NAMENODE/test-warehouse/alltypesmixedformat/year=2009/month=1'
 '2009','2',-1,1,regex:.+KB,'NOT CACHED','NOT CACHED','SEQUENCE_FILE','false','$NAMENODE/test-warehouse/alltypesmixedformat/year=2009/month=2'
 '2009','3',-1,1,regex:.+KB,'NOT CACHED','NOT CACHED','RC_FILE','false','$NAMENODE/test-warehouse/alltypesmixedformat/year=2009/month=3'
-'Total','',-1,3,regex:.+KB,'0B','','','',''
+'2009','4',-1,1,regex:.+KB,'NOT CACHED','NOT CACHED','PARQUET','false','$NAMENODE/test-warehouse/alltypesmixedformat/year=2009/month=4'
+'Total','',-1,4,regex:.+KB,'0B','','','',''
 ---- TYPES
 STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
 ====
@@ -130,28 +131,28 @@ show column stats alltypes
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
-'id','INT',7300,-1,4,4
-'bool_col','BOOLEAN',2,-1,1,1
-'tinyint_col','TINYINT',10,-1,1,1
-'smallint_col','SMALLINT',10,-1,2,2
-'int_col','INT',10,-1,4,4
-'bigint_col','BIGINT',10,-1,8,8
-'float_col','FLOAT',10,-1,4,4
-'double_col','DOUBLE',10,-1,8,8
-'date_string_col','STRING',736,-1,8,8
-'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',7300,-1,16,16
+'id','INT',7300,0,4,4
+'bool_col','BOOLEAN',2,0,1,1
+'tinyint_col','TINYINT',10,0,1,1
+'smallint_col','SMALLINT',10,0,2,2
+'int_col','INT',10,0,4,4
+'bigint_col','BIGINT',10,0,8,8
+'float_col','FLOAT',10,0,4,4
+'double_col','DOUBLE',10,0,8,8
+'date_string_col','STRING',736,0,8,8
+'string_col','STRING',10,0,1,1
+'timestamp_col','TIMESTAMP',7300,0,16,16
 'year','INT',2,0,4,4
 'month','INT',12,0,4,4
 ---- TYPES
 STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
 ====
 ---- QUERY
-# Column column stats for a table with complex types.
+# Column stats for a table with complex types.
+# TODO: when complex type stats are supported revisit: compute-stats-complextype-warning.test
 show column stats functional.allcomplextypes
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
----- RESULTS
 ---- RESULTS
 'id','INT',-1,-1,4,4
 'int_array_col','ARRAY<INT>',-1,-1,-1,-1

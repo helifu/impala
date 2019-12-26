@@ -21,9 +21,11 @@
 import pytest
 import threading
 from time import sleep
+from RuntimeProfile.ttypes import TRuntimeProfileFormat
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.test_vector import ImpalaTestDimension
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.util.cancel_util import cancel_query_and_validate_state
 from tests.verifiers.metric_verifier import MetricVerifier
 
 # PRIMARY KEY for lineitem
@@ -40,14 +42,26 @@ QUERIES = {'select l_returnflag from lineitem' : None,
 
 QUERY_TYPE = ["SELECT", "CTAS"]
 
-# Time to sleep between issuing query and canceling
-CANCEL_DELAY_IN_SECONDS = range(5)
+# Time to sleep between issuing query and canceling. Favor small times since races
+# are prone to occur more often when the time between RPCs is small.
+CANCEL_DELAY_IN_SECONDS = [0, 0.01, 0.1, 1, 4]
 
 # Number of times to execute/cancel each query under test
 NUM_CANCELATION_ITERATIONS = 1
 
-# Test cancellation on both running and hung queries
-DEBUG_ACTIONS = [None, 'WAIT']
+# Test cancellation on both running and hung queries. Node ID 0 is the scan node
+WAIT_ACTIONS = [None, '0:GETNEXT:WAIT']
+
+# Verify that failed CancelFInstances() RPCs don't lead to hung queries
+FAIL_RPC_ACTIONS = [None, 'COORD_CANCEL_QUERY_FINSTANCES_RPC:FAIL']
+
+# Test cancelling when there is a resource limit.
+CPU_LIMIT_S = [0, 100000]
+
+# Verify close rpc running concurrently with fetch rpc. The two cases verify:
+# False: close and fetch rpc run concurrently.
+# True: cancel rpc is enough to ensure that the fetch rpc is unblocked.
+JOIN_BEFORE_CLOSE = [False, True]
 
 # Extra dimensions to test order by without limit
 SORT_QUERY = 'select * from lineitem order by l_orderkey'
@@ -69,9 +83,15 @@ class TestCancellation(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('cancel_delay', *CANCEL_DELAY_IN_SECONDS))
     cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension('action', *DEBUG_ACTIONS))
+        ImpalaTestDimension('wait_action', *WAIT_ACTIONS))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('fail_rpc_action', *FAIL_RPC_ACTIONS))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('join_before_close', *JOIN_BEFORE_CLOSE))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('buffer_pool_limit', 0))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('cpu_limit_s', *CPU_LIMIT_S))
 
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('query_type') != 'CTAS' or (\
@@ -116,55 +136,59 @@ class TestCancellation(ImpalaTestSuite):
         query = "create table ctas_cancel stored as %sfile as %s" %\
             (file_format, query)
 
-    action = vector.get_value('action')
-    # node ID 0 is the scan node
-    debug_action = '0:GETNEXT:' + action if action != None else ''
+    wait_action = vector.get_value('wait_action')
+    fail_rpc_action = vector.get_value('fail_rpc_action')
+
+    debug_action = "|".join(filter(None, [wait_action, fail_rpc_action]))
     vector.get_value('exec_option')['debug_action'] = debug_action
 
     vector.get_value('exec_option')['buffer_pool_limit'] =\
         vector.get_value('buffer_pool_limit')
+    vector.get_value('exec_option')['cpu_limit_s'] = vector.get_value('cpu_limit_s')
 
     # Execute the query multiple times, cancelling it each time.
     for i in xrange(NUM_CANCELATION_ITERATIONS):
-      handle = self.execute_query_async(query, vector.get_value('exec_option'),
-                                        table_format=vector.get_value('table_format'))
-
-      def fetch_results():
-        threading.current_thread().fetch_results_error = None
-        try:
-          new_client = self.create_impala_client()
-          new_client.fetch(query, handle)
-        except ImpalaBeeswaxException as e:
-          threading.current_thread().fetch_results_error = e
-
-      thread = threading.Thread(target=fetch_results)
-      thread.start()
-
-      sleep(vector.get_value('cancel_delay'))
-      assert self.client.get_state(handle) != self.client.QUERY_STATES['EXCEPTION']
-      cancel_result = self.client.cancel(handle)
-      assert cancel_result.status_code == 0,\
-          'Unexpected status code from cancel request: %s' % cancel_result
-      thread.join()
-
-      if thread.fetch_results_error is None:
-        # If the query is cancelled while it's in the fetch rpc, it gets unregistered and
-        # therefore closed. Only call close on queries that did not fail fetch.
-        self.client.close_query(handle)
-      elif 'Cancelled' not in str(thread.fetch_results_error):
-        # If fetch failed for any reason other than cancellation, raise the error.
-        raise thread.fetch_results_error
+      cancel_query_and_validate_state(self.client, query,
+          vector.get_value('exec_option'), vector.get_value('table_format'),
+          vector.get_value('cancel_delay'), vector.get_value('join_before_close'))
 
       if query_type == "CTAS":
         self.cleanup_test_table(vector.get_value('table_format'))
 
-      # TODO: Add some additional verification to check to make sure the query was
-      # actually canceled
-
     # Executing the same query without canceling should work fine. Only do this if the
     # query has a limit or aggregation
-    if action is None and ('count' in query or 'limit' in query):
+    if not debug_action and ('count' in query or 'limit' in query):
       self.execute_query(query, vector.get_value('exec_option'))
+
+  @pytest.mark.execute_serially
+  def test_misformatted_profile_text(self):
+    """Tests that canceled queries have no whitespace formatting errors in their profiles
+    (IMPALA-2063). Executes serially because it is timing-dependent and can be flaky."""
+    query = "select count(*) from functional_parquet.alltypes where bool_col = sleep(100)"
+    client = self.hs2_client
+    # Start query
+    handle = client.execute_async(query)
+    # Wait for the query to start (with a long timeout to account for admission control
+    # queuing).
+    WAIT_SECONDS = 60 * 30
+    assert any(client.get_state(handle) == 'RUNNING_STATE' or sleep(0.1)
+               for _ in range(10 * WAIT_SECONDS)), 'Query failed to start'
+
+    client.cancel(handle)
+    # Wait up to 5 seconds for the query to get cancelled
+    # TODO(IMPALA-1262): This should be CANCELED_STATE
+    # TODO(IMPALA-8411): Remove and assert that the query is cancelled immediately
+    assert any(client.get_state(handle) == 'ERROR_STATE' or sleep(1)
+               for _ in range(5)), 'Query failed to cancel'
+    # Get profile and check for formatting errors
+    profile = client.get_runtime_profile(handle, TRuntimeProfileFormat.THRIFT)
+    for (k, v) in profile.nodes[1].info_strings.iteritems():
+      # Ensure that whitespace gets removed from values.
+      assert v == v.rstrip(), \
+        "Profile value contains surrounding whitespace: %s %s" % (k, v)
+      # Plan text may be strangely formatted.
+      assert k == 'Plan' or '\n\n' not in v, \
+        "Profile contains repeating newlines: %s %s" % (k, v)
 
   def teardown_method(self, method):
     # For some reason it takes a little while for the query to get completely torn down
@@ -187,27 +211,34 @@ class TestCancellationSerial(TestCancellation):
   @classmethod
   def add_test_dimensions(cls):
     super(TestCancellationSerial, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('query_type') == 'CTAS' or
-        v.get_value('query').startswith('compute stats'))
-    cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('cancel_delay') != 0)
-    cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('action') is None)
-    # Don't run across all cancel delay options unless running in exhaustive mode
+    # Only run the insert tests in this suite - they need to be serial to allow us to
+    # check for file handle leaks.
+    cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('query_type') == 'CTAS')
+
+    # This test suite is slow because it executes serially. Restrict some of the params
+    # that are not interesting for inserts.
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('cpu_limit_s') == CPU_LIMIT_S[0])
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('join_before_close') == JOIN_BEFORE_CLOSE[0])
     if cls.exploration_strategy() != 'exhaustive':
-      cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('cancel_delay') in [3])
+      # Only run a single 'cancel_delay' option in core.
+      cls.ImpalaTestMatrix.add_constraint(
+          lambda v: v.get_value('cancel_delay') == CANCEL_DELAY_IN_SECONDS[3])
+    else:
+      cls.ImpalaTestMatrix.add_constraint(
+          lambda v: v.get_value('cancel_delay') != CANCEL_DELAY_IN_SECONDS[0])
 
   @pytest.mark.execute_serially
   def test_cancel_insert(self, vector):
     self.execute_cancel_test(vector)
     metric_verifier = MetricVerifier(self.impalad_test_service)
-    try:
-      metric_verifier.verify_no_open_files(timeout=10)
-    except AssertionError:
-      pytest.xfail("IMPALA-551: File handle leak for INSERT")
+    metric_verifier.verify_no_open_files(timeout=10)
 
 class TestCancellationFullSort(TestCancellation):
   @classmethod
   def add_test_dimensions(cls):
-    super(TestCancellation, cls).add_test_dimensions()
+    super(TestCancellationFullSort, cls).add_test_dimensions()
     # Override dimensions to only execute the order-by without limit query.
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('query', SORT_QUERY))
@@ -217,7 +248,8 @@ class TestCancellationFullSort(TestCancellation):
         ImpalaTestDimension('cancel_delay', *SORT_CANCEL_DELAY))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('buffer_pool_limit', *SORT_BUFFER_POOL_LIMIT))
-    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('action', None))
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('fail_rpc_action') == FAIL_RPC_ACTIONS[0])
     cls.ImpalaTestMatrix.add_constraint(lambda v:\
        v.get_value('table_format').file_format =='parquet' and\
        v.get_value('table_format').compression_codec == 'none')

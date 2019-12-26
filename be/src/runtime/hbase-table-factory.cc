@@ -39,7 +39,7 @@ Status HBaseTableFactory::GetConnection(jobject* connection) {
   }
 
   // Get the JNIEnv* corresponding to current thread.
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   if (env == NULL) return Status("Error creating JNIEnv");
   JniLocalFrame jni_frame;
   RETURN_IF_ERROR(jni_frame.push(env));
@@ -86,12 +86,15 @@ Status HBaseTableFactory::GetConnection(jobject* connection) {
 }
 
 HBaseTableFactory::~HBaseTableFactory() {
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
 
   // Clean up the global refs and stop the threads.
   lock_guard<mutex> lock(connection_lock_);
   if (connection_ != NULL) {
     env->CallObjectMethod(connection_, connection_close_id_);
+    Status s = JniUtil::GetJniExceptionMsg(env);
+    // Not much we can do with the error except log it.
+    if (!s.ok()) LOG(INFO) << "Exception when cleaning up HBase " << s;
     env->DeleteGlobalRef(connection_);
     connection_ = NULL;
   }

@@ -16,6 +16,7 @@
 # under the License.
 
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIfCatalogV2
 
 # This test requires that testdata/avro_schema_resolution/create_table.sql has been run
 class TestAvroSchemaResolution(ImpalaTestSuite):
@@ -47,6 +48,7 @@ class TestAvroSchemaResolution(ImpalaTestSuite):
     for x in range(len(result.data)):
       assert comparison.data[x] == result.data[x]
 
+  @SkipIfCatalogV2.catalog_v1_test()
   def test_avro_schema_changes(self, vector, unique_database):
     """Test for IMPALA-3314 and IMPALA-3513: Impalad shouldn't crash with stale Avro
     metadata. Instead, should provide a meaningful error message.

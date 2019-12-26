@@ -17,43 +17,62 @@
 
 package org.apache.impala.analysis;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.HBaseTable;
+import org.apache.impala.catalog.FeCatalogUtils;
+import org.apache.impala.catalog.FeFsPartition;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.PartitionStatsUtil;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.PrintUtils;
+import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
+import org.apache.impala.service.FrontendProfile;
 import org.apache.impala.thrift.TComputeStatsParams;
+import org.apache.impala.thrift.TErrorCode;
+import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TPartitionStats;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TUnit;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Stopwatch;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 /**
  * Represents the following statements for statistics collection. Which statistics
  * are computed and stored depends on the statement type (incremental or not), the
  * clauses used (sampling, partition spec), as well as whether stats extrapolation
- * is enabled or not (--enable_stats_extrapolation).
+ * is enabled or not.
+ * Stats extrapolation can be configured:
+ * - at the impalad level with --enable_stats_extrapolation
+ * - at the table level HdfsTable.TBL_PROP_ENABLE_STATS_EXTRAPOLATION
  *
- * 1. COMPUTE STATS <table> [TABLESAMPLE SYSTEM(<perc>) [REPEATABLE(<seed>)]]
+ * 1. COMPUTE STATS <table> [(col_list)] [TABLESAMPLE SYSTEM(<perc>) [REPEATABLE(<seed>)]]
  * - Stats extrapolation enabled:
  *   Computes and replaces the table-level row count and total file size, as well as all
  *   table-level column statistics. Existing partition-objects and their row count are
@@ -71,6 +90,9 @@ import com.google.common.collect.Sets;
  *   partitions to set the extrapolated numRows statistic. Altering many partitions is
  *   expensive and so should be avoided in favor of enabling extrapolation.
  *
+ *   By default, statistics are computed for all columns. To control which columns are
+ *   analyzed, a whitelist of columns names can be optionally specified.
+ *
  * 2. COMPUTE INCREMENTAL STATS <table> [PARTITION <part_spec>]
  * - Stats extrapolation enabled:
  *   Not supported for now to keep the logic/code simple.
@@ -84,7 +106,7 @@ import com.google.common.collect.Sets;
  *   If a set of partitions is specified, then the incremental statistics for those
  *   partitions are recomputed (then merged into the table-level statistics).
  *
- * TODO: Allow more coarse/fine grained (db, column)
+ * TODO: Allow more coarse (db)
  * TODO: Compute stats on complex types.
  */
 public class ComputeStatsStmt extends StatementBase {
@@ -95,19 +117,38 @@ public class ComputeStatsStmt extends StatementBase {
   private static String AVRO_SCHEMA_MSG_SUFFIX = "Please re-create the table with " +
           "column definitions, e.g., using the result of 'SHOW CREATE TABLE'";
 
+  // Metrics collected when fetching incremental statistics from Catalogd. All metrics
+  // are per query.
+  private static final String STATS_FETCH_PREFIX = "StatsFetch";
+  // Time (ms) needed to fetch all partitions stats from catalogd.
+  private static final String STATS_FETCH_TIME = STATS_FETCH_PREFIX + ".Time";
+  // Number of compressed bytes received for all partitions.
+  private static final String STATS_FETCH_COMPRESSED_BYTES =
+      STATS_FETCH_PREFIX + ".CompressedBytes";
+  // Number of partitions sent from Catalogd.
+  private static final String STATS_FETCH_TOTAL_PARTITIONS =
+      STATS_FETCH_PREFIX + ".TotalPartitions";
+  // Number of partitions sent from Catalogd that include statistics.
+  private static final String STATS_FETCH_NUM_PARTITIONS_WITH_STATS =
+      STATS_FETCH_PREFIX + ".NumPartitionsWithStats";
+
+  // The maximum number of partitions that may be explicitly selected by filter
+  // predicates. Any query that selects more than this automatically drops back to a full
+  // incremental stats recomputation.
+  // TODO: We can probably do better than this, e.g. running several queries, each of
+  // which selects up to MAX_INCREMENTAL_PARTITIONS partitions.
+  private static final int MAX_INCREMENTAL_PARTITIONS = 1000;
+
   protected final TableName tableName_;
   protected final TableSampleClause sampleParams_;
 
   // Set during analysis.
-  protected Table table_;
+  protected FeTable table_;
 
   // Effective sampling percent based on the total number of bytes in the files sample.
   // Set to -1 for non-HDFS tables or if TABLESAMPLE was not specified.
+  // We run the regular COMPUTE STATS for 0.0 and 1.0 where sampling has no benefit.
   protected double effectiveSamplePerc_ = -1;
-
-  // The Null count is not currently being used in optimization or run-time,
-  // and compute stats runs 2x faster in many cases when not counting NULLs.
-  private static final boolean COUNT_NULLS = false;
 
   // Query for getting the per-partition row count and the total row count.
   // Set during analysis.
@@ -118,54 +159,63 @@ public class ComputeStatsStmt extends StatementBase {
   protected String columnStatsQueryStr_;
 
   // If true, stats will be gathered incrementally per-partition.
-  private boolean isIncremental_ = false;
+  private boolean isIncremental_;
 
   // If true, expect the compute stats process to produce output for all partitions in the
   // target table. In that case, 'expectedPartitions_' will be empty. The point of this
   // flag is to optimize the case where all partitions are targeted.
   // False for unpartitioned HDFS tables, non-HDFS tables or when stats extrapolation
   // is enabled.
-  private boolean expectAllPartitions_ = false;
+  private boolean expectAllPartitions_;
 
   // The list of valid partition statistics that can be used in an incremental computation
   // without themselves being recomputed. Populated in analyze().
-  private final List<TPartitionStats> validPartStats_ = Lists.newArrayList();
+  private final List<TPartitionStats> validPartStats_ = new ArrayList<>();
 
   // For incremental computations, the list of partitions (identified by list of partition
   // column values) that we expect to receive results for. Used to ensure that even empty
   // partitions emit results.
   // TODO: Consider using partition IDs (and adding them to the child queries with a
   // PARTITION_ID() builtin)
-  private final List<List<String>> expectedPartitions_ = Lists.newArrayList();
+  private final List<List<String>> expectedPartitions_ = new ArrayList<>();
 
   // If non-null, partitions that an incremental computation might apply to. Must be
   // null if this is a non-incremental computation.
-  private PartitionSet partitionSet_ = null;
+  private PartitionSet partitionSet_;
 
-  // The maximum number of partitions that may be explicitly selected by filter
-  // predicates. Any query that selects more than this automatically drops back to a full
-  // incremental stats recomputation.
-  // TODO: We can probably do better than this, e.g. running several queries, each of
-  // which selects up to MAX_INCREMENTAL_PARTITIONS partitions.
-  private static final int MAX_INCREMENTAL_PARTITIONS = 1000;
+  // If non-null, represents the user-specified list of columns for computing statistics.
+  // Not supported for incremental statistics.
+  private List<String> columnWhitelist_;
+
+  // The set of columns to be analyzed. Each column is valid: it must exist in the table
+  // schema, it must be of a type that can be analyzed, and cannot refer to a partitioning
+  // column for HDFS tables. If the set is null, no columns are restricted.
+  private Set<Column> validatedColumnWhitelist_;
 
   /**
    * Should only be constructed via static creation functions.
    */
   private ComputeStatsStmt(TableName tableName, TableSampleClause sampleParams,
-      boolean isIncremental, PartitionSet partitionSet) {
+      boolean isIncremental, PartitionSet partitionSet, List<String> columns) {
     Preconditions.checkState(tableName != null && !tableName.isEmpty());
     Preconditions.checkState(isIncremental || partitionSet == null);
     Preconditions.checkState(!isIncremental || sampleParams == null);
+    Preconditions.checkState(!isIncremental || columns == null);
     tableName_ = tableName;
     sampleParams_ = sampleParams;
     table_ = null;
     isIncremental_ = isIncremental;
     partitionSet_ = partitionSet;
+    columnWhitelist_ = columns;
     if (partitionSet_ != null) {
       partitionSet_.setTableName(tableName);
       partitionSet_.setPrivilegeRequirement(Privilege.ALTER);
     }
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
   }
 
   /**
@@ -173,28 +223,32 @@ public class ComputeStatsStmt extends StatementBase {
    * stats should be computed with table sampling.
    */
   public static ComputeStatsStmt createStatsStmt(TableName tableName,
-      TableSampleClause sampleParams) {
-    return new ComputeStatsStmt(tableName, sampleParams, false, null);
+      TableSampleClause sampleParams, List<String> columns) {
+    return new ComputeStatsStmt(tableName, sampleParams, false, null, columns);
   }
 
   /**
-   * Returns a stmt for COMPUTE INCREMENTAL STATS. The optional 'partitioSet' specifies a
+   * Returns a stmt for COMPUTE INCREMENTAL STATS. The optional 'partitionSet' specifies a
    * set of partitions whose stats should be computed.
    */
   public static ComputeStatsStmt createIncrementalStatsStmt(TableName tableName,
       PartitionSet partitionSet) {
-    return new ComputeStatsStmt(tableName, null, true, partitionSet);
+    return new ComputeStatsStmt(tableName, null, true, partitionSet, null);
   }
 
   private List<String> getBaseColumnStatsQuerySelectList(Analyzer analyzer) {
-    List<String> columnStatsSelectList = Lists.newArrayList();
+    List<String> columnStatsSelectList = new ArrayList<>();
     // For Hdfs tables, exclude partition columns from stats gathering because Hive
     // cannot store them as part of the non-partition column stats. For HBase tables,
     // include the single clustering column (the row key).
-    int startColIdx = (table_ instanceof HBaseTable) ? 0 : table_.getNumClusteringCols();
+    int startColIdx = (table_ instanceof FeHBaseTable) ? 0 :
+        table_.getNumClusteringCols();
 
     for (int i = startColIdx; i < table_.getColumns().size(); ++i) {
       Column c = table_.getColumns().get(i);
+      if (validatedColumnWhitelist_ != null && !validatedColumnWhitelist_.contains(c)) {
+        continue;
+      }
       if (ignoreColumn(c)) continue;
 
       // NDV approximation function. Add explicit alias for later identification when
@@ -202,7 +256,7 @@ public class ComputeStatsStmt extends StatementBase {
       String colRefSql = ToSqlUtils.getIdentSql(c.getName());
       if (isIncremental_) {
         columnStatsSelectList.add("NDV_NO_FINALIZE(" + colRefSql + ") AS " + colRefSql);
-      } else if (effectiveSamplePerc_ > 0) {
+      } else if (isSampling()) {
         columnStatsSelectList.add(String.format("SAMPLED_NDV(%s, %.10f) AS %s",
             colRefSql, effectiveSamplePerc_, colRefSql));
       } else {
@@ -210,17 +264,9 @@ public class ComputeStatsStmt extends StatementBase {
         columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
       }
 
-      if (COUNT_NULLS) {
-        // Count the number of NULL values.
-        columnStatsSelectList.add("COUNT(IF(" + colRefSql + " IS NULL, 1, NULL))");
-      } else {
-        // Using -1 to indicate "unknown". We need cast to BIGINT because backend expects
-        // an i64Val as the number of NULLs returned by the COMPUTE STATS column stats
-        // child query. See CatalogOpExecutor::SetColumnStats(). If we do not cast, then
-        // the -1 will be treated as TINYINT resulting a 0 to be placed in the #NULLs
-        // column (see IMPALA-1068).
-        columnStatsSelectList.add("CAST(-1 as BIGINT)");
-      }
+      // Count the number of NULL values.
+      columnStatsSelectList.add("COUNT(CASE WHEN " + colRefSql +
+          " IS NULL THEN 1 ELSE NULL END)");
 
       // For STRING columns also compute the max and avg string length.
       Type type = c.getType();
@@ -313,9 +359,12 @@ public class ComputeStatsStmt extends StatementBase {
       throw new AnalysisException(String.format(
           "COMPUTE STATS not supported for nested collection: %s", tableName_));
     }
-    table_ = analyzer.getTable(tableName_, Privilege.ALTER);
+    table_ = analyzer.getTable(tableName_, Privilege.ALTER, Privilege.SELECT);
+    // Adding the check here instead of tableRef.analyze because tableRef is
+    // used at multiple places and will even disallow select.
+    analyzer.ensureTableNotFullAcid(table_);
 
-    if (!(table_ instanceof HdfsTable)) {
+    if (!(table_ instanceof FeFsTable)) {
       if (partitionSet_ != null) {
         throw new AnalysisException("COMPUTE INCREMENTAL ... PARTITION not supported " +
             "for non-HDFS table " + tableName_);
@@ -323,10 +372,30 @@ public class ComputeStatsStmt extends StatementBase {
       isIncremental_ = false;
     }
 
-    HdfsTable hdfsTable = null;
-    if (table_ instanceof HdfsTable) {
-      hdfsTable = (HdfsTable)table_;
-      if (hdfsTable.isAvroTable()) checkIncompleteAvroSchema(hdfsTable);
+    if (columnWhitelist_ != null) {
+      validatedColumnWhitelist_ = new HashSet<>();
+      for (String colName : columnWhitelist_) {
+        Column col = table_.getColumn(colName);
+        if (col == null) {
+          throw new AnalysisException(colName + " not found in table: " +
+              table_.getName());
+        }
+        if (table_ instanceof FeFsTable && table_.isClusteringColumn(col)) {
+          throw new AnalysisException("COMPUTE STATS not supported for partitioning " +
+              "column " + col.getName() + " of HDFS table.");
+        }
+        if (ignoreColumn(col)) {
+          throw new AnalysisException("COMPUTE STATS not supported for column " +
+              col.getName() + " of complex type:" + col.getType().toSql());
+        }
+        validatedColumnWhitelist_.add(col);
+      }
+    }
+
+    FeFsTable hdfsTable = null;
+    if (table_ instanceof FeFsTable) {
+      hdfsTable = (FeFsTable)table_;
+      if (hdfsTable.usesAvroSchemaOverride()) checkIncompleteAvroSchema(hdfsTable);
       if (isIncremental_ && hdfsTable.getNumClusteringCols() == 0 &&
           partitionSet_ != null) {
         throw new AnalysisException(String.format(
@@ -357,7 +426,7 @@ public class ComputeStatsStmt extends StatementBase {
 
     // Build partition filters that only select partitions without valid statistics for
     // incremental computation.
-    List<String> filterPreds = Lists.newArrayList();
+    List<String> filterPreds = new ArrayList<>();
     if (isIncremental_) {
       if (partitionSet_ == null) {
         // If any column does not have stats, we recompute statistics for all partitions
@@ -388,51 +457,51 @@ public class ComputeStatsStmt extends StatementBase {
               " does not have statistics, recomputing stats for the whole table");
         }
 
-        for (HdfsPartition p: hdfsTable.getPartitions()) {
-          if (p.isDefaultPartition()) continue;
-          TPartitionStats partStats = p.getPartitionStats();
-          if (!p.hasIncrementalStats() || tableIsMissingColStats) {
-            if (partStats == null) {
-              if (LOG.isTraceEnabled()) LOG.trace(p.toString() + " does not have stats");
-            }
+        // Get incremental statistics from all relevant partitions.
+        Collection<? extends FeFsPartition> allPartitions =
+            FeCatalogUtils.loadAllPartitions(hdfsTable);
+        Map<Long, TPartitionStats> partitionStats =
+            getOrFetchPartitionStats(analyzer, hdfsTable, allPartitions,
+                /* excludedPartitions= */ Collections.<Long>emptySet());
+        for (FeFsPartition p: allPartitions) {
+          TPartitionStats partStats = partitionStats.get(p.getId());
+          if (partStats == null || tableIsMissingColStats) {
             if (!tableIsMissingColStats) filterPreds.add(p.getConjunctSql());
-            List<String> partValues = Lists.newArrayList();
-            for (LiteralExpr partValue: p.getPartitionValues()) {
-              partValues.add(PartitionKeyValue.getPartitionKeyValueString(partValue,
-                  "NULL"));
-            }
+            // TODO(vercegovac): check what happens when "NULL" is used as a partitioning
+            // value.
+            List<String> partValues = PartitionKeyValue.getPartitionKeyValueStringList(
+                p.getPartitionValues(), "NULL");
             expectedPartitions_.add(partValues);
           } else {
-            if (LOG.isTraceEnabled()) LOG.trace(p.toString() + " does have statistics");
             validPartStats_.add(partStats);
           }
         }
-        if (expectedPartitions_.size() == hdfsTable.getPartitions().size() - 1) {
+        if (expectedPartitions_.size() == hdfsTable.getPartitions().size()) {
           expectedPartitions_.clear();
           expectAllPartitions_ = true;
         }
       } else {
         // Always compute stats on a set of partitions when told to.
-        for (HdfsPartition targetPartition: partitionSet_.getPartitions()) {
+        for (FeFsPartition targetPartition: partitionSet_.getPartitions()) {
           filterPreds.add(targetPartition.getConjunctSql());
-          List<String> partValues = Lists.newArrayList();
-          for (LiteralExpr partValue: targetPartition.getPartitionValues()) {
-            partValues.add(PartitionKeyValue.getPartitionKeyValueString(partValue,
-                "NULL"));
-          }
+          List<String> partValues = PartitionKeyValue.getPartitionKeyValueStringList(
+              targetPartition.getPartitionValues(), "NULL");
           expectedPartitions_.add(partValues);
         }
         // Create a hash set out of partitionSet_ for O(1) lookups.
-        HashSet<HdfsPartition> targetPartitions =
-            Sets.newHashSet(partitionSet_.getPartitions());
-        for (HdfsPartition p : hdfsTable.getPartitions()) {
-          if (p.isDefaultPartition()) continue;
-          if (targetPartitions.contains(p)) continue;
-          TPartitionStats partStats = p.getPartitionStats();
-          if (partStats != null) validPartStats_.add(partStats);
+        // TODO(todd) avoid loading all partitions.
+        Set<Long> targetPartitions =
+            Sets.newHashSetWithExpectedSize(partitionSet_.getPartitions().size());
+        for (FeFsPartition p: partitionSet_.getPartitions()) {
+          targetPartitions.add(p.getId());
         }
+        // Get incremental statistics for partitions that are not recomputed.
+        Collection<? extends FeFsPartition> allPartitions =
+            FeCatalogUtils.loadAllPartitions(hdfsTable);
+        Map<Long, TPartitionStats> partitionStats = getOrFetchPartitionStats(
+            analyzer, hdfsTable, allPartitions, targetPartitions);
+        validPartStats_.addAll(partitionStats.values());
       }
-
       if (filterPreds.size() == 0 && validPartStats_.size() != 0) {
         if (LOG.isTraceEnabled()) {
           LOG.trace("No partitions selected for incremental stats update");
@@ -442,8 +511,11 @@ public class ComputeStatsStmt extends StatementBase {
       }
     } else {
       // Not computing incremental stats.
-      expectAllPartitions_ = !(table_ instanceof HdfsTable) ||
-          !BackendConfig.INSTANCE.enableStatsExtrapolation();
+      expectAllPartitions_ = true;
+      if (table_ instanceof FeFsTable) {
+        expectAllPartitions_ = !FeFsTable.Utils.isStatsExtrapolationEnabled(
+            (FeFsTable) table_);
+      }
     }
 
     if (filterPreds.size() > MAX_INCREMENTAL_PARTITIONS) {
@@ -461,13 +533,13 @@ public class ComputeStatsStmt extends StatementBase {
     // Query for getting the per-partition row count and the total row count.
     StringBuilder tableStatsQueryBuilder = new StringBuilder("SELECT ");
     String countSql = "COUNT(*)";
-    if (effectiveSamplePerc_ > 0) {
+    if (isSampling()) {
       // Extrapolate the count based on the effective sampling rate.
       countSql = String.format("ROUND(COUNT(*) / %.10f)", effectiveSamplePerc_);
     }
     List<String> tableStatsSelectList = Lists.newArrayList(countSql);
     // Add group by columns for incremental stats or with extrapolation disabled.
-    List<String> groupByCols = Lists.newArrayList();
+    List<String> groupByCols = new ArrayList<>();
     if (!updateTableStatsOnly()) {
       for (Column partCol: hdfsTable.getClusteringColumns()) {
         groupByCols.add(ToSqlUtils.getIdentSql(partCol.getName()));
@@ -507,7 +579,6 @@ public class ComputeStatsStmt extends StatementBase {
 
     tableStatsQueryStr_ = tableStatsQueryBuilder.toString();
     if (LOG.isTraceEnabled()) LOG.trace("Table stats query: " + tableStatsQueryStr_);
-
     if (columnStatsSelectList.isEmpty()) {
       // Table doesn't have any columns that we can compute stats for.
       if (LOG.isTraceEnabled()) {
@@ -517,9 +588,127 @@ public class ComputeStatsStmt extends StatementBase {
       columnStatsQueryStr_ = null;
       return;
     }
-
     columnStatsQueryStr_ = columnStatsQueryBuilder.toString();
     if (LOG.isTraceEnabled()) LOG.trace("Column stats query: " + columnStatsQueryStr_);
+  }
+
+  /**
+   *  Get partition statistics from the list of partitions, omitting those in
+   *  excludedPartitions and those for which incremental statistics are not present.
+   *
+   *  If incremental stats data is not present already in the local catlaog,
+   *  partition statistics are fetched from the catalog daemon.
+   */
+  private static Map<Long, TPartitionStats> getOrFetchPartitionStats(Analyzer analyzer,
+      FeFsTable table, Collection<? extends FeFsPartition> partitions,
+      Set<Long> excludedPartitions) throws AnalysisException {
+    Preconditions.checkNotNull(partitions);
+    Preconditions.checkNotNull(excludedPartitions);
+    int expectedNumStats = partitions.size() - excludedPartitions.size();
+    Preconditions.checkArgument(expectedNumStats >= 0);
+
+    // Incremental stats are already present locally when using LocalCatalog
+    // or when testing. TODO(IMPALA-7535) fetch incremental stats separately
+    // for LocalCatlaog as well.
+    if (!BackendConfig.INSTANCE.getBackendCfg().use_local_catalog
+        && !RuntimeEnv.INSTANCE.isTestEnv()) {
+      // We're configured to fetch the statistics from catalogd, so collect the relevant
+      // partition ids.
+      List<FeFsPartition> partitionsToFetch = new ArrayList<>();
+      for (FeFsPartition p: partitions) {
+        if (excludedPartitions.contains(p.getId())) continue;
+        partitionsToFetch.add(p);
+      }
+      // Gets the partition stats from catalogd.
+      return fetchPartitionStats(analyzer, table, partitionsToFetch);
+    }
+    // Get the statistics directly from the partition, if present.
+    Map<Long, TPartitionStats> ret = Maps.newHashMapWithExpectedSize(expectedNumStats);
+    for (FeFsPartition p: partitions) {
+      if (excludedPartitions.contains(p.getId())) continue;
+      if (!p.hasIncrementalStats()) continue;
+      TPartitionStats stats = p.getPartitionStats();
+      Preconditions.checkNotNull(stats);
+      ret.put(p.getId(), stats);
+    }
+    return ret;
+  }
+
+  /**
+   * Fetches statistics for the partitions specified from the target table directly
+   * from catalogd. The partition statistics that are returned are the ones where:
+   * - incremental statistics are present
+   * - the partition is whitelisted in 'partitions'
+   * - the partition is present in the local impalad catalog
+   * TODO(vercegovac): Look into parallelizing the fetch while child-queries are
+   *                   running. Easiest would be to move this fetch to the backend.
+   */
+  private static Map<Long, TPartitionStats> fetchPartitionStats(Analyzer analyzer,
+      FeFsTable table, List<FeFsPartition> partitions) throws AnalysisException {
+    Preconditions.checkNotNull(partitions);
+    Preconditions.checkState(!RuntimeEnv.INSTANCE.isTestEnv());
+    if (partitions.isEmpty()) return Collections.emptyMap();
+    Stopwatch sw = new Stopwatch().start();
+    int numCompressedBytes = 0;
+    int totalPartitions = 0;
+    int numPartitionsWithStats = 0;
+    try {
+      TGetPartitionStatsResponse response =
+          analyzer.getCatalog().getPartitionStats(table.getTableName());
+      if (response.status.status_code != TErrorCode.OK) {
+        throw new AnalysisException(
+            "Error fetching partition statistics: " + response.status.toString());
+      }
+      if (!response.isSetPartition_stats()) return Collections.emptyMap();
+
+      // The response from catalogd is from a version of the table that may be newer
+      // than the local, impalad catalog. As a result, the response might include
+      // partitions not present locally and might not include partitions that are
+      // present locally. After stats are computed, they are sent to catalogd to update
+      // the HMS and catalog state. The catalogd already handles the case where the list
+      // of partitions are out of sync (see CatalogOpExecutor#alterTableUpdateStats).
+      // As a result, at most those partitions in the intersection between remote and
+      // local catalogs are returned.
+      Map<Long, TPartitionStats> partitionStats =
+          Maps.newHashMapWithExpectedSize(partitions.size());
+      totalPartitions = partitions.size();
+      for (FeFsPartition part: partitions) {
+        ByteBuffer compressedStats = response.partition_stats.get(
+            FeCatalogUtils.getPartitionName(part));
+        if (compressedStats != null) {
+          byte[] compressedStatsBytes = new byte[compressedStats.remaining()];
+          numCompressedBytes += compressedStatsBytes.length;
+          compressedStats.get(compressedStatsBytes);
+          TPartitionStats remoteStats =
+              PartitionStatsUtil.partStatsFromCompressedBytes(
+                  compressedStatsBytes, part);
+          if (remoteStats != null && remoteStats.isSetIntermediate_col_stats()) {
+            ++numPartitionsWithStats;
+            partitionStats.put(part.getId(), remoteStats);
+          }
+        }
+      }
+      return partitionStats;
+    } catch (Exception e) {
+      Throwables.propagateIfInstanceOf(e, AnalysisException.class);
+      throw new AnalysisException("Error fetching partition statistics", e);
+    } finally {
+      recordFetchMetrics(numCompressedBytes, totalPartitions, numPartitionsWithStats, sw);
+    }
+  }
+
+  /**
+   * Adds metrics to the frontend profile when fetching incremental stats from catalogd.
+   */
+  private static void recordFetchMetrics(int numCompressedBytes,
+      int totalPartitions, int numPartitionsWithStats, Stopwatch stopwatch) {
+    FrontendProfile profile = FrontendProfile.getCurrentOrNull();
+    if (profile == null) return;
+    profile.addToCounter(STATS_FETCH_COMPRESSED_BYTES, TUnit.BYTES, numCompressedBytes);
+    profile.addToCounter(STATS_FETCH_TOTAL_PARTITIONS, TUnit.NONE, totalPartitions);
+    profile.addToCounter(STATS_FETCH_NUM_PARTITIONS_WITH_STATS, TUnit.NONE,
+        numPartitionsWithStats);
+    profile.addToCounter(STATS_FETCH_TIME, TUnit.TIME_MS, stopwatch.elapsedMillis());
   }
 
   /**
@@ -529,17 +718,22 @@ public class ComputeStatsStmt extends StatementBase {
    * not sampling. If sampling, the returned SQL includes a fixed random seed so all
    * child queries generate a consistent sample, even if the user did not originally
    * specify REPEATABLE.
-   * No-op if this statement has no TABLESAMPLE clause.
+   * Returns the empty string if this statement has no TABLESAMPLE clause or if
+   * the effective sampling rate is 0.0 or 1.0 (see isSampling()).
    */
   private String analyzeTableSampleClause(Analyzer analyzer) throws AnalysisException {
     if (sampleParams_ == null) return "";
-    if (!(table_ instanceof HdfsTable)) {
+    if (!(table_ instanceof FeFsTable)) {
       throw new AnalysisException("TABLESAMPLE is only supported on HDFS tables.");
     }
-    if (!BackendConfig.INSTANCE.enableStatsExtrapolation()) {
-      throw new AnalysisException(
-          "COMPUTE STATS TABLESAMPLE requires --enable_stats_extrapolation=true. " +
-          "Stats extrapolation is currently disabled.");
+    FeFsTable hdfsTable = (FeFsTable) table_;
+    if (!FeFsTable.Utils.isStatsExtrapolationEnabled(hdfsTable)) {
+      throw new AnalysisException(String.format(
+          "COMPUTE STATS TABLESAMPLE requires stats extrapolation which is disabled.\n" +
+          "Stats extrapolation can be enabled service-wide with %s=true or by altering " +
+          "the table to have tblproperty %s=true",
+          "--enable_stats_extrapolation",
+          HdfsTable.TBL_PROP_ENABLE_STATS_EXTRAPOLATION));
     }
     sampleParams_.analyze(analyzer);
     long sampleSeed;
@@ -550,22 +744,38 @@ public class ComputeStatsStmt extends StatementBase {
     }
 
     // Compute the sample of files and set 'sampleFileBytes_'.
-    HdfsTable hdfsTable = (HdfsTable) table_;
-    Map<Long, List<FileDescriptor>> sample = hdfsTable.getFilesSample(
-        hdfsTable.getPartitions(), sampleParams_.getPercentBytes(), sampleSeed);
+    long minSampleBytes = analyzer.getQueryOptions().compute_stats_min_sample_size;
+    long samplePerc = sampleParams_.getPercentBytes();
+    // TODO(todd): can we avoid loading all the partitions for this?
+    Collection<? extends FeFsPartition> partitions =
+        FeCatalogUtils.loadAllPartitions(hdfsTable);
+    Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>> sample =
+            FeFsTable.Utils.getFilesSample(hdfsTable,
+        partitions, samplePerc, minSampleBytes, sampleSeed);
     long sampleFileBytes = 0;
     for (List<FileDescriptor> fds: sample.values()) {
       for (FileDescriptor fd: fds) sampleFileBytes += fd.getFileLength();
     }
 
     // Compute effective sampling percent.
-    long totalFileBytes = ((HdfsTable)table_).getTotalHdfsBytes();
+    long totalFileBytes = ((FeFsTable)table_).getTotalHdfsBytes();
     if (totalFileBytes > 0) {
       effectiveSamplePerc_ = (double) sampleFileBytes / (double) totalFileBytes;
     } else {
       effectiveSamplePerc_ = 0;
     }
     Preconditions.checkState(effectiveSamplePerc_ >= 0.0 && effectiveSamplePerc_ <= 1.0);
+
+    // Warn if we will ignore TABLESAMPLE and run the regular COMPUTE STATS.
+    if (effectiveSamplePerc_ == 1.0) {
+      Preconditions.checkState(!isSampling());
+      analyzer.addWarning(String.format(
+          "Ignoring TABLESAMPLE because the effective sampling rate is 100%%.\n" +
+          "The minimum sample size is COMPUTE_STATS_MIN_SAMPLE_SIZE=%s " +
+          "and the table size %s",
+          PrintUtils.printBytes(minSampleBytes), PrintUtils.printBytes(totalFileBytes)));
+    }
+    if (!isSampling()) return "";
 
     return " " + sampleParams_.toSql(sampleSeed);
   }
@@ -577,8 +787,8 @@ public class ComputeStatsStmt extends StatementBase {
    * AnalysisException for such ill-created Avro tables. Does nothing if
    * the column definitions match the Avro schema exactly.
    */
-  private void checkIncompleteAvroSchema(HdfsTable table) throws AnalysisException {
-    Preconditions.checkState(table.isAvroTable());
+  private void checkIncompleteAvroSchema(FeFsTable table) throws AnalysisException {
+    Preconditions.checkState(table.usesAvroSchemaOverride());
     org.apache.hadoop.hive.metastore.api.Table msTable = table.getMetaStoreTable();
     // The column definitions from 'CREATE TABLE (column definitions) ...'
     Iterator<FieldSchema> colDefs = msTable.getSd().getCols().iterator();
@@ -642,8 +852,20 @@ public class ComputeStatsStmt extends StatementBase {
    * the partition level.
    */
   private boolean updateTableStatsOnly() {
-    if (!(table_ instanceof HdfsTable)) return true;
-    return !isIncremental_ && BackendConfig.INSTANCE.enableStatsExtrapolation();
+    if (!(table_ instanceof FeFsTable)) return true;
+    return !isIncremental_ && FeFsTable.Utils.isStatsExtrapolationEnabled(
+        (FeFsTable) table_);
+  }
+
+  /**
+   * Returns true if this COMPUTE STATS statement should perform sampling.
+   * Returns false if TABLESAMPLE was not specified (effectiveSamplePerc_ == -1)
+   * or if the effective sampling percent is 0% or 100% where sampling has no benefit.
+   */
+  private boolean isSampling() {
+    Preconditions.checkState(effectiveSamplePerc_ == -1
+        || effectiveSamplePerc_ >= 0.0 || effectiveSamplePerc_ <= 1.0);
+    return effectiveSamplePerc_ > 0.0 && effectiveSamplePerc_ < 1.0;
   }
 
   /**
@@ -656,36 +878,51 @@ public class ComputeStatsStmt extends StatementBase {
     return !t.isValid() || !t.isSupported() || t.isComplexType();
   }
 
-  public String getTblStatsQuery() { return tableStatsQueryStr_; }
-  public String getColStatsQuery() { return columnStatsQueryStr_; }
+  public double getEffectiveSamplingPerc() { return effectiveSamplePerc_; }
 
   /**
-   * Returns true if this statement computes stats on Parquet partitions only,
+   * For testing.
+   */
+  public String getTblStatsQuery() { return tableStatsQueryStr_; }
+  public String getColStatsQuery() { return columnStatsQueryStr_; }
+  public Set<Column> getValidatedColumnWhitelist() { return validatedColumnWhitelist_; }
+
+  /**
+   * Returns true if this statement computes stats on Parquet/ORC partitions only,
    * false otherwise.
    */
-  public boolean isParquetOnly() {
-    if (!(table_ instanceof HdfsTable)) return false;
-    Collection<HdfsPartition> affectedPartitions = null;
+  public boolean isColumnar() {
+    if (!(table_ instanceof FeFsTable)) return false;
+    Collection<? extends FeFsPartition> affectedPartitions = null;
     if (partitionSet_ != null) {
       affectedPartitions = partitionSet_.getPartitions();
     } else {
-      affectedPartitions = ((HdfsTable) table_).getPartitions();
+      FeFsTable hdfsTable = (FeFsTable)table_;
+      affectedPartitions = FeCatalogUtils.loadAllPartitions(hdfsTable);
     }
-    for (HdfsPartition partition: affectedPartitions) {
-      if (partition.getFileFormat() != HdfsFileFormat.PARQUET) return false;
+    for (FeFsPartition partition: affectedPartitions) {
+      if (partition.getFileFormat() != HdfsFileFormat.PARQUET
+          && partition.getFileFormat() != HdfsFileFormat.ORC)
+        return false;
     }
     return true;
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     if (!isIncremental_) {
+      StringBuilder columnList = new StringBuilder();
+      if (columnWhitelist_ != null) {
+        columnList.append("(");
+        columnList.append(Joiner.on(", ").join(columnWhitelist_));
+        columnList.append(")");
+      }
       String tblsmpl = "";
-      if (sampleParams_ != null) tblsmpl = " " + sampleParams_.toSql();
-      return "COMPUTE STATS " + tableName_.toSql() + tblsmpl;
+      if (sampleParams_ != null) tblsmpl = " " + sampleParams_.toSql(options);
+      return "COMPUTE STATS " + tableName_.toSql() + columnList.toString() + tblsmpl;
     } else {
-      return "COMPUTE INCREMENTAL STATS " + tableName_.toSql() +
-          partitionSet_ == null ? "" : partitionSet_.toSql();
+      return "COMPUTE INCREMENTAL STATS " + tableName_.toSql()
+          + (partitionSet_ == null ? "" : partitionSet_.toSql(options));
     }
   }
 
@@ -703,10 +940,10 @@ public class ComputeStatsStmt extends StatementBase {
     params.setExpect_all_partitions(expectAllPartitions_);
     if (!expectAllPartitions_) params.setExpected_partitions(expectedPartitions_);
     if (isIncremental_) {
-      params.setNum_partition_cols(((HdfsTable)table_).getNumClusteringCols());
+      params.setNum_partition_cols(((FeFsTable)table_).getNumClusteringCols());
     }
-    if (table_ instanceof HdfsTable) {
-      params.setTotal_file_bytes(((HdfsTable)table_).getTotalHdfsBytes());
+    if (table_ instanceof FeFsTable) {
+      params.setTotal_file_bytes(((FeFsTable)table_).getTotalHdfsBytes());
     }
     return params;
   }

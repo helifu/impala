@@ -17,70 +17,135 @@
 
 package org.apache.impala.authorization;
 
+import java.util.EnumSet;
+import java.util.Set;
+
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Sets;
+import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeTable;
 
 /**
  * Class that helps build PrivilegeRequest objects.
- * For example:
- * PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder();
- * PrivilegeRequest = builder.allOf(Privilege.SELECT).onTable("db", "tbl").toRequest();
  *
- * TODO: In the future, this class could be extended to provide the option to specify
- * multiple permissions. For example:
- * builder.allOf(SELECT, INSERT).onTable(..);
- * It could also be extended to support an "anyOf" to check if the user has any of the
- * permissions specified:
- * builder.anyOf(SELECT, INSERT).onTable(...);
+ * For example:
+ * PrivilegeRequestBuilder builder = new PrivilegeRequestBuilder(
+ *     new AuthorizableFactory(AuthorizationProvider.SENTRY));
+ * PrivilegeRequest = builder.allOf(Privilege.SELECT).onTable("db", "tbl").build();
  */
 public class PrivilegeRequestBuilder {
-  Authorizeable authorizeable_;
-  Privilege privilege_;
+  private final AuthorizableFactory authzFactory_;
+  private Authorizable authorizable_;
+  private Privilege privilege_;
+  private EnumSet<Privilege> privilegeSet_;
+  private boolean grantOption_ = false;
+
+  public PrivilegeRequestBuilder(AuthorizableFactory authzFactory) {
+    Preconditions.checkNotNull(authzFactory);
+    authzFactory_ = authzFactory;
+  }
 
   /**
-   * Sets the authorizeable object to be a column.
+   * Sets the authorizable object to be a function.
    */
-  public PrivilegeRequestBuilder onColumn(String dbName, String tableName,
-      String columnName) {
-    authorizeable_ = new AuthorizeableColumn(dbName, tableName, columnName);
+  public PrivilegeRequestBuilder onFunction(String dbName, String fnName) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newFunction(dbName, fnName);
     return this;
   }
 
   /**
-   * Sets the authorizeable object to be a table.
+   * Sets the authorizable object to be a URI.
    */
-  public PrivilegeRequestBuilder onTable(String dbName, String tableName) {
-    authorizeable_ = new AuthorizeableTable(dbName, tableName);
+  public PrivilegeRequestBuilder onUri(String uriName) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newUri(uriName);
     return this;
   }
 
   /**
-   * Sets the authorizeable object to be a server.
+   * Sets the authorizable object to be a table.
+   */
+  public PrivilegeRequestBuilder onTable(FeTable table) {
+    Preconditions.checkNotNull(table);
+    String dbName = Preconditions.checkNotNull(table.getTableName().getDb());
+    String tblName = Preconditions.checkNotNull(table.getTableName().getTbl());
+    return onTable(dbName, tblName, table.getOwnerUser());
+  }
+
+  /**
+   * Sets the authorizable object to be a table.
+   */
+  public PrivilegeRequestBuilder onTable(
+      String dbName, String tableName, String ownerUser) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newTable(dbName, tableName, ownerUser);
+    return this;
+  }
+
+  public PrivilegeRequestBuilder onTableUnknownOwner(String dbName, String tableName) {
+    // Useful when owner cannot be determined because the table does not exist.
+    // This call path is specifically meant for cases that try to mask the
+    // TableNotFound AnalysisExceptions and instead propagate that as an
+    // AuthorizationException.
+    return onTable(dbName, tableName, null);
+  }
+
+  /**
+   * Sets the authorizable object to be a server.
    */
   public PrivilegeRequestBuilder onServer(String serverName) {
-    authorizeable_ = new AuthorizeableServer(serverName);
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newServer(serverName);
     return this;
   }
 
   /**
-   * Sets the authorizeable object to be a database.
+   * Sets the authorizable object to be a database.
    */
-  public PrivilegeRequestBuilder onDb(String dbName) {
-    authorizeable_ = new AuthorizeableDb(dbName);
+  public PrivilegeRequestBuilder onDb(FeDb db) {
+    Preconditions.checkState(authorizable_ == null);
+    Preconditions.checkNotNull(db);
+    return onDb(db.getName(), db.getMetaStoreDb().getOwnerName());
+  }
+
+  /**
+   * Sets the authorizable object to be a database.
+   */
+  public PrivilegeRequestBuilder onDb(String dbName, String ownerUser) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newDatabase(dbName, ownerUser);
     return this;
   }
 
   /**
-   * Specifies that permissions on any table in the given database.
+   * Sets the authorizable object to be a column.
    */
-  public PrivilegeRequestBuilder onAnyTable(String dbName) {
-    return onTable(dbName, AuthorizeableTable.ANY_TABLE_NAME);
+  public PrivilegeRequestBuilder onColumn(String dbName, String tableName,
+      String columnName, String tblOwnerUser) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ =
+        authzFactory_.newColumnInTable(dbName, tableName, columnName, tblOwnerUser);
+    return this;
   }
 
   /**
    * Specifies that permissions on any column in the given table.
    */
-  public PrivilegeRequestBuilder onAnyColumn(String dbName, String tableName) {
-    return onColumn(dbName, tableName, AuthorizeableColumn.ANY_COLUMN_NAME);
+  public PrivilegeRequestBuilder onAnyColumn(
+      String dbName, String tableName, String tblOwnerUser) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newColumnInTable(dbName, tableName, tblOwnerUser);
+    return this;
+  }
+
+  /**
+   * Specifies that permissions on any column in any table.
+   */
+  public PrivilegeRequestBuilder onAnyColumn(String dbName, String dbOwnerUser) {
+    Preconditions.checkState(authorizable_ == null);
+    authorizable_ = authzFactory_.newColumnAllTbls(dbName, dbOwnerUser);
+    return this;
   }
 
   /**
@@ -88,6 +153,14 @@ public class PrivilegeRequestBuilder {
    */
   public PrivilegeRequestBuilder allOf(Privilege privilege) {
     privilege_ = privilege;
+    return this;
+  }
+
+  /**
+   * Specifies any of the privileges the user needs to have.
+   */
+  public PrivilegeRequestBuilder anyOf(EnumSet<Privilege> privileges) {
+    privilegeSet_ = privileges;
     return this;
   }
 
@@ -108,12 +181,30 @@ public class PrivilegeRequestBuilder {
   }
 
   /**
-   * Builds a PrivilegeRequest object based on the current Authorizeable object
+   * Specifies that grant option is required.
+   */
+  public PrivilegeRequestBuilder grantOption() {
+    grantOption_ = true;
+    return this;
+  }
+
+  /**
+   * Builds a PrivilegeRequest object based on the current Authorizable object
    * and privilege settings.
    */
-  public PrivilegeRequest toRequest() {
-    Preconditions.checkNotNull(authorizeable_);
+  public PrivilegeRequest build() {
+    Preconditions.checkNotNull(authorizable_);
     Preconditions.checkNotNull(privilege_);
-    return new PrivilegeRequest(authorizeable_, privilege_);
+    return new PrivilegeRequest(authorizable_, privilege_, grantOption_);
+  }
+
+  public Set<PrivilegeRequest> buildSet() {
+    Preconditions.checkNotNull(authorizable_);
+    Preconditions.checkNotNull(privilegeSet_);
+    Set<PrivilegeRequest> privileges = Sets.newHashSet();
+    for (Privilege p : privilegeSet_) {
+      privileges.add(new PrivilegeRequest(authorizable_, p, grantOption_));
+    }
+    return privileges;
   }
 }

@@ -49,7 +49,7 @@ using std::random_device;
 
 namespace impala {
 
-static const string LOCALHOST("127.0.0.1");
+const string LOCALHOST_IP_STR("127.0.0.1");
 
 Status GetHostname(string* hostname) {
   char name[HOST_NAME_MAX];
@@ -122,7 +122,7 @@ bool IsResolvedAddress(const TNetworkAddress& addr) {
 
 bool FindFirstNonLocalhost(const vector<string>& addresses, string* addr) {
   for (const string& candidate: addresses) {
-    if (candidate != LOCALHOST) {
+    if (candidate != LOCALHOST_IP_STR) {
       *addr = candidate;
       return true;
     }
@@ -157,35 +157,32 @@ TNetworkAddress MakeNetworkAddress(const string& address) {
   return ret;
 }
 
-/// Utility method because Thrift does not supply useful constructors
-TBackendDescriptor MakeBackendDescriptor(const Hostname& hostname, const IpAddr& ip,
-    int port) {
-  TBackendDescriptor be_desc;
-  be_desc.address = MakeNetworkAddress(hostname, port);
-  be_desc.ip_address = ip;
-  be_desc.is_coordinator = true;
-  be_desc.is_executor = true;
-  return be_desc;
-}
-
 bool IsWildcardAddress(const string& ipaddress) {
   return ipaddress == "0.0.0.0";
 }
 
 string TNetworkAddressToString(const TNetworkAddress& address) {
   stringstream ss;
-  ss << address;
+  ss << address.hostname << ":" << dec << address.port;
   return ss.str();
 }
 
-ostream& operator<<(ostream& out, const TNetworkAddress& hostport) {
-  out << hostport.hostname << ":" << dec << hostport.port;
-  return out;
+string NetworkAddressPBToString(const NetworkAddressPB& address) {
+  stringstream ss;
+  ss << address.hostname() << ":" << dec << address.port();
+  return ss.str();
+}
+
+TNetworkAddress FromNetworkAddressPB(const NetworkAddressPB& address) {
+  TNetworkAddress t_address;
+  t_address.__set_hostname(address.hostname());
+  t_address.__set_port(address.port());
+  return t_address;
 }
 
 /// Pick a random port in the range of ephemeral ports
 /// https://tools.ietf.org/html/rfc6335
-int FindUnusedEphemeralPort(vector<int>* used_ports) {
+int FindUnusedEphemeralPort() {
   static uint32_t LOWER = 49152, UPPER = 65000;
   random_device rd;
   srand(rd());
@@ -198,15 +195,10 @@ int FindUnusedEphemeralPort(vector<int>* used_ports) {
   server_address.sin_addr.s_addr = INADDR_ANY;
   for (int tries = 0; tries < 100; ++tries) {
     int port = LOWER + rand() % (UPPER - LOWER);
-    if (used_ports != nullptr
-        && find(used_ports->begin(), used_ports->end(), port) != used_ports->end()) {
-      continue;
-    }
     server_address.sin_port = htons(port);
     if (bind(sockfd, reinterpret_cast<struct sockaddr*>(&server_address),
         sizeof(server_address)) == 0) {
       close(sockfd);
-      if (used_ports != nullptr) used_ports->push_back(port);
       return port;
     }
   }

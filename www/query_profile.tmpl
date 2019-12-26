@@ -24,16 +24,25 @@ under the License.
 
 {{> www/query_detail_tabs.tmpl }}
 
-<h4>
-  <a href="/query_profile_encoded?query_id={{query_id}}" download="profile_{{query_id}}">
-    Download Thrift Profile
-  </a>
-</h4>
+<br/>
+<div>
+    <h4>Download Profile (Available Formats):
+        <a style="font-size:16px;" class="btn btn-primary"
+            href="{{ __common__.host-url }}/query_profile_encoded?query_id={{query_id}}"
+            download="thrift_profile_{{query_id}}">Thrift</a>
+        <a style="font-size:16px;" class="btn btn-primary"
+            href="{{ __common__.host-url }}/query_profile_json?query_id={{query_id}}"
+            download="json_profile_{{query_id}}">Json</a>
+        <a style="font-size:16px;" class="btn btn-primary"
+            href="{{ __common__.host-url }}/query_profile_plain_text?query_id={{query_id}}"
+            download="profile_{{query_id}}">Text</a>
+    </h4>
+</div>
 
 <pre>{{profile}}</pre>
 
 <script>
-document.getElementById("profile-tab").className = "active";
+$("#profile-tab").addClass("active");
 </script>
 {{> www/common-footer.tmpl }}
 

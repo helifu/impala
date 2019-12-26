@@ -17,28 +17,38 @@
 
 #include "kudu/util/pstack_watcher.h"
 
-#include <memory>
-#include <stdio.h>
-#include <string>
-#include <sys/types.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <string>
 #include <vector>
 
+#include <boost/bind.hpp>
+#include <glog/logging.h>
+
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/strings/numbers.h"
+#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/env.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/thread.h"
 
 namespace kudu {
 
-using std::shared_ptr;
 using std::string;
 using std::vector;
+using strings::SkipEmpty;
+using strings::SkipWhitespace;
+using strings::Split;
 using strings::Substitute;
 
 PstackWatcher::PstackWatcher(MonoDelta timeout)
-    : timeout_(std::move(timeout)), running_(true), cond_(&lock_) {
+    : timeout_(timeout), running_(true), cond_(&lock_) {
   CHECK_OK(Thread::Create("pstack_watcher", "pstack_watcher",
                  boost::bind(&PstackWatcher::Run, this), &thread_));
 }
@@ -74,7 +84,7 @@ void PstackWatcher::Wait() const {
 void PstackWatcher::Run() {
   MutexLock guard(lock_);
   if (!running_) return;
-  cond_.TimedWait(timeout_);
+  cond_.WaitFor(timeout_);
   if (!running_) return;
 
   WARN_NOT_OK(DumpStacks(DUMP_FULL), "Unable to print pstack from watcher");
@@ -98,6 +108,55 @@ Status PstackWatcher::HasProgram(const char* progname) {
   return Status::NotFound(Substitute("can't find $0: $1", progname, exit_info));
 }
 
+Status PstackWatcher::HasGoodGdb() {
+  // Check for the existence of gdb.
+  RETURN_NOT_OK(HasProgram("gdb"));
+
+  // gdb exists, run it and parse the output of --version. For example:
+  //
+  // GNU gdb (GDB) Red Hat Enterprise Linux (7.2-75.el6)
+  // ...
+  //
+  // Or:
+  //
+  // GNU gdb (Ubuntu 7.11.1-0ubuntu1~16.5) 7.11.1
+  // ...
+  string stdout;
+  RETURN_NOT_OK(Subprocess::Call({"gdb", "--version"}, "", &stdout));
+  vector<string> lines = Split(stdout, "\n", SkipEmpty());
+  if (lines.empty()) {
+    return Status::Incomplete("gdb version not found");
+  }
+  vector<string> words = Split(lines[0], " ", SkipWhitespace());
+  if (words.empty()) {
+    return Status::Incomplete("could not parse gdb version");
+  }
+  string version = words[words.size() - 1];
+  version = StripPrefixString(version, "(");
+  version = StripSuffixString(version, ")");
+
+  // The variable pretty print routine in older versions of gdb is buggy in
+  // that it reads the values of all local variables, including uninitialized
+  // ones. For some variable types with an embedded length (such as std::string
+  // or std::vector), this can lead to all sorts of incorrect memory accesses,
+  // causing deadlocks or seemingly infinite loops within gdb.
+  //
+  // It's not clear exactly when this behavior was fixed, so we whitelist the
+  // oldest known good version: the one found in Ubuntu 14.04.
+  //
+  // See the following gdb bug reports for more information:
+  // - https://sourceware.org/bugzilla/show_bug.cgi?id=11868
+  // - https://sourceware.org/bugzilla/show_bug.cgi?id=12127
+  // - https://sourceware.org/bugzilla/show_bug.cgi?id=16196
+  // - https://sourceware.org/bugzilla/show_bug.cgi?id=16286
+  autodigit_less lt;
+  if (lt(version, "7.7")) {
+    return Status::NotSupported("gdb version too old", version);
+  }
+
+  return Status::OK();
+}
+
 Status PstackWatcher::DumpStacks(int flags) {
   return DumpPidStacks(getpid(), flags);
 }
@@ -105,50 +164,43 @@ Status PstackWatcher::DumpStacks(int flags) {
 Status PstackWatcher::DumpPidStacks(pid_t pid, int flags) {
 
   // Prefer GDB if available; it gives us line numbers and thread names.
-  if (HasProgram("gdb").ok()) {
+  Status s = HasGoodGdb();
+  if (s.ok()) {
     return RunGdbStackDump(pid, flags);
   }
+  WARN_NOT_OK(s, "gdb not available");
 
   // Otherwise, try to use pstack or gstack.
-  const char *progname = nullptr;
-  if (HasProgram("pstack").ok()) {
-    progname = "pstack";
-  } else if (HasProgram("gstack").ok()) {
-    progname = "gstack";
+  for (const auto& p : { "pstack", "gstack" }) {
+    s = HasProgram(p);
+    if (s.ok()) {
+      return RunPstack(p, pid);
+    }
+    WARN_NOT_OK(s, Substitute("$0 not available", p));
   }
 
-  if (!progname) {
-    return Status::ServiceUnavailable("Neither gdb, pstack, nor gstack appears to be installed.");
-  }
-  return RunPstack(progname, pid);
+  return Status::ServiceUnavailable("Neither gdb, pstack, nor gstack appear to be installed.");
 }
 
 Status PstackWatcher::RunGdbStackDump(pid_t pid, int flags) {
   // Command: gdb -quiet -batch -nx -ex cmd1 -ex cmd2 /proc/$PID/exe $PID
   vector<string> argv;
-  argv.push_back("gdb");
+  argv.emplace_back("gdb");
   // Don't print introductory version/copyright messages.
-  argv.push_back("-quiet");
+  argv.emplace_back("-quiet");
   // Exit after processing all of the commands below.
-  argv.push_back("-batch");
+  argv.emplace_back("-batch");
   // Don't run commands from .gdbinit
-  argv.push_back("-nx");
-  // On RHEL6 and older Ubuntu, we occasionally would see gdb spin forever
-  // trying to collect backtraces. Setting a backtrace limit is a reasonable
-  // workaround, since we don't really expect >100-deep stacks anyway.
-  //
-  // See https://bugs.launchpad.net/ubuntu/+source/gdb/+bug/434168
-  argv.push_back("-ex");
-  argv.push_back("set backtrace limit 100");
-  argv.push_back("-ex");
-  argv.push_back("set print pretty on");
-  argv.push_back("-ex");
-  argv.push_back("info threads");
-  argv.push_back("-ex");
-  argv.push_back("thread apply all bt");
+  argv.emplace_back("-nx");
+  argv.emplace_back("-ex");
+  argv.emplace_back("set print pretty on");
+  argv.emplace_back("-ex");
+  argv.emplace_back("info threads");
+  argv.emplace_back("-ex");
+  argv.emplace_back("thread apply all bt");
   if (flags & DUMP_FULL) {
-    argv.push_back("-ex");
-    argv.push_back("thread apply all bt full");
+    argv.emplace_back("-ex");
+    argv.emplace_back("thread apply all bt full");
   }
   string executable;
   Env* env = Env::Default();
@@ -173,7 +225,9 @@ Status PstackWatcher::RunStackDump(const vector<string>& argv) {
   }
   Subprocess pstack_proc(argv);
   RETURN_NOT_OK_PREPEND(pstack_proc.Start(), "RunStackDump proc.Start() failed");
-  if (::close(pstack_proc.ReleaseChildStdinFd()) == -1) {
+  int ret;
+  RETRY_ON_EINTR(ret, ::close(pstack_proc.ReleaseChildStdinFd()));
+  if (ret == -1) {
     return Status::IOError("Unable to close child stdin", ErrnoToString(errno), errno);
   }
   RETURN_NOT_OK_PREPEND(pstack_proc.Wait(), "RunStackDump proc.Wait() failed");

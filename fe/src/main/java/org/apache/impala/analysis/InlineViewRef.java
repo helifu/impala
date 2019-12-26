@@ -18,13 +18,13 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.impala.catalog.ColumnStats;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.slf4j.Logger;
@@ -43,7 +43,7 @@ public class InlineViewRef extends TableRef {
 
   // Catalog or local view that is referenced.
   // Null for inline views parsed directly from a query string.
-  private final View view_;
+  private final FeView view_;
 
   // If not null, these will serve as the column labels for the inline view. This provides
   // a layer of separation between column labels visible from outside the inline view
@@ -61,7 +61,7 @@ public class InlineViewRef extends TableRef {
   protected Analyzer inlineViewAnalyzer_;
 
   // list of tuple ids materialized by queryStmt
-  protected final ArrayList<TupleId> materializedTupleIds_ = Lists.newArrayList();
+  protected final List<TupleId> materializedTupleIds_ = new ArrayList<>();
 
   // Map inline view's output slots to the corresponding resultExpr of queryStmt.
   protected final ExprSubstitutionMap smap_;
@@ -93,9 +93,9 @@ public class InlineViewRef extends TableRef {
   /**
    * C'tor for creating inline views that replace a local or catalog view ref.
    */
-  public InlineViewRef(View view, TableRef origTblRef) {
+  public InlineViewRef(FeView view, TableRef origTblRef) {
     super(view.getTableName().toPath(), origTblRef.getExplicitAlias(),
-        origTblRef.getPrivilege());
+        origTblRef.getPrivilege(), origTblRef.requireGrantOption());
     queryStmt_ = view.getQueryStmt().clone();
     queryStmt_.reset();
     if (view.isLocalView()) queryStmt_.reset();
@@ -145,7 +145,7 @@ public class InlineViewRef extends TableRef {
     // Catalog views refs require special analysis settings for authorization.
     boolean isCatalogView = (view_ != null && !view_.isLocalView());
     if (isCatalogView) {
-      analyzer.registerAuthAndAuditEvent(view_, priv_);
+      analyzer.registerAuthAndAuditEvent(view_, priv_, requireGrantOption_);
       if (inlineViewAnalyzer_.isExplain()) {
         // If the user does not have privileges on the view's definition
         // then we report a masked authorization error so as not to reveal
@@ -164,7 +164,7 @@ public class InlineViewRef extends TableRef {
     inlineViewAnalyzer_.setUseHiveColLabels(
         isCatalogView ? true : analyzer.useHiveColLabels());
     queryStmt_.analyze(inlineViewAnalyzer_);
-    correlatedTupleIds_.addAll(queryStmt_.getCorrelatedTupleIds(inlineViewAnalyzer_));
+    correlatedTupleIds_.addAll(queryStmt_.getCorrelatedTupleIds());
     if (explicitColLabels_ != null) {
       Preconditions.checkState(
           explicitColLabels_.size() == queryStmt_.getColLabels().size());
@@ -215,6 +215,7 @@ public class InlineViewRef extends TableRef {
       LOG.trace("inline view " + getUniqueAlias() + " baseTblSmap: " +
           baseTblSmap_.debugString());
     }
+    Preconditions.checkState(baseTblSmap_.checkComposedFrom(smap_));
 
     analyzeTableSample(analyzer);
     analyzeHints(analyzer);
@@ -246,8 +247,8 @@ public class InlineViewRef extends TableRef {
       throws AnalysisException {
     int numColLabels = getColLabels().size();
     Preconditions.checkState(numColLabels > 0);
-    HashSet<String> uniqueColAliases = Sets.newHashSetWithExpectedSize(numColLabels);
-    ArrayList<StructField> fields = Lists.newArrayListWithCapacity(numColLabels);
+    Set<String> uniqueColAliases = Sets.newHashSetWithExpectedSize(numColLabels);
+    List<StructField> fields = Lists.newArrayListWithCapacity(numColLabels);
     for (int i = 0; i < numColLabels; ++i) {
       // inline view select statement has been analyzed. Col label should be filled.
       Expr selectItemExpr = queryStmt_.getResultExprs().get(i);
@@ -307,6 +308,8 @@ public class InlineViewRef extends TableRef {
     return queryStmt_.getColLabels();
   }
 
+  public FeView getView() { return view_; }
+
   @Override
   protected TableRef clone() { return new InlineViewRef(this); }
 
@@ -321,21 +324,18 @@ public class InlineViewRef extends TableRef {
   }
 
   @Override
-  protected String tableRefToSql() {
+  protected String tableRefToSql(ToSqlOptions options) {
     // Enclose the alias in quotes if Hive cannot parse it without quotes.
     // This is needed for view compatibility between Impala and Hive.
-    String aliasSql = null;
     String alias = getExplicitAlias();
-    if (alias != null) aliasSql = ToSqlUtils.getIdentSql(alias);
     if (view_ != null) {
-      return view_.getTableName().toSql() + (aliasSql == null ? "" : " " + aliasSql);
+      return view_.getTableName().toSql() + ToSqlUtils.formatAlias(alias);
     }
-    Preconditions.checkNotNull(aliasSql);
     StringBuilder sql = new StringBuilder()
         .append("(")
-        .append(queryStmt_.toSql())
-        .append(") ")
-        .append(aliasSql);
+        .append(queryStmt_.toSql(options))
+        .append(")")
+        .append(ToSqlUtils.formatAlias(alias));
     // Add explicit col labels for debugging even though this syntax isn't supported.
     if (explicitColLabels_ != null) {
       sql.append(" (");

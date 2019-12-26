@@ -17,8 +17,12 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
+
 import org.apache.impala.analysis.Analyzer;
+import org.apache.impala.analysis.Expr;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.thrift.TExecNodePhase;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
@@ -89,7 +93,7 @@ public class SubplanNode extends PlanNode {
     } else {
       cardinality_ = -1;
     }
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
   }
 
   @Override
@@ -116,14 +120,27 @@ public class SubplanNode extends PlanNode {
   }
 
   @Override
+  public void computePipelineMembership() {
+    children_.get(0).computePipelineMembership();
+    pipelines_ = new ArrayList<>();
+    for (PipelineMembership leftPipeline : children_.get(0).getPipelines()) {
+      if (leftPipeline.getPhase() == TExecNodePhase.GETNEXT) {
+          pipelines_.add(new PipelineMembership(
+              leftPipeline.getId(), leftPipeline.getHeight() + 1, TExecNodePhase.GETNEXT));
+      }
+    }
+    children_.get(1).setPipelinesRecursive(pipelines_);
+  }
+
+  @Override
   protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
     output.append(String.format("%s%s\n", prefix, getDisplayLabel()));
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
       if (!conjuncts_.isEmpty()) {
-        output.append(detailPrefix + "predicates: " +
-            getExplainString(conjuncts_) + "\n");
+        output.append(detailPrefix
+            + "predicates: " + Expr.getExplainString(conjuncts_, detailLevel) + "\n");
       }
     }
     return output.toString();

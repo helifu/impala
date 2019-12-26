@@ -36,7 +36,10 @@ under the License.
       <th>Num. instances</th>
       <th>Num. remaining instances</th>
       <th>Done</th>
-      <th>Peak mem. consumption</th>
+      <th>Peak per-host mem. consumption</th>
+      <th>Scan bytes read</th>
+      <th>User CPU(s)</th>
+      <th>Kernel CPU(s)</th>
       <th>Time since last report (ms)</th>
     </tr>
   </thead>
@@ -46,8 +49,6 @@ under the License.
 </table>
 
 <script>
-document.getElementById("backends-tab").className = "active";
-
 var intervalId = 0;
 var table = null;
 var refresh = function () {
@@ -57,14 +58,17 @@ var refresh = function () {
 
 $(document).ready(function() {
     table = $('#backends').DataTable({
-        ajax: { url: "/query_backends?query_id={{query_id}}&json",
+        ajax: { url: make_url("/query_backends?query_id={{query_id}}&json"),
                 dataSrc: "backend_states",
               },
         "columns": [ {data: 'host'},
                      {data: 'num_instances'},
                      {data: 'num_remaining_instances'},
                      {data: 'done'},
-                     {data: 'peak_mem_consumption'},
+                     {data: 'peak_per_host_mem_consumption', render: renderSize},
+                     {data: 'bytes_read', render: renderSize},
+                     {data: 'cpu_user_s'},
+                     {data: 'cpu_sys_s'},
                      {data: 'time_since_last_heard_from'}],
         "order": [[ 0, "desc" ]],
         "pageLength": 100
@@ -87,8 +91,13 @@ function toggleRefresh() {
 
 {{^backend_states}}
 <div class="alert alert-info" role="alert">
-Query <strong>{{query_id}}</strong> has completed, or has no backends.
+Query <strong>{{query_id}}</strong> has either completed or has no backends or has not
+started any backends yet.
 </div>
 {{/backend_states}}
+
+<script>
+$("#backends-tab").addClass("active");
+</script>
 
 {{> www/common-footer.tmpl }}

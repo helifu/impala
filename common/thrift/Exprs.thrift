@@ -21,24 +21,26 @@ namespace java org.apache.impala.thrift
 include "Types.thrift"
 
 enum TExprNodeType {
-  NULL_LITERAL,
-  BOOL_LITERAL,
-  INT_LITERAL,
-  FLOAT_LITERAL,
-  STRING_LITERAL,
-  DECIMAL_LITERAL,
-  TIMESTAMP_LITERAL,
-  CASE_EXPR,
-  COMPOUND_PRED,
-  IN_PRED,
-  IS_NULL_PRED,
-  LIKE_PRED,
-  SLOT_REF,
-  TUPLE_IS_NULL_PRED,
-  FUNCTION_CALL,
-  AGGREGATE_EXPR,
-  IS_NOT_EMPTY_PRED,
-  KUDU_PARTITION_EXPR
+  NULL_LITERAL = 0
+  BOOL_LITERAL = 1
+  INT_LITERAL = 2
+  FLOAT_LITERAL = 3
+  STRING_LITERAL = 4
+  DECIMAL_LITERAL = 5
+  TIMESTAMP_LITERAL = 6
+  CASE_EXPR = 7
+  COMPOUND_PRED = 8
+  IN_PRED = 9
+  IS_NULL_PRED = 10
+  LIKE_PRED = 11
+  SLOT_REF = 12
+  TUPLE_IS_NULL_PRED = 13
+  FUNCTION_CALL = 14
+  AGGREGATE_EXPR = 15
+  IS_NOT_EMPTY_PRED = 16
+  KUDU_PARTITION_EXPR = 17
+  VALID_TUPLE_ID_EXPR = 18
+  DATE_LITERAL = 19
 }
 
 struct TBoolLiteral {
@@ -51,7 +53,10 @@ struct TCaseExpr {
 }
 
 struct TDateLiteral {
-  1: required Types.TTimestamp value
+  // Number of days since 1970-01-01.
+  1: required i32 days_since_epoch
+  // String representation
+  2: required string date_string
 }
 
 struct TDecimalLiteral {
@@ -77,15 +82,16 @@ struct TTimestampLiteral {
 // in any messages. This enum is here to provide a single definition that can be shared
 // by the front and backend.
 enum TExtractField {
-  INVALID_FIELD,
-  YEAR,
-  MONTH,
-  DAY,
-  HOUR,
-  MINUTE,
-  SECOND,
-  MILLISECOND,
-  EPOCH
+  INVALID_FIELD = 0
+  YEAR = 1
+  QUARTER = 2
+  MONTH = 3
+  DAY = 4
+  HOUR = 5
+  MINUTE = 6
+  SECOND = 7
+  MILLISECOND = 8
+  EPOCH = 9
 }
 
 struct TInPredicate {
@@ -135,6 +141,11 @@ struct TKuduPartitionExpr {
   2: required list<i32> referenced_columns
 }
 
+struct TCastExpr {
+  // Holds the format clause of a cast expression.
+  1: required string cast_format
+}
+
 // This is essentially a union over the subclasses of Expr.
 struct TExprNode {
   1: required TExprNodeType node_type
@@ -165,6 +176,7 @@ struct TExprNode {
   19: optional TAggregateExpr agg_expr
   20: optional TTimestampLiteral timestamp_literal
   21: optional TKuduPartitionExpr kudu_partition_expr
+  22: optional TCastExpr cast_expr
 }
 
 // A flattened representation of a tree of Expr nodes, obtained by depth-first

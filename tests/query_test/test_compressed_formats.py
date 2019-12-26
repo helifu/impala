@@ -23,7 +23,7 @@ from os.path import join
 from subprocess import call
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
@@ -40,6 +40,7 @@ compression_formats = [
 # Missing Coverage: Compressed data written by Hive is queriable by Impala on a non-hdfs
 # filesystem.
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
@@ -71,21 +72,14 @@ class TestCompressedFormats(ImpalaTestSuite):
     file_format = vector.get_value('file_format')
     extension, suffix = vector.get_value('compression_format')
     if file_format in ['rc', 'seq']:
-      # Test that compressed RC/sequence files are supported.
+      # TODO: How about LZO?
+      # Test that {gzip,snappy,bzip,deflate}-compressed
+      # {RC,sequence,text} files are supported.
       db_suffix = '_%s_%s' % (file_format, suffix)
       self._copy_and_query_compressed_file(
-       'tinytable', db_suffix, suffix, '000000_0', extension)
+        'tinytable', db_suffix, suffix, '000000_0', extension)
     elif file_format is 'text':
-      # TODO: How about LZO?
-      if suffix in ['gzip', 'snap', 'bzip']:
-        # Test that {gzip,snappy,bzip}-compressed text files are supported.
-        db_suffix = '_%s_%s' % (file_format, suffix)
-        self._copy_and_query_compressed_file(
-          'tinytable', db_suffix, suffix, '000000_0', extension)
-      else:
-        # Deflate-compressed (['def']) text files (or at least text files with a
-        # compressed extension) have not been tested yet.
-        pytest.skip("Skipping the text/def tests")
+        pytest.xfail('IMPALA-9004: TestCompressedFormats is broken for text files')
     else:
       assert False, "Unknown file_format: %s" % file_format
 
@@ -110,8 +104,8 @@ class TestCompressedFormats(ImpalaTestSuite):
     hive_cmd = drop_cmd + 'CREATE TABLE %s LIKE %s;' % (dest_table, src_table)
 
     # Create the table
-    call(["hive", "-e", hive_cmd]);
-    call(["hadoop", "fs", "-cp", src_file, dest_file])
+    self.run_stmt_in_hive(hive_cmd)
+    self.filesystem_client.copy(src_file, dest_file, overwrite=True)
     # Try to read the compressed file with extension
     query = 'select count(*) from %s' % dest_table
     try:
@@ -120,6 +114,7 @@ class TestCompressedFormats(ImpalaTestSuite):
       result = self.execute_scalar(query)
       # Fail iff we expected an error
       assert expected_error is None, 'Query is expected to fail'
+      assert result and int(result) > 0
     except Exception as e:
       error_msg = str(e)
       print error_msg
@@ -127,73 +122,27 @@ class TestCompressedFormats(ImpalaTestSuite):
         print "Unexpected error:\n%s", error_msg
         raise
     finally:
-      call(["hive", "-e", drop_cmd]);
+      self.run_stmt_in_hive(drop_cmd)
 
-class TestTableWriters(ImpalaTestSuite):
+class TestUnsupportedTableWriters(ImpalaTestSuite):
   @classmethod
   def get_workload(cls):
     return 'functional-query'
 
   @classmethod
   def add_test_dimensions(cls):
-    super(TestTableWriters, cls).add_test_dimensions()
+    super(TestUnsupportedTableWriters, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
-    # This class tests many formats, but doesn't use the contraints
-    # Each format is tested within one test file, we constrain to text/none
-    # as each test file only needs to be run once.
+    # This class tests different formats, but doesn't use constraints.
+    # The constraint added below is only to make sure that the test file runs once.
     cls.ImpalaTestMatrix.add_constraint(lambda v:
         (v.get_value('table_format').file_format =='text' and
         v.get_value('table_format').compression_codec == 'none'))
 
-  def test_seq_writer(self, vector, unique_database):
-    self.run_test_case('QueryTest/seq-writer', vector, unique_database)
-
-  @SkipIfS3.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
-  def test_seq_writer_hive_compatibility(self, vector, unique_database):
-    self.client.execute('set ALLOW_UNSUPPORTED_FORMATS=1')
-    # Write sequence files with different compression codec/compression mode and then read
-    # it back in Impala and Hive.
-    # Note that we don't test snappy here as the snappy codec used by Impala does not seem
-    # to be fully compatible with the snappy codec used by Hive.
-    for comp_codec, comp_mode in [('NONE', 'RECORD'), ('NONE', 'BLOCK'),
-                                  ('DEFAULT', 'RECORD'), ('DEFAULT', 'BLOCK'),
-                                  ('GZIP', 'RECORD'), ('GZIP', 'BLOCK')]:
-      table_name = '%s.seq_tbl_%s_%s' % (unique_database, comp_codec, comp_mode)
-      self.client.execute('set COMPRESSION_CODEC=%s' % comp_codec)
-      self.client.execute('set SEQ_COMPRESSION_MODE=%s' % comp_mode)
-      self.client.execute('create table %s like functional.zipcode_incomes stored as '
-          'sequencefile' % table_name)
-      # Write sequence file of size greater than 4K
-      self.client.execute('insert into %s select * from functional.zipcode_incomes where '
-          'zip >= "5"' % table_name)
-      # Write sequence file of size less than 4K
-      self.client.execute('insert into %s select * from functional.zipcode_incomes where '
-          'zip="00601"' % table_name)
-
-      count_query = 'select count(*) from %s' % table_name
-
-      # Read it back in Impala
-      output = self.client.execute(count_query)
-      assert '16541' == output.get_data()
-      # Read it back in Hive
-      # Note that username is passed in for the sake of remote cluster tests. The default
-      # HDFS user is typically 'hdfs', and this is needed to run a count() operation using
-      # hive. For local mini clusters, the usename can be anything. See IMPALA-5413.
-      output = self.run_stmt_in_hive(count_query, username='hdfs')
-      assert '16541' == output.split('\n')[1]
-
-  def test_avro_writer(self, vector):
-    self.run_test_case('QueryTest/avro-writer', vector)
-
-  def test_text_writer(self, vector):
-    # TODO debug this test.
-    # This caused by a zlib failure. Suspected cause is too small a buffer
-    # passed to zlib for compression; similar to IMPALA-424
-    pytest.skip()
-    self.run_test_case('QueryTest/text-writer', vector)
+  def test_error_message(self, vector, unique_database):
+    # Tests that an appropriate error message is displayed for unsupported writers like
+    # compressed text, avro and sequence.
+    self.run_test_case('QueryTest/unsupported-writers', vector, unique_database)
 
 @pytest.mark.execute_serially
 class TestLargeCompressedFile(ImpalaTestSuite):
@@ -261,7 +210,7 @@ class TestLargeCompressedFile(ImpalaTestSuite):
     # Total uncompressed size of a nested structure.
     total_chunk_size = num_blocks_per_chunk * payload_size
 
-    hdfs_put = subprocess.Popen(["hadoop", "fs", "-put", "-f", "-", file_name],
+    hdfs_put = subprocess.Popen(["hdfs", "dfs", "-put", "-d", "-f", "-", file_name],
         stdin=subprocess.PIPE, bufsize=-1)
     for i in range(num_chunks):
       hdfs_put.stdin.write(struct.pack('>i', total_chunk_size))

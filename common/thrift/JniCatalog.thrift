@@ -22,6 +22,7 @@ include "CatalogObjects.thrift"
 include "Types.thrift"
 include "Status.thrift"
 include "TCLIService.thrift"
+include "hive_metastore.thrift"
 
 // This is a short value due to the HDFS API limits
 const i16 HDFS_DEFAULT_CACHE_REPLICATION_FACTOR = 1
@@ -29,49 +30,88 @@ const i16 HDFS_DEFAULT_CACHE_REPLICATION_FACTOR = 1
 // Structs used to execute DDL operations using the JniCatalog.
 
 enum TDdlType {
-  ALTER_TABLE,
-  ALTER_VIEW,
-  CREATE_DATABASE,
-  CREATE_TABLE,
-  CREATE_TABLE_AS_SELECT,
-  CREATE_TABLE_LIKE,
-  CREATE_VIEW,
-  CREATE_FUNCTION,
-  COMPUTE_STATS,
-  DROP_DATABASE,
-  DROP_TABLE,
-  DROP_VIEW,
-  DROP_FUNCTION,
-  CREATE_DATA_SOURCE,
-  DROP_DATA_SOURCE,
-  DROP_STATS,
-  CREATE_ROLE,
-  DROP_ROLE,
-  GRANT_ROLE,
-  REVOKE_ROLE,
-  GRANT_PRIVILEGE,
-  REVOKE_PRIVILEGE,
-  TRUNCATE_TABLE,
+  ALTER_TABLE = 0
+  ALTER_VIEW = 1
+  CREATE_DATABASE = 2
+  CREATE_TABLE = 3
+  CREATE_TABLE_AS_SELECT = 4
+  CREATE_TABLE_LIKE = 5
+  CREATE_VIEW = 6
+  CREATE_FUNCTION = 7
+  COMPUTE_STATS = 8
+  DROP_DATABASE = 9
+  DROP_TABLE = 10
+  DROP_VIEW = 11
+  DROP_FUNCTION = 12
+  CREATE_DATA_SOURCE = 13
+  DROP_DATA_SOURCE = 14
+  DROP_STATS = 15
+  CREATE_ROLE = 16
+  DROP_ROLE = 17
+  GRANT_ROLE = 18
+  REVOKE_ROLE = 19
+  GRANT_PRIVILEGE = 20
+  REVOKE_PRIVILEGE = 21
+  TRUNCATE_TABLE = 22
+  COMMENT_ON = 23
+  ALTER_DATABASE = 24
+  COPY_TESTCASE = 25
+}
+
+enum TOwnerType {
+  USER = 0
+  ROLE = 1
+}
+
+// Types of ALTER DATABASE commands supported.
+enum TAlterDbType {
+  SET_OWNER = 0
+}
+
+// Parameters for ALTER DATABASE SET OWNER commands.
+struct TAlterDbSetOwnerParams {
+  // The owner type.
+  1: required TOwnerType owner_type
+
+  // The owner name.
+  2: required string owner_name
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  3: optional string server_name
+}
+
+struct TAlterDbParams {
+  // The type of ALTER DATABASE command.
+  1: required TAlterDbType alter_type
+
+  // Name of the database to alter.
+  2: required string db
+
+  // Parameters for ALTER DATABASE SET OWNER commands.
+  3: optional TAlterDbSetOwnerParams set_owner_params
 }
 
 // Types of ALTER TABLE commands supported.
 enum TAlterTableType {
-  ADD_REPLACE_COLUMNS,
-  ADD_PARTITION,
-  ADD_DROP_RANGE_PARTITION,
-  ALTER_COLUMN,
-  DROP_COLUMN,
-  DROP_PARTITION,
-  RENAME_TABLE,
-  RENAME_VIEW,
-  SET_FILE_FORMAT,
-  SET_LOCATION,
-  SET_TBL_PROPERTIES,
+  ADD_COLUMNS = 0
+  REPLACE_COLUMNS = 1
+  ADD_PARTITION = 2
+  ADD_DROP_RANGE_PARTITION = 3
+  ALTER_COLUMN = 4
+  DROP_COLUMN = 5
+  DROP_PARTITION = 6
+  RENAME_TABLE = 7
+  RENAME_VIEW = 8
+  SET_FILE_FORMAT = 9
+  SET_LOCATION = 10
+  SET_TBL_PROPERTIES = 11
   // Used internally by COMPUTE STATS and by ALTER TABLE SET COLUMN STATS.
-  UPDATE_STATS,
-  SET_CACHED,
-  RECOVER_PARTITIONS,
-  SET_ROW_FORMAT,
+  UPDATE_STATS = 12
+  SET_CACHED = 13
+  RECOVER_PARTITIONS = 14
+  SET_ROW_FORMAT = 15
+  SET_OWNER = 16
 }
 
 // Parameters of CREATE DATABASE commands
@@ -88,6 +128,13 @@ struct TCreateDbParams {
 
   // Do not throw an error if a database of the same name already exists.
   4: optional bool if_not_exists
+
+  // Owner of the database
+  5: required string owner
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  6: optional string server_name
 }
 
 // Parameters of CREATE DATA SOURCE commands
@@ -163,13 +210,19 @@ struct TAlterTableOrViewRenameParams {
   1: required CatalogObjects.TTableName new_table_name
 }
 
-// Parameters for ALTER TABLE ADD|REPLACE COLUMNS commands.
-struct TAlterTableAddReplaceColsParams {
+// Parameters for ALTER TABLE ADD COLUMNS commands.
+struct TAlterTableAddColsParams {
   // List of columns to add to the table
   1: required list<CatalogObjects.TColumn> columns
 
-  // If true, replace all existing columns. If false add (append) columns to the table.
-  2: required bool replace_existing_cols
+  // If true, no error is raised when a column already exists.
+  2: required bool if_not_exists
+}
+
+// Parameters for ALTER TABLE REPLACE COLUMNS commands.
+struct TAlterTableReplaceColsParams {
+  // List of columns to replace to the table
+  1: required list<CatalogObjects.TColumn> columns
 }
 
 // Parameters for specifying a single partition in ALTER TABLE ADD PARTITION
@@ -197,8 +250,8 @@ struct TAlterTableAddPartitionParams {
 }
 
 enum TRangePartitionOperationType {
-  ADD,
-  DROP
+  ADD = 0
+  DROP = 1
 }
 
 // Parameters for ALTER TABLE ADD/DROP RANGE PARTITION command
@@ -282,6 +335,19 @@ struct TAlterTableSetLocationParams {
   2: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
 }
 
+// Parameters for ALTER TABLE/VIEW SET OWNER commands.
+struct TAlterTableOrViewSetOwnerParams {
+  // The owner type.
+  1: required TOwnerType owner_type
+
+  // The owner name.
+  2: required string owner_name
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  3: optional string server_name
+}
+
 // Parameters for updating the table and/or column statistics
 // of a table. Used by ALTER TABLE SET COLUMN STATS, and internally by
 // a COMPUTE STATS command.
@@ -328,7 +394,7 @@ struct TAlterTableParams {
   3: optional TAlterTableOrViewRenameParams rename_params
 
   // Parameters for ALTER TABLE ADD COLUMNS
-  4: optional TAlterTableAddReplaceColsParams add_replace_cols_params
+  4: optional TAlterTableAddColsParams add_cols_params
 
   // Parameters for ALTER TABLE ADD PARTITION
   5: optional TAlterTableAddPartitionParams add_partition_params
@@ -362,6 +428,12 @@ struct TAlterTableParams {
 
   // Parameters for ALTER TABLE SET ROW FORMAT
   15: optional TAlterTableSetRowFormatParams set_row_format_params
+
+  // Parameters for ALTER TABLE/VIEW SET OWNER
+  16: optional TAlterTableOrViewSetOwnerParams set_owner_params
+
+  // Parameters for ALTER TABLE REPLACE COLUMNS
+  17: optional TAlterTableReplaceColsParams replace_cols_params
 }
 
 // Parameters of CREATE TABLE LIKE commands
@@ -396,6 +468,13 @@ struct TCreateTableLikeParams {
   // any such columns of the source table. If unspecified, the destination table will
   // inherit the sort columns of the source table.
   9: optional list<string> sort_columns
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  10: optional string server_name
+
+  // The sorting order used in SORT BY clauses.
+  11: required Types.TSortingOrder sorting_order
 }
 
 // Parameters of CREATE TABLE commands
@@ -450,6 +529,19 @@ struct TCreateTableParams {
 
   // Optional list of sort columns for the new table.
   16: optional list<string> sort_columns
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  17: optional string server_name
+
+  // The sorting order used in SORT BY clauses.
+  18: required Types.TSortingOrder sorting_order
+
+  // Primary Keys Structures for Hive API
+  19: optional list<hive_metastore.SQLPrimaryKey> primary_keys;
+
+  // Foreign Keys Structure for Hive API
+  20: optional list<hive_metastore.SQLForeignKey> foreign_keys;
 }
 
 // Parameters of a CREATE VIEW or ALTER VIEW AS SELECT command
@@ -474,6 +566,10 @@ struct TCreateOrAlterViewParams {
 
   // Do not throw an error if a table or view of the same name already exists
   7: optional bool if_not_exists
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  8: optional string server_name
 }
 
 // Parameters of a COMPUTE STATS command
@@ -537,20 +633,23 @@ struct TGrantRevokeRoleParams {
   3: required bool is_grant
 }
 
-// Parameters for GRANT/REVOKE privilege TO/FROM role.
+// Parameters for GRANT/REVOKE privilege TO/FROM user/role.
 struct TGrantRevokePrivParams {
   // List of privileges being granted or revoked. The 'has_grant_opt' for each
   // TPrivilege is inherited from the 'has_grant_opt' of this object.
   1: required list<CatalogObjects.TPrivilege> privileges
 
-  // The role name this change should apply to.
-  2: required string role_name
+  // The principal name this change should apply to.
+  2: required string principal_name
 
   // True if this is a GRANT statement false if this is a REVOKE statement.
   3: required bool is_grant
 
   // True if WITH GRANT OPTION is set.
   4: required bool has_grant_opt
+
+  // The type of principal
+  5: required CatalogObjects.TPrincipalType principal_type
 }
 
 // Parameters of DROP DATABASE commands
@@ -563,6 +662,10 @@ struct TDropDbParams {
 
   // If true, drops all tables of the database
   3: required bool cascade
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  4: optional string server_name
 }
 
 // Parameters of DROP TABLE/VIEW commands
@@ -578,6 +681,10 @@ struct TDropTableOrViewParams {
 
   // Set to true for tables and false for views
   4: optional bool is_table
+
+  // The server name for security privileges when authorization is enabled.
+  // TODO: Need to cleanup:IMPALA-7553
+  5: optional string server_name
 }
 
 // Parameters of TRUNCATE commands
@@ -615,6 +722,28 @@ struct TTableUsageMetrics {
 
   // Number of metadata operations performed on the table since it was loaded.
   3: optional i64 num_metadata_operations
+
+  // Number of files in this table. For partitioned table, this includes file counts
+  // across all the partitions.
+  4: optional i64 num_files
+
+  // The median time spent on table metadata loading
+  5: optional i64 median_table_loading_ns
+
+  // The maximum time spent on table metadata loading
+  6: optional i64 max_table_loading_ns
+
+  // Number of table loading counts
+  7: optional i64 num_table_loading
+
+  // The 75th percentile table loading time
+  8: optional i64 p75_loading_time_ns
+
+  // The 95th percentile table loading time
+  9: optional i64 p95_loading_time_ns
+
+  // The 99th percentile table loading time
+  10: optional i64 p99_loading_time_ns
 }
 
 // Response to a GetCatalogUsage request.
@@ -625,5 +754,88 @@ struct TGetCatalogUsageResponse{
   // List of the most frequently accessed (in terms of number of metadata operations)
   // tables.
   2: required list<TTableUsageMetrics> frequently_accessed_tables
+
+  // List of the tables that have most number of files
+  3: required list<TTableUsageMetrics> high_file_count_tables
+
+  // List of the tables that have the longest table metadata loading time
+  4: required list<TTableUsageMetrics> long_metadata_loading_tables
 }
 
+struct TColumnName {
+  // Name of table/view.
+  1: required CatalogObjects.TTableName table_name
+
+  // Name of column.
+  2: required string column_name
+}
+
+struct TCommentOnParams {
+  // Contents of comment to alter. When this field is not set, the comment will be removed.
+  1: optional string comment
+
+  //--------------------------------------
+  // Only one of these fields can be set.
+  //--------------------------------------
+
+  // Name of database to alter.
+  2: optional string db
+
+  // Name of table/view to alter.
+  3: optional CatalogObjects.TTableName table_name
+
+  // Name of column to alter.
+  4: optional TColumnName column_name
+}
+
+struct TEventProcessorMetrics {
+  // status of event processor
+  1: required string status
+
+  // Total number of events received so far
+  2: optional i64 events_received
+
+  // Total number of events skipped so far
+  3: optional i64 events_skipped
+
+  // Mean time in sec for the fetching metastore events
+  4: optional double events_fetch_duration_mean
+
+  // Mean time in sec for processing a given batch of events
+  5: optional double events_process_duration_mean
+
+  // Average number of events received in 1 min
+  6: optional double events_received_1min_rate
+
+  // Average number of events received in 1 min
+  7: optional double events_received_5min_rate
+
+  // Average number of events received in 1 min
+  8: optional double events_received_15min_rate
+
+  // Average number events skipped in a polling interval
+  9: optional double events_skipped_per_poll_mean
+
+  // Last metastore event id that the catalog server synced to
+  10: optional i64 last_synced_event_id
+}
+
+// Response to GetCatalogServerMetrics() call.
+struct TGetCatalogServerMetricsResponse {
+  // Partial fetch RPC queue length.
+  1: required i32 catalog_partial_fetch_rpc_queue_len
+
+  // gets the events processor metrics if configured
+  2: optional TEventProcessorMetrics event_metrics;
+}
+
+// Request to copy the generated testcase from a given input path.
+struct TCopyTestCaseReq {
+  1: required string input_path
+}
+
+struct TEventProcessorMetricsSummaryResponse {
+  // summary view of the events processor which can include status,
+  // metrics and other details
+  1: required string summary
+}

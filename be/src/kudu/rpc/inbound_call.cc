@@ -17,9 +17,15 @@
 
 #include "kudu/rpc/inbound_call.h"
 
-#include <glog/stl_logging.h>
+#include <cstdint>
 #include <memory>
+#include <ostream>
 
+#include <glog/logging.h>
+#include <google/protobuf/message.h>
+#include <google/protobuf/message_lite.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
@@ -27,13 +33,22 @@
 #include "kudu/rpc/rpcz_store.h"
 #include "kudu/rpc/serialization.h"
 #include "kudu/rpc/service_if.h"
+#include "kudu/rpc/transfer.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/trace.h"
 
+namespace google {
+namespace protobuf {
+class FieldDescriptor;
+}
+}
+
 using google::protobuf::FieldDescriptor;
-using google::protobuf::io::CodedOutputStream;
+using google::protobuf::Message;
 using google::protobuf::MessageLite;
+using std::string;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
@@ -44,7 +59,8 @@ namespace rpc {
 InboundCall::InboundCall(Connection* conn)
   : conn_(conn),
     trace_(new Trace),
-    method_info_(nullptr) {
+    method_info_(nullptr),
+    deadline_(MonoTime::Max()) {
   RecordCallReceived();
 }
 
@@ -64,6 +80,11 @@ Status InboundCall::ParseFrom(gscoped_ptr<InboundTransfer> transfer) {
                               header_.remote_method().InitializationErrorString());
   }
   remote_method_.FromPB(header_.remote_method());
+
+  // Compute and cache the call deadline.
+  if (header_.has_timeout_millis() && header_.timeout_millis() != 0) {
+    deadline_ = timing_.time_received + MonoDelta::FromMilliseconds(header_.timeout_millis());
+  }
 
   if (header_.sidecar_offsets_size() > TransferLimits::kMaxSidecars) {
     return Status::Corruption(strings::Substitute(
@@ -161,16 +182,17 @@ void InboundCall::SerializeResponseBuffer(const MessageLite& response,
   ResponseHeader resp_hdr;
   resp_hdr.set_call_id(header_.call_id());
   resp_hdr.set_is_error(!is_success);
-  uint32_t absolute_sidecar_offset = protobuf_msg_size;
+  int32_t sidecar_byte_size = 0;
   for (const unique_ptr<RpcSidecar>& car : outbound_sidecars_) {
-    resp_hdr.add_sidecar_offsets(absolute_sidecar_offset);
-    absolute_sidecar_offset += car->AsSlice().size();
+    resp_hdr.add_sidecar_offsets(sidecar_byte_size + protobuf_msg_size);
+    int32_t sidecar_bytes = car->AsSlice().size();
+    DCHECK_LE(sidecar_byte_size, TransferLimits::kMaxTotalSidecarBytes - sidecar_bytes);
+    sidecar_byte_size += sidecar_bytes;
   }
 
-  int additional_size = absolute_sidecar_offset - protobuf_msg_size;
   serialization::SerializeMessage(response, &response_msg_buf_,
-                                  additional_size, true);
-  int main_msg_size = additional_size + response_msg_buf_.size();
+                                  sidecar_byte_size, true);
+  int64_t main_msg_size = sidecar_byte_size + response_msg_buf_.size();
   serialization::SerializeHeader(resp_hdr, main_msg_size,
                                  &response_hdr_buf_);
 }
@@ -198,7 +220,17 @@ Status InboundCall::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
   if (outbound_sidecars_.size() > TransferLimits::kMaxSidecars) {
     return Status::ServiceUnavailable("All available sidecars already used");
   }
+  int64_t sidecar_bytes = car->AsSlice().size();
+  if (outbound_sidecars_total_bytes_ >
+      TransferLimits::kMaxTotalSidecarBytes - sidecar_bytes) {
+    return Status::RuntimeError(Substitute("Total size of sidecars $0 would exceed limit $1",
+        static_cast<int64_t>(outbound_sidecars_total_bytes_) + sidecar_bytes,
+        TransferLimits::kMaxTotalSidecarBytes));
+  }
+
   outbound_sidecars_.emplace_back(std::move(car));
+  outbound_sidecars_total_bytes_ += sidecar_bytes;
+  DCHECK_GE(outbound_sidecars_total_bytes_, 0);
   *idx = outbound_sidecars_.size() - 1;
   return Status::OK();
 }
@@ -218,7 +250,7 @@ string InboundCall::ToString() const {
                       header_.call_id());
 }
 
-void InboundCall::DumpPB(const DumpRunningRpcsRequestPB& req,
+void InboundCall::DumpPB(const DumpConnectionsRequestPB& req,
                          RpcCallInProgressPB* resp) {
   resp->mutable_header()->CopyFrom(header_);
   if (req.include_traces() && trace_) {
@@ -250,7 +282,7 @@ void InboundCall::RecordCallReceived() {
   timing_.time_received = MonoTime::Now();
 }
 
-void InboundCall::RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time) {
+void InboundCall::RecordHandlingStarted(Histogram* incoming_queue_time) {
   DCHECK(incoming_queue_time != nullptr);
   DCHECK(!timing_.time_handled.Initialized());  // Protect against multiple calls.
   timing_.time_handled = MonoTime::Now();
@@ -275,20 +307,7 @@ void InboundCall::RecordHandlingCompleted() {
 }
 
 bool InboundCall::ClientTimedOut() const {
-  if (!header_.has_timeout_millis() || header_.timeout_millis() == 0) {
-    return false;
-  }
-
-  MonoTime now = MonoTime::Now();
-  int total_time = (now - timing_.time_received).ToMilliseconds();
-  return total_time > header_.timeout_millis();
-}
-
-MonoTime InboundCall::GetClientDeadline() const {
-  if (!header_.has_timeout_millis() || header_.timeout_millis() == 0) {
-    return MonoTime::Max();
-  }
-  return timing_.time_received + MonoDelta::FromMilliseconds(header_.timeout_millis());
+  return MonoTime::Now() >= deadline_;
 }
 
 MonoTime InboundCall::GetTimeReceived() const {

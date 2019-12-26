@@ -15,19 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <zstd.h>
 #include <iostream>
 
 #include "gen-cpp/Descriptors_types.h"
 
+#include "exec/read-write-util.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/mem-pool.h"
 #include "testutil/gtest-util.h"
+#include "testutil/rand-util.h"
 #include "util/decompress.h"
 #include "util/compress.h"
+#include "util/ubsan.h"
 
 #include "common/names.h"
+
+using std::mt19937;
+using std::uniform_int_distribution;
 
 namespace impala {
 
@@ -57,15 +64,17 @@ class DecompressorTest : public ::testing::Test {
     mem_pool_.FreeAll();
   }
 
-  void RunTest(THdfsCompression::type format) {
+  void RunTest(THdfsCompression::type format, int clevel = 0) {
     scoped_ptr<Codec> compressor;
     scoped_ptr<Codec> decompressor;
 
-    EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, format, &compressor));
+    Codec::CodecInfo codec_info(format, clevel);
+    EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, codec_info, &compressor));
     EXPECT_OK(Codec::CreateDecompressor(&mem_pool_, true, format, &decompressor));
 
-    // LZ4 is not implemented to work without an allocated output
-    if(format == THdfsCompression::LZ4) {
+    // LZ4 & ZSTD are not implemented to work without an allocated output
+    if (format == THdfsCompression::LZ4 || format == THdfsCompression::ZSTD ||
+        format == THdfsCompression::LZ4_BLOCKED) {
       CompressAndDecompressNoOutputAllocated(compressor.get(), decompressor.get(),
           sizeof(input_), input_);
       CompressAndDecompressNoOutputAllocated(compressor.get(), decompressor.get(),
@@ -96,7 +105,9 @@ class DecompressorTest : public ::testing::Test {
   void RunTestStreaming(THdfsCompression::type format) {
     scoped_ptr<Codec> compressor;
     scoped_ptr<Codec> decompressor;
-    EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, format, &compressor));
+    Codec::CodecInfo codec_info(format);
+
+    EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, codec_info, &compressor));
     EXPECT_OK(Codec::CreateDecompressor(&mem_pool_, true, format, &decompressor));
 
     CompressAndStreamingDecompress(compressor.get(), decompressor.get(),
@@ -123,7 +134,7 @@ class DecompressorTest : public ::testing::Test {
         compressed, &output_len, &output));
 
     EXPECT_EQ(output_len, input_len);
-    EXPECT_EQ(memcmp(input, output, input_len), 0);
+    EXPECT_EQ(Ubsan::MemCmp(input, output, input_len), 0);
 
     // Preallocated output buffers
     int64_t max_compressed_length = compressor->MaxOutputLen(input_len, input);
@@ -145,7 +156,7 @@ class DecompressorTest : public ::testing::Test {
                                            &output_len, &output));
 
     EXPECT_EQ(output_len, input_len);
-    EXPECT_EQ(memcmp(input, output, input_len), 0);
+    EXPECT_EQ(Ubsan::MemCmp(input, output, input_len), 0);
   }
 
   // Test the behavior when the decompressor is given too little / too much space.
@@ -218,7 +229,8 @@ class DecompressorTest : public ::testing::Test {
       int64_t compressed_bytes_read = 0;
       RETURN_IF_ERROR(decompressor->ProcessBlockStreaming(compressed_bytes_remaining,
           compressed_input, &compressed_bytes_read, &output_len, &output, &stream_end));
-      EXPECT_EQ(memcmp(uncompressed_input + decompressed_len, output, output_len), 0);
+      EXPECT_EQ(
+          Ubsan::MemCmp(uncompressed_input + decompressed_len, output, output_len), 0);
       decompressed_len += output_len;
       EXPECT_LE(decompressed_len, uncompressed_len);
       compressed_input = compressed_input + compressed_bytes_read;
@@ -227,7 +239,9 @@ class DecompressorTest : public ::testing::Test {
 
     EXPECT_EQ(0, compressed_bytes_remaining);
     EXPECT_EQ(stream_end, expected_stream_end);
-    if (stream_end) EXPECT_EQ(decompressed_len, uncompressed_len);
+    if (stream_end) {
+      EXPECT_EQ(decompressed_len, uncompressed_len);
+    }
     if (bytes_decompressed != NULL) *bytes_decompressed = decompressed_len;
 
     return Status::OK();
@@ -266,7 +280,7 @@ class DecompressorTest : public ::testing::Test {
         &output_len, &output));
 
     EXPECT_EQ(output_len, input_len);
-    EXPECT_EQ(memcmp(input, output, input_len), 0);
+    EXPECT_EQ(Ubsan::MemCmp(input, output, input_len), 0);
   }
 
   void RunTestMultiStreamDecompressing(THdfsCompression::type format) {
@@ -327,7 +341,8 @@ class DecompressorTest : public ::testing::Test {
     *compressed_len = 0;
 
     scoped_ptr<Codec> compressor;
-    EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, format, &compressor));
+    Codec::CodecInfo codec_info(format);
+    EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, codec_info, &compressor));
 
     // Make sure we don't completely fill the buffer, leave at least RAW_INPUT_SIZE
     // bytes free in compressed buffer for junk data testing (Test case 3).
@@ -358,7 +373,6 @@ class DecompressorTest : public ::testing::Test {
   // Buffer to hold generated random data that contains repeated letter [a..z] and [A..Z]
   // for compressor/decompressor testing.
   uint8_t input_[2 * 26 * 1024];
-
   // Buffer for testing ProcessBlockStreaming() which allocates STREAM_OUT_BUF_SIZE output
   // buffer. This is 4x the size of the output buffers to ensure that the decompressed output
   // requires several calls and doesn't need to be nicely aligned (the last call gets a
@@ -408,8 +422,8 @@ TEST_F(DecompressorTest, Impala1506) {
   MemTracker trax;
   MemPool pool(&trax);
   scoped_ptr<Codec> compressor;
-  EXPECT_OK(
-      Codec::CreateCompressor(&pool, true, impala::THdfsCompression::GZIP, &compressor));
+  Codec::CodecInfo codec_info(impala::THdfsCompression::GZIP);
+  EXPECT_OK(Codec::CreateCompressor(&pool, true, codec_info, &compressor));
 
   int64_t input_len = 3;
   const uint8_t input[3] = {1, 2, 3};
@@ -449,12 +463,12 @@ TEST_F(DecompressorTest, LZ4Huge) {
 
   // Generate a big random payload.
   int payload_len = numeric_limits<int>::max();
-  uint8_t* payload = new uint8_t[payload_len];
+  unique_ptr<uint8_t[]> payload(new uint8_t[payload_len]);
   for (int i = 0 ; i < payload_len; ++i) payload[i] = rand();
 
   scoped_ptr<Codec> compressor;
-  EXPECT_OK(Codec::CreateCompressor(nullptr, true, impala::THdfsCompression::LZ4,
-      &compressor));
+  Codec::CodecInfo codec_info(impala::THdfsCompression::LZ4);
+  EXPECT_OK(Codec::CreateCompressor(nullptr, true, codec_info, &compressor));
 
   // The returned max_size is 0 because the payload is too big.
   int64_t max_size = compressor->MaxOutputLen(payload_len);
@@ -462,11 +476,92 @@ TEST_F(DecompressorTest, LZ4Huge) {
 
   // Trying to compress it should give an error
   int64_t compressed_len = max_size;
-  uint8_t* compressed = new uint8_t[max_size];
-  EXPECT_ERROR(compressor->ProcessBlock(true, payload_len, payload,
-      &compressed_len, &compressed), TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE);
+  unique_ptr<uint8_t[]> compressed(new uint8_t[max_size]);
+  uint8_t* compressed_ptr = compressed.get();
+  EXPECT_ERROR(compressor->ProcessBlock(true, payload_len, payload.get(),
+      &compressed_len, &compressed_ptr), TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE);
 }
 
+TEST_F(DecompressorTest, ZSTD) {
+  RunTest(THdfsCompression::ZSTD, ZSTD_CLEVEL_DEFAULT);
+  mt19937 rng;
+  RandTestUtil::SeedRng("ZSTD_COMPRESSION_LEVEL_SEED", &rng);
+  // zstd supports compression levels from 1 up to ZSTD_maxCLevel()
+  const int clevel = uniform_int_distribution<int>(1, ZSTD_maxCLevel())(rng);
+  RunTest(THdfsCompression::ZSTD, clevel);
+}
+
+TEST_F(DecompressorTest, LZ4HadoopCompat) {
+  scoped_ptr<Codec> compressor;
+  scoped_ptr<Codec> decompressor;
+
+  THdfsCompression::type format = THdfsCompression::LZ4_BLOCKED;
+  Codec::CodecInfo codec_info(format);
+  EXPECT_OK(Codec::CreateCompressor(&mem_pool_, true, codec_info, &compressor));
+  EXPECT_OK(Codec::CreateDecompressor(&mem_pool_, true, format, &decompressor));
+
+  // Hadoop uses a block compression scheme on top of lz4. The input stream could be
+  // split into blocks and each block contains the uncompressed length for the block
+  // followed by one of more length-prefixed blocks of compressed data.
+  // Block layout:
+  //     <4 byte big endian uncompressed_size><inner block 1>...<inner block N>
+  //     inner block <i> layout: <4-byte big endian compressed_size><lz4 compressed block>
+  // For this unit test we assume an inner block size of 8K.
+  const int64_t input_len = sizeof(input_);
+  const int64_t block_len = 8192;
+  const int64_t num_blocks = ceil((double)input_len/(double)block_len);
+  const int64_t max_compressed_block_length = compressor->MaxOutputLen(block_len, NULL);
+  const int64_t total_compressed_buffer_length =
+      max_compressed_block_length * num_blocks;
+  uint8_t* const compressed_buffer = mem_pool_.Allocate(total_compressed_buffer_length);
+  // Write the total uncompressed_size
+  ReadWriteUtil::PutInt(compressed_buffer, static_cast<uint32_t>(input_len));
+  int64_t compressed_buffer_index = sizeof(uint32_t);
+  // Preallocate output buffers for compressor
+  uint8_t* const compressed_block = mem_pool_.Allocate(max_compressed_block_length);
+  // Generate Hadoop's compressed block layout
+  const int num_8K_inner_blocks = input_len / block_len;
+  for (int i=0; i < (num_8K_inner_blocks * block_len); i += block_len) {
+    uint8_t* input = &input_[i];
+    uint8_t* compressed = compressed_block;
+    int64_t compressed_length = max_compressed_block_length;
+    EXPECT_OK(compressor->ProcessBlock(true, block_len, input, &compressed_length,
+        &compressed));
+    compressed += sizeof(uint32_t);
+    compressed_length -= sizeof(uint32_t);
+    memcpy(compressed_buffer + compressed_buffer_index, compressed, compressed_length);
+    compressed_buffer_index += compressed_length;
+  }
+  // Compress the last block (not a multiple of 8K bytes), if any
+  if (input_len % block_len != 0) {
+    const int64_t last_block_sz = input_len % block_len;
+    const uint64_t last_block_index = input_len - last_block_sz;
+    uint8_t* input = &input_[last_block_index];
+    uint8_t* compressed = compressed_block;
+    int64_t compressed_length = max_compressed_block_length;
+    EXPECT_OK(compressor->ProcessBlock(true, last_block_sz, input, &compressed_length,
+        &compressed));
+    compressed += sizeof(uint32_t);
+    compressed_length -= sizeof(uint32_t);
+    memcpy(compressed_buffer + compressed_buffer_index, compressed, compressed_length);
+    compressed_buffer_index += compressed_length;
+  }
+  DCHECK_LE(compressed_buffer_index, total_compressed_buffer_length);
+
+  // Now that we have a compressed block using Hadoop's lz4 block compression scheme,
+  // let's decompress it using Impala's LZ4BlockDecompressor.
+  int64_t output_len = input_len;
+  uint8_t* output = mem_pool_.Allocate(output_len);
+  EXPECT_OK(decompressor->ProcessBlock(true, compressed_buffer_index, compressed_buffer,
+      &output_len, &output));
+
+  EXPECT_EQ(output_len, input_len);
+  EXPECT_EQ(memcmp(input_, output, input_len), 0);
+}
+
+TEST_F(DecompressorTest, LZ4Blocked) {
+  RunTest(THdfsCompression::LZ4_BLOCKED);
+}
 }
 
 int main(int argc, char **argv) {

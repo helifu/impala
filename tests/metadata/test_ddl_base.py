@@ -73,17 +73,63 @@ class TestDdlBase(ImpalaTestSuite):
     """Extracts the serde properties mapping from the output of DESCRIBE FORMATTED"""
     return self._get_properties('Storage Desc Params:', table_name)
 
-  def _get_properties(self, section_name, table_name):
-    """Extracts the table properties mapping from the output of DESCRIBE FORMATTED"""
-    result = self.client.execute("describe formatted " + table_name)
+  def _get_db_owner_properties(self, db_name):
+    """Extracts the DB properties mapping from the output of DESCRIBE FORMATTED"""
+    return self._get_properties("Owner:", db_name, True)
+
+  def _get_properties(self, section_name, name, is_db=False):
+    """Extracts the db/table properties mapping from the output of DESCRIBE FORMATTED"""
+    result = self.client.execute("describe {0} formatted {1}".format(
+      "database" if is_db else "", name))
     match = False
-    properties = dict();
+    properties = dict()
     for row in result.data:
-      if section_name in row:
-        match = True
-      elif match:
-        row = row.split('\t')
-        if (row[1] == 'NULL'):
+      fields = row.split("\t")
+      if fields[0] != '':
+        # Start of new section.
+        if match:
+          # Finished processing matching section.
           break
-        properties[row[1].rstrip()] = row[2].rstrip()
+        match = section_name in fields[0]
+      elif match:
+        if fields[1] == 'NULL':
+          break
+        properties[fields[1].rstrip()] = fields[2].rstrip()
     return properties
+
+  def _get_property(self, property_name, name, is_db=False):
+    """Extracts a db/table property value from the output of DESCRIBE FORMATTED."""
+    result = self.client.execute("describe {0} formatted {1}".format(
+      "database" if is_db else "", name))
+    for row in result.data:
+      if property_name in row:
+        row = row.split('\t')
+        if row[1] == 'NULL':
+          break
+        return row[1].rstrip()
+    return None
+
+  def _get_db_comment(self, db_name):
+    """Extracts the DB comment from the output of DESCRIBE DATABASE"""
+    result = self.client.execute("describe database {0}".format(db_name))
+    return result.data[0].split('\t')[2]
+
+  def _get_table_or_view_comment(self, table_name):
+    props = self._get_tbl_properties(table_name)
+    return props["comment"] if "comment" in props else None
+
+  def _get_column_comment(self, table_or_view_name, col_name):
+    result = self.client.execute("describe {0}".format(table_or_view_name))
+    comments = dict()
+    for row in result.data:
+      cols = row.split('\t')
+      if len(cols) <= 9:
+        comments[cols[0].rstrip()] = cols[2].rstrip()
+    return comments.get(col_name)
+
+
+  def _get_table_or_view_owner(self, table_name):
+    """Returns a tuple(owner, owner_type) for a given table name"""
+    owner_name = self._get_property("Owner:", table_name)
+    owner_type = self._get_property("OwnerType:", table_name)
+    return (owner_name, owner_type)

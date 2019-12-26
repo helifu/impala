@@ -15,45 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "codegen/llvm-codegen.h"
 #include "exec/union-node.h"
-#include "exprs/scalar-expr.h"
+
+#include "codegen/llvm-codegen.h"
+#include "exec/exec-node-util.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
+#include "gen-cpp/PlanNodes_types.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
-#include "runtime/tuple.h"
 #include "runtime/tuple-row.h"
+#include "runtime/tuple.h"
 #include "util/runtime-profile-counters.h"
-#include "gen-cpp/PlanNodes_types.h"
 
 #include "common/names.h"
 
 using namespace impala;
 
-UnionNode::UnionNode(ObjectPool* pool, const TPlanNode& tnode,
-    const DescriptorTbl& descs)
-    : ExecNode(pool, tnode, descs),
-      tuple_id_(tnode.union_node.tuple_id),
-      tuple_desc_(descs.GetTupleDescriptor(tuple_id_)),
-      first_materialized_child_idx_(tnode.union_node.first_materialized_child_idx),
-      child_idx_(0),
-      child_batch_(nullptr),
-      child_row_idx_(0),
-      child_eos_(false),
-      const_exprs_lists_idx_(0),
-      to_close_child_idx_(-1) { }
-
-Status UnionNode::Init(const TPlanNode& tnode, RuntimeState* state) {
-  RETURN_IF_ERROR(ExecNode::Init(tnode, state));
+Status UnionPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+  RETURN_IF_ERROR(PlanNode::Init(tnode, state));
   DCHECK(tnode.__isset.union_node);
   DCHECK_EQ(conjuncts_.size(), 0);
-  DCHECK(tuple_desc_ != nullptr);
+  const TupleDescriptor* tuple_desc =
+      state->desc_tbl().GetTupleDescriptor(tnode.union_node.tuple_id);
+  DCHECK(tuple_desc != nullptr);
   // Create const_exprs_lists_ from thrift exprs.
   const vector<vector<TExpr>>& const_texpr_lists = tnode.union_node.const_expr_lists;
   for (const vector<TExpr>& texprs : const_texpr_lists) {
     vector<ScalarExpr*> const_exprs;
-    RETURN_IF_ERROR(ScalarExpr::Create(texprs, *row_desc(), state, &const_exprs));
-    DCHECK_EQ(const_exprs.size(), tuple_desc_->slots().size());
+    RETURN_IF_ERROR(ScalarExpr::Create(texprs, *row_descriptor_, state, &const_exprs));
+    DCHECK_EQ(const_exprs.size(), tuple_desc->slots().size());
     const_exprs_lists_.push_back(const_exprs);
   }
   // Create child_exprs_lists_ from thrift exprs.
@@ -62,11 +53,33 @@ Status UnionNode::Init(const TPlanNode& tnode, RuntimeState* state) {
     const vector<TExpr>& texprs = thrift_result_exprs[i];
     vector<ScalarExpr*> child_exprs;
     RETURN_IF_ERROR(
-        ScalarExpr::Create(texprs, *child(i)->row_desc(), state, &child_exprs));
+        ScalarExpr::Create(texprs, *children_[i]->row_descriptor_, state, &child_exprs));
     child_exprs_lists_.push_back(child_exprs);
-    DCHECK_EQ(child_exprs.size(), tuple_desc_->slots().size());
+    DCHECK_EQ(child_exprs.size(), tuple_desc->slots().size());
   }
   return Status::OK();
+}
+
+Status UnionPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
+  ObjectPool* pool = state->obj_pool();
+  *node = pool->Add(new UnionNode(pool, *this, state->desc_tbl()));
+  return Status::OK();
+}
+
+UnionNode::UnionNode(
+    ObjectPool* pool, const UnionPlanNode& pnode, const DescriptorTbl& descs)
+  : ExecNode(pool, pnode, descs),
+    tuple_id_(pnode.tnode_->union_node.tuple_id),
+    tuple_desc_(descs.GetTupleDescriptor(tuple_id_)),
+    first_materialized_child_idx_(pnode.tnode_->union_node.first_materialized_child_idx),
+    child_idx_(0),
+    child_batch_(nullptr),
+    child_row_idx_(0),
+    child_eos_(false),
+    const_exprs_lists_idx_(0),
+    to_close_child_idx_(-1) {
+  const_exprs_lists_ = pnode.const_exprs_lists_;
+  child_exprs_lists_ = pnode.child_exprs_lists_;
 }
 
 Status UnionNode::Prepare(RuntimeState* state) {
@@ -109,8 +122,8 @@ void UnionNode::Codegen(RuntimeState* state) {
     codegen_status = Tuple::CodegenMaterializeExprs(codegen, false, *tuple_desc_,
         child_exprs_lists_[i], true, &tuple_materialize_exprs_fn);
     if (!codegen_status.ok()) {
-      // Codegen may fail in some corner cases (e.g. we don't handle TYPE_CHAR). If this
-      // happens, abort codegen for this and the remaining children.
+      // Codegen may fail in some corner cases. If this happens, abort codegen for this
+      // and the remaining children.
       codegen_message << "Codegen failed for child: " << children_[i]->id();
       break;
     }
@@ -123,7 +136,7 @@ void UnionNode::Codegen(RuntimeState* state) {
 
     int replaced = codegen->ReplaceCallSites(union_materialize_batch_fn,
         tuple_materialize_exprs_fn, Tuple::MATERIALIZE_EXPRS_SYMBOL);
-    DCHECK_EQ(replaced, 1) << LlvmCodeGen::Print(union_materialize_batch_fn);
+    DCHECK_REPLACE_COUNT(replaced, 1) << LlvmCodeGen::Print(union_materialize_batch_fn);
 
     union_materialize_batch_fn = codegen->FinalizeFunction(
         union_materialize_batch_fn);
@@ -139,6 +152,7 @@ void UnionNode::Codegen(RuntimeState* state) {
 
 Status UnionNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   // Open const expr lists.
   for (const vector<ScalarExprEvaluator*>& evals : const_expr_evals_lists_) {
@@ -271,6 +285,7 @@ Status UnionNode::GetNextConst(RuntimeState* state, RowBatch* row_batch) {
 
 Status UnionNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -298,22 +313,22 @@ Status UnionNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
 
   int num_rows_added = row_batch->num_rows() - num_rows_before;
   DCHECK_GE(num_rows_added, 0);
-  if (limit_ != -1 && num_rows_returned_ + num_rows_added > limit_) {
+  if (limit_ != -1 && rows_returned() + num_rows_added > limit_) {
     // Truncate the row batch if we went over the limit.
-    num_rows_added = limit_ - num_rows_returned_;
+    num_rows_added = limit_ - rows_returned();
     row_batch->set_num_rows(num_rows_before + num_rows_added);
     DCHECK_GE(num_rows_added, 0);
   }
-  num_rows_returned_ += num_rows_added;
+  IncrementNumRowsReturned(num_rows_added);
 
   *eos = ReachedLimit() ||
       (!HasMorePassthrough() && !HasMoreMaterialized() && !HasMoreConst(state));
 
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
-Status UnionNode::Reset(RuntimeState* state) {
+Status UnionNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   child_idx_ = 0;
   child_batch_.reset();
   child_row_idx_ = 0;
@@ -322,7 +337,7 @@ Status UnionNode::Reset(RuntimeState* state) {
   // Since passthrough is disabled in subplans, verify that there is no passthrough child
   // that needs to be closed.
   DCHECK_EQ(to_close_child_idx_, -1);
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void UnionNode::Close(RuntimeState* state) {

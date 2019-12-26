@@ -22,6 +22,7 @@
 #include "exprs/anyval-util.h"
 #include "exprs/conditional-functions.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.inline.h"
 #include "runtime/runtime-state.h"
 
 #include "gen-cpp/Exprs_types.h"
@@ -175,16 +176,11 @@ string CaseExpr::DebugString() const {
 //                                   %"class.impala::TupleRow"* %row)
 //   ret i16 %else_val
 // }
-Status CaseExpr::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) {
-  if (ir_compute_fn_ != nullptr) {
-    *fn = ir_compute_fn_;
-    return Status::OK();
-  }
-
+Status CaseExpr::GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** fn) {
   const int num_children = GetNumChildren();
   llvm::Function* child_fns[num_children];
   for (int i = 0; i < num_children; ++i) {
-    RETURN_IF_ERROR(GetChild(i)->GetCodegendComputeFn(codegen, &child_fns[i]));
+    RETURN_IF_ERROR(GetChild(i)->GetCodegendComputeFn(codegen, false, &child_fns[i]));
   }
 
   llvm::LLVMContext& context = codegen->context();
@@ -279,7 +275,6 @@ Status CaseExpr::GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn)
   }
   *fn = codegen->FinalizeFunction(function);
   if (UNLIKELY(*fn == nullptr)) return Status(TErrorCode::IR_VERIFY_FAILED, "CaseExpr");
-  ir_compute_fn_ = *fn;
   return Status::OK();
 }
 
@@ -316,6 +311,9 @@ void CaseExpr::GetChildVal(int child_idx, ScalarExprEvaluator* eval,
       break;
     case TYPE_DECIMAL:
       *reinterpret_cast<DecimalVal*>(dst) = child->GetDecimalVal(eval, row);
+      break;
+    case TYPE_DATE:
+      *reinterpret_cast<DateVal*>(dst) = child->GetDateVal(eval, row);
       break;
     default:
       DCHECK(false) << child->type();
@@ -355,6 +353,9 @@ bool CaseExpr::AnyValEq(
     case TYPE_DECIMAL:
       return AnyValUtil::Equals(type, *reinterpret_cast<const DecimalVal*>(v1),
                                 *reinterpret_cast<const DecimalVal*>(v2));
+    case TYPE_DATE:
+      return AnyValUtil::Equals(type, *reinterpret_cast<const DateVal*>(v1),
+                                *reinterpret_cast<const DateVal*>(v2));
     default:
       DCHECK(false) << type;
       return false;
@@ -362,7 +363,7 @@ bool CaseExpr::AnyValEq(
 }
 
 #define CASE_COMPUTE_FN(THEN_TYPE) \
-  THEN_TYPE CaseExpr::Get##THEN_TYPE( \
+  THEN_TYPE CaseExpr::Get##THEN_TYPE##Interpreted(            \
       ScalarExprEvaluator* eval, const TupleRow* row) const { \
     DCHECK(eval->opened()); \
     FunctionContext* fn_ctx = eval->fn_context(fn_ctx_idx_); \
@@ -414,5 +415,6 @@ CASE_COMPUTE_FN(DoubleVal)
 CASE_COMPUTE_FN(StringVal)
 CASE_COMPUTE_FN(TimestampVal)
 CASE_COMPUTE_FN(DecimalVal)
+CASE_COMPUTE_FN(DateVal)
 
 }

@@ -86,42 +86,44 @@ struct LibCacheEntry {
   // before it is removed to return the same error.
   Status loading_status;
 
-  LibCacheEntry() : use_count(0), should_remove(false), check_needs_refresh(false),
-                    shared_object_handle(NULL) {}
+  LibCacheEntry()
+    : use_count(0),
+      should_remove(false),
+      check_needs_refresh(false),
+      shared_object_handle(nullptr) {}
   ~LibCacheEntry();
 };
 
-LibCache::LibCache() : current_process_handle_(NULL) {
-}
+LibCache::LibCache() : current_process_handle_(nullptr) {}
 
 LibCache::~LibCache() {
   DropCache();
-  if (current_process_handle_ != NULL) DynamicClose(current_process_handle_);
+  if (current_process_handle_ != nullptr) DynamicClose(current_process_handle_);
 }
 
 Status LibCache::Init() {
-  DCHECK(LibCache::instance_.get() == NULL);
+  DCHECK(LibCache::instance_.get() == nullptr);
   LibCache::instance_.reset(new LibCache());
   return LibCache::instance_->InitInternal();
 }
 
 Status LibCache::InitInternal() {
   if (TestInfo::is_fe_test()) {
-    // In the FE tests, NULL gives the handle to the java process.
+    // In the FE tests, nullptr gives the handle to the java process.
     // Explicitly load the fe-support shared object.
     string fe_support_path;
     PathBuilder::GetFullBuildPath("service/libfesupport.so", &fe_support_path);
     RETURN_IF_ERROR(DynamicOpen(fe_support_path.c_str(), &current_process_handle_));
   } else {
-    RETURN_IF_ERROR(DynamicOpen(NULL, &current_process_handle_));
+    RETURN_IF_ERROR(DynamicOpen(nullptr, &current_process_handle_));
   }
-  DCHECK(current_process_handle_ != NULL)
+  DCHECK(current_process_handle_ != nullptr)
       << "We should always be able to get current process handle.";
   return Status::OK();
 }
 
 LibCacheEntry::~LibCacheEntry() {
-  if (shared_object_handle != NULL) {
+  if (shared_object_handle != nullptr) {
     DCHECK_EQ(use_count, 0);
     DCHECK(should_remove);
     DynamicClose(shared_object_handle);
@@ -129,28 +131,31 @@ LibCacheEntry::~LibCacheEntry() {
   unlink(local_path.c_str());
 }
 
+LibCacheEntryHandle::~LibCacheEntryHandle() {
+  if (entry_ != nullptr) LibCache::instance()->DecrementUseCount(entry_);
+}
+
 Status LibCache::GetSoFunctionPtr(const string& hdfs_lib_file, const string& symbol,
-    void** fn_ptr, LibCacheEntry** ent, bool quiet) {
+    time_t exp_mtime, void** fn_ptr, LibCacheEntry** ent, bool quiet) {
   if (hdfs_lib_file.empty()) {
     // Just loading a function ptr in the current process. No need to take any locks.
-    DCHECK(current_process_handle_ != NULL);
+    DCHECK(current_process_handle_ != nullptr);
     RETURN_IF_ERROR(DynamicLookup(current_process_handle_, symbol.c_str(), fn_ptr, quiet));
     return Status::OK();
   }
 
-  LibCacheEntry* entry = NULL;
+  LibCacheEntry* entry = nullptr;
   unique_lock<mutex> lock;
-  if (ent != NULL && *ent != NULL) {
+  if (ent != nullptr && *ent != nullptr) {
     // Reuse already-cached entry provided by user
     entry = *ent;
     unique_lock<mutex> l(entry->lock);
     lock.swap(l);
   } else {
-    RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, TYPE_SO, &lock, &entry));
+    RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, TYPE_SO, exp_mtime, &lock, &entry));
   }
-  DCHECK(entry != NULL);
+  DCHECK(entry != nullptr);
   DCHECK_EQ(entry->type, TYPE_SO);
-
   LibCacheEntry::SymbolMap::iterator it = entry->symbol_cache.find(symbol);
   if (it != entry->symbol_cache.end()) {
     *fn_ptr = it->second;
@@ -160,8 +165,8 @@ Status LibCache::GetSoFunctionPtr(const string& hdfs_lib_file, const string& sym
     entry->symbol_cache[symbol] = *fn_ptr;
   }
 
-  DCHECK(*fn_ptr != NULL);
-  if (ent != NULL && *ent == NULL) {
+  DCHECK(*fn_ptr != nullptr);
+  if (ent != nullptr && *ent == nullptr) {
     // Only set and increment user's entry if it wasn't already cached
     *ent = entry;
     ++(*ent)->use_count;
@@ -170,37 +175,48 @@ Status LibCache::GetSoFunctionPtr(const string& hdfs_lib_file, const string& sym
 }
 
 void LibCache::DecrementUseCount(LibCacheEntry* entry) {
-  if (entry == NULL) return;
+  if (entry == nullptr) return;
   bool can_delete = false;
   {
-    unique_lock<mutex> lock(entry->lock);;
+    unique_lock<mutex> lock(entry->lock);
     --entry->use_count;
     can_delete = (entry->use_count == 0 && entry->should_remove);
   }
   if (can_delete) delete entry;
 }
 
-Status LibCache::GetLocalLibPath(const string& hdfs_lib_file, LibType type,
-                                 string* local_path) {
+Status LibCache::GetLocalPath(const std::string& hdfs_lib_file, LibType type,
+    time_t exp_mtime, LibCacheEntryHandle* handle, string* path) {
+  DCHECK(handle != nullptr && handle->entry() == nullptr);
+  LibCacheEntry* entry = nullptr;
   unique_lock<mutex> lock;
-  LibCacheEntry* entry = NULL;
-  RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, type, &lock, &entry));
-  DCHECK(entry != NULL);
-  DCHECK_EQ(entry->type, type);
-  *local_path = entry->local_path;
+  RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, type, exp_mtime, &lock, &entry));
+  DCHECK(entry != nullptr);
+  ++entry->use_count;
+  handle->SetEntry(entry);
+  *path = entry->local_path;
   return Status::OK();
 }
 
 Status LibCache::CheckSymbolExists(const string& hdfs_lib_file, LibType type,
-    const string& symbol, bool quiet) {
+    const string& symbol, bool quiet, time_t* mtime) {
   if (type == TYPE_SO) {
-    void* dummy_ptr = NULL;
-    return GetSoFunctionPtr(hdfs_lib_file, symbol, &dummy_ptr, NULL, quiet);
+    void* dummy_ptr = nullptr;
+    LibCacheEntry* entry = nullptr;
+    RETURN_IF_ERROR(
+        GetSoFunctionPtr(hdfs_lib_file, symbol, -1, &dummy_ptr, &entry, quiet));
+    *mtime = -1;
+    if (entry != nullptr) {
+      *mtime = entry->last_mod_time;
+      // done holding this entry, so decrement its use count.
+      DecrementUseCount(entry);
+    }
+    return Status::OK();
   } else if (type == TYPE_IR) {
     unique_lock<mutex> lock;
-    LibCacheEntry* entry = NULL;
-    RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, type, &lock, &entry));
-    DCHECK(entry != NULL);
+    LibCacheEntry* entry = nullptr;
+    RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, type, -1, &lock, &entry));
+    DCHECK(entry != nullptr);
     DCHECK_EQ(entry->type, TYPE_IR);
     if (entry->symbols.find(symbol) == entry->symbols.end()) {
       stringstream ss;
@@ -208,12 +224,15 @@ Status LibCache::CheckSymbolExists(const string& hdfs_lib_file, LibType type,
          << " (local path: " << entry->local_path << ")";
       return quiet ? Status::Expected(ss.str()) : Status(ss.str());
     }
+    *mtime = entry->last_mod_time;
     return Status::OK();
   } else if (type == TYPE_JAR) {
     // TODO: figure out how to inspect contents of jars
     unique_lock<mutex> lock;
-    LibCacheEntry* dummy_entry = NULL;
-    return GetCacheEntry(hdfs_lib_file, type, &lock, &dummy_entry);
+    LibCacheEntry* entry = nullptr;
+    RETURN_IF_ERROR(GetCacheEntry(hdfs_lib_file, type, -1, &lock, &entry));
+    *mtime = entry->last_mod_time;
+    return Status::OK();
   } else {
     DCHECK(false);
     return Status("Shouldn't get here.");
@@ -238,8 +257,8 @@ void LibCache::RemoveEntry(const string& hdfs_lib_file) {
   RemoveEntryInternal(hdfs_lib_file, it);
 }
 
-void LibCache::RemoveEntryInternal(const string& hdfs_lib_file,
-                                   const LibMap::iterator& entry_iter) {
+void LibCache::RemoveEntryInternal(
+    const string& hdfs_lib_file, const LibMap::iterator& entry_iter) {
   LibCacheEntry* entry = entry_iter->second;
   VLOG(1) << "Removing lib cache entry: " << hdfs_lib_file
           << ", local path: " << entry->local_path;
@@ -279,19 +298,20 @@ void LibCache::DropCache() {
 }
 
 Status LibCache::GetCacheEntry(const string& hdfs_lib_file, LibType type,
-                               unique_lock<mutex>* entry_lock, LibCacheEntry** entry) {
+    time_t exp_mtime, unique_lock<mutex>* entry_lock, LibCacheEntry** entry) {
   Status status;
   {
     // If an error occurs, local_entry_lock is released before calling RemoveEntry()
     // below because it takes the global lock_ which must be acquired before taking entry
     // locks.
     unique_lock<mutex> local_entry_lock;
-    status = GetCacheEntryInternal(hdfs_lib_file, type, &local_entry_lock, entry);
+    status =
+        GetCacheEntryInternal(hdfs_lib_file, type, exp_mtime, &local_entry_lock, entry);
     if (status.ok()) {
       entry_lock->swap(local_entry_lock);
       return status;
     }
-    if (*entry == NULL) return status;
+    if (*entry == nullptr) return status;
 
     // Set loading_status on the entry so that if another thread calls
     // GetCacheEntry() for this lib before this thread is able to acquire lock_ in
@@ -304,79 +324,125 @@ Status LibCache::GetCacheEntry(const string& hdfs_lib_file, LibType type,
 }
 
 Status LibCache::GetCacheEntryInternal(const string& hdfs_lib_file, LibType type,
-    unique_lock<mutex>* entry_lock, LibCacheEntry** entry) {
+    time_t exp_mtime, unique_lock<mutex>* entry_lock, LibCacheEntry** entry) {
   DCHECK(!hdfs_lib_file.empty());
-  *entry = NULL;
+  *entry = nullptr;
 
-  // Check if this file is already cached or an error occured on another thread while
-  // loading the library.
-  unique_lock<mutex> lib_cache_lock(lock_);
-  LibMap::iterator it = lib_cache_.find(hdfs_lib_file);
-  if (it != lib_cache_.end()) {
-    {
-      unique_lock<mutex> local_entry_lock((it->second)->lock);
-      if (!(it->second)->loading_status.ok()) {
-        // If loading_status is already set, the returned *entry should be NULL.
-        DCHECK(*entry == NULL);
-        return (it->second)->loading_status;
-      }
-    }
-
-    *entry = it->second;
-    if ((*entry)->check_needs_refresh) {
-      // Check if file has been modified since loading the cached copy. If so, remove the
-      // cached entry and create a new one.
-      (*entry)->check_needs_refresh = false;
-      time_t last_mod_time;
-      hdfsFS hdfs_conn;
-      Status status = HdfsFsCache::instance()->GetConnection(hdfs_lib_file, &hdfs_conn);
-      if (!status.ok()) {
-        RemoveEntryInternal(hdfs_lib_file, it);
-        *entry = NULL;
-        return status;
-      }
-      status = GetLastModificationTime(hdfs_conn, hdfs_lib_file.c_str(), &last_mod_time);
-      if (!status.ok() || (*entry)->last_mod_time < last_mod_time) {
-        RemoveEntryInternal(hdfs_lib_file, it);
-        *entry = NULL;
-      }
-      RETURN_IF_ERROR(status);
+  // Check if this file is already cached. Refresh the entry if needed.
+  {
+    unique_lock<mutex> lib_cache_lock(lock_);
+    LibMap::iterator it = lib_cache_.find(hdfs_lib_file);
+    if (it != lib_cache_.end()) {
+      RETURN_IF_ERROR(
+          RefreshCacheEntry(hdfs_lib_file, type, exp_mtime, it, entry_lock, entry));
+      if (*entry != nullptr) return Status::OK();
     }
   }
 
-  if (*entry != NULL) {
-    // Release the lib_cache_ lock. This guarantees other threads looking at other
-    // libs can continue.
-    lib_cache_lock.unlock();
+  // Entry didn't exist. Create a new entry and load it. Note that the cache lock is
+  // *not* held and the entry is not added to the cache until it is loaded. Loading is
+  // expensive, so *not* holding the cache lock and *not* making the entry visible to
+  // other threads avoids blocking other threads with an expensive operation.
+  unique_ptr<LibCacheEntry> new_entry = make_unique<LibCacheEntry>();
+  RETURN_IF_ERROR(LoadCacheEntry(hdfs_lib_file, exp_mtime, type, new_entry.get()));
+
+  // Entry is now loaded. Check that another thread did not already load and add an entry
+  // for the same key. If so, refresh it if needed. If the existing entry is valid, then
+  // use it and discard new_entry.
+  {
+    unique_lock<mutex> lib_cache_lock(lock_);
+    LibMap::iterator it = lib_cache_.find(hdfs_lib_file);
+    if (it != lib_cache_.end()) {
+      Status status =
+          RefreshCacheEntry(hdfs_lib_file, type, exp_mtime, it, entry_lock, entry);
+      // The entry lock is held at this point if entry is valid.
+      if (!status.ok() || *entry != nullptr) {
+        // new_entry will be discarded; while wasted work, it avoids holding
+        // the cache lock while loading.
+        new_entry->should_remove = true;
+        return status;
+      }
+    }
+
+    // The entry was not found or was removed for refresh. Use the new entry, so
+    // lock it and add it to the cache.
+    *entry = new_entry.release();
+    unique_lock<mutex> local_entry_lock((*entry)->lock);
+    entry_lock->swap(local_entry_lock);
+    lib_cache_[hdfs_lib_file] = *entry;
+  }
+  return Status::OK();
+}
+
+Status LibCache::RefreshCacheEntry(const string& hdfs_lib_file, LibType type,
+    time_t exp_mtime, const LibMap::iterator& iter, unique_lock<mutex>* entry_lock,
+    LibCacheEntry** entry) {
+  // Check if an error occurred on another thread while loading the library.
+  {
+    unique_lock<mutex> local_entry_lock((iter->second)->lock);
+    if (!(iter->second)->loading_status.ok()) {
+      // If loading_status is already set, the returned *entry should be nullptr.
+      DCHECK(*entry == nullptr);
+      return (iter->second)->loading_status;
+    }
+  }
+
+  // Refresh the cache entry if needed. A refresh is needed if check_needs_refresh is set
+  // (e.g., set by ddl) or if the exp_mtime argument is more recent.
+  // If refreshed or an error occurred, remove the entry and set the returned entry to
+  // nullptr.
+  *entry = iter->second;
+  if ((*entry)->check_needs_refresh || (*entry)->last_mod_time < exp_mtime) {
+    // Check if file has been modified since loading the cached copy. If so, remove the
+    // cached entry and create a new one.
+    (*entry)->check_needs_refresh = false;
+    hdfsFS hdfs_conn;
+    Status status = HdfsFsCache::instance()->GetConnection(hdfs_lib_file, &hdfs_conn);
+    if (!status.ok()) {
+      RemoveEntryInternal(hdfs_lib_file, iter);
+      *entry = nullptr;
+      return status;
+    }
+    time_t fs_last_modified_time;
+    status =
+        GetLastModificationTime(hdfs_conn, hdfs_lib_file.c_str(), &fs_last_modified_time);
+
+    // Check that the expected last_modified_time is the same as what's on the filesystem.
+    if (status.ok() && exp_mtime >= 0 && fs_last_modified_time != exp_mtime) {
+      status = Status(TErrorCode::LIB_VERSION_MISMATCH, hdfs_lib_file,
+          fs_last_modified_time, exp_mtime);
+    }
+    if (!status.ok() || (*entry)->last_mod_time < fs_last_modified_time) {
+      RemoveEntryInternal(hdfs_lib_file, iter);
+      *entry = nullptr;
+    }
+    RETURN_IF_ERROR(status);
+  }
+
+  // No refresh needed, the entry can be used.
+  if (*entry != nullptr) {
+    // The cache level lock continues to be held while the entry lock is obtained
+    // so that some other thread does not access the entry and delete it.
     unique_lock<mutex> local_entry_lock((*entry)->lock);
     entry_lock->swap(local_entry_lock);
 
+    // Let the caller propagate any error that occurred when loading the entry.
     RETURN_IF_ERROR((*entry)->copy_file_status);
-    DCHECK_EQ((*entry)->type, type);
+    DCHECK_EQ((*entry)->type, type) << (*entry)->local_path;
     DCHECK(!(*entry)->local_path.empty());
-    return Status::OK();
   }
+  return Status::OK();
+}
 
-  // Entry didn't exist. Add the entry then release lock_ (so other libraries
-  // can be accessed).
-  *entry = new LibCacheEntry();
-
-  // Grab the entry lock before adding it to lib_cache_. We still need to do more
-  // work to initialize *entry and we don't want another thread to pick up
-  // the uninitialized entry.
-  unique_lock<mutex> local_entry_lock((*entry)->lock);
-  entry_lock->swap(local_entry_lock);
-  lib_cache_[hdfs_lib_file] = *entry;
-  lib_cache_lock.unlock();
-
-  // At this point we have the entry lock but not the lib cache lock.
-  DCHECK(*entry != NULL);
-  (*entry)->type = type;
+Status LibCache::LoadCacheEntry(const std::string& hdfs_lib_file, time_t exp_mtime,
+    LibType type, LibCacheEntry* entry) {
+  DCHECK(entry != nullptr);
+  entry->type = type;
 
   // Copy the file
-  (*entry)->local_path = MakeLocalPath(hdfs_lib_file, FLAGS_local_library_dir);
+  entry->local_path = MakeLocalPath(hdfs_lib_file, FLAGS_local_library_dir);
   VLOG(1) << "Adding lib cache entry: " << hdfs_lib_file
-          << ", local path: " << (*entry)->local_path;
+          << ", local path: " << entry->local_path;
 
   hdfsFS hdfs_conn, local_conn;
   RETURN_IF_ERROR(HdfsFsCache::instance()->GetConnection(hdfs_lib_file, &hdfs_conn));
@@ -385,28 +451,32 @@ Status LibCache::GetCacheEntryInternal(const string& hdfs_lib_file, LibType type
   // Note: the file can be updated between getting last_mod_time and copying the file to
   // local_path. This can only result in the file unnecessarily being refreshed, and does
   // not affect correctness.
-  (*entry)->copy_file_status = GetLastModificationTime(
-      hdfs_conn, hdfs_lib_file.c_str(), &(*entry)->last_mod_time);
-  RETURN_IF_ERROR((*entry)->copy_file_status);
+  entry->copy_file_status =
+      GetLastModificationTime(hdfs_conn, hdfs_lib_file.c_str(), &entry->last_mod_time);
+  RETURN_IF_ERROR(entry->copy_file_status);
 
-  (*entry)->copy_file_status = CopyHdfsFile(
-      hdfs_conn, hdfs_lib_file, local_conn, (*entry)->local_path);
-  RETURN_IF_ERROR((*entry)->copy_file_status);
+  // Check that the exp_mtime is the same as what's on the filesystem.
+  if (exp_mtime >= 0 && exp_mtime != entry->last_mod_time) {
+    return Status(
+        TErrorCode::LIB_VERSION_MISMATCH, hdfs_lib_file, entry->last_mod_time, exp_mtime);
+  }
+
+  entry->copy_file_status =
+      CopyHdfsFile(hdfs_conn, hdfs_lib_file, local_conn, entry->local_path);
+  RETURN_IF_ERROR(entry->copy_file_status);
 
   if (type == TYPE_SO) {
     // dlopen the local library
-    RETURN_IF_ERROR(
-        DynamicOpen((*entry)->local_path.c_str(), &(*entry)->shared_object_handle));
+    RETURN_IF_ERROR(DynamicOpen(entry->local_path.c_str(), &entry->shared_object_handle));
   } else if (type == TYPE_IR) {
     // Load the module temporarily and populate all symbols.
-    const string file = (*entry)->local_path;
+    const string file = entry->local_path;
     const string module_id = filesystem::path(file).stem().string();
-    RETURN_IF_ERROR(LlvmCodeGen::GetSymbols(file, module_id, &(*entry)->symbols));
+    RETURN_IF_ERROR(LlvmCodeGen::GetSymbols(file, module_id, &entry->symbols));
   } else {
     DCHECK_EQ(type, TYPE_JAR);
     // Nothing to do.
   }
-
   return Status::OK();
 }
 

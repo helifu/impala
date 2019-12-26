@@ -34,18 +34,21 @@ using impala_udf::DoubleVal;
 using impala_udf::TimestampVal;
 using impala_udf::StringVal;
 using impala_udf::DecimalVal;
+using impala_udf::DateVal;
 
 class TExprNode;
 
 class NullLiteral: public ScalarExpr {
  public:
   virtual bool IsLiteral() const override { return true; }
-  virtual Status GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn)
+  virtual Status GetCodegendComputeFnImpl(LlvmCodeGen* codegen, llvm::Function** fn)
       override WARN_UNUSED_RESULT;
   virtual std::string DebugString() const override;
 
   /// Constructor for test.
   NullLiteral(PrimitiveType type) : ScalarExpr(type, true) { }
+
+  static const char* LLVM_CLASS_NAME;
 
  protected:
   friend class ScalarExpr;
@@ -53,19 +56,8 @@ class NullLiteral: public ScalarExpr {
 
   NullLiteral(const TExprNode& node) : ScalarExpr(node) { }
 
-  virtual BooleanVal GetBooleanVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual TinyIntVal GetTinyIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual SmallIntVal GetSmallIntVal(
-      ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual IntVal GetIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual BigIntVal GetBigIntVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual FloatVal GetFloatVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual DoubleVal GetDoubleVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual StringVal GetStringVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual TimestampVal GetTimestampVal(
-      ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual DecimalVal GetDecimalVal(ScalarExprEvaluator*, const TupleRow*) const override;
-  virtual CollectionVal GetCollectionVal(
+  GENERATE_GET_VAL_INTERPRETED_OVERRIDES_FOR_ALL_SCALAR_TYPES
+  virtual CollectionVal GetCollectionValInterpreted(
       ScalarExprEvaluator*, const TupleRow*) const override;
 };
 

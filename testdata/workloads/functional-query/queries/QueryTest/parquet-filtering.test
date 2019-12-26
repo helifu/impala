@@ -178,8 +178,7 @@ select count(*) from functional_parquet.alltypes where date_string_col = '01/01/
 0
 ---- RUNTIME_PROFILE
 aggregation(SUM, NumRowGroups): 24
-aggregation(SUM, NumDictFilteredRowGroups): 2
-aggregation(SUM, NumStatsFilteredRowGroups): 22
+aggregation(SUM, NumDictFilteredRowGroups): 24
 ====
 ---- QUERY
 # string_col: All values pass
@@ -220,6 +219,27 @@ select count(*) from functional_parquet.alltypes where timestamp_col = '2009-01-
 0
 ---- RUNTIME_PROFILE
 aggregation(SUM, NumRowGroups): 24
+aggregation(SUM, NumDictFilteredRowGroups): 0
+====
+---- QUERY
+# date_col: All values pass
+# Filters 0/4 row groups
+select count(*) from functional_parquet.date_tbl where date_col > '2017-12-31';
+---- RESULTS
+4
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 4
+aggregation(SUM, NumDictFilteredRowGroups): 0
+====
+---- QUERY
+# date_col: No values pass
+# Note: dictionary filtering currently does not work on dates (see IMPALA-4994)
+# Filters 0/4 row groups
+select count(*) from functional_parquet.date_tbl where date_col = '2017-12-31';
+---- RESULTS
+0
+---- RUNTIME_PROFILE
+aggregation(SUM, NumRowGroups): 4
 aggregation(SUM, NumDictFilteredRowGroups): 0
 ====
 ---- QUERY

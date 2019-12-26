@@ -17,22 +17,18 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.hadoop.fs.permission.FsAction;
-
-import org.apache.impala.authorization.AuthorizeableFn;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequest;
-import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCreateFunctionParams;
 import org.apache.impala.thrift.TFunctionBinaryType;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -58,21 +54,21 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
   protected final FunctionArgs args_;
   protected final TypeDef retTypeDef_;
   protected final HdfsUri location_;
-  protected final HashMap<CreateFunctionStmtBase.OptArg, String> optArgs_;
+  protected final Map<CreateFunctionStmtBase.OptArg, String> optArgs_;
   protected final boolean ifNotExists_;
 
   // Result of analysis.
   protected Function fn_;
 
   // Db object for function fn_. Set in analyze().
-  protected Db db_;
+  protected FeDb db_;
 
   // Set in analyze()
   protected String sqlString_;
 
   protected CreateFunctionStmtBase(FunctionName fnName, FunctionArgs args,
       TypeDef retTypeDef, HdfsUri location, boolean ifNotExists,
-      HashMap<CreateFunctionStmtBase.OptArg, String> optArgs) {
+      Map<CreateFunctionStmtBase.OptArg, String> optArgs) {
     // The return and arg types must either be both null or non-null.
     Preconditions.checkState(!(args == null ^ retTypeDef == null));
     fnName_ = fnName;
@@ -134,7 +130,7 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     // Validate function name is legal
-    fnName_.analyze(analyzer);
+    fnName_.analyze(analyzer, false);
 
     if (hasSignature()) {
       // Validate function arguments and return type.
@@ -146,26 +142,19 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
       fn_ = createFunction(fnName_, null, null, false);
     }
 
-    // For now, if authorization is enabled, the user needs ALL on the server
-    // to create functions.
-    // TODO: this is not the right granularity but acceptable for now.
-    analyzer.registerPrivReq(new PrivilegeRequest(
-        new AuthorizeableFn(fn_.signatureString()), Privilege.ALL));
+    analyzer.registerPrivReq(builder ->
+        builder.onFunction(fn_.dbName(), fn_.signatureString())
+            .allOf(Privilege.CREATE)
+            .build());
 
-    Db builtinsDb = analyzer.getCatalog().getDb(Catalog.BUILTINS_DB);
-    if (builtinsDb.containsFunction(fn_.getName())) {
-      throw new AnalysisException("Function cannot have the same name as a builtin: " +
-          fn_.getFunctionName().getFunction());
-    }
-
-    db_ = analyzer.getDb(fn_.dbName(), Privilege.CREATE);
+    db_ = analyzer.getDb(fn_.dbName(), true);
     Function existingFn = db_.getFunction(fn_, Function.CompareMode.IS_INDISTINGUISHABLE);
     if (existingFn != null && !ifNotExists_) {
       throw new AnalysisException(Analyzer.FN_ALREADY_EXISTS_ERROR_MSG +
           existingFn.signatureString());
     }
 
-    location_.analyze(analyzer, Privilege.CREATE, FsAction.READ);
+    location_.analyze(analyzer, Privilege.ALL, FsAction.READ);
     fn_.setLocation(location_);
 
     // Check the file type from the binary type to infer the type of the UDA
@@ -201,5 +190,5 @@ public abstract class CreateFunctionStmtBase extends StatementBase {
    * Creates a concrete function.
    */
   protected abstract Function createFunction(FunctionName fnName,
-      ArrayList<Type> argTypes, Type retType, boolean hasVarArgs);
+      List<Type> argTypes, Type retType, boolean hasVarArgs);
 }

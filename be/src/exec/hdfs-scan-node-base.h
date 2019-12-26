@@ -31,6 +31,7 @@
 #include "exec/filter-context.h"
 #include "exec/scan-node.h"
 #include "runtime/descriptors.h"
+#include "runtime/io/request-context.h"
 #include "runtime/io/request-ranges.h"
 #include "util/avro-util.h"
 #include "util/container-util.h"
@@ -53,7 +54,7 @@ class TScanRange;
 struct HdfsFileDesc {
   HdfsFileDesc(const std::string& filename)
     : fs(NULL), filename(filename), file_length(0), mtime(0),
-      file_compression(THdfsCompression::NONE) {
+      file_compression(THdfsCompression::NONE), is_erasure_coded(false) {
   }
 
   /// Connection to the filesystem containing the file.
@@ -70,6 +71,9 @@ struct HdfsFileDesc {
   int64_t mtime;
 
   THdfsCompression::type file_compression;
+
+  /// is erasure coded
+  bool is_erasure_coded;
 
   /// Splits (i.e. raw byte ranges) for this file, assigned to this scan node.
   std::vector<io::ScanRange*> splits;
@@ -94,6 +98,19 @@ struct ScanRangeMetadata {
       : partition_id(partition_id), original_split(original_split) { }
 };
 
+class HdfsScanPlanNode : public ScanPlanNode {
+ public:
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+
+  /// Conjuncts for each materialized tuple (top-level row batch tuples and collection
+  /// item tuples). Includes a copy of PlanNode.conjuncts_.
+  typedef std::unordered_map<TupleId, std::vector<ScalarExpr*>> ConjunctsMap;
+  ConjunctsMap conjuncts_map_;
+
+  /// Conjuncts to evaluate on parquet::Statistics.
+  std::vector<ScalarExpr*> min_max_conjuncts_;
+};
 
 /// Base class for all Hdfs scan nodes. Contains common members and functions
 /// that are independent of whether batches are materialized by the main thread
@@ -114,21 +131,56 @@ struct ScanRangeMetadata {
 /// Scanners may also use the same filters to eliminate rows at finer granularities
 /// (e.g. per row).
 ///
-/// TODO: Revisit and minimize metrics. Move those specific to legacy multi-threaded
-/// scans into HdfsScanNode.
+/// Counters:
+///
+///   TotalRawHdfsReadTime - the total wall clock time spent by Disk I/O threads in HDFS
+///     read operations. For example, if we have 3 reading threads and each spent 1 sec,
+///     this counter will report 3 sec.
+///
+///   TotalRawHdfsOpenFileTime - the total wall clock time spent by Disk I/O threads in
+///     HDFS open operations.
+///
+///   PerReadThreadRawHdfsThroughput - the read throughput in bytes/sec for each HDFS
+///     read thread while it is executing I/O operations on behalf of this scan.
+///
+///   NumDisksAccessed - number of distinct disks accessed by HDFS scan. Each local disk
+///     is counted as a disk and each remote disk queue (e.g. HDFS remote reads, S3)
+///     is counted as a distinct disk.
+///
+///   ScannerIoWaitTime - total amount of time scanner threads spent waiting for
+///     I/O. This is comparable to ScannerThreadsTotalWallClockTime in the traditional
+///     HDFS scan nodes and the scan node total time for the MT_DOP > 1 scan nodes.
+///     Low values show that each I/O completed before or around the time that the
+///     scanner thread was ready to process the data. High values show that scanner
+///     threads are spending significant time waiting for I/O instead of processing data.
+///     Note that if CPU load is high, this can include time that the thread is runnable
+///     but not scheduled.
+///
+///   AverageHdfsReadThreadConcurrency - the average number of HDFS read threads
+///     executing read operations on behalf of this scan. Higher values show that this
+///     scan is using a larger proportion of the I/O capacity of the system. Lower values
+///     show that either this thread is not I/O bound or that it is getting a small share
+///     of the I/O capacity of the system because of other concurrently executing
+///     queries.
+///
+///   Hdfs Read Thread Concurrency Bucket - the bucket counting (%) of HDFS read thread
+///     concurrency.
+///
 /// TODO: Once the legacy scan node has been removed, several functions can be made
 /// non-virtual. Also merge this class with HdfsScanNodeMt.
+
 class HdfsScanNodeBase : public ScanNode {
  public:
-  HdfsScanNodeBase(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  HdfsScanNodeBase(ObjectPool* pool, const HdfsScanPlanNode& pnode,
+      const THdfsScanNode& hdfs_scan_node, const DescriptorTbl& descs);
   ~HdfsScanNodeBase();
 
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) WARN_UNUSED_RESULT;
-  virtual Status Prepare(RuntimeState* state) WARN_UNUSED_RESULT;
-  virtual void Codegen(RuntimeState* state);
-  virtual Status Open(RuntimeState* state) WARN_UNUSED_RESULT;
-  virtual Status Reset(RuntimeState* state) WARN_UNUSED_RESULT;
-  virtual void Close(RuntimeState* state);
+  virtual Status Prepare(RuntimeState* state) override WARN_UNUSED_RESULT;
+  virtual void Codegen(RuntimeState* state) override;
+  virtual Status Open(RuntimeState* state) override WARN_UNUSED_RESULT;
+  virtual Status Reset(
+      RuntimeState* state, RowBatch* row_batch) override WARN_UNUSED_RESULT;
+  virtual void Close(RuntimeState* state) override;
 
   /// Returns true if this node uses separate threads for scanners that append RowBatches
   /// to a queue, false otherwise.
@@ -159,7 +211,9 @@ class HdfsScanNodeBase : public ScanNode {
   const AvroSchemaElement& avro_schema() const { return *avro_schema_.get(); }
   int skip_header_line_count() const { return skip_header_line_count_; }
   io::RequestContext* reader_context() const { return reader_context_.get(); }
-  bool optimize_parquet_count_star() const { return optimize_parquet_count_star_; }
+  bool optimize_parquet_count_star() const {
+    return parquet_count_star_slot_offset_ != -1;
+  }
   int parquet_count_star_slot_offset() const { return parquet_count_star_slot_offset_; }
 
   typedef std::unordered_map<TupleId, std::vector<ScalarExprEvaluator*>>
@@ -174,6 +228,9 @@ class HdfsScanNodeBase : public ScanNode {
 
   RuntimeProfile::HighWaterMarkCounter* max_compressed_text_file_length() {
     return max_compressed_text_file_length_;
+  }
+  RuntimeProfile::Counter* scanner_io_wait_time() const {
+    return scanner_io_wait_time_;
   }
 
   const static int SKIP_COLUMN = -1;
@@ -210,32 +267,55 @@ class HdfsScanNodeBase : public ScanNode {
   /// This is thread safe.
   io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
       int64_t offset, int64_t partition_id, int disk_id, bool expected_local,
+      bool is_erasure_coded, int64_t mtime,
       const io::BufferOpts& buffer_opts,
-      const io::ScanRange* original_split = NULL);
+      const io::ScanRange* original_split = nullptr);
 
   /// Same as above, but it takes a pointer to a ScanRangeMetadata object which contains
   /// the partition_id, original_splits, and other information about the scan range.
   io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
       int64_t offset, ScanRangeMetadata* metadata, int disk_id, bool expected_local,
-      const io::BufferOpts& buffer_opts);
+      bool is_erasure_coded, int64_t mtime, const io::BufferOpts& buffer_opts);
+
+  /// Same as the first overload, but it takes sub-ranges as well.
+  io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
+      int64_t offset, std::vector<io::ScanRange::SubRange>&& sub_ranges,
+      int64_t partition_id, int disk_id, bool expected_local, bool is_erasure_coded,
+      int64_t mtime, const io::BufferOpts& buffer_opts,
+      const io::ScanRange* original_split = nullptr);
+
+  /// Same as above, but it takes both sub-ranges and metadata.
+  io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
+      int64_t offset, std::vector<io::ScanRange::SubRange>&& sub_ranges,
+      ScanRangeMetadata* metadata, int disk_id, bool expected_local,
+      bool is_erasure_coded, int64_t mtime, const io::BufferOpts& buffer_opts);
 
   /// Old API for compatibility with text scanners (e.g. LZO text scanner).
   io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
-      int64_t offset, int64_t partition_id, int disk_id, bool try_cache,
-      bool expected_local, int mtime, const io::ScanRange* original_split = NULL);
+      int64_t offset, int64_t partition_id, int disk_id, int cache_options,
+      bool expected_local, int64_t mtime, bool is_erasure_coded = false,
+      const io::ScanRange* original_split = nullptr);
 
-  /// Adds ranges to the io mgr queue. 'num_files_queued' indicates how many file's scan
-  /// ranges have been added completely.  A file's scan ranges are added completely if no
-  /// new scanner threads will be needed to process that file besides the additional
-  /// threads needed to process those in 'ranges'.
-  /// Can be overridden to add scan-node specific actions like starting scanner threads.
+  /// Adds ranges to the io mgr queue. Can be overridden to add scan-node specific
+  /// actions like starting scanner threads. Must not be called once
+  /// remaining_scan_range_submissions_ is 0.
+  /// The enqueue_location specifies whether the scan ranges are added to the head or
+  /// tail of the queue.
   virtual Status AddDiskIoRanges(const std::vector<io::ScanRange*>& ranges,
-      int num_files_queued) WARN_UNUSED_RESULT;
+      EnqueueLocation enqueue_location = EnqueueLocation::TAIL) WARN_UNUSED_RESULT;
 
-  /// Adds all splits for file_desc to the io mgr queue and indicates one file has
-  /// been added completely.
-  inline Status AddDiskIoRanges(const HdfsFileDesc* file_desc) WARN_UNUSED_RESULT {
-    return AddDiskIoRanges(file_desc->splits, 1);
+  /// Adds all splits for file_desc to the io mgr queue.
+  inline Status AddDiskIoRanges(const HdfsFileDesc* file_desc,
+      EnqueueLocation enqueue_location = EnqueueLocation::TAIL) WARN_UNUSED_RESULT {
+    return AddDiskIoRanges(file_desc->splits);
+  }
+
+  /// When this counter goes to 0, AddDiskIoRanges() can no longer be called.
+  /// Furthermore, this implies that scanner threads failing to
+  /// acquire a new scan range with StartNextScanRange() can exit.
+  inline void UpdateRemainingScanRangeSubmissions(int32_t delta) {
+    remaining_scan_range_submissions_.Add(delta);
+    DCHECK_GE(remaining_scan_range_submissions_.Load(), 0);
   }
 
   /// Allocates and initializes a new template tuple allocated from pool with values
@@ -292,8 +372,6 @@ class HdfsScanNodeBase : public ScanNode {
   virtual void TransferToScanNodePool(MemPool* pool);
 
   /// map from volume id to <number of split, per volume split lengths>
-  /// TODO: move this into some global .h, no need to include this file just for this
-  /// typedef
   typedef boost::unordered_map<int32_t, std::pair<int, int64_t>> PerVolumeStats;
 
   /// Update the per volume stats with the given scan range params list
@@ -318,6 +396,21 @@ class HdfsScanNodeBase : public ScanNode {
   bool PartitionPassesFilters(int32_t partition_id, const std::string& stats_name,
       const std::vector<FilterContext>& filter_ctxs);
 
+  /// Helper to increase reservation from 'curr_reservation' up to 'ideal_reservation'
+  /// that may succeed in getting a partial increase if the full increase is not
+  /// possible. First increases to an I/O buffer multiple then increases in I/O buffer
+  /// sized increments. 'curr_reservation' can refer to a "share' of the total
+  /// reservation of the buffer pool client, e.g. the 'share" belonging to a single
+  /// scanner thread. Returns the new reservation after increases.
+  int64_t IncreaseReservationIncrementally(int64_t curr_reservation,
+      int64_t ideal_reservation);
+
+  /// Update the number of [un]compressed bytes read for the given SlotId. This is used
+  /// to track the number of bytes read per column and is meant to be called by
+  /// individual scanner classes.
+  void UpdateBytesRead(
+      SlotId slot_id, int64_t uncompressed_bytes_read, int64_t compressed_bytes_read);
+
  protected:
   friend class ScannerContext;
   friend class HdfsScanner;
@@ -339,13 +432,10 @@ class HdfsScanNodeBase : public ScanNode {
   /// Tuple id resolved in Prepare() to set tuple_desc_
   const int tuple_id_;
 
-  /// Set to true when this scan node can optimize a count(*) query by populating the
-  /// tuple with data from the Parquet num rows statistic. See
+  /// The byte offset of the slot for Parquet metadata if Parquet count star optimization
+  /// is enabled. When set, this scan node can optimize a count(*) query by populating
+  /// the tuple with data from the Parquet num rows statistic. See
   /// applyParquetCountStartOptimization() in HdfsScanNode.java.
-  const bool optimize_parquet_count_star_;
-
-  // The byte offset of the slot for Parquet metadata if Parquet count star optimization
-  // is enabled.
   const int parquet_count_star_slot_offset_;
 
   /// RequestContext object to use with the disk-io-mgr for reads.
@@ -402,8 +492,14 @@ class HdfsScanNodeBase : public ScanNode {
   /// this variable.
   bool initial_ranges_issued_ = false;
 
-  /// Number of files that have not been issued from the scanners.
-  AtomicInt32 num_unqueued_files_;
+  /// When this counter drops to 0, AddDiskIoRanges() will not be called again, and
+  /// therefore scanner threads that can't get work should exit. For most
+  /// file formats (except for sequence-based formats), this is 0 after
+  /// IssueInitialRanges(). Note that some scanners (namely Parquet) issue
+  /// additional work to the IO subsystem without using AddDiskIoRanges(),
+  /// but that is managed within the scanner, and doesn't require
+  /// additional scanner threads.
+  AtomicInt32 remaining_scan_range_submissions_ = { 1 };
 
   /// Per scanner type codegen'd fn.
   typedef boost::unordered_map<THdfsFileFormat::type, void*> CodegendFnMap;
@@ -439,40 +535,37 @@ class HdfsScanNodeBase : public ScanNode {
   /// profile.
   bool counters_running_ = false;
 
-  /// The size of the largest compressed text file to be scanned. This is used to
-  /// estimate scanner thread memory usage.
-  RuntimeProfile::HighWaterMarkCounter* max_compressed_text_file_length_ = nullptr;
-
   /// Disk accessed bitmap
   RuntimeProfile::Counter disks_accessed_bitmap_;
-
-  /// Total number of bytes read locally
-  RuntimeProfile::Counter* bytes_read_local_ = nullptr;
-
-  /// Total number of bytes read via short circuit read
-  RuntimeProfile::Counter* bytes_read_short_circuit_ = nullptr;
-
-  /// Total number of bytes read from data node cache
-  RuntimeProfile::Counter* bytes_read_dn_cache_ = nullptr;
-
-  /// Total number of remote scan ranges
-  RuntimeProfile::Counter* num_remote_ranges_ = nullptr;
-
-  /// Total number of bytes read remotely that were expected to be local
-  RuntimeProfile::Counter* unexpected_remote_bytes_ = nullptr;
-
-  /// Total number of file handle opens where the file handle was present in the cache
-  RuntimeProfile::Counter* cached_file_handles_hit_count_ = nullptr;
-
-  /// Total number of file handle opens where the file handle was not in the cache
-  RuntimeProfile::Counter* cached_file_handles_miss_count_ = nullptr;
-
   /// The number of active hdfs reading threads reading for this node.
   RuntimeProfile::Counter active_hdfs_read_thread_counter_;
 
-  /// Average number of active hdfs reading threads
-  /// This should be created in Open() and stopped when all the scanner threads are done.
+  /// Definition of following counters can be found in hdfs-scan-node-base.cc
+  RuntimeProfile::HighWaterMarkCounter* max_compressed_text_file_length_ = nullptr;
+  RuntimeProfile::Counter* bytes_read_local_ = nullptr;
+  RuntimeProfile::Counter* bytes_read_short_circuit_ = nullptr;
+  RuntimeProfile::Counter* bytes_read_dn_cache_ = nullptr;
+  RuntimeProfile::Counter* num_remote_ranges_ = nullptr;
+  RuntimeProfile::Counter* unexpected_remote_bytes_ = nullptr;
+  RuntimeProfile::Counter* cached_file_handles_hit_count_ = nullptr;
+  RuntimeProfile::Counter* cached_file_handles_miss_count_ = nullptr;
+  RuntimeProfile::Counter* data_cache_hit_count_ = nullptr;
+  RuntimeProfile::Counter* data_cache_partial_hit_count_ = nullptr;
+  RuntimeProfile::Counter* data_cache_miss_count_ = nullptr;
+  RuntimeProfile::Counter* data_cache_hit_bytes_ = nullptr;
+  RuntimeProfile::Counter* data_cache_miss_bytes_ = nullptr;
+  RuntimeProfile::Counter* scanner_io_wait_time_ = nullptr;
   RuntimeProfile::Counter* average_hdfs_read_thread_concurrency_ = nullptr;
+  RuntimeProfile::Counter* per_read_thread_throughput_counter_ = nullptr;
+  RuntimeProfile::Counter* num_disks_accessed_counter_ = nullptr;
+  RuntimeProfile::Counter* hdfs_read_timer_ = nullptr;
+  RuntimeProfile::Counter* hdfs_open_file_timer_ = nullptr;
+  RuntimeProfile::SummaryStatsCounter* initial_range_ideal_reservation_stats_ = nullptr;
+  RuntimeProfile::SummaryStatsCounter* initial_range_actual_reservation_stats_ = nullptr;
+  RuntimeProfile::SummaryStatsCounter* compressed_bytes_read_per_column_counter_ =
+      nullptr;
+  RuntimeProfile::SummaryStatsCounter* uncompressed_bytes_read_per_column_counter_ =
+      nullptr;
 
   /// HDFS read thread concurrency bucket: bucket[i] refers to the number of sample
   /// taken where there are i concurrent hdfs read thread running. Created in Open().
@@ -487,14 +580,50 @@ class HdfsScanNodeBase : public ScanNode {
   /// scanner threads.
   Status status_;
 
+  /// Struct that tracks the uncompressed and compressed bytes read. Used by the map
+  /// bytes_read_per_col_ to track the [un]compressed bytes read per column. Types are
+  /// atomic as the struct may be updated concurrently.
+  struct BytesRead {
+    AtomicInt64 uncompressed_bytes_read;
+    AtomicInt64 compressed_bytes_read;
+  };
+
+  /// Map from SlotId (column identifer) to a pair where the first entry is the number of
+  /// uncompressed bytes read for the column and the second entry is the number of
+  /// compressed bytes read for the column. This map is used to update the
+  /// [un]compressed_bytes_read_per_column counter.
+  std::unordered_map<SlotId, BytesRead> bytes_read_per_col_;
+
+  /// Lock that controls access to bytes_read_per_col_ so that multiple scanners
+  /// can update the map concurrently
+  boost::shared_mutex bytes_read_per_col_lock_;
+
   /// Performs dynamic partition pruning, i.e., applies runtime filters to files, and
   /// issues initial ranges for all file types. Waits for runtime filters if necessary.
   /// Only valid to call if !initial_ranges_issued_. Sets initial_ranges_issued_ to true.
+  /// A non-ok status is returned only if it encounters an invalid scan range or if a
+  /// scanner thread cancels the scan when it runs into an error.
   Status IssueInitialScanRanges(RuntimeState* state) WARN_UNUSED_RESULT;
 
-  /// Create and open new scanner for this partition type.
-  /// If the scanner is successfully created and opened, it is returned in 'scanner'.
-  Status CreateAndOpenScanner(HdfsPartitionDescriptor* partition,
+  /// Gets the next scan range to process and allocates buffer for it. 'reservation' is
+  /// an in/out argument with the current reservation available for this range. It may
+  /// be increased by this function up to a computed "ideal" reservation, in which case
+  /// *reservation is increased to reflect the new reservation.
+  ///
+  /// Returns Status::OK() and sets 'scan_range' if it gets a range to process. Returns
+  /// Status::OK() and sets 'scan_range' to NULL when no more ranges are left to process.
+  /// Returns an error status if there was an error getting the range or allocating
+  /// buffers.
+  Status StartNextScanRange(int64_t* reservation, io::ScanRange** scan_range);
+
+  /// Helper for the CreateAndOpenScanner() implementations in the subclass. Creates and
+  /// opens a new scanner for this partition type. Depending on the outcome, the
+  /// behaviour differs:
+  /// - If the scanner is successfully created and opened, returns OK and sets *scanner.
+  /// - If the scanner cannot be created, returns an error and does not set *scanner.
+  /// - If the scanner is created but opening fails, returns an error and sets *scanner.
+  ///   The caller is then responsible for closing the scanner.
+  Status CreateAndOpenScannerHelper(HdfsPartitionDescriptor* partition,
       ScannerContext* context, boost::scoped_ptr<HdfsScanner>* scanner)
       WARN_UNUSED_RESULT;
 

@@ -18,18 +18,18 @@
 #include "kudu/util/mem_tracker.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <deque>
 #include <limits>
 #include <list>
 #include <memory>
-#include <mutex>
+#include <ostream>
 
-#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/once.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/process_memory.h"
-#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -56,8 +56,13 @@ void MemTracker::CreateRootTracker() {
 
 shared_ptr<MemTracker> MemTracker::CreateTracker(int64_t byte_limit,
                                                  const string& id,
-                                                 const shared_ptr<MemTracker>& parent) {
-  shared_ptr<MemTracker> real_parent = parent ? parent : GetRootTracker();
+                                                 shared_ptr<MemTracker> parent) {
+  shared_ptr<MemTracker> real_parent;
+  if (parent) {
+    real_parent = std::move(parent);
+  } else {
+    real_parent = GetRootTracker();
+  }
   shared_ptr<MemTracker> tracker(new MemTracker(byte_limit, id, real_parent));
   real_parent->AddChildTracker(tracker);
   tracker->Init();

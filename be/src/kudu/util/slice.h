@@ -7,17 +7,24 @@
 #ifndef KUDU_UTIL_SLICE_H_
 #define KUDU_UTIL_SLICE_H_
 
-#include <assert.h>
-#include <map>
-#include <stddef.h>
+// NOTE: using stdint.h instead of cstdint because this file is supposed
+//       to be processed by a compiler lacking C++11 support.
 #include <stdint.h>
-#include <string.h>
+
+#include <cassert>
+#include <cstddef>
+#include <cstring>
+#include <iosfwd>
+#include <map>
 #include <string>
 
 #ifdef KUDU_HEADERS_USE_RICH_SLICE
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/faststring.h"
+#endif
+#ifdef KUDU_HEADERS_NO_STUBS
+#include "kudu/gutil/port.h"
 #endif
 #include "kudu/util/kudu_export.h"
 
@@ -290,6 +297,14 @@ inline int Slice::compare(const Slice& b) const {
   }
   return r;
 }
+
+// We don't run TSAN on this function because it makes it really slow and causes some
+// test timeouts. This is only used on local buffers anyway, so we don't lose much
+// by not checking it.
+#ifdef KUDU_HEADERS_NO_STUBS
+ATTRIBUTE_NO_SANITIZE_THREAD
+#endif
+bool IsAllZeros(const Slice& s);
 
 /// @brief STL map whose keys are Slices.
 ///

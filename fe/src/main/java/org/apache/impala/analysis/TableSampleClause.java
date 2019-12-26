@@ -21,6 +21,8 @@ import org.apache.impala.common.AnalysisException;
 
 import com.google.common.base.Preconditions;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 /**
  * Represents a TABLESAMPLE clause.
  *
@@ -30,7 +32,7 @@ import com.google.common.base.Preconditions;
  * The first number specifies the percent of table bytes to sample.
  * The second number specifies the random seed to use.
  */
-public class TableSampleClause implements ParseNode {
+public class TableSampleClause extends StmtNode {
   // Required percent of bytes to sample.
   private final long percentBytes_;
   // Optional random seed. Null if not specified.
@@ -63,7 +65,14 @@ public class TableSampleClause implements ParseNode {
   }
 
   @Override
-  public String toSql() { return toSql(randomSeed_); }
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
+    return toSql(randomSeed_);
+  }
 
   /**
    * Prints the SQL of this TABLESAMPLE clause. The optional REPEATABLE clause is

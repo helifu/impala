@@ -17,8 +17,8 @@
 
 package org.apache.impala.analysis;
 
-import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function.CompareMode;
@@ -31,10 +31,12 @@ import org.apache.impala.thrift.TCaseExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 
 /**
  * CASE and DECODE are represented using this class. The backend implementation is
@@ -127,8 +129,8 @@ public class CaseExpr extends Expr {
     // Add the key_expr/val_expr pairs
     while (childIdx + 2 <= decodeExpr.getChildren().size()) {
       Expr candidate = decodeExpr.getChild(childIdx++);
-      if (candidate.isLiteral()) {
-        if (candidate.isNullLiteral()) {
+      if (IS_LITERAL.apply(candidate)) {
+        if (IS_NULL_VALUE.apply(candidate)) {
           // An example case is DECODE(foo, NULL, bar), since NULLs are considered
           // equal, this becomes CASE WHEN foo IS NULL THEN bar END.
           children_.add(encodedIsNull.clone());
@@ -197,23 +199,27 @@ public class CaseExpr extends Expr {
   }
 
   @Override
-  public String toSqlImpl() {
-    return (decodeExpr_ == null) ? toCaseSql() : decodeExpr_.toSqlImpl();
+  public String toSqlImpl(ToSqlOptions options) {
+    return (decodeExpr_ == null) ? toCaseSql(options) : decodeExpr_.toSqlImpl(options);
   }
 
   @VisibleForTesting
-  String toCaseSql() {
+  final String toCaseSql() {
+    return toCaseSql(DEFAULT);
+  }
+
+  String toCaseSql(ToSqlOptions options) {
     StringBuilder output = new StringBuilder("CASE");
     int childIdx = 0;
     if (hasCaseExpr_) {
-      output.append(" " + children_.get(childIdx++).toSql());
+      output.append(" " + children_.get(childIdx++).toSql(options));
     }
     while (childIdx + 2 <= children_.size()) {
-      output.append(" WHEN " + children_.get(childIdx++).toSql());
-      output.append(" THEN " + children_.get(childIdx++).toSql());
+      output.append(" WHEN " + children_.get(childIdx++).toSql(options));
+      output.append(" THEN " + children_.get(childIdx++).toSql(options));
     }
     if (hasElseExpr_) {
-      output.append(" ELSE " + children_.get(children_.size() - 1).toSql());
+      output.append(" ELSE " + children_.get(children_.size() - 1).toSql(options));
     }
     output.append(" END");
     return output.toString();
@@ -287,7 +293,8 @@ public class CaseExpr extends Expr {
       } else {
         // If no case expr was given, then the when exprs should always return
         // boolean or be castable to boolean.
-        if (!Type.isImplicitlyCastable(whenExpr.getType(), Type.BOOLEAN, false)) {
+        if (!Type.isImplicitlyCastable(whenExpr.getType(), Type.BOOLEAN,
+            false, analyzer.isDecimalV2())) {
           Preconditions.checkState(isCase());
           throw new AnalysisException("When expr '" + whenExpr.toSql() + "'" +
               " is not of type boolean and not castable to type boolean.");
@@ -385,7 +392,7 @@ public class CaseExpr extends Expr {
     boolean allOutputsKnown = true;
     int numOutputConstants = 0;
     long maxOutputNonConstNdv = -1;
-    HashSet<LiteralExpr> constLiteralSet = Sets.newHashSetWithExpectedSize(children_.size());
+    Set<LiteralExpr> constLiteralSet = Sets.newHashSetWithExpectedSize(children_.size());
 
     for (int i = loopStart; i < children_.size(); ++i) {
       // The children follow this ordering:
@@ -401,7 +408,7 @@ public class CaseExpr extends Expr {
       Expr outputExpr = children_.get(i);
 
       if (outputExpr.isConstant()) {
-        if (outputExpr.isLiteral()) {
+        if (IS_LITERAL.apply(outputExpr)) {
           LiteralExpr outputLiteral = (LiteralExpr) outputExpr;
           if (constLiteralSet.add(outputLiteral)) ++numOutputConstants;
         } else {
@@ -435,6 +442,16 @@ public class CaseExpr extends Expr {
   private boolean isDecode() { return decodeExpr_ != null; }
   public boolean hasCaseExpr() { return hasCaseExpr_; }
   public boolean hasElseExpr() { return hasElseExpr_; }
+
+  @Override
+  public String debugString() {
+    return Objects.toStringHelper(this)
+        .add("decodeExpr_", decodeExpr_ == null ? "null" : decodeExpr_.debugString())
+        .add("hasCaseExpr", hasCaseExpr_)
+        .add("hasElseExpr", hasElseExpr_)
+        .addValue(super.debugString())
+        .toString();
+  }
 
   @Override
   public Expr clone() { return new CaseExpr(this); }

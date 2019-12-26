@@ -125,17 +125,18 @@ set(UTIL_SRCS
   cache_metrics.cc
   coding.cc
   condition_variable.cc
+  cow_object.cc
   crc.cc
   debug-util.cc
+  decimal_util.cc
   debug/trace_event_impl.cc
   debug/trace_event_impl_constants.cc
   debug/trace_event_synthetic_delay.cc
-  env.cc
-  env_posix.cc
-  env_util.cc
+  debug/unwind_safeness.cc
+  easy_json.cc
+  env.cc env_posix.cc env_util.cc
   errno.cc
   faststring.cc
-  failure_detector.cc
   fault_injection.cc
   file_cache.cc
   flags.cc
@@ -174,7 +175,6 @@ set(UTIL_SRCS
   pb_util-internal.cc
   process_memory.cc
   random_util.cc
-  resettable_heartbeater.cc
   rolling_log.cc
   rw_mutex.cc
   rwc_lock.cc
@@ -201,6 +201,8 @@ set(UTIL_SRCS
   # Remove from compilation, as it depends on generated method calls. Replaced by
   # kudu_version.cc in Impala's common library.
   # version_info.cc
+  version_util.cc
+  website_util.cc
   zlib.cc
 )
 
@@ -209,7 +211,7 @@ set(UTIL_SRCS
 # optimized regardless of the default optimization options.
 set_source_files_properties(memory/overwrite.cc PROPERTIES COMPILE_FLAGS "-O3")
 
-if(NOT NO_NVM_SUPPORT)
+if(HAVE_LIB_VMEM)
   set(UTIL_SRCS
     ${UTIL_SRCS}
     nvm_cache.cc)
@@ -236,7 +238,7 @@ if(NOT APPLE)
     rt)
 endif()
 
-if (NOT NO_NVM_SUPPORT)
+if(HAVE_LIB_VMEM)
   set(UTIL_LIBS
     ${UTIL_LIBS}
     vmem)
@@ -253,11 +255,6 @@ ADD_EXPORTABLE_LIBRARY(kudu_util
   DEPS ${UTIL_LIBS}
   NONLINK_DEPS gen_version_info
   EXPORTED_DEPS ${EXPORTED_UTIL_LIBS})
-
-if(NO_NVM_SUPPORT)
-  target_compile_definitions(kudu_util PRIVATE
-    NO_NVM_SUPPORT=1)
-endif()
 
 #######################################
 # kudu_util_compression
@@ -281,23 +278,26 @@ ADD_EXPORTABLE_LIBRARY(kudu_util_compression
 # kudu_test_util
 #######################################
 
-if(NOT NO_TESTS)
-  add_library(kudu_test_util
-    test_util.cc)
-  target_link_libraries(kudu_test_util
-    gflags
-    glog
-    gmock
-    kudu_util)
+# Used by mini-cluster, so must be built even when NO_TESTS=0.
+add_library(kudu_test_util
+  test_util.cc)
+target_link_libraries(kudu_test_util
+  gflags
+  glog
+  # Impala doesn't have gmock in its toolchain
+  gtest
+  #gmock
+  kudu_util)
 
-  if(NOT NO_NVM_SUPPORT)
-    target_link_libraries(kudu_test_util
-      vmem)
-  endif()
+if(HAVE_LIB_VMEM)
+  target_link_libraries(kudu_test_util
+    vmem)
+endif()
 
 #######################################
 # kudu_curl_util
 #######################################
+if(NOT NO_TESTS)
   add_library(kudu_curl_util
     curl_util.cc)
   target_link_libraries(kudu_curl_util
@@ -305,11 +305,12 @@ if(NOT NO_TESTS)
     ${CURL_LIBRARIES}
     glog
     gutil)
+endif()
 
 #######################################
 # kudu_test_main
 #######################################
-
+if(NOT NO_TESTS)
   add_library(kudu_test_main
     test_main.cc)
   target_link_libraries(kudu_test_main
@@ -339,20 +340,23 @@ target_link_libraries(protoc-gen-insertions gutil glog gflags protoc protobuf ${
 #######################################
 
 set(KUDU_TEST_LINK_LIBS kudu_util gutil ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(async_util-test)
 ADD_KUDU_TEST(atomic-test)
 ADD_KUDU_TEST(bit-util-test)
 ADD_KUDU_TEST(bitmap-test)
 ADD_KUDU_TEST(blocking_queue-test)
 ADD_KUDU_TEST(bloom_filter-test)
+ADD_KUDU_TEST(cache-bench RUN_SERIAL true)
 ADD_KUDU_TEST(cache-test)
 ADD_KUDU_TEST(callback_bind-test)
 ADD_KUDU_TEST(countdown_latch-test)
 ADD_KUDU_TEST(crc-test RUN_SERIAL true) # has a benchmark
 ADD_KUDU_TEST(debug-util-test)
+ADD_KUDU_TEST(decimal_util-test)
+ADD_KUDU_TEST(easy_json-test)
 ADD_KUDU_TEST(env-test LABELS no_tsan)
 ADD_KUDU_TEST(env_util-test)
 ADD_KUDU_TEST(errno-test)
-ADD_KUDU_TEST(failure_detector-test)
 ADD_KUDU_TEST(faststring-test)
 ADD_KUDU_TEST(file_cache-test)
 ADD_KUDU_TEST(file_cache-stress-test RUN_SERIAL true)
@@ -362,6 +366,7 @@ ADD_KUDU_TEST(flags-test)
 ADD_KUDU_TEST(group_varint-test)
 ADD_KUDU_TEST(hash_util-test)
 ADD_KUDU_TEST(hdr_histogram-test)
+ADD_KUDU_TEST(int128-test)
 ADD_KUDU_TEST(inline_slice-test)
 ADD_KUDU_TEST(interval_tree-test)
 ADD_KUDU_TEST(jsonreader-test)
@@ -379,6 +384,7 @@ ADD_KUDU_TEST(mt-metrics-test RUN_SERIAL true)
 ADD_KUDU_TEST(mt-threadlocal-test RUN_SERIAL true)
 ADD_KUDU_TEST(net/dns_resolver-test)
 ADD_KUDU_TEST(net/net_util-test)
+ADD_KUDU_TEST(net/socket-test)
 ADD_KUDU_TEST(object_pool-test)
 ADD_KUDU_TEST(oid_generator-test)
 ADD_KUDU_TEST(once-test)
@@ -387,27 +393,28 @@ ADD_KUDU_TEST(path_util-test)
 ADD_KUDU_TEST(process_memory-test RUN_SERIAL true)
 ADD_KUDU_TEST(random-test)
 ADD_KUDU_TEST(random_util-test)
-ADD_KUDU_TEST(resettable_heartbeater-test)
 ADD_KUDU_TEST(rle-test)
 ADD_KUDU_TEST(rolling_log-test)
-ADD_KUDU_TEST(rw_mutex-test)
+ADD_KUDU_TEST(rw_mutex-test RUN_SERIAL true)
 ADD_KUDU_TEST(rw_semaphore-test)
-ADD_KUDU_TEST(rwc_lock-test)
+ADD_KUDU_TEST(rwc_lock-test RUN_SERIAL true)
 ADD_KUDU_TEST(safe_math-test)
 ADD_KUDU_TEST(scoped_cleanup-test)
 ADD_KUDU_TEST(slice-test)
+ADD_KUDU_TEST(sorted_disjoint_interval_list-test)
 ADD_KUDU_TEST(spinlock_profiling-test)
-ADD_KUDU_TEST(stack_watchdog-test)
+ADD_KUDU_TEST(stack_watchdog-test PROCESSORS 2)
 ADD_KUDU_TEST(status-test)
 ADD_KUDU_TEST(string_case-test)
-ADD_KUDU_TEST(striped64-test)
+ADD_KUDU_TEST(striped64-test RUN_SERIAL true)
 ADD_KUDU_TEST(subprocess-test)
 ADD_KUDU_TEST(thread-test)
 ADD_KUDU_TEST(threadpool-test)
 ADD_KUDU_TEST(throttler-test)
-ADD_KUDU_TEST(trace-test)
+ADD_KUDU_TEST(trace-test PROCESSORS 4)
 ADD_KUDU_TEST(url-coding-test)
 ADD_KUDU_TEST(user-test)
+ADD_KUDU_TEST(version_util-test)
 
 if (NOT APPLE)
   ADD_KUDU_TEST(minidump-test)
@@ -474,5 +481,6 @@ endif()
 ADD_KUDU_TEST(compression/compression-test)
 if(NOT NO_TESTS)
   target_link_libraries(compression-test
+    cfile
     kudu_util_compression)
 endif()

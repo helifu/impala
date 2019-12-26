@@ -36,7 +36,6 @@ import re
 from tests.performance.query import Query
 
 # Setup logging for this module.
-logging.basicConfig(level=logging.INFO, format='[%(name)s] %(threadName)s: %(message)s')
 LOG = logging.getLogger('query_executor')
 LOG.setLevel(level=logging.INFO)
 
@@ -158,12 +157,15 @@ class BeeswaxQueryExecConfig(ImpalaQueryExecConfig):
   """
 
   def __init__(self, use_kerberos=False, exec_options=None, impalad='localhost:21000',
-      plugin_runner=None):
+               plugin_runner=None, user=None, password=None, use_ssl=False):
     super(BeeswaxQueryExecConfig, self).__init__(plugin_runner=plugin_runner,
         impalad=impalad)
     self.use_kerberos = use_kerberos
     self.exec_options = dict()
     self._build_options(exec_options)
+    self.user = user
+    self.password = password
+    self.use_ssl = use_ssl
 
   def _build_options(self, exec_options):
     """Read the exec_options into self.exec_options

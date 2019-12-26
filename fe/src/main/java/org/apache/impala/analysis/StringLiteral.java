@@ -21,10 +21,10 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.math.BigDecimal;
 
-import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TStringLiteral;
@@ -36,6 +36,7 @@ import java_cup.runtime.Symbol;
 
 public class StringLiteral extends LiteralExpr {
   private final String value_;
+  public static int MAX_STRING_LEN = Integer.MAX_VALUE;
 
   // Indicates whether this value needs to be unescaped in toThrift().
   private final boolean needsUnescaping_;
@@ -63,14 +64,17 @@ public class StringLiteral extends LiteralExpr {
   public boolean localEquals(Expr that) {
     if (!super.localEquals(that)) return false;
     StringLiteral other = (StringLiteral) that;
-    return needsUnescaping_ == other.needsUnescaping_ && value_.equals(other.value_);
+    return needsUnescaping_ == other.needsUnescaping_ && type_.equals(other.type_)
+        && value_.equals(other.value_);
   }
 
   @Override
   public int hashCode() { return value_.hashCode(); }
 
   @Override
-  public String toSqlImpl() { return "'" + getNormalizedValue() + "'"; }
+  public String toSqlImpl(ToSqlOptions options) {
+    return "'" + getNormalizedValue() + "'";
+  }
 
   @Override
   protected void toThrift(TExprNode msg) {
@@ -79,12 +83,16 @@ public class StringLiteral extends LiteralExpr {
     msg.string_literal = new TStringLiteral(val);
   }
 
-  public String getValue() { return value_; }
+  /**
+   * Returns the original value that the string literal was constructed with,
+   * without escaping or unescaping it.
+   */
+  public String getValueWithOriginalEscapes() { return value_; }
 
   public String getUnescapedValue() {
     // Unescape string exactly like Hive does. Hive's method assumes
     // quotes so we add them here to reuse Hive's code.
-    return BaseSemanticAnalyzer.unescapeSQLString("'" + getNormalizedValue()
+    return MetastoreShim.unescapeSQLString("'" + getNormalizedValue()
         + "'");
   }
 
@@ -126,7 +134,7 @@ public class StringLiteral extends LiteralExpr {
 
   @Override
   public String getStringValue() {
-    return value_;
+    return getValueWithOriginalEscapes();
   }
 
   @Override
@@ -138,7 +146,7 @@ public class StringLiteral extends LiteralExpr {
 
   @Override
   protected Expr uncheckedCastTo(Type targetType) throws AnalysisException {
-    Preconditions.checkState(targetType.isNumericType() || targetType.isDateType()
+    Preconditions.checkState(targetType.isNumericType() || targetType.isDateOrTimeType()
         || targetType.equals(this.type_) || targetType.isStringType());
     if (targetType.equals(this.type_)) {
       return this;
@@ -146,8 +154,10 @@ public class StringLiteral extends LiteralExpr {
       type_ = targetType;
     } else if (targetType.isNumericType()) {
       return convertToNumber();
-    } else if (targetType.isDateType()) {
-      // Let the BE do the cast so it is in Boost format
+    } else if (targetType.isDateOrTimeType()) {
+      // Let the BE do the cast
+      // - it is in Boost format in case target type is TIMESTAMP
+      // - CCTZ is used for conversion in case target type is DATE.
       return new CastExpr(targetType, this);
     }
     return this;

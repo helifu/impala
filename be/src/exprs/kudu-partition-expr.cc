@@ -33,8 +33,9 @@ namespace impala {
 KuduPartitionExpr::KuduPartitionExpr(const TExprNode& node)
   : ScalarExpr(node), tkudu_partition_expr_(node.kudu_partition_expr) {}
 
-Status KuduPartitionExpr::Init(const RowDescriptor& row_desc, RuntimeState* state) {
-  RETURN_IF_ERROR(ScalarExpr::Init(row_desc, state));
+Status KuduPartitionExpr::Init(
+    const RowDescriptor& row_desc, bool is_entry_point, RuntimeState* state) {
+  RETURN_IF_ERROR(ScalarExpr::Init(row_desc, is_entry_point, state));
   DCHECK_EQ(tkudu_partition_expr_.referenced_columns.size(), children_.size());
 
   // Create the KuduPartitioner we'll use to get the partition index for each row.
@@ -59,8 +60,8 @@ Status KuduPartitionExpr::Init(const RowDescriptor& row_desc, RuntimeState* stat
   return Status::OK();
 }
 
-IntVal KuduPartitionExpr::GetIntVal(ScalarExprEvaluator* eval,
-    const TupleRow* row) const {
+IntVal KuduPartitionExpr::GetIntValInterpreted(
+    ScalarExprEvaluator* eval, const TupleRow* row) const {
   for (int i = 0; i < children_.size(); ++i) {
     void* val = eval->GetValue(*GetChild(i), row);
     if (val == NULL) {
@@ -70,8 +71,8 @@ IntVal KuduPartitionExpr::GetIntVal(ScalarExprEvaluator* eval,
     }
     int col = tkudu_partition_expr_.referenced_columns[i];
     const ColumnDescriptor& col_desc = table_desc_->col_descs()[col];
-    PrimitiveType type = col_desc.type().type;
-    DCHECK_EQ(GetChild(i)->type().type, type);
+    const ColumnType& type = col_desc.type();
+    DCHECK_EQ(GetChild(i)->type().type, type.type);
     Status s = WriteKuduValue(col, type, val, false, row_.get());
     // This can only fail if we set a col to an incorect type, which would be a bug in
     // planning, so we can DCHECK.
@@ -88,9 +89,9 @@ IntVal KuduPartitionExpr::GetIntVal(ScalarExprEvaluator* eval,
   return IntVal(kudu_partition);
 }
 
-Status KuduPartitionExpr::GetCodegendComputeFn(
+Status KuduPartitionExpr::GetCodegendComputeFnImpl(
     LlvmCodeGen* codegen, llvm::Function** fn) {
-  return Status("Error: KuduPartitionExpr::GetCodegendComputeFn not implemented.");
+  return GetCodegendComputeFnWrapper(codegen, fn);
 }
 
 } // namespace impala

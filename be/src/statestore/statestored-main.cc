@@ -26,7 +26,6 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "rpc/rpc-trace.h"
-#include "runtime/mem-tracker.h"
 #include "statestore/statestore.h"
 #include "util/common-metrics.h"
 #include "util/debug-util.h"
@@ -38,12 +37,6 @@
 DECLARE_int32(state_store_port);
 DECLARE_int32(webserver_port);
 DECLARE_bool(enable_webserver);
-DECLARE_string(principal);
-DECLARE_string(ssl_server_certificate);
-DECLARE_string(ssl_private_key);
-DECLARE_string(ssl_private_key_password_cmd);
-DECLARE_string(ssl_cipher_list);
-DECLARE_string(ssl_minimum_version);
 
 #include "common/names.h"
 
@@ -56,12 +49,11 @@ int StatestoredMain(int argc, char** argv) {
   FLAGS_webserver_port = 25010;
   InitCommonRuntime(argc, argv, false);
 
-  MemTracker mem_tracker;
-  scoped_ptr<Webserver> webserver(new Webserver());
   scoped_ptr<MetricGroup> metrics(new MetricGroup("statestore"));
+  scoped_ptr<Webserver> webserver(new Webserver(metrics.get()));
 
   if (FLAGS_enable_webserver) {
-    AddDefaultUrlCallbacks(webserver.get(), &mem_tracker, metrics.get());
+    AddDefaultUrlCallbacks(webserver.get(), metrics.get());
     ABORT_IF_ERROR(webserver->Start());
   } else {
     LOG(INFO) << "Not starting webserver";
@@ -81,29 +73,8 @@ int StatestoredMain(int argc, char** argv) {
   CommonMetrics::InitCommonMetrics(metrics.get());
 
   Statestore statestore(metrics.get());
-  ABORT_IF_ERROR(statestore.Init());
+  ABORT_IF_ERROR(statestore.Init(FLAGS_state_store_port));
   statestore.RegisterWebpages(webserver.get());
-  boost::shared_ptr<TProcessor> processor(
-      new StatestoreServiceProcessor(statestore.thrift_iface()));
-  boost::shared_ptr<TProcessorEventHandler> event_handler(
-      new RpcEventHandler("statestore", metrics.get()));
-  processor->setEventHandler(event_handler);
-
-  ThriftServer* server;
-  ThriftServerBuilder builder("StatestoreService", processor, FLAGS_state_store_port);
-  if (EnableInternalSslConnections()) {
-    SSLProtocol ssl_version;
-    ABORT_IF_ERROR(
-        SSLProtoVersions::StringToProtocol(FLAGS_ssl_minimum_version, &ssl_version));
-    LOG(INFO) << "Enabling SSL for Statestore";
-    builder.ssl(FLAGS_ssl_server_certificate, FLAGS_ssl_private_key)
-        .pem_password_cmd(FLAGS_ssl_private_key_password_cmd)
-        .ssl_version(ssl_version)
-        .cipher_list(FLAGS_ssl_cipher_list);
-  }
-  ABORT_IF_ERROR(builder.metrics(metrics.get()).Build(&server));
-  ABORT_IF_ERROR(server->Start());
-
   statestore.MainLoop();
 
   return 0;

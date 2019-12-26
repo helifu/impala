@@ -17,7 +17,15 @@
 
 // Common protobuf definitions.
 
+syntax="proto2";
+
 package impala;
+
+// Refer to Types.thrift for documentation.
+message NetworkAddressPB {
+  required string hostname = 1;
+  required int32 port = 2;
+}
 
 // Proto-serialized version of Impala's Status object.
 message StatusPB {
@@ -27,8 +35,8 @@ message StatusPB {
 
 // 128-bit ID (equivalent to TUniqueID).
 message UniqueIdPB {
-  optional int64 hi = 1;
-  optional int64 lo = 2;
+  required fixed64 hi = 1;
+  required fixed64 lo = 2;
 }
 
 // The compression codec. Currently used in row batch's header to
@@ -36,4 +44,4 @@ message UniqueIdPB {
 enum CompressionType {
   NONE = 0; // No compression.
   LZ4 = 1;
-};
+}

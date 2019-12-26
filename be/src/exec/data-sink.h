@@ -54,7 +54,11 @@ class TInsertStats;
 /// Close() is called to release any resources before destroying the sink.
 class DataSink {
  public:
-  DataSink(const RowDescriptor* row_desc, const string& name, RuntimeState* state);
+  /// If this is the sink at the root of a fragment, 'sink_id' must be a unique ID for
+  /// the sink for use in runtime profiles and other purposes. Otherwise this is a join
+  /// build sink owned by an ExecNode and 'sink_id' must be -1.
+  DataSink(TDataSinkId sink_id, const RowDescriptor* row_desc, const string& name,
+      RuntimeState* state);
   virtual ~DataSink();
 
   /// Setup. Call before Send(), Open(), or Close() during the prepare phase of the query
@@ -62,6 +66,10 @@ class DataSink {
   /// Also creates a MemTracker and MemPool for the output (and partitioning) expr and
   /// initializes their evaluators. Subclasses must call DataSink::Prepare().
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker);
+
+  /// Codegen expressions in the sink. Overridden by sink type which supports codegen.
+  /// No-op by default.
+  virtual void Codegen(LlvmCodeGen* codegen);
 
   /// Call before Send() to open the sink and initialize output expression evaluators.
   virtual Status Open(RuntimeState* state);
@@ -85,20 +93,15 @@ class DataSink {
       const TPlanFragmentInstanceCtx& fragment_instance_ctx,
       const RowDescriptor* row_desc, RuntimeState* state, DataSink** sink);
 
-  /// Merges one update to the DML stats for a partition. dst_stats will have the
-  /// combined stats of src_stats and dst_stats after this method returns.
-  static void MergeDmlStats(const TInsertStats& src_stats,
-      TInsertStats* dst_stats);
-
-  /// Outputs the DML stats contained in the map of partition updates to a string
-  static std::string OutputDmlStats(const PartitionStatusMap& stats,
-      const std::string& prefix = "");
-
   MemTracker* mem_tracker() const { return mem_tracker_.get(); }
   RuntimeProfile* profile() const { return profile_; }
   const std::vector<ScalarExprEvaluator*>& output_expr_evals() const {
     return output_expr_evals_;
   }
+  bool is_closed() const { return closed_; }
+
+  /// Default partition key when none is specified.
+  static const char* const ROOT_PARTITION_KEY;
 
  protected:
   /// Set to true after Close() has been called. Subclasses should check and set this in

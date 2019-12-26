@@ -17,18 +17,16 @@
 
 #pragma once
 
-#include <functional>
-#include <map>
+#include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/stringpiece.h"
-#include "kudu/security/crypto.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
@@ -37,17 +35,24 @@
 // Forward declarations for the relevant OpenSSL typedefs
 // in addition to openssl_util.h.
 typedef struct asn1_string_st ASN1_INTEGER;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 typedef struct env_md_st EVP_MD;
+#else
+typedef struct evp_md_st EVP_MD;
+#endif
 typedef struct rsa_st RSA;
 typedef struct x509_st X509;
 typedef struct X509_req_st X509_REQ;
-struct stack_st_X509_EXTENSION; // STACK_OF(X509_EXTENSION)
+
+// STACK_OF(X509_EXTENSION)
+struct stack_st_X509_EXTENSION; // IWYU pragma: keep
 
 namespace kudu {
 namespace security {
 
 class Cert;
 class CertSignRequest;
+class PrivateKey;
 
 namespace ca {
 

@@ -16,17 +16,20 @@
 # under the License.
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfLocal
+from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfLocal,
+                               SkipIfCatalogV2)
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
 from tests.util.filesystem_utils import IS_ISILON, WAREHOUSE
+import re
 
 TEST_TBL = 'read_only_tbl'
 TBL_LOC = '%s/%s' % (WAREHOUSE, TEST_TBL)
 
 
 @SkipIfS3.hdfs_acls
+@SkipIfABFS.hdfs_acls
 @SkipIfADLS.hdfs_acls
 @SkipIfLocal.hdfs_client
 class TestHdfsPermissions(ImpalaTestSuite):
@@ -51,6 +54,7 @@ class TestHdfsPermissions(ImpalaTestSuite):
     self.client.execute('drop table if exists %s' % TEST_TBL)
     self.hdfs_client.delete_file_dir('test-warehouse/%s' % TEST_TBL, recursive=True)
 
+  @SkipIfCatalogV2.impala_7539()
   def test_insert_into_read_only_table(self, vector):
     permission = 444
     if IS_ISILON:
@@ -64,8 +68,8 @@ class TestHdfsPermissions(ImpalaTestSuite):
       self.client.execute('insert into table %s select 1' % TEST_TBL)
       assert False, 'Expected INSERT INTO read-only table to fail'
     except Exception, e:
-      assert 'does not have WRITE access to at least one HDFS path: hdfs:' in str(e)
-
+      assert re.search('does not have WRITE access to HDFS location: .*/read_only_tbl',
+                       str(e))
     # Should still be able to query this table without any errors.
     assert self.execute_scalar('select count(*) from %s' % TEST_TBL) == "0"
 
@@ -80,8 +84,11 @@ class TestHdfsPermissions(ImpalaTestSuite):
 
     # Verify with a partitioned table
     try:
-      self.client.execute('insert into table functional_seq.alltypes '\
+      self.client.execute(
+          'insert into table functional_seq.alltypes '
           'partition(year, month) select * from functional.alltypes limit 0')
       assert False, 'Expected INSERT INTO read-only partition to fail'
     except Exception, e:
-      assert 'does not have WRITE access to at least one HDFS path: hdfs:' in str(e)
+      assert re.search(
+          'does not have WRITE access to HDFS location: .*/alltypes_seq',
+          str(e))

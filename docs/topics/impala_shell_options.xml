@@ -34,11 +34,11 @@ under the License.
 
   <conbody>
 
-    <p>
-      You can specify the following options when starting the <codeph>impala-shell</codeph> command to change how
-      shell commands are executed. The table shows the format to use when specifying each option on the command
-      line, or through the <filepath>$HOME/.impalarc</filepath> configuration file.
-    </p>
+    <p> You can specify the following options when starting the
+        <codeph>impala-shell</codeph> command to change how shell commands are
+      executed. The table shows the format to use when specifying each option on
+      the command line, or through the <codeph>impala-shell</codeph>
+      configuration file. </p>
 
     <note>
       <p>
@@ -83,9 +83,8 @@ under the License.
           <tbody>
             <row>
               <entry>
-                <p>
-                  -B or --delimited
-                </p>
+                <p> -B or </p>
+                <p>--delimited </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -106,6 +105,35 @@ under the License.
             <row>
               <entry>
                 <p>
+                  -b or
+                </p>
+                <p>
+                  --kerberos_host_fqdn
+                </p>
+              </entry>
+              <entry>
+                <p>
+                  kerberos_host_fqdn=
+                </p>
+                <p>
+                  <varname>load-balancer-hostname</varname>
+                </p>
+              </entry>
+              <entry>
+                <p>
+                  If set, the setting overrides the expected hostname of the
+                  Impala daemon's Kerberos service principal.
+                    <cmdname>impala-shell</cmdname> will check that the server's
+                  principal matches this hostname. This may be used when
+                    <codeph>impalad</codeph> is configured to be accessed via a
+                  load-balancer, but it is desired for impala-shell to talk to a
+                  specific <codeph>impalad</codeph> directly.
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry>
+                <p>
                   --print_header
                 </p>
               </entry>
@@ -120,8 +148,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -o <varname>filename</varname> or --output_file <varname>filename</varname>
+                <p> -o <varname>filename</varname> or </p>
+                <p>--output_file <varname>filename</varname>
                 </p>
               </entry>
               <entry rev="2.0.0">
@@ -162,9 +190,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -p or --show_profiles
-                </p>
+                <p> -p or </p>
+                <p>--show_profiles </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -180,9 +207,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -h or --help
-                </p>
+                <p> -h or </p>
+                <p>--help </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -214,10 +240,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -i <varname>hostname</varname> or
-                  --impalad=<varname>hostname</varname>[:<varname>portnum</varname>]
-                </p>
+                <p> -i <varname>hostname</varname> or </p>
+                <p>--impalad=<varname>hostname</varname>[:<varname>portnum</varname>] </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -236,8 +260,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -q <varname>query</varname> or --query=<varname>query</varname>
+                <p> -q <varname>query</varname> or </p>
+                <p>--query=<varname>query</varname>
                 </p>
               </entry>
               <entry rev="2.0.0">
@@ -260,8 +284,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -f <varname>query_file</varname> or --query_file=<varname>query_file</varname>
+                <p> -f <varname>query_file</varname> or</p>
+                <p> --query_file=<varname>query_file</varname>
                 </p>
               </entry>
               <entry rev="2.0.0">
@@ -280,10 +304,11 @@ under the License.
             </row>
             <row rev="2.11.0 IMPALA-5736">
               <entry>
-                <p>
-                  --query_option="<varname>option</varname>=<varname>value</varname>"
-                  -Q "<varname>option</varname>=<varname>value</varname>"
-                </p>
+                <p> --query_option=</p>
+                <p>"<varname>option</varname>=</p>
+                <p><varname>value</varname>" </p>
+                <p>-Q "<varname>option</varname>=</p>
+                <p><varname>value</varname>" </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -301,9 +326,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -k or --kerberos
-                </p>
+                <p> -k or </p>
+                <p>--kerberos </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -316,12 +340,16 @@ under the License.
                   is not enabled on the instance of <codeph>impalad</codeph> to which you are connecting, errors
                   are displayed.
                 </p>
+                <p>
+                  See <keyword keyref="kerberos"/> for the steps to set up and
+                  use Kerberos authentication in Impala.
+                </p>
               </entry>
             </row>
             <row>
               <entry>
-                <p>
-                  -s <varname>kerberos_service_name</varname> or --kerberos_service_name=<varname>name</varname>
+                <p> -s <varname>kerberos_service_name</varname> or </p>
+                <p>--kerberos_service_name=<varname>name</varname>
                 </p>
               </entry>
               <entry rev="2.0.0">
@@ -340,9 +368,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -V or --verbose
-                </p>
+                <p> -V or </p>
+                <p>--verbose </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -375,9 +402,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -v or --version
-                </p>
+                <p> -v or </p>
+                <p>--version </p>
               </entry>
               <entry rev="2.0.0">
                 <p>
@@ -409,29 +435,8 @@ under the License.
             </row>
             <row>
               <entry>
-                <p>
-                  -r or --refresh_after_connect
-                </p>
-              </entry>
-              <entry rev="2.0.0">
-                <p>
-                  refresh_after_connect=true
-                </p>
-              </entry>
-              <entry>
-                <p>
-                  Updates Impala metadata upon connection. Same as running the
-                  <codeph><xref href="impala_invalidate_metadata.xml#invalidate_metadata">INVALIDATE
-                  METADATA</xref></codeph> statement after connecting. (This option was originally named when the
-                  <codeph>REFRESH</codeph> statement did the extensive metadata updates now performed by
-                  <codeph>INVALIDATE METADATA</codeph>.)
-                </p>
-              </entry>
-            </row>
-            <row>
-              <entry>
-                <p>
-                  -d <varname>default_db</varname> or --database=<varname>default_db</varname>
+                <p> -d <varname>default_db</varname> or </p>
+                <p>--database=<varname>default_db</varname>
                 </p>
               </entry>
               <entry rev="2.0.0">
@@ -518,11 +523,10 @@ under the License.
               <entry>
                 N/A
               </entry>
-              <entry>
-                Specifies the path of the file containing <cmdname>impala-shell</cmdname> configuration settings.
-                The default is <filepath>$HOME/.impalarc</filepath>. This setting can only be specified on the
-                command line.
-              </entry>
+              <entry> Specifies the path of the file containing
+                  <cmdname>impala-shell</cmdname> configuration settings. The
+                default is <filepath>/etc/impalarc</filepath>. This setting can
+                only be specified on the command line. </entry>
             </row>
             <row rev="2.3.0">
               <entry>--live_progress</entry>
@@ -549,6 +553,34 @@ under the License.
                 This feature is available in <keyword keyref="impala25_full"/> and higher.
               </entry>
             </row>
+            <row rev="2.3.0 IMPALA-2143">
+              <entry>--auth_creds_ok_in_clear</entry>
+              <entry>N/A</entry>
+              <entry>
+                Allows LDAP authentication to be used with an insecure connection to the shell.
+                WARNING: This will allow authentication credentials to be sent unencrypted,
+                and hence may be vulnerable to an attack.
+              </entry>
+            </row>
+            <row>
+              <entry>--protocol=<varname>protocol</varname></entry>
+              <entry>N/A</entry>
+              <entry>Protocol to use for the connection to Impala. <p>Valid
+                    <varname>protocol</varname> values are:<ul>
+                    <li><codeph>'hs2'</codeph>: Impala-shell uses the binary TCP
+                      based transport to speak to the Impala Daemon via the
+                      HiveServer2 protocol.</li>
+                    <li><codeph>'hs2-http'</codeph>: Impala-shell uses HTTP
+                      transport to speak to the Impala Daemon via the
+                      HiveServer2 protocol.</li>
+                    <li><codeph>'beeswax'</codeph>: Impala-shell uses the binary
+                      TCP based transport to speak to the Impala Daemon via
+                      Beeswax. This is the current default setting.</li>
+                  </ul></p><p>You cannot connect to the 3.2 or earlier versions
+                  of Impala using the <codeph>'hs2'</codeph> or
+                    <codeph>'hs2-http'</codeph> option.</p><p>Beeswax support is
+                  deprecated and will be removed in the future.</p></entry>
+            </row>
           </tbody>
         </tgroup>
       </table>
@@ -560,77 +592,88 @@ under the License.
     <title>impala-shell Configuration File</title>
 
     <conbody>
-
-      <p>
-        You can define a set of default options for your <cmdname>impala-shell</cmdname> environment, stored in the
-        file <filepath>$HOME/.impalarc</filepath>. This file consists of key-value pairs, one option per line.
-        Everything after a <codeph>#</codeph> character on a line is treated as a comment and ignored.
-      </p>
-
-      <p>
-        The configuration file must contain a header label <codeph>[impala]</codeph>, followed by the options
-        specific to <cmdname>impala-shell</cmdname>. (This standard convention for configuration files lets you
-        use a single file to hold configuration options for multiple applications.)
-      </p>
-
-      <p>
-        To specify a different filename or path for the configuration file, specify the argument
-        <codeph>--config_file=<varname>path_to_config_file</varname></codeph> on the
-        <cmdname>impala-shell</cmdname> command line.
-      </p>
-
-      <p>
-        The names of the options in the configuration file are similar (although not necessarily identical) to the
-        long-form command-line arguments to the <cmdname>impala-shell</cmdname> command. For the names to use, see
-        <xref href="impala_shell_options.xml#shell_option_summary"/>.
-      </p>
-
-      <p>
-        Any options you specify on the <cmdname>impala-shell</cmdname> command line override any corresponding
-        options within the configuration file.
-      </p>
-
-      <p>
-        The following example shows a configuration file that you might use during benchmarking tests. It sets
-        verbose mode, so that the output from each SQL query is followed by timing information.
-        <cmdname>impala-shell</cmdname> starts inside the database containing the tables with the benchmark data,
-        avoiding the need to issue a <codeph>USE</codeph> statement or use fully qualified table names.
-      </p>
-
-      <p>
-        In this example, the query output is formatted as delimited text rather than enclosed in ASCII art boxes,
-        and is stored in a file rather than printed to the screen. Those options are appropriate for benchmark
-        situations, so that the overhead of <cmdname>impala-shell</cmdname> formatting and printing the result set
-        does not factor into the timing measurements. It also enables the <codeph>show_profiles</codeph> option.
-        That option prints detailed performance information after each query, which might be valuable in
-        understanding the performance of benchmark queries.
-      </p>
-
-<codeblock>[impala]
+      <p>You can store a set of default settings for
+          <cmdname>impala-shell</cmdname> in the <codeph>impala-shell</codeph>
+        configuration file.</p>
+      <p>The global <codeph>impala-shell</codeph> configuration file is located
+        in <codeph>/etc/impalarc</codeph>.</p>
+      <p>The user-level <codeph>impala-shell</codeph> configuration file is
+        located in <codeph>~/.impalarc</codeph>.</p>
+      <p>Note that the global-level file name is different from the user-level
+        file name. The global-level file name does not include a dot
+          (<filepath>.</filepath>) in the file name.</p>
+      <p>The default path of the global configuration file can be changed by
+        setting the <codeph>$IMPALA_SHELL_GLOBAL_CONFIG_FILE</codeph>
+        environment variable.</p>
+      <p>To specify a different file name or path for the user-level
+        configuration file, start <cmdname>impala-shell</cmdname> with the
+          <codeph>--config_file</codeph>
+        <cmdname>impala-shell</cmdname> option set to the path of the
+        configuration file. </p>
+      <p>Typically, an administrator creates the global configuration file for
+        the <cmdname>impala-shell</cmdname>, and if the user-level configuration
+        file exists, the options set in the user configuration file take
+        precedence over those in the global configuration file.</p>
+      <p>In turn, any options you specify on the <cmdname>impala-shell</cmdname>
+        command line override any corresponding options within the configuration
+        file. </p>
+      <p> The <codeph>impala-shell</codeph> configuration file (global or user)
+        configuration file must contain a header label
+        <codeph>[impala]</codeph>, followed by the options specific to
+          <cmdname>impala-shell</cmdname>.</p>
+      <p>The <codeph>impala-shell</codeph> configuration file consists of
+        key-value pairs, one option per line. Everything after the
+          <codeph>#</codeph> character on a line is treated as a comment and
+        ignored. </p>
+      <p> The names of the options in the configuration file are similar
+        (although not necessarily identical) to the long-form command-line
+        arguments to the <cmdname>impala-shell</cmdname> command. For the names
+        to use, see <xref href="impala_shell_options.xml#shell_option_summary"
+        />. </p>
+      <p>You can specify key-value pair options using <codeph>keyval</codeph>,
+        similar to the <codeph>--var</codeph> command-line option. For example,
+          <codeph>keyval=</codeph><varname>variable1</varname>=<varname>value1</varname>.</p>
+      <p>The query options specified in the <codeph>[impala]</codeph> section
+        override the options specified in the
+          <codeph>[impala.query_options]</codeph> section.</p>
+      <p> The following example shows a configuration file that you might use
+        during benchmarking tests. It sets verbose mode, so that the output from
+        each SQL query is followed by timing information.
+          <cmdname>impala-shell</cmdname> starts inside the database containing
+        the tables with the benchmark data, avoiding the need to issue a
+          <codeph>USE</codeph> statement or use fully qualified table names. </p>
+      <p> In this example, the query output is formatted as delimited text
+        rather than enclosed in ASCII art boxes, and is stored in a file rather
+        than printed to the screen. Those options are appropriate for benchmark
+        situations, so that the overhead of <cmdname>impala-shell</cmdname>
+        formatting and printing the result set does not factor into the timing
+        measurements. It also enables the <codeph>show_profiles</codeph> option.
+        That option prints detailed performance information after each query,
+        which might be valuable in understanding the performance of benchmark
+        queries. </p>
+      <codeblock>[impala]
 verbose=true
 default_db=tpc_benchmarking
 write_delimited=true
 output_delimiter=,
 output_file=/home/tester1/benchmark_results.csv
 show_profiles=true
-</codeblock>
-
-      <p rev="2.11.0 IMPALA-5736">
-        The following example shows a configuration file that connects to a specific remote Impala node, runs a
-        single query within a particular database, then exits. Any query options predefined under the
-        <codeph>[impala.query_options]</codeph> section in the configuration file take effect during the session.
-      </p>
-
-      <p>
-        You would typically use this kind of single-purpose
-        configuration setting with the <cmdname>impala-shell</cmdname> command-line option
-        <codeph>--config_file=<varname>path_to_config_file</varname></codeph>, to easily select between many
-        predefined queries that could be run against different databases, hosts, or even different clusters. To run
-        a sequence of statements instead of a single query, specify the configuration option
-        <codeph>query_file=<varname>path_to_query_file</varname></codeph> instead.
-      </p>
-
-<codeblock>[impala]
+keyval=msg1=hello,keyval=msg2=world</codeblock>
+      <p rev="2.11.0 IMPALA-5736"> The following example shows a configuration
+        file that connects to a specific remote Impala node, runs a single query
+        within a particular database, then exits. Any query options predefined
+        under the <codeph>[impala.query_options]</codeph> section in the
+        configuration file take effect during the session. </p>
+      <p> You would typically use this kind of single-purpose configuration
+        setting with the <cmdname>impala-shell</cmdname> command-line option
+            <codeph>--config_file=<varname>path_to_config_file</varname></codeph>,
+        to easily select between many predefined queries that could be run
+        against different databases, hosts, or even different clusters. To run a
+        sequence of statements instead of a single query, specify the
+        configuration option
+            <codeph>query_file=<varname>path_to_query_file</varname></codeph>
+        instead. </p>
+      <codeblock>[impala]
 impalad=impala-test-node1.example.com
 default_db=site_stats
 # Issue a predefined query and immediately exit.

@@ -17,12 +17,16 @@
 
 #pragma once
 
-#include "kudu/security/openssl_util.h"
+#include <cstdint>
+#include <memory>
+
+#include "kudu/gutil/port.h"
+#include "kudu/security/openssl_util.h" // IWYU pragma: keep
 #include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
 
-struct ssl_st;
-typedef ssl_st SSL;
+struct iovec;
+typedef struct ssl_st SSL;
 
 namespace kudu {
 namespace security {
@@ -36,7 +40,7 @@ class TlsSocket : public Socket {
 
   Status Writev(const struct ::iovec *iov,
                 int iov_len,
-                int32_t *nwritten) override WARN_UNUSED_RESULT;
+                int64_t *nwritten) override WARN_UNUSED_RESULT;
 
   Status Recv(uint8_t *buf, int32_t amt, int32_t *nread) override WARN_UNUSED_RESULT;
 

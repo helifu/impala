@@ -23,8 +23,8 @@
 #include <unordered_map>
 
 #include "common/status.h"
-#include "util/uid-util.h"
 #include "gen-cpp/Types_types.h"
+#include "util/sharded-query-map-util.h"
 
 namespace impala {
 
@@ -39,7 +39,7 @@ class FragmentInstanceState;
 /// entry point for gaining refcounted access to a QueryState. It also initiates
 /// query execution.
 /// Thread-safe.
-class QueryExecMgr {
+class QueryExecMgr : public CacheLineAligned {
  public:
   /// Creates QueryState if it doesn't exist and initiates execution of all fragment
   /// instance for this query. All fragment instances hold a reference to their
@@ -49,12 +49,13 @@ class QueryExecMgr {
   /// was started (like low memory). In that case, no QueryState is created.
   /// After this function returns, it is legal to call QueryState::Cancel(), regardless of
   /// the return value of this function.
-  Status StartQuery(const TExecQueryFInstancesParams& params);
+  Status StartQuery(const ExecQueryFInstancesRequestPB* request,
+      const TQueryCtx& query_ctx, const TExecPlanFragmentInfo& fragment_info);
 
   /// Creates a QueryState for the given query with the provided parameters. Only valid
   /// to call if the QueryState does not already exist. The caller must call
   /// ReleaseQueryState() with the returned QueryState to decrement the refcount.
-  QueryState* CreateQueryState(const TQueryCtx& query_ctx);
+  QueryState* CreateQueryState(const TQueryCtx& query_ctx, int64_t mem_limit);
 
   /// If a QueryState for the given query exists, increments that refcount and returns
   /// the QueryState, otherwise returns nullptr.
@@ -64,19 +65,20 @@ class QueryExecMgr {
   void ReleaseQueryState(QueryState* qs);
 
  private:
-  /// protects qs_map_
-  boost::mutex qs_map_lock_;
 
-  /// map from query id to QueryState (owned by us)
-  std::unordered_map<TUniqueId, QueryState*> qs_map_;
+  typedef ShardedQueryMap<QueryState*> QueryStateMap;
+  QueryStateMap qs_map_;
 
   /// Gets the existing QueryState or creates a new one if not present.
   /// 'created' is set to true if it was created, false otherwise.
   /// Increments the refcount.
-  QueryState* GetOrCreateQueryState(const TQueryCtx& query_ctx, bool* created);
+  QueryState* GetOrCreateQueryState(
+      const TQueryCtx& query_ctx, int64_t mem_limit, bool* created);
 
   /// Execute instances and decrement refcount (acquire ownership of qs).
-  void StartQueryHelper(QueryState* qs);
+  /// Return only after all fragments complete unless an instances hit
+  /// an error or the query is cancelled.
+  void ExecuteQueryHelper(QueryState* qs);
 };
 }
 

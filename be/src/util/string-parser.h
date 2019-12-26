@@ -25,6 +25,7 @@
 
 #include "common/logging.h"
 #include "runtime/decimal-value.h"
+#include "runtime/date-parse-util.h"
 #include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "util/decimal-util.h"
@@ -102,8 +103,17 @@ class StringParser {
       ParseResult* result) {
     boost::gregorian::date d;
     boost::posix_time::time_duration t;
-    *result = TimestampParser::Parse(s, len, &d, &t) ? PARSE_SUCCESS : PARSE_FAILURE;
+    *result = TimestampParser::ParseSimpleDateFormat(s, len, &d, &t) ? PARSE_SUCCESS :
+        PARSE_FAILURE;
     return {d, t};
+  }
+
+  /// Parse a DateValue from s.
+  static inline DateValue StringToDate(const char* s, int len, ParseResult* result) {
+    DateValue d;
+    *result = DateParser::ParseSimpleDateFormat(s, len, false, &d) ? PARSE_SUCCESS :
+        PARSE_FAILURE;
+    return d;
   }
 
   /// Parses a decimal from s, returning the result.
@@ -394,7 +404,8 @@ class StringParser {
     if (exponent > digits_after_dot_count) {
       // Ex: 0.1e3 (which at this point would have precision == 1 and scale == 1), the
       //     scale must be set to 0 and the value set to 100 which means a precision of 3.
-      *value *= DecimalUtil::GetScaleMultiplier<T>(exponent - digits_after_dot_count);
+      *value = ArithmeticUtil::AsUnsigned<std::multiplies>(
+          *value, DecimalUtil::GetScaleMultiplier<T>(exponent - digits_after_dot_count));
       *precision = total_digits_count + (exponent - digits_after_dot_count);
       *scale = 0;
     } else {

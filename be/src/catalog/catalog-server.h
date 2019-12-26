@@ -30,7 +30,7 @@
 #include "catalog/catalog.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/condition-variable.h"
-#include "util/metrics.h"
+#include "util/metrics-fwd.h"
 #include "rapidjson/rapidjson.h"
 
 namespace impala {
@@ -74,6 +74,11 @@ class CatalogServer {
   }
   Catalog* catalog() const { return catalog_.get(); }
 
+  /// Add a topic item to pending_topic_updates_. Caller must hold catalog_lock_.
+  /// The return value is true if the operation succeeds and false otherwise.
+  bool AddPendingTopicItem(std::string key, int64_t version, const uint8_t* item_data,
+      uint32_t size, bool deleted);
+
  private:
   /// Thrift API implementation which proxies requests onto this CatalogService.
   boost::shared_ptr<CatalogServiceIf> thrift_iface_;
@@ -85,8 +90,14 @@ class CatalogServer {
   /// Metric that tracks the amount of time taken preparing a catalog update.
   StatsMetric<double>* topic_processing_time_metric_;
 
+  /// Tracks the partial fetch RPC call queue length on the Catalog server.
+  IntGauge* partial_fetch_rpc_queue_len_metric_;
+
   /// Thread that polls the catalog for any updates.
   std::unique_ptr<Thread> catalog_update_gathering_thread_;
+
+  /// Thread that periodically wakes up and refreshes certain Catalog metrics.
+  std::unique_ptr<Thread> catalog_metrics_refresh_thread_;
 
   /// Protects catalog_update_cv_, pending_topic_updates_,
   /// catalog_objects_to/from_version_, and last_sent_catalog_version.
@@ -114,11 +125,6 @@ class CatalogServer {
   /// Set in UpdateCatalogTopicCallback() and protected by the catalog_lock_.
   int64_t last_sent_catalog_version_;
 
-  /// The minimum catalog object version in pending_topic_updates_. All items in
-  /// pending_topic_updates_ will be greater than this version. Set by the
-  /// catalog_update_gathering_thread_ and protected by catalog_lock_.
-  int64_t catalog_objects_min_version_;
-
   /// The max catalog version in pending_topic_updates_. Set by the
   /// catalog_update_gathering_thread_ and protected by catalog_lock_.
   int64_t catalog_objects_max_version_;
@@ -143,19 +149,8 @@ class CatalogServer {
   /// Also, explicitly releases free memory back to the OS after each complete iteration.
   [[noreturn]] void GatherCatalogUpdatesThread();
 
-  /// Builds the next topic update to send based on what items
-  /// have been added/changed/removed from the catalog since the last hearbeat. To do
-  /// this, it enumerates the given catalog objects returned looking for the objects that
-  /// have a catalog version that is > the catalog version sent with the last heartbeat.
-  /// 'topic_deletions' is true if 'catalog_objects' contain deleted catalog
-  /// objects.
-  ///
-  /// The key for each entry is a string composed of:
-  /// "TCatalogObjectType:<unique object name>". So for table foo.bar, the key would be
-  /// "TABLE:foo.bar". Encoding the object type information in the key ensures the keys
-  /// are unique. Must hold catalog_lock_ when calling this function.
-  void BuildTopicUpdates(const std::vector<TCatalogObject>& catalog_objects,
-      bool topic_deletions);
+  /// Executed by the catalog_metrics_refresh_thread_. Refreshes certain catalog metrics.
+  [[noreturn]] void RefreshMetrics();
 
   /// Example output:
   /// "databases": [
@@ -175,7 +170,7 @@ class CatalogServer {
   ///             ]
   ///         }
   ///     ]
-  void CatalogUrlCallback(const Webserver::ArgumentMap& args,
+  void CatalogUrlCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
   /// Debug webpage handler that is used to dump the internal state of catalog objects.
@@ -183,13 +178,15 @@ class CatalogServer {
   /// will get the matching TCatalogObject struct, if one exists.
   /// For example, to dump table "bar" in database "foo":
   /// <host>:25020/catalog_objects?object_type=TABLE&object_name=foo.bar
-  void CatalogObjectsUrlCallback(const Webserver::ArgumentMap& args,
+  void CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
   /// Retrieves from the FE information about the current catalog usage and populates
-  /// the /catalog debug webpage. The catalog usage includes information about the TOP-N
-  /// frequently used (in terms of number of metadata operations) tables as well as the
-  /// TOP-N tables with the highest memory requirements.
+  /// the /catalog debug webpage. The catalog usage includes information about
+  /// 1. the TOP-N frequently used (in terms of number of metadata operations) tables,
+  /// 2. the TOP-N tables with the highest memory requirements
+  /// 3. the TOP-N tables with the most number of files.
+  /// 4. the TOP-N tables with the longest metadata loading time (nanoseconds)
   ///
   /// Example output:
   /// "large_tables": [
@@ -204,6 +201,23 @@ class CatalogServer {
   ///        "frequency": 10
   ///      }
   ///  ]
+  ///  "high_file_count_tables": [
+  ///      {
+  ///        "name": functional.alltypesagg",
+  ///        "num_files": 30
+  ///      }
+  ///  ]
+  ///  "long_metadata_loading_tables": [
+  ///      {
+  ///        "name": "tpcds.warehouse",
+  ///        "median_metadata_loading_time_ns": 12361844,
+  ///        "max_metadata_loading_time_ns": 175518387,
+  ///        "p75_loading_time_ns": 12361844,
+  ///        "p95_loading_time_ns": 175518387,
+  ///        "p99_loading_time_ns": 175518387,
+  ///        "table_loading_count": 3
+  ///      }
+  ///  ]
   void GetCatalogUsage(rapidjson::Document* document);
 
   /// Debug webpage handler that is used to dump all the registered metrics of a
@@ -212,8 +226,13 @@ class CatalogServer {
   /// table. For example, to get the table metrics of table "bar" in database
   /// "foo":
   /// <host>:25020/table_metrics?name=foo.bar
-  void TableMetricsUrlCallback(const Webserver::ArgumentMap& args,
+  void TableMetricsUrlCallback(const Webserver::WebRequest& req,
       rapidjson::Document* document);
+
+  // url handler for the metastore events page. It calls into JniCatalog to get the latest
+  // metastore event processor metrics and adds it to the document
+  void EventMetricsUrlCallback(
+      const Webserver::WebRequest& req, rapidjson::Document* document);
 };
 
 }

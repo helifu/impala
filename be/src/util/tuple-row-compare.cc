@@ -203,12 +203,11 @@ Status TupleRowComparator::Codegen(RuntimeState* state) {
 //   ret i32 0
 // }
 Status TupleRowComparator::CodegenCompare(LlvmCodeGen* codegen, llvm::Function** fn) {
-  SCOPED_TIMER(codegen->codegen_timer());
   llvm::LLVMContext& context = codegen->context();
   const vector<ScalarExpr*>& ordering_exprs = ordering_exprs_;
   llvm::Function* key_fns[ordering_exprs.size()];
   for (int i = 0; i < ordering_exprs.size(); ++i) {
-    Status status = ordering_exprs[i]->GetCodegendComputeFn(codegen, &key_fns[i]);
+    Status status = ordering_exprs[i]->GetCodegendComputeFn(codegen, false, &key_fns[i]);
     if (!status.ok()) {
       return Status::Expected(Substitute(
             "Could not codegen TupleRowComparator::Compare(): $0", status.GetDetail()));
@@ -221,9 +220,9 @@ Status TupleRowComparator::CodegenCompare(LlvmCodeGen* codegen, llvm::Function**
   //     ScalarExprEvaluator** ordering_expr_evals_rhs,
   //     TupleRow* lhs, TupleRow* rhs)
   llvm::PointerType* expr_evals_type =
-      codegen->GetPtrPtrType(ScalarExprEvaluator::LLVM_CLASS_NAME);
-  llvm::PointerType* tuple_row_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
-  LlvmCodeGen::FnPrototype prototype(codegen, "Compare", codegen->int_type());
+      codegen->GetStructPtrPtrType<ScalarExprEvaluator>();
+  llvm::PointerType* tuple_row_type = codegen->GetStructPtrType<TupleRow>();
+  LlvmCodeGen::FnPrototype prototype(codegen, "Compare", codegen->i32_type());
   prototype.AddArgument("ordering_expr_evals_lhs", expr_evals_type);
   prototype.AddArgument("ordering_expr_evals_rhs", expr_evals_type);
   prototype.AddArgument("lhs", tuple_row_type);

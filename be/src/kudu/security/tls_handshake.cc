@@ -20,15 +20,15 @@
 #include <memory>
 #include <string>
 
-#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/tls_socket.h"
-#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
 #include "kudu/util/trace.h"
 
@@ -89,7 +89,7 @@ Status TlsHandshake::Continue(const string& recv, string* send) {
 
   BIO* rbio = SSL_get_rbio(ssl_.get());
   int n = BIO_write(rbio, recv.data(), recv.size());
-  DCHECK_EQ(n, recv.size());
+  DCHECK(n == recv.size() || (n == -1 && recv.empty()));
   DCHECK_EQ(BIO_ctrl_pending(rbio), recv.size());
 
   int rc = SSL_do_handshake(ssl_.get());
@@ -117,7 +117,6 @@ Status TlsHandshake::Continue(const string& recv, string* send) {
     DCHECK_GE(send->size(), 0);
     return Status::OK();
   }
-  DCHECK_GT(send->size(), 0);
   return Status::Incomplete("TLS Handshake incomplete");
 }
 
@@ -251,6 +250,24 @@ string TlsHandshake::GetProtocol() const {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(has_started_);
   return SSL_get_version(ssl_.get());
+}
+
+string TlsHandshake::GetCipherDescription() const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+  CHECK(has_started_);
+  const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_.get());
+  if (!cipher) {
+    return "NONE";
+  }
+  char buf[512];
+  const char* description = SSL_CIPHER_description(cipher, buf, sizeof(buf));
+  if (!description) {
+    return "NONE";
+  }
+  string ret(description);
+  StripTrailingNewline(&ret);
+  StripDupCharacters(&ret, ' ', 0);
+  return ret;
 }
 
 } // namespace security

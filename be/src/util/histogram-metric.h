@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_UTIL_HISTOGRAM_METRIC
-#define IMPALA_UTIL_HISTOGRAM_METRIC
+#pragma once
 
 #include "util/hdr-histogram.h"
 #include "util/metrics.h"
 #include "util/spinlock.h"
+#include "util/stopwatch.h"
 
 namespace impala {
+
+class HdrHistogram;
 
 /// Metric which constructs (using HdrHistogram) a histogram of a set of values.
 /// Thread-safe: histogram access protected by a spin lock.
@@ -31,45 +33,13 @@ class HistogramMetric : public Metric {
   /// Constructs a new histogram metric. `highest_trackable_value` is the maximum value
   /// that may be entered into the histogram. `num_significant_digits` is the precision
   /// that values must be stored with.
-  HistogramMetric(
-      const TMetricDef& def, uint64_t highest_trackable_value, int num_significant_digits)
-    : Metric(def),
-      histogram_(new HdrHistogram(highest_trackable_value, num_significant_digits)),
-      unit_(def.units) {
-    DCHECK_EQ(TMetricKind::HISTOGRAM, def.kind);
-  }
+  HistogramMetric(const TMetricDef& def, uint64_t highest_trackable_value,
+      int num_significant_digits);
 
-  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* value) {
-    rapidjson::Value container(rapidjson::kObjectType);
-    AddStandardFields(document, &container);
+  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* value) override;
 
-    {
-      boost::lock_guard<SpinLock> l(lock_);
-
-      container.AddMember(
-          "25th %-ile", histogram_->ValueAtPercentile(25), document->GetAllocator());
-      container.AddMember(
-          "50th %-ile", histogram_->ValueAtPercentile(50), document->GetAllocator());
-      container.AddMember(
-          "75th %-ile", histogram_->ValueAtPercentile(75), document->GetAllocator());
-      container.AddMember(
-          "90th %-ile", histogram_->ValueAtPercentile(90), document->GetAllocator());
-      container.AddMember(
-          "95th %-ile", histogram_->ValueAtPercentile(95), document->GetAllocator());
-      container.AddMember(
-          "99.9th %-ile", histogram_->ValueAtPercentile(99.9), document->GetAllocator());
-      container.AddMember("max", histogram_->MaxValue(), document->GetAllocator());
-      container.AddMember("min", histogram_->MinValue(), document->GetAllocator());
-      container.AddMember("count", histogram_->TotalCount(), document->GetAllocator());
-    }
-    rapidjson::Value type_value(PrintTMetricKind(TMetricKind::HISTOGRAM).c_str(),
-        document->GetAllocator());
-    container.AddMember("kind", type_value, document->GetAllocator());
-    rapidjson::Value units(PrintTUnit(unit()).c_str(), document->GetAllocator());
-    container.AddMember("units", units, document->GetAllocator());
-
-    *value = container;
-  }
+  virtual TMetricKind::type ToPrometheus(std::string name, std::stringstream* value,
+      std::stringstream* metric_kind) override;
 
   void Update(int64_t val) {
     boost::lock_guard<SpinLock> l(lock_);
@@ -77,45 +47,38 @@ class HistogramMetric : public Metric {
   }
 
   /// Reset the histogram by removing all previous entries.
-  void Reset() {
-    boost::lock_guard<SpinLock> l(lock_);
-    uint64_t highest = histogram_->highest_trackable_value();
-    int digits = histogram_->num_significant_digits();
-    histogram_.reset(new HdrHistogram(highest, digits));
-  }
+  void Reset();
 
-  virtual void ToLegacyJson(rapidjson::Document*) { }
+  virtual void ToLegacyJson(rapidjson::Document*) override {}
 
   const TUnit::type& unit() const { return unit_; }
 
-  virtual std::string ToHumanReadable() {
-    boost::lock_guard<SpinLock> l(lock_);
-    std::stringstream out;
-    out << "Count: " << histogram_->TotalCount() << ", "
-        << "min / max: " << PrettyPrinter::Print(histogram_->MinValue(), unit_)
-        << " / " << PrettyPrinter::Print(histogram_->MaxValue(), unit_) << ", "
-        << "25th %-ile: "
-        << PrettyPrinter::Print(histogram_->ValueAtPercentile(25), unit_) << ", "
-        << "50th %-ile: "
-        << PrettyPrinter::Print(histogram_->ValueAtPercentile(50), unit_) << ", "
-        << "75th %-ile: "
-        << PrettyPrinter::Print(histogram_->ValueAtPercentile(75), unit_) << ", "
-        << "90th %-ile: "
-        << PrettyPrinter::Print(histogram_->ValueAtPercentile(90), unit_) << ", "
-        << "95th %-ile: "
-        << PrettyPrinter::Print(histogram_->ValueAtPercentile(95), unit_) << ", "
-        << "99.9th %-ile: "
-        << PrettyPrinter::Print(histogram_->ValueAtPercentile(99.9), unit_);
-    return out.str();
-  }
+  virtual std::string ToHumanReadable() override;
+
+  /// Render a HdrHistogram into a human readable string representation. The histogram
+  /// type is a template parameter so that it accepts both Impala's and Kudu's
+  /// HdrHistogram classes.
+  template <class T>
+  static std::string HistogramToHumanReadable(T* histogram, TUnit::type unit);
 
  private:
-  // Protects histogram_ pointer itself.
+  /// Protects histogram_ pointer itself.
   SpinLock lock_;
   boost::scoped_ptr<HdrHistogram> histogram_;
   const TUnit::type unit_;
+
+  DISALLOW_COPY_AND_ASSIGN(HistogramMetric);
 };
 
-}
+// Utility class to update histogram with elapsed time in code block.
+class ScopedHistogramTimer {
+ public:
+  ScopedHistogramTimer(HistogramMetric* metric) : metric_(metric) { sw_.Start(); }
 
-#endif
+  ~ScopedHistogramTimer() { metric_->Update(sw_.ElapsedTime()); }
+
+ private:
+  HistogramMetric* const metric_;
+  MonotonicStopWatch sw_;
+};
+} // namespace impala

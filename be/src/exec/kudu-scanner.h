@@ -62,6 +62,11 @@ class KuduScanner {
   void Close();
 
  private:
+  /// Handles count(*) queries, writing only the NumRows from the Kudu batch.
+  /// The optimization is possible only in simpler cases e.g. when there are no conjucts.
+  /// Check ScanNode.java#canApplyCountStarOptimization for full detail.
+  Status GetNextWithCountStarOptimization(RowBatch* row_batch, bool* eos);
+
   /// Handles the case where the projection is empty (e.g. count(*)).
   /// Does this by adding sets of rows to 'row_batch' instead of adding one-by-one.
   /// If in the rare case where there is any conjunct, evaluate them once for each row
@@ -87,6 +92,9 @@ class KuduScanner {
     uint8_t* mem = reinterpret_cast<uint8_t*>(t);
     return reinterpret_cast<Tuple*>(mem + scan_node_->tuple_desc()->byte_size());
   }
+
+  /// Builds the error string by adding the PlanNode id and KuduTable to the message.
+  string BuildErrorString(const char* msg);
 
   KuduScanNodeBase* scan_node_;
   RuntimeState* state_;

@@ -17,7 +17,6 @@
 
 package org.apache.impala.analysis;
 
-import java.util.HashMap;
 import java.util.Map;
 
 import org.apache.impala.catalog.Column;
@@ -41,14 +40,14 @@ import com.google.common.base.Preconditions;
 */
 public class AlterTableSetColumnStats extends AlterTableStmt {
   private final String colName_;
-  private final HashMap<String, String> statsMap_;
+  private final Map<String, String> statsMap_;
 
   // Complete column stats reflecting this alteration. Existing stats values
   // are preserved. Result of analysis.
   private ColumnStats colStats_;
 
   public AlterTableSetColumnStats(TableName tableName, String colName,
-      HashMap<String, String> statsMap) {
+      Map<String, String> statsMap) {
     super(tableName);
     colName_ = colName;
     statsMap_ = statsMap;
@@ -124,7 +123,7 @@ public class AlterTableSetColumnStats extends AlterTableStmt {
             "Expected a positive integer or -1 for unknown.",
             statsValue, statsKey));
       }
-      stats.update(statsKey, statsVal);
+      stats.update(col.getType(), statsKey, statsVal);
     } else if (statsKey == ColumnStats.StatsKey.AVG_SIZE) {
       Float statsVal = null;
       try {
@@ -138,7 +137,7 @@ public class AlterTableSetColumnStats extends AlterTableStmt {
             "Expected a positive floating-point number or -1 for unknown.",
             statsValue, statsKey));
       }
-      stats.update(statsKey, statsVal);
+      stats.update(col.getType(), statsKey, statsVal);
     } else {
       Preconditions.checkState(false, "Unhandled StatsKey value: " + statsKey);
     }

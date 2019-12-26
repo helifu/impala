@@ -20,13 +20,24 @@ import pytest
 import re
 import time
 
-from tests.common.environ import specific_build_type_timeout
+from beeswaxd.BeeswaxService import QueryState
+from tests.common.environ import build_flavor_timeout
+from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfLocal
+from tests.common.skip import SkipIfLocal, SkipIfIsilon
+from tests.verifiers.metric_verifier import MetricVerifier
 
-WAIT_TIME_MS = specific_build_type_timeout(60000, slow_build_timeout=100000)
+# slow_build_timeout is set to 200000 to avoid failures like IMPALA-8064 where the
+# runtime filters don't arrive in time.
+WAIT_TIME_MS = build_flavor_timeout(60000, slow_build_timeout=200000)
 
+# Some of the queries in runtime_filters consume a lot of memory, leading to
+# significant memory reservations in parallel tests.
+# Skipping Isilon due to IMPALA-6998. TODO: Remove when there's a holistic revamp of
+# what tests to run for non-HDFS platforms
+@pytest.mark.execute_serially
 @SkipIfLocal.multiple_impalad
+@SkipIfIsilon.jira(reason="IMPALA-6998")
 class TestRuntimeFilters(ImpalaTestSuite):
   @classmethod
   def get_workload(cls):
@@ -48,9 +59,44 @@ class TestRuntimeFilters(ImpalaTestSuite):
     mode"""
     now = time.time()
     self.run_test_case('QueryTest/runtime_filters_wait', vector)
-    duration = time.time() - now
-    assert duration < WAIT_TIME_MS, \
-        "Query took too long (%ss, possibly waiting for missing filters?)" % str(duration)
+    duration_s = time.time() - now
+    assert duration_s < (WAIT_TIME_MS / 1000), \
+        "Query took too long (%ss, possibly waiting for missing filters?)" \
+        % str(duration_s)
+
+  @pytest.mark.execute_serially
+  def test_wait_time_cancellation(self, vector):
+    """Regression test for IMPALA-9065 to ensure that threads waiting for filters
+    get woken up and exit promptly when the query is cancelled."""
+    # Make sure the cluster is quiesced before we start this test
+    self._verify_no_fragments_running()
+
+    self.change_database(self.client, vector.get_value('table_format'))
+    # Set up a query where a scan (plan node 0, scanning alltypes) will wait
+    # indefinitely for a filter to arrive. The filter arrival is delayed
+    # by adding a wait to the scan of alltypestime (plan node 0).
+    QUERY = """select straight_join *
+               from alltypes t1
+                    join /*+shuffle*/ alltypestiny t2 on t1.id = t2.id"""
+    self.client.set_configuration_option("DEBUG_ACTION", "1:OPEN:WAIT")
+    self.client.set_configuration_option("RUNTIME_FILTER_WAIT_TIME_MS", "10000000")
+    # Run same query with different delays to better exercise call paths.
+    for delay_s in [0, 1, 2]:
+      handle = self.client.execute_async(QUERY)
+      self.wait_for_state(handle, QueryState.RUNNING, 10)
+      time.sleep(delay_s)  # Give the query time to get blocked waiting for the filter.
+      self.client.close_query(handle)
+
+      # Ensure that cancellation has succeeded and the cluster has quiesced.
+      self._verify_no_fragments_running()
+
+  def _verify_no_fragments_running(self):
+    """Raise an exception if there are fragments running on the cluster after a
+    timeout."""
+    for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
+      verifier = MetricVerifier(impalad.service)
+      verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0, timeout=10)
+      verifier.wait_for_backend_admission_control_state(timeout=10)
 
   def test_file_filtering(self, vector):
     if 'kudu' in str(vector.get_value('table_format')):
@@ -85,9 +131,10 @@ class TestBloomFilters(ImpalaTestSuite):
     mode"""
     now = time.time()
     self.run_test_case('QueryTest/bloom_filters_wait', vector)
-    duration = time.time() - now
-    assert duration < 60, \
-        "Query took too long (%ss, possibly waiting for missing filters?)" % str(duration)
+    duration_s = time.time() - now
+    assert duration_s < (WAIT_TIME_MS / 1000), \
+        "Query took too long (%ss, possibly waiting for missing filters?)" \
+        % str(duration_s)
 
 
 @SkipIfLocal.multiple_impalad
@@ -104,7 +151,14 @@ class TestMinMaxFilters(ImpalaTestSuite):
         lambda v: v.get_value('table_format').file_format in ['kudu'])
 
   def test_min_max_filters(self, vector):
-    self.run_test_case('QueryTest/min_max_filters', vector)
+    self.run_test_case('QueryTest/min_max_filters', vector,
+        test_file_vars={'$RUNTIME_FILTER_WAIT_TIME_MS': str(WAIT_TIME_MS)})
+
+  def test_decimal_min_max_filters(self, vector):
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip("skip decimal min max filter test with various joins")
+    self.run_test_case('QueryTest/decimal_min_max_filters', vector,
+        test_file_vars={'$RUNTIME_FILTER_WAIT_TIME_MS': str(WAIT_TIME_MS)})
 
   def test_large_strings(self, cursor, unique_database):
     """Tests that truncation of large strings by min-max filters still gives correct

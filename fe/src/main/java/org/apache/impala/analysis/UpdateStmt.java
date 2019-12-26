@@ -19,15 +19,16 @@ package org.apache.impala.analysis;
 
 import static java.lang.String.format;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.common.Pair;
 import org.apache.impala.planner.DataSink;
 import org.apache.impala.planner.TableSink;
+import org.apache.impala.thrift.TSortingOrder;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 
 /**
  * Representation of an Update statement.
@@ -54,19 +55,19 @@ public class UpdateStmt extends ModifyStmt {
 
   public UpdateStmt(UpdateStmt other) {
     super(other.targetTablePath_, other.fromClause_.clone(),
-        Lists.<Pair<SlotRef, Expr>>newArrayList(), other.wherePredicate_);
+        new ArrayList<>(), other.wherePredicate_);
   }
 
   /**
    * Return an instance of a KuduTableSink specialized as an Update operation.
    */
   @Override
-  public DataSink createDataSink() {
+  public DataSink createDataSink(List<Expr> resultExprs) {
     // analyze() must have been called before.
     Preconditions.checkState(table_ != null);
     DataSink dataSink = TableSink.create(table_, TableSink.Op.UPDATE,
-        ImmutableList.<Expr>of(), referencedColumns_, false, false,
-        ImmutableList.<Integer>of());
+        ImmutableList.<Expr>of(), resultExprs, referencedColumns_, false, false,
+        new Pair<>(ImmutableList.<Integer> of(), TSortingOrder.LEXICAL));
     Preconditions.checkState(!referencedColumns_.isEmpty());
     return dataSink;
   }
@@ -77,17 +78,19 @@ public class UpdateStmt extends ModifyStmt {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
+    if (!options.showRewritten() && sqlString_ != null) return sqlString_;
+
     StringBuilder b = new StringBuilder();
     b.append("UPDATE ");
 
     if (fromClause_ == null) {
-      b.append(targetTableRef_.toSql());
+      b.append(targetTableRef_.toSql(options));
     } else {
       if (targetTableRef_.hasExplicitAlias()) {
         b.append(targetTableRef_.getExplicitAlias());
       } else {
-        b.append(targetTableRef_.toSql());
+        b.append(targetTableRef_.toSql(options));
       }
     }
     b.append(" SET");
@@ -99,16 +102,14 @@ public class UpdateStmt extends ModifyStmt {
       } else {
         first = false;
       }
-      b.append(format(" %s = %s",
-          i.first.toSql(),
-          i.second.toSql()));
+      b.append(format(" %s = %s", i.first.toSql(options), i.second.toSql(options)));
     }
 
-    b.append(fromClause_.toSql());
+    b.append(fromClause_.toSql(options));
 
     if (wherePredicate_ != null) {
       b.append(" WHERE ");
-      b.append(wherePredicate_.toSql());
+      b.append(wherePredicate_.toSql(options));
     }
     return b.toString();
   }

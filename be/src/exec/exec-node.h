@@ -26,10 +26,12 @@
 #include "common/status.h"
 #include "exprs/scalar-expr-evaluator.h"
 #include "gen-cpp/PlanNodes_types.h"
+#include "gutil/threading/thread_collision_warner.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/descriptors.h" // for RowDescriptor
-#include "util/blocking-queue.h"
+#include "runtime/reservation-manager.h"
+#include "util/runtime-profile-counters.h"
 #include "util/runtime-profile.h"
 
 namespace impala {
@@ -42,29 +44,87 @@ class RowBatch;
 class RuntimeState;
 class ScalarExpr;
 class SubplanNode;
+class SubplanPlanNode;
 class TPlan;
 class TupleRow;
 class TDebugOptions;
+class ExecNode;
 
-/// Superclass of all execution nodes.
+/// PlanNode and ExecNode are the super-classes of all plan nodes and execution nodes
+/// respectively. The plan nodes contain a subset of the static state of their
+/// corresponding ExecNode, of which there is one instance per fragment. ExecNode contains
+/// only runtime state and there can be up to MT_DOP instances of it per fragment.
+/// Hence every ExecNode has a corresponding PlanNode which may or may not be at the same
+/// level of hierarchy as the ExecNode.
+/// TODO: IMPALA-9216: Move all the static state of ExecNode into PlanNode.
 ///
 /// All subclasses need to make sure to check RuntimeState::is_cancelled()
 /// periodically in order to ensure timely termination after the cancellation
 /// flag gets set.
-/// TODO: Move static state of ExecNode into PlanNode, of which there is one instance
-/// per fragment. ExecNode contains only runtime state and there can be up to MT_DOP
-/// instances of it per fragment.
+
+class PlanNode {
+ public:
+  PlanNode() = default;
+
+  /// Initializes this object from the thrift tnode desc. All internal members created and
+  /// initialized here will be owned by state->obj_pool().
+  /// If overridden in subclass, must first call superclass's Init().
+  /// Should only be called after all children have been set and Init()-ed.
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
+
+  /// Create its corresponding exec node. Place exec node in state->obj_pool().
+  virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const = 0;
+
+  /// Creates plan node tree from list of nodes contained in plan via depth-first
+  /// traversal. All nodes are placed in state->obj_pool() and have Init() called on them.
+  /// Returns error if 'plan' is corrupted, otherwise success.
+  static Status CreateTree(
+      RuntimeState* state, const TPlan& plan, PlanNode** root) WARN_UNUSED_RESULT;
+
+  virtual ~PlanNode(){}
+
+  /// TODO: IMPALA-9216: Add accessor methods for these members instead of making
+  /// them public.
+  /// Reference to the thrift node that represents this PlanNode.
+  const TPlanNode* tnode_ = nullptr;
+
+  /// Conjuncts in this node. 'conjuncts_' live in this exec node's object pool. Note:
+  /// conjunct_evals_ are not created for Aggregation nodes. TODO: move conjuncts to
+  /// query-state's obj pool.
+  std::vector<ScalarExpr*> conjuncts_;
+
+  RowDescriptor* row_descriptor_ = nullptr;
+
+  // Runtime filter's expressions assigned to this plan node.
+  std::vector<ScalarExpr*> runtime_filter_exprs_;
+
+  std::vector<PlanNode*> children_;
+
+  /// Pointer to the containing SubplanPlanNode or NULL if not inside a subplan.
+  /// Set by the containing SubplanPlanNode::Prepare() before Prepare() is called on
+  /// 'this' node. Not owned.
+  SubplanPlanNode* containing_subplan_ = nullptr;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(PlanNode);
+
+  /// Create a single exec node derived from thrift node; place exec node in 'pool'.
+  static Status CreatePlanNode(ObjectPool* pool, const TPlanNode& tnode, PlanNode** node,
+      RuntimeState* state) WARN_UNUSED_RESULT;
+
+  static Status CreateTreeHelper(RuntimeState* state,
+      const std::vector<TPlanNode>& tnodes, PlanNode* parent, int* node_idx,
+      PlanNode** root) WARN_UNUSED_RESULT;
+};
+
 class ExecNode {
  public:
-  /// Init conjuncts.
-  ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  /// Copies over state from the 'pnode', initializes internal objects from 'pool' that
+  /// cannot fail during initialization and finally initializes references to descriptors
+  /// from 'descs'.
+  ExecNode(ObjectPool* pool, const PlanNode& pnode, const DescriptorTbl& descs);
 
   virtual ~ExecNode();
-
-  /// Initializes this object from the thrift tnode desc. The subclass should
-  /// do any initialization that can fail in Init() rather than the ctor.
-  /// If overridden in subclass, must first call superclass's Init().
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) WARN_UNUSED_RESULT;
 
   /// Sets up internal structures, etc., without doing any actual work.
   /// Must be called prior to Open(). Will only be called once in this
@@ -111,7 +171,8 @@ class ExecNode {
   /// Resets the stream of row batches to be retrieved by subsequent GetNext() calls.
   /// Clears all internal state, returning this node to the state it was in after calling
   /// Prepare() and before calling Open(). This function must not clear memory
-  /// still owned by this node that is backing rows returned in GetNext().
+  /// still owned by this node that is backing rows returned in GetNext(). 'row_batch' can
+  /// be used to transfer ownership of any such memory.
   /// Prepare() and Open() must have already been called before calling Reset().
   /// GetNext() may have optionally been called (not necessarily until eos).
   /// Close() must not have been called.
@@ -121,7 +182,7 @@ class ExecNode {
   /// implementation calls Reset() on children.
   /// Note that this function may be called many times (proportional to the input data),
   /// so should be fast.
-  virtual Status Reset(RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status Reset(RuntimeState* state, RowBatch* row_batch) WARN_UNUSED_RESULT;
 
   /// Close() will get called for every exec node, regardless of what else is called and
   /// the status of these calls (i.e. Prepare() may never have been called, or
@@ -139,9 +200,9 @@ class ExecNode {
   virtual void Close(RuntimeState* state);
 
   /// Creates exec node tree from list of nodes contained in plan via depth-first
-  /// traversal. All nodes are placed in state->obj_pool() and have Init() called on them.
-  /// Returns error if 'plan' is corrupted, otherwise success.
-  static Status CreateTree(RuntimeState* state, const TPlan& plan,
+  /// traversal. All nodes are placed in state->obj_pool().
+  /// Returns error if 'plan_node' is corrupted, otherwise success.
+  static Status CreateTree(RuntimeState* state, const PlanNode& plan_node,
       const DescriptorTbl& descs, ExecNode** root) WARN_UNUSED_RESULT;
 
   /// Set debug action in 'tree' according to debug_options.
@@ -188,6 +249,10 @@ class ExecNode {
   int id() const { return id_; }
   TPlanNodeType::type type() const { return type_; }
 
+  /// Returns a unique label for this ExecNode of the form "PLAN_NODE_TYPE(id=[int])",
+  /// for example, EXCHANGE_NODE (id=2).
+  std::string label() const;
+
   /// Returns the row descriptor for rows produced by this node. The RowDescriptor is
   /// constant for the lifetime of the fragment instance, and so is shared by reference
   /// across the plan tree, including in RowBatches. The lifetime of the descriptor is the
@@ -196,116 +261,142 @@ class ExecNode {
 
   ExecNode* child(int i) { return children_[i]; }
   int num_children() const { return children_.size(); }
+
+  /// Valid to call in or after Prepare().
   SubplanNode* get_containing_subplan() const { return containing_subplan_; }
+
   void set_containing_subplan(SubplanNode* sp) {
-    DCHECK(containing_subplan_ == NULL);
+    DCHECK(containing_subplan_ == nullptr);
     containing_subplan_ = sp;
   }
-  int64_t rows_returned() const { return num_rows_returned_; }
+
   int64_t limit() const { return limit_; }
-  bool ReachedLimit() { return limit_ != -1 && num_rows_returned_ >= limit_; }
+
+  /// Returns the number of rows returned by this Node.
+  int64_t rows_returned() const {
+    DCHECK(getExecutionModel() != NON_TASK_BASED_SYNC);
+    return num_rows_returned_;
+  }
+
+  /// Returns the number of rows returned by this Node. Thread safe version of
+  /// rows_returned().
+  /// TODO: The thread safe versions can be removed if we remove the legacy multi-threaded
+  /// scan nodes.
+  int64_t rows_returned_shared() const {
+    // Ideally this function should only be called when num_rows_returned_ is shared by
+    // multiple threads. Both the HdfsScanNodeMt and KuduScanNodeMt call this function
+    // from the scanner code-path for simplicity.
+    DCHECK(
+        getExecutionModel() == NON_TASK_BASED_SYNC || getExecutionModel() == TASK_BASED);
+    return base::subtle::Acquire_Load(&num_rows_returned_);
+  }
+
+  /// Returns true if a valid limit is set and number of rows returned by this node has
+  /// exceeded the limit.
+  bool ReachedLimit() {
+    DCHECK(getExecutionModel() != NON_TASK_BASED_SYNC);
+    return limit_ != -1 && num_rows_returned_ >= limit_;
+  }
+
+  /// Returns true if a valid limit is set and number of rows returned by this node has
+  /// exceeded the limit. Thread safe version of ReachedLimit().
+  bool ReachedLimitShared() {
+    // Ideally this function should only be called when num_rows_returned_ is shared by
+    // multiple threads. Both the HdfsScanNodeMt and KuduScanNodeMt call this function
+    // from the scanner code-path for simplicity.
+    DCHECK(
+        getExecutionModel() == NON_TASK_BASED_SYNC || getExecutionModel() == TASK_BASED);
+    return limit_ != -1 && base::subtle::Acquire_Load(&num_rows_returned_) >= limit_;
+  }
 
   RuntimeProfile* runtime_profile() { return runtime_profile_; }
   MemTracker* mem_tracker() { return mem_tracker_.get(); }
   MemTracker* expr_mem_tracker() { return expr_mem_tracker_.get(); }
   MemPool* expr_perm_pool() { return expr_perm_pool_.get(); }
   MemPool* expr_results_pool() { return expr_results_pool_.get(); }
+  const TBackendResourceProfile& resource_profile() { return resource_profile_; }
+  bool is_closed() const { return is_closed_; }
 
   /// Return true if codegen was disabled by the planner for this ExecNode. Does not
   /// check to see if codegen was enabled for the enclosing fragment.
   bool IsNodeCodegenDisabled() const;
 
-  /// Add codegen disabled message if codegen is disabled for this ExecNode.
-  void AddCodegenDisabledMessage(RuntimeState* state);
-
-  /// Extract node id from p->name().
-  static int GetNodeIdFromProfile(RuntimeProfile* p);
+  /// Returns true if this node is inside the right-hand side plan tree of a SubplanNode.
+  bool IsInSubplan() const { return plan_node_.containing_subplan_ != nullptr; }
 
   /// Names of counters shared by all exec nodes
   static const std::string ROW_THROUGHPUT_COUNTER;
 
  protected:
   friend class DataSink;
+  friend class ScopedGetNextEventAdder;
+  friend class ScopedOpenEventAdder;
 
-  /// Initialize 'buffer_pool_client_' and claim the initial reservation for this
-  /// ExecNode. Only needs to be called by ExecNodes that will use the client.
-  /// The client is automatically cleaned up in Close(). Should not be called if
-  /// the client is already open.
-  ///
-  /// The ExecNode must return the initial reservation to
-  /// QueryState::initial_reservations(), which is done automatically in Close() as long
-  /// as the initial reservation is not released before Close().
-  Status ClaimBufferReservation(RuntimeState* state) WARN_UNUSED_RESULT;
-
-  /// Release any unused reservation in excess of the node's initial reservation. Returns
-  /// an error if releasing the reservation requires flushing pages to disk, and that
-  /// fails.
-  Status ReleaseUnusedReservation() WARN_UNUSED_RESULT;
-
-  /// Enable the increase reservation denial probability on 'buffer_pool_client_' based on
-  /// the 'debug_action_' set on this node. Returns an error if 'debug_action_param_' is
-  /// invalid.
-  Status EnableDenyReservationDebugAction();
-
-  /// Extends blocking queue for row batches. Row batches have a property that
-  /// they must be processed in the order they were produced, even in cancellation
-  /// paths. Preceding row batches can contain ptrs to memory in subsequent row batches
-  /// and we need to make sure those ptrs stay valid.
-  /// Row batches that are added after Shutdown() are queued in another queue, which can
-  /// be cleaned up during Close().
-  /// All functions are thread safe.
-  class RowBatchQueue : public BlockingQueue<std::unique_ptr<RowBatch>> {
-   public:
-    /// max_batches is the maximum number of row batches that can be queued.
-    /// When the queue is full, producers will block.
-    RowBatchQueue(int max_batches);
-    ~RowBatchQueue();
-
-    /// Adds a batch to the queue. This is blocking if the queue is full.
-    void AddBatch(std::unique_ptr<RowBatch> batch);
-
-    /// Gets a row batch from the queue. Returns NULL if there are no more.
-    /// This function blocks.
-    /// Returns NULL after Shutdown().
-    std::unique_ptr<RowBatch> GetBatch();
-
-    /// Deletes all row batches in cleanup_queue_. Not valid to call AddBatch()
-    /// after this is called.
-    void Cleanup();
-
-   private:
-    /// Lock protecting cleanup_queue_
-    SpinLock lock_;
-
-    /// Queue of orphaned row batches
-    std::list<std::unique_ptr<RowBatch>> cleanup_queue_;
+  enum ExecutionModel {
+    /// Exec nodes with single threaded execution. This is the default execution model
+    /// for majority of the nodes. BlockingJoin node is an exception since it could spawn
+    /// a build thread in some cases. Due to the blocking nature of such join operators,
+    /// it can be considered as not requiring explicit synchronization.
+    NON_TASK_BASED_NO_SYNC,
+    /// Exec nodes which spawn multiple worker threads. Examples are HdfsScanNode and
+    /// and KuduScanNode. Requires syncronization if the main thread and worker threads
+    /// share resources.
+    NON_TASK_BASED_SYNC,
+    /// Task Based multi-threading. Examples are HdfsScanNodeMt and KuduScanNodeMt.
+    TASK_BASED
   };
+
+  virtual ExecutionModel getExecutionModel() const { return NON_TASK_BASED_NO_SYNC; }
+
+  BufferPool::ClientHandle* buffer_pool_client() {
+    return reservation_manager_.buffer_pool_client();
+  }
+
+  Status ClaimBufferReservation(RuntimeState* state) WARN_UNUSED_RESULT {
+    return reservation_manager_.ClaimBufferReservation(state);
+  }
+
+  Status ReleaseUnusedReservation() WARN_UNUSED_RESULT {
+    return reservation_manager_.ReleaseUnusedReservation();
+  }
+
+  /// Reference to the PlanNode shared across fragment instances.
+  /// TODO: Store a specialized reference directly in the child classes when all static
+  /// state is moved there and accessed directly.
+  const PlanNode& plan_node_;
 
   /// Unique within a single plan tree.
   int id_;
   TPlanNodeType::type type_;
   ObjectPool* pool_;
 
+  /// ExecNode lifecycle events for this ExecNode. Initialised for nodes outside subplan.
+  /// Within a subplan, we iterate through the lifecycle multiple times so this would
+  /// have a lot of overhead and not be particularly useful. All times are relative to
+  /// QueryState::fragment_events_start_time().
+  RuntimeProfile::EventSequence* events_ = nullptr;
+
+  /// Used to track whether the first GetNext() event was added to 'events_' so that
+  /// ScopedGetNextEventAdder can avoid adding a duplicate event.
+  bool first_getnext_added_ = false;
+
   /// Conjuncts and their evaluators in this node. 'conjuncts_' live in the
   /// query-state's object pool while the evaluators live in this exec node's
-  /// object pool.
+  /// object pool. Note: conjunct_evals_ are not created for Aggregation nodes.
   std::vector<ScalarExpr*> conjuncts_;
   std::vector<ScalarExprEvaluator*> conjunct_evals_;
 
   std::vector<ExecNode*> children_;
-  RowDescriptor row_descriptor_;
+  RowDescriptor& row_descriptor_;
 
   /// Resource information sent from the frontend.
   const TBackendResourceProfile resource_profile_;
 
   /// debug-only: if debug_action_ is not INVALID, node will perform action in
   /// debug_phase_
-  TExecNodePhase::type debug_phase_;
-  TDebugAction::type debug_action_;
-  std::string debug_action_param_;
+  TDebugOptions debug_options_;
 
   int64_t limit_;  // -1: no limit
-  int64_t num_rows_returned_;
 
   /// Runtime profile for this node. Owned by the QueryState's ObjectPool.
   RuntimeProfile* const runtime_profile_;
@@ -329,33 +420,12 @@ class ExecNode {
   /// execution where the memory is not needed.
   boost::scoped_ptr<MemPool> expr_results_pool_;
 
-  /// Buffer pool client for this node. Initialized with the node's minimum reservation
-  /// in ClaimBufferReservation(). After initialization, the client must hold onto at
-  /// least the minimum reservation so that it can be returned to the initial
-  /// reservations pool in Close().
-  BufferPool::ClientHandle buffer_pool_client_;
-
-  bool is_closed() const { return is_closed_; }
-
   /// Pointer to the containing SubplanNode or NULL if not inside a subplan.
-  /// Set by SubplanNode::Init(). Not owned.
+  /// Set by SubplanNode::Prepare() before Prepare() is called on 'this' node. Not owned.
   SubplanNode* containing_subplan_;
-
-  /// Returns true if this node is inside the right-hand side plan tree of a SubplanNode.
-  /// Valid to call in or after Prepare().
-  bool IsInSubplan() const { return containing_subplan_ != NULL; }
 
   /// If true, codegen should be disabled for this exec node.
   const bool disable_codegen_;
-
-  /// Create a single exec node derived from thrift node; place exec node in 'pool'.
-  static Status CreateNode(ObjectPool* pool, const TPlanNode& tnode,
-      const DescriptorTbl& descs, ExecNode** node,
-      RuntimeState* state) WARN_UNUSED_RESULT;
-
-  static Status CreateTreeHelper(RuntimeState* state,
-      const std::vector<TPlanNode>& tnodes, const DescriptorTbl& descs, ExecNode* parent,
-      int* node_idx, ExecNode** root) WARN_UNUSED_RESULT;
 
   virtual bool IsScanNode() const { return false; }
 
@@ -365,7 +435,7 @@ class ExecNode {
       TExecNodePhase::type phase, RuntimeState* state) WARN_UNUSED_RESULT {
     DCHECK_NE(phase, TExecNodePhase::INVALID);
     // Fast path for the common case when an action is not enabled for this phase.
-    if (LIKELY(debug_phase_ != phase)) return Status::OK();
+    if (LIKELY(debug_options_.phase != phase)) return Status::OK();
     return ExecDebugActionImpl(phase, state);
   }
 
@@ -375,7 +445,58 @@ class ExecNode {
   /// TODO: IMPALA-2399: replace QueryMaintenance() - see JIRA for more details.
   Status QueryMaintenance(RuntimeState* state) WARN_UNUSED_RESULT;
 
+  /// Sets the number of rows returned.
+  void SetNumRowsReturned(int64_t value) {
+    DCHECK(getExecutionModel() != NON_TASK_BASED_SYNC);
+    num_rows_returned_ = value;
+    DFAKE_SCOPED_LOCK_THREAD_LOCKED(single_thread_check_);
+  }
+
+  /// Increment the number of rows returned.
+  void IncrementNumRowsReturned(int64_t value) {
+    DCHECK(getExecutionModel() != NON_TASK_BASED_SYNC);
+    num_rows_returned_ += value;
+    DFAKE_SCOPED_LOCK_THREAD_LOCKED(single_thread_check_);
+  }
+
+  /// Increment the number of rows returned. Thread safe version of
+  /// IncrementNumRowsReturned().
+  void IncrementNumRowsReturnedShared(int64_t value) {
+    DCHECK(getExecutionModel() == NON_TASK_BASED_SYNC);
+    base::subtle::Barrier_AtomicIncrement(&num_rows_returned_, value);
+  }
+
+  /// Decrement the number of rows returned.
+  void DecrementNumRowsReturned(int64_t value) { IncrementNumRowsReturned(-1 * value); }
+
+  /// Decrement the number of rows returned. Thread safe version of
+  /// DecrementNumRowsReturned().
+  void DecrementNumRowsReturnedShared(int64_t value) {
+    IncrementNumRowsReturnedShared(-1 * value);
+  }
+
+  /// Caps the input row batch to ensure that the limit is not exceeded.
+  /// Sets the eos and returns true, if the limit is reached.
+  bool CheckLimitAndTruncateRowBatchIfNeeded(RowBatch* row_batch, bool* eos);
+
+  /// Caps the input row batch to ensure that the limit is not exceeded.
+  /// Sets the eos and returns true, if the limit is reached.
+  /// Uses thread safe functions.
+  bool CheckLimitAndTruncateRowBatchIfNeededShared(RowBatch* row_batch, bool* eos);
+
  private:
+  DISALLOW_COPY_AND_ASSIGN(ExecNode);
+
+  /// Keeps track of number of rows returned by an exec node. If this variable is shared
+  /// by multiple threads, it should be accessed using thread-safe functions defined
+  /// above. The single-threaded code-paths should use non-atomic functions defined
+  /// above. The only exceptions are HdfsScanNodeMt and KuduScanNodeMt, which are single
+  /// threaded (task based multi-threading support), but use the thread-safe functions
+  /// in the scanner code-path for code simplicity. This is because both the task based
+  /// MT scan nodes (HdfsScanNodeMt/KuduScanNodeMt) and regular scan nodes
+  /// (HdfsScanNode/KuduScanNode) call common scanner functions.
+  int64_t num_rows_returned_;
+  DFAKE_MUTEX(single_thread_check_);
   /// Implementation of ExecDebugAction(). This is the slow path we take when there is
   /// actually a debug action enabled for 'phase'.
   Status ExecDebugActionImpl(
@@ -384,6 +505,12 @@ class ExecNode {
   /// Set in ExecNode::Close(). Used to make Close() idempotent. This is not protected
   /// by a lock, it assumes all calls to Close() are made by the same thread.
   bool is_closed_;
+
+  /// Wraps the buffer pool client for this node. Initialized with the node's minimum
+  /// reservation in ClaimBufferReservation(). After initialization, the client must hold
+  /// onto at least the minimum reservation so that it can be returned to the initial
+  /// reservations pool in Close().
+  ReservationManager reservation_manager_;
 };
 
 inline bool ExecNode::EvalPredicate(ScalarExprEvaluator* eval, TupleRow* row) {

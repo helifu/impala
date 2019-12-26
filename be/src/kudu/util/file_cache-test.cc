@@ -17,20 +17,29 @@
 
 #include "kudu/util/file_cache.h"
 
+#include <unistd.h>
+
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/cache.h"
+#include "kudu/util/debug-util.h"
 #include "kudu/util/env.h"
-#include "kudu/util/metrics.h"
+#include "kudu/util/metrics.h"  // IWYU pragma: keep
 #include "kudu/util/random.h"
 #include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 DECLARE_bool(cache_force_single_shard);
@@ -48,13 +57,25 @@ template <class FileType>
 class FileCacheTest : public KuduTest {
  public:
   FileCacheTest()
-      : rand_(SeedRandom()),
-        initial_open_fds_(CountOpenFds(env_)) {
+      : rand_(SeedRandom()) {
     // Simplify testing of the actual cache capacity.
     FLAGS_cache_force_single_shard = true;
 
     // Speed up tests that check the number of descriptors.
     FLAGS_file_cache_expiry_period_ms = 1;
+
+    // libunwind internally uses two file descriptors as a pipe.
+    // Make sure it gets initialized early so that our fd count
+    // doesn't get affected by it.
+    ignore_result(GetStackTraceHex());
+    initial_open_fds_ = CountOpenFds();
+  }
+
+  int CountOpenFds() const {
+    // Only count files in the test working directory so that we don't
+    // accidentally count other fds that might be opened or closed in
+    // the background by other threads.
+    return kudu::CountOpenFds(env_, GetTestPath("*"));
   }
 
   void SetUp() override {
@@ -80,7 +101,7 @@ class FileCacheTest : public KuduTest {
 
   void AssertFdsAndDescriptors(int num_expected_fds,
                                int num_expected_descriptors) {
-    ASSERT_EQ(initial_open_fds_ + num_expected_fds, CountOpenFds(env_));
+    ASSERT_EQ(initial_open_fds_ + num_expected_fds, CountOpenFds());
 
     // The expiry thread may take some time to run.
     ASSERT_EVENTUALLY([&]() {
@@ -89,7 +110,7 @@ class FileCacheTest : public KuduTest {
   }
 
   Random rand_;
-  const int initial_open_fds_;
+  int initial_open_fds_;
   unique_ptr<FileCache<FileType>> cache_;
 };
 
@@ -165,7 +186,7 @@ TYPED_TEST(FileCacheTest, TestBasicOperations) {
 
   // With the cache gone, so are the cached fds.
   this->cache_.reset();
-  ASSERT_EQ(this->initial_open_fds_, CountOpenFds(this->env_));
+  ASSERT_EQ(this->initial_open_fds_, this->CountOpenFds());
 }
 
 TYPED_TEST(FileCacheTest, TestDeletion) {
@@ -193,7 +214,7 @@ TYPED_TEST(FileCacheTest, TestDeletion) {
   {
     shared_ptr<TypeParam> f1;
     ASSERT_OK(this->cache_->OpenExistingFile(kFile2, &f1));
-    ASSERT_EQ(this->initial_open_fds_ + 1, CountOpenFds(this->env_));
+    ASSERT_EQ(this->initial_open_fds_ + 1, this->CountOpenFds());
     ASSERT_OK(this->cache_->DeleteFile(kFile2));
     {
       shared_ptr<TypeParam> f2;
@@ -201,10 +222,10 @@ TYPED_TEST(FileCacheTest, TestDeletion) {
     }
     ASSERT_TRUE(this->cache_->DeleteFile(kFile2).IsNotFound());
     ASSERT_TRUE(this->env_->FileExists(kFile2));
-    ASSERT_EQ(this->initial_open_fds_ + 1, CountOpenFds(this->env_));
+    ASSERT_EQ(this->initial_open_fds_ + 1, this->CountOpenFds());
   }
   ASSERT_FALSE(this->env_->FileExists(kFile2));
-  ASSERT_EQ(this->initial_open_fds_, CountOpenFds(this->env_));
+  ASSERT_EQ(this->initial_open_fds_, this->CountOpenFds());
 
   // Create a test file, open it, and let it go out of scope before
   // deleting it. The deletion should evict the fd and close it, despite
@@ -217,11 +238,45 @@ TYPED_TEST(FileCacheTest, TestDeletion) {
     ASSERT_OK(this->cache_->OpenExistingFile(kFile3, &f3));
   }
   ASSERT_TRUE(this->env_->FileExists(kFile3));
-  ASSERT_EQ(this->initial_open_fds_ + 1, CountOpenFds(this->env_));
+  ASSERT_EQ(this->initial_open_fds_ + 1, this->CountOpenFds());
   ASSERT_OK(this->cache_->DeleteFile(kFile3));
   ASSERT_FALSE(this->env_->FileExists(kFile3));
-  ASSERT_EQ(this->initial_open_fds_, CountOpenFds(this->env_));
+  ASSERT_EQ(this->initial_open_fds_, this->CountOpenFds());
 }
+
+TYPED_TEST(FileCacheTest, TestInvalidation) {
+  const string kFile1 = this->GetTestPath("foo");
+  const string kData1 = "test data 1";
+  ASSERT_OK(this->WriteTestFile(kFile1, kData1));
+
+  // Open the file.
+  shared_ptr<TypeParam> f;
+  ASSERT_OK(this->cache_->OpenExistingFile(kFile1, &f));
+
+  // Write a new file and rename it in place on top of file1.
+  const string kFile2 = this->GetTestPath("foo2");
+  const string kData2 = "test data 2 (longer than original)";
+  ASSERT_OK(this->WriteTestFile(kFile2, kData2));
+  ASSERT_OK(this->env_->RenameFile(kFile2, kFile1));
+
+  // We should still be able to access the file, since it has a cached fd.
+  uint64_t size;
+  ASSERT_OK(f->Size(&size));
+  ASSERT_EQ(kData1.size(), size);
+
+  // If we invalidate it from the cache and try again, it should crash because
+  // the existing descriptor was invalidated.
+  this->cache_->Invalidate(kFile1);
+  ASSERT_DEATH({ f->Size(&size); }, "invalidated");
+
+  // But if we re-open the path again, the new descriptor should read the
+  // new data.
+  shared_ptr<TypeParam> f2;
+  ASSERT_OK(this->cache_->OpenExistingFile(kFile1, &f2));
+  ASSERT_OK(f2->Size(&size));
+  ASSERT_EQ(kData2.size(), size);
+}
+
 
 TYPED_TEST(FileCacheTest, TestHeavyReads) {
   const int kNumFiles = 20;
@@ -254,9 +309,9 @@ TYPED_TEST(FileCacheTest, TestHeavyReads) {
     uint64_t size;
     ASSERT_OK(f->Size(&size));
     Slice s(buf.get(), size);
-    ASSERT_OK(f->Read(0, &s));
+    ASSERT_OK(f->Read(0, s));
     ASSERT_EQ(data, s);
-    ASSERT_LE(CountOpenFds(this->env_),
+    ASSERT_LE(this->CountOpenFds(),
               this->initial_open_fds_ + kCacheCapacity);
   }
 }

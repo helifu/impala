@@ -22,7 +22,8 @@
 
 #include "kudu/security/init.h"
 #include "kudu/security/test/mini_kdc.h"
-#include "kudu/util/env.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using std::string;
@@ -73,6 +74,22 @@ TEST_F(MiniKdcTest, TestBasicOperation) {
   kdc.SetKrb5Environment();
   ASSERT_OK(security::InitKerberosForServer(kSPN, kt_path));
   ASSERT_EQ("kudu/foo.example.com@KRBTEST.COM", *security::GetLoggedInPrincipalFromKeytab());
+
+  // Test parse krb5 principal.
+  string service_name;
+  string hostname;
+  string realm;
+  for (const auto& principal : { "kudu/foo.example.com@KRBTEST.COM", "kudu/foo.example.com" }) {
+    ASSERT_OK(security::Krb5ParseName(principal, &service_name, &hostname, &realm));
+    ASSERT_EQ("kudu", service_name);
+    ASSERT_EQ("foo.example.com", hostname);
+    ASSERT_EQ("KRBTEST.COM", realm);
+  }
+
+  // Test bad format principal.
+  ASSERT_TRUE(security::Krb5ParseName("", &service_name, &hostname, &realm).IsInvalidArgument());
+  ASSERT_TRUE(security::Krb5ParseName("kudu@KRBTEST.COM", &service_name,
+      &hostname, &realm).IsInvalidArgument());
 
   // Test principal canonicalization.
   string princ = "foo";

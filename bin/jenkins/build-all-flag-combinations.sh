@@ -17,45 +17,67 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Build Impala with the most common build configurations and check that the build
-# succeeds.a Intended for use as a precommit test to make sure nothing got broken.
+# Build Impala with the a variety of common build configurations and check that the build
+# succeeds. Intended for use as a precommit test to make sure nothing got broken.
 #
 # Assumes that ninja and ccache are installed.
+#
+# Usage: build-all-flag-combinations.sh [--dryrun]
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
+
+export IMPALA_MAVEN_OPTIONS="-U"
 
 . bin/impala-config.sh
-OPTIONS=("-skiptests" "-noclean")
-FAILED_OPTIONS=""
-for BUILD_TYPE in "" -asan -release -ubsan -tsan
-do
-  OPTIONS[2]=$BUILD_TYPE
-  for NINJA in "" -ninja
-  do
-    OPTIONS[3]=$NINJA
-    for BUILD_SHARED_LIBS in "" -so
-    do
-      OPTIONS[4]=$BUILD_SHARED_LIBS
-      if ! ./bin/clean.sh
-      then
-        echo "Clean failed"
-        exit 1
-      fi
-      echo "Building with OPTIONS: ${OPTIONS[@]}"
-      if ! time -p ./buildall.sh ${OPTIONS[@]}
-      then
-        echo "Build failed with OPTIONS: ${OPTIONS[@]}"
-        FAILED_OPTIONS="${FAILED_OPTIONS}:${OPTIONS[@]}"
-      fi
-      ccache -s
-    done
-  done
+
+# These are configurations for buildall.
+CONFIGS=(
+  # Test gcc builds with and without -so:
+  "-skiptests -noclean"
+  "-skiptests -noclean -release"
+  "-skiptests -noclean -release -so -ninja"
+  # clang sanitizer builds:
+  "-skiptests -noclean -asan"
+  "-skiptests -noclean -tsan"
+  "-skiptests -noclean -ubsan -so -ninja"
+  # USE_CDP_HIVE=true build:
+  "-skiptests -noclean -use_cdp_hive"
+)
+
+FAILED=""
+
+for CONFIG in "${CONFIGS[@]}"; do
+  CONFIG2=${CONFIG/-use_cdp_hive/}
+  if [[ "$CONFIG" != "$CONFIG2" ]]; then
+    CONFIG=$CONFIG2
+    export USE_CDP_HIVE=true
+  else
+    export USE_CDP_HIVE=false
+  fi
+  DESCRIPTION="Options $CONFIG USE_CDP_HIVE=$USE_CDP_HIVE"
+
+  if [[ $# == 1 && $1 == "--dryrun" ]]; then
+    echo $DESCRIPTION
+    continue
+  fi
+
+  if ! ./bin/clean.sh; then
+    echo "Clean failed"
+    exit 1
+  fi
+  echo "Building with OPTIONS: $DESCRIPTION"
+  if ! time -p ./buildall.sh $CONFIG; then
+    echo "Build failed: $DESCRIPTION"
+    FAILED="${FAILED}:${DESCRIPTION}"
+  fi
+  ccache -s
 done
 
-if [[ "$FAILED_OPTIONS" != "" ]]
+if [[ "$FAILED" != "" ]]
 then
-  echo "Builds with the following options failed:"
-  echo "$FAILED_OPTIONS"
+  echo "The following builds failed:"
+  echo "$FAILED"
   exit 1
 fi

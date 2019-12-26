@@ -20,7 +20,6 @@
 #include <vector>
 
 #include "gutil/strings/substitute.h"
-#include "scheduling/scheduler.h"
 #include "scheduling/scheduler-test-util.h"
 #include "util/benchmark.h"
 #include "util/cpu-info.h"
@@ -131,7 +130,7 @@ void BenchmarkFunction(int num_iterations, void* data) {
 /// blocks. Scheduling will be done according to the parameter 'replica_preference'.
 void RunClusterSizeBenchmark(TReplicaPreference::type replica_preference) {
   string suite_name = strings::Substitute(
-      "Cluster Size, $0", PrintTReplicaPreference(replica_preference));
+      "Cluster Size, $0", PrintThriftEnum(replica_preference));
   Benchmark suite(suite_name, false /* micro_heuristics */);
   vector<TestCtx> test_ctx(CLUSTER_SIZES.size());
 

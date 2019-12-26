@@ -20,10 +20,11 @@
 
 #include "kudu/util/memory/memory.h"
 
-#include <string.h>
+#include <mm_malloc.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include <gflags/gflags.h>
 
@@ -38,7 +39,7 @@ using std::min;
 // TODO(onufry) - test whether the code still tests OK if we set this to true,
 // or remove this code and add a test that Google allocator does not change it's
 // contract - 16-aligned in -c opt and %16 == 8 in debug.
-DEFINE_bool_hidden(allocator_aligned_mode, false,
+DEFINE_bool(allocator_aligned_mode, false,
             "Use 16-byte alignment instead of 8-byte, "
             "unless explicitly specified otherwise - to boost SIMD");
 TAG_FLAG(allocator_aligned_mode, hidden);
@@ -147,23 +148,23 @@ void* HeapBufferAllocator::Malloc(size_t size) {
   }
 }
 
-void* HeapBufferAllocator::Realloc(void* previousData, size_t previousSize,
-                                   size_t newSize) {
+void* HeapBufferAllocator::Realloc(void* previous_data, size_t previous_size,
+                                   size_t new_size) {
   if (aligned_mode_) {
-    void* data = Malloc(newSize);
+    void* data = Malloc(new_size);
     if (data) {
 // NOTE(ptab): We should use realloc here to avoid memmory coping,
 // but it doesn't work on memory allocated by posix_memalign(...).
 // realloc reallocates the memory but doesn't preserve the content.
 // TODO(ptab): reiterate after some time to check if it is fixed (tcmalloc ?)
-      memcpy(data, previousData, min(previousSize, newSize));
-      free(previousData);
+      memcpy(data, previous_data, min(previous_size, new_size));
+      free(previous_data);
       return data;
     } else {
       return nullptr;
     }
   } else {
-    return realloc(previousData, newSize);
+    return realloc(previous_data, new_size);
   }
 }
 

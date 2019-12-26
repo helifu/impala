@@ -18,44 +18,53 @@
 #include "kudu/rpc/negotiation.h"
 
 #include <poll.h>
-#include <sys/time.h>
+#include <sys/socket.h>
 
+#include <cerrno>
+#include <ctime>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/client_negotiation.h"
 #include "kudu/rpc/connection.h"
+#include "kudu/rpc/connection_id.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/reactor.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/server_negotiation.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/socket.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/trace.h"
 
-DEFINE_bool_hidden(rpc_trace_negotiation, false,
+DEFINE_bool(rpc_trace_negotiation, false,
             "If enabled, dump traces of all RPC negotiations to the log");
 TAG_FLAG(rpc_trace_negotiation, runtime);
 TAG_FLAG(rpc_trace_negotiation, advanced);
 TAG_FLAG(rpc_trace_negotiation, experimental);
 
-DEFINE_int32_hidden(rpc_negotiation_inject_delay_ms, 0,
+DEFINE_int32(rpc_negotiation_inject_delay_ms, 0,
              "If enabled, injects the given number of milliseconds delay into "
              "the RPC negotiation process on the server side.");
 TAG_FLAG(rpc_negotiation_inject_delay_ms, unsafe);
 
-DEFINE_bool_hidden(rpc_encrypt_loopback_connections, false,
+DEFINE_bool(rpc_encrypt_loopback_connections, false,
             "Whether to encrypt data transfer on RPC connections that stay within "
             "a single host. Encryption here is likely to offer no additional "
             "security benefit since only a local 'root' user could intercept the "
@@ -63,6 +72,7 @@ DEFINE_bool_hidden(rpc_encrypt_loopback_connections, false,
             "an attacker.");
 TAG_FLAG(rpc_encrypt_loopback_connections, advanced);
 
+using std::string;
 using std::unique_ptr;
 using strings::Substitute;
 
@@ -210,6 +220,8 @@ static Status DoClientNegotiation(Connection* conn,
   // Transfer the negotiated socket and state back to the connection.
   conn->adopt_socket(client_negotiation.release_socket());
   conn->set_remote_features(client_negotiation.take_server_features());
+  conn->set_confidential(client_negotiation.tls_negotiated() ||
+      (conn->socket()->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections));
 
   // Sanity check: if no authn token was supplied as user credentials,
   // the negotiated authentication type cannot be AuthenticationType::TOKEN.
@@ -264,6 +276,8 @@ static Status DoServerNegotiation(Connection* conn,
   conn->adopt_socket(server_negotiation.release_socket());
   conn->set_remote_features(server_negotiation.take_client_features());
   conn->set_remote_user(server_negotiation.take_authenticated_user());
+  conn->set_confidential(server_negotiation.tls_negotiated() ||
+      (conn->socket()->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections));
 
   return Status::OK();
 }

@@ -20,41 +20,47 @@
 
 #include "kudu/util/nvm_cache.h"
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
-#include <libvmem.h>
 #include <memory>
 #include <mutex>
-#include <stdlib.h>
 #include <string>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <libvmem.h>
+
+#include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/atomic_refcount.h"
+#include "kudu/gutil/dynamic_annotations.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/hash/city.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/cache_metrics.h"
-#include "kudu/util/flags.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/slice.h"
 
-DEFINE_string_hidden(nvm_cache_path, "/vmem",
+DEFINE_string(nvm_cache_path, "/vmem",
               "The path at which the NVM cache will try to allocate its memory. "
               "This can be a tmpfs or ramfs for testing purposes.");
 TAG_FLAG(nvm_cache_path, experimental);
 
-DEFINE_int32_hidden(nvm_cache_allocation_retry_count, 10,
+DEFINE_int32(nvm_cache_allocation_retry_count, 10,
              "The number of times that the NVM cache will retry attempts to allocate "
              "memory for new entries. In between attempts, a cache entry will be "
              "evicted.");
 TAG_FLAG(nvm_cache_allocation_retry_count, advanced);
 TAG_FLAG(nvm_cache_allocation_retry_count, experimental);
 
-DEFINE_bool_hidden(nvm_cache_simulate_allocation_failure, false,
+DEFINE_bool(nvm_cache_simulate_allocation_failure, false,
             "If true, the NVM cache will inject failures in calls to vmem_malloc "
             "for testing.");
 TAG_FLAG(nvm_cache_simulate_allocation_failure, unsafe);
@@ -62,11 +68,10 @@ TAG_FLAG(nvm_cache_simulate_allocation_failure, unsafe);
 
 namespace kudu {
 
-class MetricEntity;
-
 namespace {
 
 using std::shared_ptr;
+using std::string;
 using std::vector;
 
 typedef simple_spinlock MutexType;
@@ -458,8 +463,6 @@ class ShardedLRUCache : public Cache {
  private:
   gscoped_ptr<CacheMetrics> metrics_;
   vector<NvmLRUCache*> shards_;
-  MutexType id_mutex_;
-  uint64_t last_id_;
   VMEM* vmp_;
 
   static inline uint32_t HashSlice(const Slice& s) {
@@ -472,9 +475,8 @@ class ShardedLRUCache : public Cache {
   }
 
  public:
-  explicit ShardedLRUCache(size_t capacity, const string& id, VMEM* vmp)
-        : last_id_(0),
-          vmp_(vmp) {
+  explicit ShardedLRUCache(size_t capacity, const string& /*id*/, VMEM* vmp)
+        : vmp_(vmp) {
 
     const size_t per_shard = (capacity + (kNumShards - 1)) / kNumShards;
     for (int s = 0; s < kNumShards; s++) {
@@ -516,10 +518,6 @@ class ShardedLRUCache : public Cache {
     return reinterpret_cast<LRUHandle*>(handle)->val_ptr();
   }
 
-  virtual uint64_t NewId() OVERRIDE {
-    std::lock_guard<MutexType> l(id_mutex_);
-    return ++(last_id_);
-  }
   virtual void SetMetrics(const scoped_refptr<MetricEntity>& entity) OVERRIDE {
     metrics_.reset(new CacheMetrics(entity));
     for (NvmLRUCache* cache : shards_) {
@@ -543,7 +541,8 @@ class ShardedLRUCache : public Cache {
         handle->kv_data = &buf[sizeof(LRUHandle)];
         handle->val_length = val_len;
         handle->key_length = key_len;
-        handle->charge = charge + key.size();
+        handle->charge = (charge == kAutomaticCharge) ?
+            vmem_malloc_usable_size(vmp_, buf) : charge;
         handle->hash = HashSlice(key);
         memcpy(handle->kv_data, key.data(), key.size());
         return reinterpret_cast<PendingHandle*>(handle);

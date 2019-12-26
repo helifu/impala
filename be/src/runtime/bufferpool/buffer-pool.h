@@ -29,6 +29,7 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "gutil/macros.h"
+#include "runtime/mem-tracker-types.h"
 #include "runtime/tmp-file-mgr.h"
 #include "util/aligned-new.h"
 #include "util/internal-queue.h"
@@ -37,6 +38,7 @@
 
 namespace impala {
 
+class MetricGroup;
 class ReservationTracker;
 class RuntimeProfile;
 class SystemAllocator;
@@ -158,9 +160,9 @@ class BufferPool : public CacheLineAligned {
   /// 'buffer_bytes_limit': the maximum physical memory in bytes that can be used by the
   ///     buffer pool. If 'buffer_bytes_limit' is not a multiple of 'min_buffer_len', the
   ///     remainder will not be usable.
-  /// 'clean_page_bytes_limit': the maximum bytes of clean pages that will be retained by the
-  ///     buffer pool.
-  BufferPool(int64_t min_buffer_len, int64_t buffer_bytes_limit,
+  /// 'clean_page_bytes_limit': the maximum bytes of clean pages that will be retained by
+  ///     the buffer pool.
+  BufferPool(MetricGroup* metrics, int64_t min_buffer_len, int64_t buffer_bytes_limit,
       int64_t clean_page_bytes_limit);
   ~BufferPool();
 
@@ -174,11 +176,12 @@ class BufferPool : public CacheLineAligned {
   ///
   /// The client's reservation is created as a child of 'parent_reservation' with limit
   /// 'reservation_limit' and associated with MemTracker 'mem_tracker'. The initial
-  /// reservation is 0 bytes.
+  /// reservation is 0 bytes. 'mem_limit_mode' determines whether reservation
+  /// increases are checked against the soft or hard limit of 'mem_tracker'.
   Status RegisterClient(const std::string& name, TmpFileMgr::FileGroup* file_group,
       ReservationTracker* parent_reservation, MemTracker* mem_tracker,
-      int64_t reservation_limit, RuntimeProfile* profile,
-      ClientHandle* client) WARN_UNUSED_RESULT;
+      int64_t reservation_limit, RuntimeProfile* profile, ClientHandle* client,
+      MemLimit mem_limit_mode = MemLimit::SOFT) WARN_UNUSED_RESULT;
 
   /// Deregister 'client' if it is registered. All pages must be destroyed and buffers
   /// must be freed for the client before calling this. Releases any reservation that
@@ -227,19 +230,36 @@ class BufferPool : public CacheLineAligned {
   /// pinned multiple times via 'page_handle'. May return an error if 'page_handle' was
   /// unpinned earlier with no subsequent GetBuffer() call and a read error is
   /// encountered while bringing the page back into memory.
-  Status ExtractBuffer(
-      ClientHandle* client, PageHandle* page_handle, BufferHandle* buffer_handle) WARN_UNUSED_RESULT;
+  Status ExtractBuffer(ClientHandle* client, PageHandle* page_handle,
+      BufferHandle* buffer_handle) WARN_UNUSED_RESULT;
 
   /// Allocates a new buffer of 'len' bytes. Uses reservation from 'client'. The caller
   /// is responsible for ensuring it has enough unused reservation before calling
   /// AllocateBuffer() (otherwise it will DCHECK). AllocateBuffer() only fails when
   /// a system error prevents the buffer pool from fulfilling the reservation.
+  /// Safe to call concurrently with any other operations for 'client', except for
+  /// operations on the same 'handle'.
   Status AllocateBuffer(
       ClientHandle* client, int64_t len, BufferHandle* handle) WARN_UNUSED_RESULT;
 
+  /// Like AllocateBuffer(), except used when the client may not have the reservation
+  /// to allocate the buffer. Tries to increase reservation on the behalf of the client
+  /// if needed to allocate the buffer. If the reservation isn't available, 'handle'
+  /// isn't opened and OK is returned. If an unexpected error occurs, an error is
+  /// returned and any reservation increase remains in effect. Safe to call concurrently
+  /// with any other operations for 'client', except for operations on the same 'handle'.
+  ///
+  /// This function is a transitional mechanism for components to allocate memory from
+  /// the buffer pool without implementing the reservation accounting required to operate
+  /// within a predetermined memory constraint. Wherever possible, clients should reserve
+  /// memory ahead of time and allocate out of that instead of relying on this "best
+  /// effort" interface.
+  Status AllocateUnreservedBuffer(
+      ClientHandle* client, int64_t len, BufferHandle* handle) WARN_UNUSED_RESULT;
+
   /// If 'handle' is open, close 'handle', free the buffer and decrease the reservation
-  /// usage from 'client'. Idempotent. Safe to call concurrently with any other
-  /// operations for 'client'.
+  /// usage from 'client'. Idempotent. Safe to call concurrently with other operations
+  /// for 'client', except for operations on the same 'handle'.
   void FreeBuffer(ClientHandle* client, BufferHandle* handle);
 
   /// Transfer ownership of buffer from 'src_client' to 'dst_client' and move the
@@ -247,7 +267,8 @@ class BufferPool : public CacheLineAligned {
   /// decreases reservation usage in 'src_client'. 'src' must be open and 'dst' must be
   /// closed before calling. 'src'/'dst' and 'src_client'/'dst_client' must be different.
   /// After a successful call, 'src' is closed and 'dst' is open. Safe to call
-  /// concurrently with any other operations for 'src_client'.
+  /// concurrently with any other operations for 'src_client', except for operations
+  /// on the same handles.
   Status TransferBuffer(ClientHandle* src_client, BufferHandle* src,
       ClientHandle* dst_client, BufferHandle* dst) WARN_UNUSED_RESULT;
 
@@ -322,21 +343,23 @@ class BufferPool::ClientHandle {
 
   /// Request to increase reservation for this client by 'bytes' by calling
   /// ReservationTracker::IncreaseReservation(). Returns true if the reservation was
-  /// successfully increased.
+  /// successfully increased. Thread-safe.
   bool IncreaseReservation(int64_t bytes) WARN_UNUSED_RESULT;
 
   /// Tries to ensure that 'bytes' of unused reservation is available for this client
   /// to use by calling ReservationTracker::IncreaseReservationToFit(). Returns true
-  /// if successful, after which 'bytes' can be used.
+  /// if successful, after which 'bytes' can be used. Thread-safe.
   bool IncreaseReservationToFit(int64_t bytes) WARN_UNUSED_RESULT;
 
   /// Try to decrease this client's reservation down to a minimum of 'target_bytes' by
-  /// releasing unused reservation to ancestor ReservationTrackers, all the way up to
-  /// the root of the ReservationTracker tree. May block waiting for unpinned pages to
-  /// be flushed. This client's reservation must be at least 'target_bytes' before
-  /// calling this method. May fail if decreasing the reservation requires flushing
-  /// unpinned pages to disk and a write to disk fails.
-  Status DecreaseReservationTo(int64_t target_bytes) WARN_UNUSED_RESULT;
+  /// releasing up to 'max_decrease' bytes of unused reservation to ancestor
+  /// ReservationTrackers, all the way up to the root of the ReservationTracker tree.
+  /// May block waiting for unpinned pages to be flushed. This client's reservation
+  /// must be at least 'target_bytes' before calling this method. May fail if decreasing
+  /// the reservation requires flushing unpinned pages to disk and a write to disk fails.
+  /// Thread-safe.
+  Status DecreaseReservationTo(
+      int64_t max_decrease, int64_t target_bytes) WARN_UNUSED_RESULT;
 
   /// Move some of this client's reservation to the SubReservation. 'bytes' of unused
   /// reservation must be available in this tracker.
@@ -353,7 +376,8 @@ class BufferPool::ClientHandle {
   int64_t GetUnusedReservation() const;
 
   /// Try to transfer 'bytes' of reservation from 'src' to this client using
-  /// ReservationTracker::TransferReservationTo().
+  /// ReservationTracker::TransferReservationTo(). Not valid to call if 'this'
+  /// has unpinned pages.
   bool TransferReservationFrom(ReservationTracker* src, int64_t bytes);
 
   /// Transfer 'bytes' of reservation from this client to 'dst' using
@@ -384,14 +408,20 @@ class BufferPool::ClientHandle {
 /// Helper class that allows dividing up a client's reservation into separate buckets.
 class BufferPool::SubReservation {
  public:
+  // Construct without initializing this SubReservation.
+  SubReservation();
+  // Construct and initialize with 'client' as the parent.
   SubReservation(ClientHandle* client);
   ~SubReservation();
+
+  // Initialize with 'client' as the parent.
+  void Init(ClientHandle* client);
 
   /// Returns the amount of reservation stored in this sub-reservation.
   int64_t GetReservation() const;
 
   /// Releases the sub-reservation to the client's tracker. Must be called before
-  /// destruction.
+  /// destruction if this was initialized.
   void Close();
 
   bool is_closed() const { return tracker_ == nullptr; }
@@ -507,7 +537,7 @@ class BufferPool::PageHandle {
   DISALLOW_COPY_AND_ASSIGN(PageHandle);
   friend class BufferPool;
   friend class BufferPoolTest;
-  friend class Page;
+  friend struct Page;
 
   /// Internal helper to open the handle for the given page.
   void Open(Page* page, ClientHandle* client);

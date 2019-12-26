@@ -17,14 +17,14 @@
 
 package org.apache.impala.analysis;
 
+import java.util.HashMap;
 import java.util.Map;
 
-import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.HBaseTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.KuduColumn;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableAlterColParams;
 import org.apache.impala.thrift.TAlterTableParams;
@@ -32,7 +32,6 @@ import org.apache.impala.thrift.TAlterTableType;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.collect.Maps;
 
 /**
  * Represents DDL statements that alter column properties:
@@ -63,7 +62,7 @@ public class AlterTableAlterColStmt extends AlterTableStmt {
    */
   public static AlterTableAlterColStmt createDropDefaultStmt(
       TableName tableName, String colName) {
-    Map<ColumnDef.Option, Object> option = Maps.newHashMap();
+    Map<ColumnDef.Option, Object> option = new HashMap<>();
     option.put(ColumnDef.Option.DEFAULT, new NullLiteral());
     return new AlterTableAlterColStmt(
         tableName, colName, new ColumnDef(colName, null, option), true);
@@ -101,8 +100,8 @@ public class AlterTableAlterColStmt extends AlterTableStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    Table t = getTargetTable();
-    if (t instanceof HBaseTable) {
+    FeTable t = getTargetTable();
+    if (t instanceof FeHBaseTable) {
       throw new AnalysisException(
           "ALTER TABLE CHANGE/ALTER COLUMN not currently supported on HBase tables.");
     }
@@ -135,7 +134,7 @@ public class AlterTableAlterColStmt extends AlterTableStmt {
     }
     if (newColDef_.hasKuduOptions()) {
       // Disallow Kudu options on non-Kudu tables.
-      if (!(t instanceof KuduTable)) {
+      if (!(t instanceof FeKuduTable)) {
         if (isDropDefault_) {
           throw new AnalysisException(String.format(
               "Unsupported column option for non-Kudu table: DROP DEFAULT"));
@@ -154,7 +153,7 @@ public class AlterTableAlterColStmt extends AlterTableStmt {
                 newColDef_.toString()));
       }
     }
-    if (t instanceof KuduTable) {
+    if (t instanceof FeKuduTable) {
       KuduColumn col = (KuduColumn) t.getColumn(colName_);
       if (!col.getType().equals(newColDef_.getType())) {
         throw new AnalysisException(String.format("Cannot change the type of a Kudu " +
@@ -165,10 +164,6 @@ public class AlterTableAlterColStmt extends AlterTableStmt {
         throw new AnalysisException(String.format(
             "Cannot %s default value for primary key column '%s'",
             isDropDefault_ ? "drop" : "set", colName_));
-      }
-      if (newColDef_.getComment() != null) {
-        // IMPALA-5351
-        throw new AnalysisException("Kudu does not support column comments.");
       }
       if (newColDef_.isPrimaryKey()) {
         throw new AnalysisException(

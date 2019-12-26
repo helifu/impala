@@ -145,10 +145,10 @@ Status FilterContext::CodegenEval(
   LlvmBuilder builder(context);
 
   *fn = nullptr;
-  llvm::PointerType* this_type = codegen->GetPtrType(FilterContext::LLVM_CLASS_NAME);
-  llvm::PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
+  llvm::PointerType* this_type = codegen->GetStructPtrType<FilterContext>();
+  llvm::PointerType* tuple_row_ptr_type = codegen->GetStructPtrType<TupleRow>();
   LlvmCodeGen::FnPrototype prototype(codegen, "FilterContextEval",
-      codegen->boolean_type());
+      codegen->bool_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_type));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
 
@@ -165,7 +165,7 @@ Status FilterContext::CodegenEval(
       llvm::BasicBlock::Create(context, "eval_filter", eval_filter_fn);
 
   llvm::Function* compute_fn;
-  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, &compute_fn));
+  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, false, &compute_fn));
   DCHECK(compute_fn != nullptr);
 
   // The function for checking against the bloom filter for match.
@@ -206,7 +206,7 @@ Status FilterContext::CodegenEval(
 
   // Create a global constant of the filter expression's ColumnType. It needs to be a
   // constant for constant propagation and dead code elimination in 'runtime_filter_fn'.
-  llvm::Type* col_type = codegen->GetType(ColumnType::LLVM_CLASS_NAME);
+  llvm::Type* col_type = codegen->GetStructType<ColumnType>();
   llvm::Constant* expr_type_arg = codegen->ConstantToGVPtr(
       col_type, filter_expr->type().ToIR(codegen), "expr_type_arg");
 
@@ -281,8 +281,8 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
   LlvmBuilder builder(context);
 
   *fn = nullptr;
-  llvm::PointerType* this_type = codegen->GetPtrType(FilterContext::LLVM_CLASS_NAME);
-  llvm::PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
+  llvm::PointerType* this_type = codegen->GetStructPtrType<FilterContext>();
+  llvm::PointerType* tuple_row_ptr_type = codegen->GetStructPtrType<TupleRow>();
   LlvmCodeGen::FnPrototype prototype(
       codegen, "FilterContextInsert", codegen->void_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_type));
@@ -306,8 +306,8 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
     llvm::Value* local_min_max_filter_ptr =
         builder.CreateStructGEP(nullptr, this_arg, 4, "local_min_max_filter_ptr");
     llvm::PointerType* min_max_filter_type =
-        codegen->GetPtrType(MinMaxFilter::GetLlvmClassName(filter_expr->type().type))
-            ->getPointerTo();
+        codegen->GetNamedPtrType(MinMaxFilter::GetLlvmClassName(
+        filter_expr->type().type))->getPointerTo();
     local_min_max_filter_ptr = builder.CreatePointerCast(
         local_min_max_filter_ptr, min_max_filter_type, "cast_min_max_filter_ptr");
     local_filter_arg =
@@ -334,7 +334,7 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
       llvm::BasicBlock::Create(context, "insert_filter", insert_filter_fn);
 
   llvm::Function* compute_fn;
-  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, &compute_fn));
+  RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, false, &compute_fn));
   DCHECK(compute_fn != nullptr);
 
   // Load 'expr_eval' from 'this_arg' FilterContext object.
@@ -372,13 +372,13 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
   if (ctx->filter->is_bloom_filter()) {
     // Create a global constant of the filter expression's ColumnType. It needs to be a
     // constant for constant propagation and dead code elimination in 'get_hash_value_fn'.
-    llvm::Type* col_type = codegen->GetType(ColumnType::LLVM_CLASS_NAME);
+    llvm::Type* col_type = codegen->GetStructType<ColumnType>();
     llvm::Constant* expr_type_arg = codegen->ConstantToGVPtr(
         col_type, filter_expr->type().ToIR(codegen), "expr_type_arg");
 
     // Call RawValue::GetHashValue() on the result of the filter's expression.
     llvm::Value* seed_arg =
-        codegen->GetIntConstant(TYPE_INT, RuntimeFilterBank::DefaultHashSeed());
+        codegen->GetI32Constant(RuntimeFilterBank::DefaultHashSeed());
     llvm::Value* get_hash_value_args[] = {val_ptr_phi, expr_type_arg, seed_arg};
     llvm::Function* get_hash_value_fn =
         codegen->GetFunction(IRFunction::RAW_VALUE_GET_HASH_VALUE, false);
@@ -388,7 +388,7 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
 
     // Call Insert() on the bloom filter.
     llvm::Function* insert_bloom_filter_fn;
-    if (CpuInfo::IsSupported(CpuInfo::AVX2)) {
+    if (LlvmCodeGen::IsCPUFeatureEnabled(CpuInfo::AVX2)) {
       insert_bloom_filter_fn =
           codegen->GetFunction(IRFunction::BLOOM_FILTER_INSERT_AVX2, false);
     } else {
@@ -403,7 +403,7 @@ Status FilterContext::CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_exp
     DCHECK(ctx->filter->is_min_max_filter());
     // The function for inserting into the min-max filter.
     llvm::Function* min_max_insert_fn = codegen->GetFunction(
-        MinMaxFilter::GetInsertIRFunctionType(filter_expr->type().type), false);
+        MinMaxFilter::GetInsertIRFunctionType(filter_expr->type()), false);
     DCHECK(min_max_insert_fn != nullptr);
 
     llvm::Value* insert_filter_args[] = {local_filter_arg, val_ptr_phi};

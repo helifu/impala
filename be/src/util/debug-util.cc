@@ -18,18 +18,24 @@
 #include "util/debug-util.h"
 
 #include <iomanip>
+#include <random>
 #include <sstream>
+#include <boost/algorithm/string.hpp>
 #include <boost/tokenizer.hpp>
 
 #include "common/version.h"
 #include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
+#include "runtime/exec-env.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "runtime/row-batch.h"
 #include "util/cpu-info.h"
+#include "util/impalad-metrics.h"
+#include "util/metrics.h"
 #include "util/string-parser.h"
 #include "util/uid-util.h"
+#include "util/time.h"
 
 // / WARNING this uses a private API of GLog: DumpStackTraceToString().
 namespace google {
@@ -40,7 +46,11 @@ extern void DumpStackTraceToString(std::string* s);
 
 #include "common/names.h"
 
+using boost::algorithm::iequals;
 using boost::char_separator;
+using boost::is_any_of;
+using boost::split;
+using boost::token_compress_on;
 using boost::tokenizer;
 using namespace beeswax;
 using namespace parquet;
@@ -50,66 +60,41 @@ DECLARE_string(hostname);
 
 namespace impala {
 
-#define THRIFT_ENUM_OUTPUT_FN_IMPL(E, MAP) \
-  ostream& operator<<(ostream& os, const E::type& e) {\
-    map<int, const char*>::const_iterator i;\
-    i = MAP.find(e);\
-    if (i != MAP.end()) {\
-      os << i->second;\
-    }\
-    return os;\
+#define PRINT_THRIFT_ENUM_IMPL(T) \
+  string PrintThriftEnum(const T::type& value) { \
+    map<int, const char*>::const_iterator it = _##T##_VALUES_TO_NAMES.find(value); \
+    return it == _##T##_VALUES_TO_NAMES.end() ? std::to_string(value) : it->second; \
   }
 
-// Macro to stamp out operator<< for thrift enums.  Why doesn't thrift do this?
-#define THRIFT_ENUM_OUTPUT_FN(E) THRIFT_ENUM_OUTPUT_FN_IMPL(E , _##E##_VALUES_TO_NAMES)
-
-// Macro to implement Print function that returns string for thrift enums. Make sure you
-// define a corresponding THRIFT_ENUM_OUTPUT_FN.
-#define THRIFT_ENUM_PRINT_FN(E) \
-  string Print##E(const E::type& e) {\
-    stringstream ss;\
-    ss << e;\
-    return ss.str();\
-  }
-
-THRIFT_ENUM_OUTPUT_FN(TFunctionBinaryType);
-THRIFT_ENUM_OUTPUT_FN(TCatalogObjectType);
-THRIFT_ENUM_OUTPUT_FN(TDdlType);
-THRIFT_ENUM_OUTPUT_FN(TCatalogOpType);
-THRIFT_ENUM_OUTPUT_FN(THdfsFileFormat);
-THRIFT_ENUM_OUTPUT_FN(THdfsCompression);
-THRIFT_ENUM_OUTPUT_FN(TReplicaPreference);
-THRIFT_ENUM_OUTPUT_FN(TSessionType);
-THRIFT_ENUM_OUTPUT_FN(TStmtType);
-THRIFT_ENUM_OUTPUT_FN(QueryState);
-THRIFT_ENUM_OUTPUT_FN(Encoding);
-THRIFT_ENUM_OUTPUT_FN(CompressionCodec);
-THRIFT_ENUM_OUTPUT_FN(Type);
-THRIFT_ENUM_OUTPUT_FN(TMetricKind);
-THRIFT_ENUM_OUTPUT_FN(TUnit);
-THRIFT_ENUM_OUTPUT_FN(TImpalaQueryOptions);
-
-THRIFT_ENUM_PRINT_FN(TCatalogObjectType);
-THRIFT_ENUM_PRINT_FN(TDdlType);
-THRIFT_ENUM_PRINT_FN(TCatalogOpType);
-THRIFT_ENUM_PRINT_FN(TReplicaPreference);
-THRIFT_ENUM_PRINT_FN(TSessionType);
-THRIFT_ENUM_PRINT_FN(TStmtType);
-THRIFT_ENUM_PRINT_FN(QueryState);
-THRIFT_ENUM_PRINT_FN(Encoding);
-THRIFT_ENUM_PRINT_FN(TMetricKind);
-THRIFT_ENUM_PRINT_FN(TUnit);
-THRIFT_ENUM_PRINT_FN(TImpalaQueryOptions);
-
-
-ostream& operator<<(ostream& os, const TUniqueId& id) {
-  os << PrintId(id);
-  return os;
-}
+PRINT_THRIFT_ENUM_IMPL(QueryState)
+PRINT_THRIFT_ENUM_IMPL(Encoding)
+PRINT_THRIFT_ENUM_IMPL(TCatalogObjectType)
+PRINT_THRIFT_ENUM_IMPL(TCatalogOpType)
+PRINT_THRIFT_ENUM_IMPL(TDdlType)
+PRINT_THRIFT_ENUM_IMPL(TExplainLevel)
+PRINT_THRIFT_ENUM_IMPL(THdfsCompression)
+PRINT_THRIFT_ENUM_IMPL(THdfsFileFormat)
+PRINT_THRIFT_ENUM_IMPL(THdfsSeqCompressionMode)
+PRINT_THRIFT_ENUM_IMPL(TImpalaQueryOptions)
+PRINT_THRIFT_ENUM_IMPL(TJoinDistributionMode)
+PRINT_THRIFT_ENUM_IMPL(TKuduReadMode)
+PRINT_THRIFT_ENUM_IMPL(TMetricKind)
+PRINT_THRIFT_ENUM_IMPL(TParquetArrayResolution)
+PRINT_THRIFT_ENUM_IMPL(TParquetFallbackSchemaResolution)
+PRINT_THRIFT_ENUM_IMPL(TPlanNodeType)
+PRINT_THRIFT_ENUM_IMPL(TPrefetchMode)
+PRINT_THRIFT_ENUM_IMPL(TReplicaPreference)
+PRINT_THRIFT_ENUM_IMPL(TRuntimeFilterMode)
+PRINT_THRIFT_ENUM_IMPL(TSessionType)
+PRINT_THRIFT_ENUM_IMPL(TStmtType)
+PRINT_THRIFT_ENUM_IMPL(TUnit)
+PRINT_THRIFT_ENUM_IMPL(TParquetTimestampType)
+PRINT_THRIFT_ENUM_IMPL(TTransactionalType)
 
 string PrintId(const TUniqueId& id, const string& separator) {
   stringstream out;
-  out << hex << id.hi << separator << id.lo;
+  // Outputting the separator string resets the stream width.
+  out << hex << setfill('0') << setw(16) << id.hi << separator << setw(16) << id.lo;
   return out.str();
 }
 
@@ -156,15 +141,6 @@ bool ParseId(const string& s, TUniqueId* id) {
   bool valid = *error_hi == '\0' && *error_lo == '\0';
   *separator = ':';
   return valid;
-}
-
-string PrintPlanNodeType(const TPlanNodeType::type& type) {
-  map<int, const char*>::const_iterator i;
-  i = _TPlanNodeType_VALUES_TO_NAMES.find(type);
-  if (i != _TPlanNodeType_VALUES_TO_NAMES.end()) {
-    return i->second;
-  }
-  return "Invalid plan node type";
 }
 
 string PrintTuple(const Tuple* t, const TupleDescriptor& d) {
@@ -320,6 +296,122 @@ string GetStackTrace() {
 
 string GetBackendString() {
   return Substitute("$0:$1", FLAGS_hostname, FLAGS_be_port);
+}
+
+DebugActionTokens TokenizeDebugActions(const string& debug_actions) {
+  DebugActionTokens results;
+  list<string> actions;
+  split(actions, debug_actions, is_any_of("|"), token_compress_on);
+  for (const string& a : actions) {
+    vector<string> components;
+    split(components, a, is_any_of(":"), token_compress_on);
+    results.push_back(components);
+  }
+  return results;
+}
+
+vector<string> TokenizeDebugActionParams(const string& action) {
+  vector<string> tokens;
+  split(tokens, action, is_any_of("@"), token_compress_on);
+  return tokens;
+}
+
+/// Helper to DebugActionImpl(). Given a probability as a string (e.g. "0.3"),
+/// determine whether the action should be executed, as returned in 'should_execute'.
+/// Returns true if the parsing was successful.
+static bool ParseProbability(const string& prob_str, bool* should_execute) {
+  StringParser::ParseResult parse_result;
+  double probability = StringParser::StringToFloat<double>(
+      prob_str.c_str(), prob_str.size(), &parse_result);
+  if (parse_result != StringParser::PARSE_SUCCESS ||
+      probability < 0.0 || probability > 1.0) {
+    return false;
+  }
+  // +1L ensures probability of 0.0 and 1.0 work as expected.
+  *should_execute = rand() < probability * (RAND_MAX + 1L);
+  return true;
+}
+
+Status DebugActionImpl(
+    const string& debug_action, const char* label, const std::vector<string>& args) {
+  const DebugActionTokens& action_list = TokenizeDebugActions(debug_action);
+  static const char ERROR_MSG[] = "Invalid debug_action $0:$1 ($2)";
+  for (const vector<string>& components : action_list) {
+    // 'components' should be of the form {label, arg_0, ..., arg_n, action}
+    if (components.size() != 2 + args.size() || !iequals(components[0], label)) {
+      continue;
+    }
+    // Check if the arguments match.
+    bool matches = true;
+    for (int i = 0; i < args.size(); ++i) {
+      if (!iequals(components[i + 1], args[i])) {
+        matches = false;
+        break;
+      }
+    }
+    if (!matches) continue;
+    const string& action_str = components[args.size() + 1];
+    // 'tokens' becomes {command, param0, param1, ... }
+    vector<string> tokens = TokenizeDebugActionParams(action_str);
+    DCHECK_GE(tokens.size(), 1);
+    const string& cmd = tokens[0];
+    int sleep_millis = 0;
+    if (iequals(cmd, "SLEEP")) {
+      // SLEEP@<millis>
+      if (tokens.size() != 2) {
+        return Status(
+            Substitute(ERROR_MSG, components[0], action_str, "expected SLEEP@<ms>"));
+      }
+      sleep_millis = atoi(tokens[1].c_str());
+    } else if (iequals(cmd, "JITTER")) {
+      // JITTER@<millis>[@<probability>}
+      if (tokens.size() < 2 || tokens.size() > 3) {
+        return Status(Substitute(ERROR_MSG, components[0], action_str,
+            "expected JITTER@<ms>[@<probability>]"));
+      }
+      int max_millis = atoi(tokens[1].c_str());
+      if (tokens.size() == 3) {
+        bool should_execute = true;
+        if (!ParseProbability(tokens[2], &should_execute)) {
+          return Status(
+              Substitute(ERROR_MSG, components[0], action_str, "invalid probability"));
+        }
+        if (!should_execute) continue;
+      }
+      sleep_millis = rand() % (max_millis + 1);
+    } else if (iequals(cmd, "FAIL")) {
+      // FAIL[@<probability>][@<error message>]
+      if (tokens.size() > 3) {
+        return Status(Substitute(ERROR_MSG, components[0], action_str,
+            "expected FAIL[@<probability>][@<error message>]"));
+      }
+      if (tokens.size() >= 2) {
+        bool should_execute = true;
+        if (!ParseProbability(tokens[1], &should_execute)) {
+          return Status(
+              Substitute(ERROR_MSG, components[0], action_str, "invalid probability"));
+        }
+        if (!should_execute) continue;
+      }
+      string error_msg = tokens.size() == 3 ?
+          tokens[2] :
+          Substitute("Debug Action: $0:$1", components[0], action_str);
+
+      if (ImpaladMetrics::DEBUG_ACTION_NUM_FAIL != nullptr) {
+        ImpaladMetrics::DEBUG_ACTION_NUM_FAIL->Increment(1l);
+      }
+      return Status(TErrorCode::INTERNAL_ERROR, error_msg);
+    } else {
+      DCHECK(false) << "Invalid debug action";
+      return Status(Substitute(ERROR_MSG, components[0], action_str, "invalid command"));
+    }
+    if (sleep_millis > 0) {
+      VLOG(1) << Substitute("Debug Action: $0:$1 sleeping for $2 ms", components[0],
+          action_str, sleep_millis);
+      SleepForMs(sleep_millis);
+    }
+  }
+  return Status::OK();
 }
 
 }

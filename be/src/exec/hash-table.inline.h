@@ -48,12 +48,13 @@ inline void HashTableCtx::ExprValuesCache::NextRow() {
   DCHECK_LE(cur_expr_values_hash_ - expr_values_hash_array_.get(), capacity_);
 }
 
-template <bool FORCE_NULL_EQUALITY>
+template <bool INCLUSIVE_EQUALITY>
 inline int64_t HashTable::Probe(Bucket* buckets, int64_t num_buckets,
     HashTableCtx* ht_ctx, uint32_t hash, bool* found) {
   DCHECK(buckets != NULL);
   DCHECK_GT(num_buckets, 0);
   *found = false;
+  ++num_probes_;
   int64_t bucket_idx = hash & (num_buckets - 1);
 
   // In case of linear probing it counts the total number of steps for statistics and
@@ -65,7 +66,7 @@ inline int64_t HashTable::Probe(Bucket* buckets, int64_t num_buckets,
     if (LIKELY(!bucket->filled)) return bucket_idx;
     if (hash == bucket->hash) {
       if (ht_ctx != NULL &&
-          ht_ctx->Equals<FORCE_NULL_EQUALITY>(GetRow(bucket, ht_ctx->scratch_row_))) {
+          ht_ctx->Equals<INCLUSIVE_EQUALITY>(GetRow(bucket, ht_ctx->scratch_row_))) {
         *found = true;
         return bucket_idx;
       }
@@ -92,7 +93,6 @@ inline int64_t HashTable::Probe(Bucket* buckets, int64_t num_buckets,
 
 inline HashTable::HtData* HashTable::InsertInternal(
     HashTableCtx* ht_ctx, Status* status) {
-  ++num_probes_;
   bool found = false;
   uint32_t hash = ht_ctx->expr_values_cache()->CurExprValuesHash();
   int64_t bucket_idx = Probe<true>(buckets_, num_buckets_, ht_ctx, hash, &found);
@@ -135,7 +135,6 @@ inline void HashTable::PrefetchBucket(uint32_t hash) {
 }
 
 inline HashTable::Iterator HashTable::FindProbeRow(HashTableCtx* ht_ctx) {
-  ++num_probes_;
   bool found = false;
   uint32_t hash = ht_ctx->expr_values_cache()->CurExprValuesHash();
   int64_t bucket_idx = Probe<false>(buckets_, num_buckets_, ht_ctx, hash, &found);
@@ -149,7 +148,6 @@ inline HashTable::Iterator HashTable::FindProbeRow(HashTableCtx* ht_ctx) {
 // TODO: support lazy evaluation like HashTable::Insert().
 inline HashTable::Iterator HashTable::FindBuildRowBucket(
     HashTableCtx* ht_ctx, bool* found) {
-  ++num_probes_;
   uint32_t hash = ht_ctx->expr_values_cache()->CurExprValuesHash();
   int64_t bucket_idx = Probe<true>(buckets_, num_buckets_, ht_ctx, hash, found);
   DuplicateNode* duplicates = NULL;

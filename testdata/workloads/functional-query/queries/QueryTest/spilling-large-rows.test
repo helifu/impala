@@ -1,6 +1,8 @@
 ====
 ---- QUERY
 # Create a temporary table with 10MB strings for the following tests.
+# Need to bump memory estimate to prevent running out of memory.
+set mem_limit="1.2gb";
 create table bigstrs stored as parquet as
 select *, repeat(string_col, 10000000) as bigstr
 from functional.alltypes
@@ -15,7 +17,7 @@ select id, count(distinct bigstr)
 from bigstrs
 group by id
 ---- CATCH
-Row of size 9.54 MB could not be materialized in plan node
+Row of size 9.54 MB could not be materialized by AGGREGATION_NODE
 ====
 ---- QUERY
 # Agg should be able to process the large strings if we increase the row size.
@@ -55,20 +57,22 @@ int,bigint
 ====
 ---- QUERY
 # Row is too big to process in right side of hash join.
-select straight_join at.id, bs.id, at.string_col
-from functional.alltypes at
-  join bigstrs bs on repeat(at.string_col, 10000) = substring(bs.bigstr, 5000000, 10000) and at.id = bs.id
-where at.id < 100
+set mem_limit="1gb";
+select straight_join atp.id, bs.id, atp.string_col
+from functional.alltypes atp
+  join bigstrs bs on repeat(atp.string_col, 10000) = substring(bs.bigstr, 5000000, 10000) and atp.id = bs.id
+where atp.id < 100
 ---- CATCH
-Row of size 9.54 MB could not be materialized in plan node with id 2. Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
+Row of size 9.54 MB could not be materialized by HASH_JOIN_NODE (id=2). Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
 ====
 ---- QUERY
 # Row is too big to process in right side of hash join.
+set mem_limit="1gb";
 set max_row_size=18m;
-select straight_join at.id, bs.id, at.string_col
-from functional.alltypes at
-  join bigstrs bs on repeat(at.string_col, 10000) = substring(bs.bigstr, 5000000, 10000) and at.id = bs.id
-where at.id < 100
+select straight_join atp.id, bs.id, atp.string_col
+from functional.alltypes atp
+  join bigstrs bs on repeat(atp.string_col, 10000) = substring(bs.bigstr, 5000000, 10000) and atp.id = bs.id
+where atp.id < 100
 ---- TYPES
 int,int,string
 ---- RESULTS
@@ -104,7 +108,7 @@ select id, substr(bigstr, 1, 5)
 from bigstrs
 order by bigstr, id
 ---- CATCH
-Row of size 9.54 MB could not be materialized in plan node with id 1. Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
+Row of size 9.54 MB could not be materialized by SORT_NODE (id=1). Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
 ====
 ---- QUERY
 # Sort should be able to process the large strings if we increase the row size.
@@ -143,11 +147,12 @@ FROM (
   ) a
 ORDER BY id
 ---- CATCH
-Row of size 9.54 MB could not be materialized in plan node with id 1. Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
+Row of size 9.54 MB could not be materialized by SORT_NODE (id=1). Increase the max_row_size query option (currently 512.00 KB) to process larger rows.
 ====
 ---- QUERY
 # Sort and analytic should be able to process the large strings if we increase the row
 # size.
+set mem_limit="1gb";
 set max_row_size=10m;
 SELECT id, int_col, substring(bigstr, 1, 10), substring(bigstr, 9999999, 1), rank
 FROM (

@@ -22,25 +22,29 @@
 # CLASSPATH wildcard expansion, we have to add every dependency jar
 # explicitly to the CLASSPATH.
 
+if [ "$0" = "$BASH_SOURCE" ]; then
+  >&2 echo "error: $BASH_SOURCE should be sourced, not executed. e.g:"
+  >&2 echo "   source $BASH_SOURCE"
+  exit 1
+fi
+
 CLASSPATH=\
 "$IMPALA_HOME"/fe/src/test/resources:\
 "$IMPALA_HOME"/fe/target/classes:\
 "$IMPALA_HOME"/fe/target/dependency:\
-"$IMPALA_HOME"/fe/target/test-classes:\
-"${HIVE_HOME}"/lib/datanucleus-api-jdo-3.2.1.jar:\
-"${HIVE_HOME}"/lib/datanucleus-core-3.2.2.jar:\
-"${HIVE_HOME}"/lib/datanucleus-rdbms-3.2.1.jar:
+"$IMPALA_HOME"/fe/target/test-classes:
 
-for jar in "${IMPALA_HOME}"/fe/target/dependency/*.jar; do
-  if [ -e "$jar" ] ; then
-    CLASSPATH="${CLASSPATH}:$jar"
-  fi
-done
+FE_CP_FILE="$IMPALA_HOME/fe/target/build-classpath.txt"
 
-for jar in "${IMPALA_HOME}"/testdata/target/dependency/*.jar; do
-  if [ -e "$jar" ] ; then
-    CLASSPATH="${CLASSPATH}:$jar"
-  fi
-done
+if [ ! -s "$FE_CP_FILE" ]; then
+  >&2 echo FE classpath file $FE_CP_FILE missing.
+  >&2 echo Build the front-end first.
+  return 1
+fi
+
+CLASSPATH=$(cat "$IMPALA_HOME"/fe/target/build-classpath.txt):"$CLASSPATH"
+
+: ${CUSTOM_CLASSPATH=}
+CLASSPATH="$CUSTOM_CLASSPATH:$CLASSPATH"
 
 export CLASSPATH

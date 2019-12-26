@@ -67,6 +67,7 @@ from tempfile import mkdtemp
 
 import json
 import os
+import pipes
 import sh
 import shutil
 import subprocess
@@ -78,16 +79,24 @@ from tests.common.test_dimensions import TableFormatInfo
 IMPALA_HOME = os.environ["IMPALA_HOME"]
 
 
+def configured_call(cmd):
+  """Call a command in a shell with config-impala.sh."""
+  if type(cmd) is list:
+    cmd = " ".join([pipes.quote(arg) for arg in cmd])
+  cmd = "source {0}/bin/impala-config.sh && {1}".format(IMPALA_HOME, cmd)
+  return subprocess.check_call(["bash", "-c", cmd])
+
+
 def load_data(db_to_load, table_formats, scale):
   """Loads a database with a particular scale factor."""
-  subprocess.check_call(["{0}/bin/load-data.py".format(IMPALA_HOME),
-                         "--workloads", db_to_load, "--scale_factor", str(scale),
-                         "--table_formats", "text/none," + table_formats])
+  configured_call(["{0}/bin/load-data.py".format(IMPALA_HOME),
+                   "--workloads", db_to_load, "--scale_factor", str(scale),
+                   "--table_formats", "text/none," + table_formats])
   for table_format in table_formats.split(","):
     suffix = TableFormatInfo.create_from_string(None, table_format).db_suffix()
     db_name = db_to_load + scale + suffix
-    subprocess.check_call(["{0}/tests/util/compute_table_stats.py".format(IMPALA_HOME),
-                           "--stop_on_error", "--db_names", db_name])
+    configured_call(["{0}/tests/util/compute_table_stats.py".format(IMPALA_HOME),
+                     "--stop_on_error", "--db_names", db_name])
 
 def get_git_hash_for_name(name):
   return sh.git("rev-parse", name).strip()
@@ -99,17 +108,18 @@ def build(git_hash, options):
   buildall = ["{0}/buildall.sh".format(IMPALA_HOME), "-notests", "-release", "-noclean"]
   if options.ninja:
     buildall += ["-ninja"]
-  subprocess.check_call(buildall)
+  configured_call(buildall)
 
 
 def start_minicluster():
-  subprocess.check_call(["{0}/bin/create-test-configuration.sh".format(IMPALA_HOME)])
-  subprocess.check_call(["{0}/testdata/bin/run-all.sh".format(IMPALA_HOME)])
+  configured_call(["{0}/bin/create-test-configuration.sh".format(IMPALA_HOME)])
+  configured_call(["{0}/testdata/bin/run-all.sh".format(IMPALA_HOME)])
 
 
-def start_impala(num_impalads):
-  subprocess.check_call(["{0}/bin/start-impala-cluster.py".format(IMPALA_HOME), "-s",
-                         str(num_impalads), "-c", str(num_impalads)])
+def start_impala(num_impalads, options):
+  configured_call(["{0}/bin/start-impala-cluster.py".format(IMPALA_HOME), "-s",
+                   str(num_impalads), "-c", str(num_impalads)] +
+                  ["--impalad_args={0}".format(arg) for arg in options.impalad_args])
 
 
 def run_workload(base_dir, workloads, options):
@@ -134,7 +144,7 @@ def run_workload(base_dir, workloads, options):
   if options.query_names:
     run_workload += ["--query_names={0}".format(options.query_names)]
 
-  subprocess.check_call(run_workload)
+  configured_call(run_workload)
 
 
 def report_benchmark_results(file_a, file_b, description):
@@ -222,12 +232,13 @@ def perf_ab_test(options, args):
 
   if options.start_minicluster:
     start_minicluster()
-  start_impala(options.num_impalads)
+  start_impala(options.num_impalads, options)
 
   workloads = set(options.workloads.split(","))
 
   if options.load:
-    WORKLOAD_TO_DATASET = {"tpch": "tpch", "tpcds": "tpcds", "targeted-perf": "tpch"}
+    WORKLOAD_TO_DATASET = {"tpch": "tpch", "tpcds": "tpcds", "targeted-perf": "tpch",
+                           "tpcds-unmodified": "tpcds-unmodified"}
     datasets = set([WORKLOAD_TO_DATASET[workload] for workload in workloads])
     for dataset in datasets:
       load_data(dataset, options.table_formats, options.scale)
@@ -244,7 +255,7 @@ def perf_ab_test(options, args):
     sh.git.checkout("--", "testdata/workloads")
     build(hash_b, options)
     restore_workloads(workload_dir)
-    start_impala(options.num_impalads)
+    start_impala(options.num_impalads, options)
     run_workload(temp_dir, workloads, options)
     compare(temp_dir, hash_a, hash_b)
 
@@ -259,7 +270,7 @@ def parse_options():
   parser.add_option("--iterations", default=30, help="number of times to run each query")
   parser.add_option("--table_formats", default="parquet/none", help="comma-separated "
                     "list of table formats. Default: parquet/none")
-  parser.add_option("--num_impalads", default=3, help="number of impalads. Default: 1")
+  parser.add_option("--num_impalads", default=1, help="number of impalads. Default: 1")
   # Less commonly-used options:
   parser.add_option("--query_names",
                     help="comma-separated list of regular expressions. A query is "
@@ -270,6 +281,9 @@ def parse_options():
                     help="start a new Hadoop minicluster")
   parser.add_option("--ninja", action="store_true",
                     help = "use ninja, rather than Make, as the build tool")
+  parser.add_option("--impalad_args", dest="impalad_args", action="append", type="string",
+                    default=[],
+                    help="Additional arguments to pass to each Impalad during startup")
 
   parser.set_usage(textwrap.dedent("""
     single_node_perf_run.py [options] git_hash_A [git_hash_B]

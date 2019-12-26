@@ -21,6 +21,7 @@
 
 /// We need zlib.h here to declare stream_ below.
 #include <zlib.h>
+#include <zstd.h>
 
 #include "util/codec.h"
 
@@ -131,5 +132,36 @@ class Lz4Compressor : public Codec {
   virtual std::string file_extension() const override { return "lz4"; }
 };
 
+/// ZStandard compression codec.
+class ZstandardCompressor : public Codec {
+ public:
+  ZstandardCompressor(MemPool* mem_pool = nullptr, bool reuse_buffer = false,
+      int clevel = ZSTD_CLEVEL_DEFAULT);
+  virtual ~ZstandardCompressor() {}
+
+  virtual int64_t MaxOutputLen(
+      int64_t input_len, const uint8_t* input = nullptr) override;
+  virtual Status ProcessBlock(bool output_preallocated, int64_t input_length,
+      const uint8_t* input, int64_t* output_length,
+      uint8_t** output) override WARN_UNUSED_RESULT;
+  virtual std::string file_extension() const override { return "zstd"; }
+
+ private:
+  int clevel_;
+};
+
+/// Hadoop's block compression scheme on top of LZ4.
+class Lz4BlockCompressor : public Codec {
+ public:
+  Lz4BlockCompressor(MemPool* mem_pool = nullptr, bool reuse_buffer = false);
+  virtual ~Lz4BlockCompressor() { }
+
+  virtual int64_t MaxOutputLen(
+      int64_t input_len, const uint8_t* input = nullptr) override;
+  virtual Status ProcessBlock(bool output_preallocated, int64_t input_length,
+      const uint8_t* input, int64_t* output_length,
+      uint8_t** output) override WARN_UNUSED_RESULT;
+  virtual std::string file_extension() const override { return "lz4"; }
+};
 }
 #endif

@@ -17,14 +17,17 @@
 
 package org.apache.impala.analysis;
 
+import java.util.List;
+
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
-import org.apache.impala.catalog.View;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TShowStatsParams;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -36,15 +39,15 @@ public class ShowStatsStmt extends StatementBase {
   protected final TableName tableName_;
 
   // Set during analysis.
-  protected Table table_;
+  protected FeTable table_;
 
   public ShowStatsStmt(TableName tableName, TShowStatsOp op) {
-    this.op_ = op;
-    this.tableName_ = tableName;
+    op_ = Preconditions.checkNotNull(op);
+    tableName_ = Preconditions.checkNotNull(tableName);
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     return getSqlPrefix() + " " + tableName_.toString();
   }
 
@@ -64,14 +67,19 @@ public class ShowStatsStmt extends StatementBase {
   }
 
   @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
+  }
+
+  @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     table_ = analyzer.getTable(tableName_, Privilege.VIEW_METADATA);
     Preconditions.checkNotNull(table_);
-    if (table_ instanceof View) {
+    if (table_ instanceof FeView) {
       throw new AnalysisException(String.format(
           "%s not applicable to a view: %s", getSqlPrefix(), table_.getFullName()));
     }
-    if (table_ instanceof HdfsTable) {
+    if (table_ instanceof FeFsTable) {
       if (table_.getNumClusteringCols() == 0 && op_ == TShowStatsOp.PARTITIONS) {
         throw new AnalysisException("Table is not partitioned: " + table_.getFullName());
       }
@@ -79,10 +87,10 @@ public class ShowStatsStmt extends StatementBase {
         throw new AnalysisException(getSqlPrefix() + " must target a Kudu table: " +
             table_.getFullName());
       }
-    } else if (table_ instanceof KuduTable) {
-      KuduTable kuduTable = (KuduTable) table_;
+    } else if (table_ instanceof FeKuduTable) {
+      FeKuduTable kuduTable = (FeKuduTable) table_;
       if (op_ == TShowStatsOp.RANGE_PARTITIONS &&
-          kuduTable.getRangePartitioningColNames().isEmpty()) {
+          FeKuduTable.Utils.getRangePartitioningColNames(kuduTable).isEmpty()) {
         throw new AnalysisException(getSqlPrefix() + " requested but table does not " +
             "have range partitions: " + table_.getFullName());
       }

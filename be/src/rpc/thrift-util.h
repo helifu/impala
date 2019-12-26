@@ -49,12 +49,11 @@ class ThriftSerializer {
 
   /// Serializes obj into result.  Result will contain a copy of the memory.
   template <class T>
-  Status Serialize(T* obj, std::vector<uint8_t>* result) {
-    uint32_t len = 0;
-    uint8_t* buffer = NULL;
-    RETURN_IF_ERROR(Serialize<T>(obj, &len, &buffer));
-    result->resize(len);
-    memcpy(&((*result)[0]), buffer, len);
+  Status SerializeToVector(const T* obj, std::vector<uint8_t>* result) {
+    uint32_t len;
+    uint8_t* buffer;
+    RETURN_IF_ERROR(SerializeToBuffer(obj, &len, &buffer));
+    result->assign(buffer, buffer + len);
     return Status::OK();
   }
 
@@ -62,7 +61,7 @@ class ThriftSerializer {
   /// memory returned is owned by this object and will be invalid when another object
   /// is serialized.
   template <class T>
-  Status Serialize(T* obj, uint32_t* len, uint8_t** buffer) {
+  Status SerializeToBuffer(const T* obj, uint32_t* len, uint8_t** buffer) {
     try {
       mem_buffer_->resetBuffer();
       obj->write(protocol_.get());
@@ -76,7 +75,7 @@ class ThriftSerializer {
   }
 
   template <class T>
-  Status Serialize(T* obj, std::string* result) {
+  Status SerializeToString(const T* obj, std::string* result) {
     try {
       mem_buffer_->resetBuffer();
       obj->write(protocol_.get());
@@ -92,15 +91,6 @@ class ThriftSerializer {
  private:
   boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem_buffer_;
   boost::shared_ptr<apache::thrift::protocol::TProtocol> protocol_;
-};
-
-class ThriftDeserializer {
- public:
-  ThriftDeserializer(bool compact);
-
- private:
-  boost::shared_ptr<apache::thrift::protocol::TProtocolFactory> factory_;
-  boost::shared_ptr<apache::thrift::protocol::TProtocol> tproto_;
 };
 
 /// Utility to create a protocol (deserialization) object for 'mem'.
@@ -149,14 +139,17 @@ Status WaitForServer(const std::string& host, int port, int num_retries,
    int retry_interval_ms);
 
 /// Print a TColumnValue. If null, print "NULL".
-std::ostream& operator<<(std::ostream& out, const TColumnValue& colval);
+void PrintTColumnValue(std::ostream& out, const TColumnValue& colval);
 
 /// Compares two TNetworkAddresses alphanumerically by their host:port
 /// string representation
 bool TNetworkAddressComparator(const TNetworkAddress& a, const TNetworkAddress& b);
 
-/// Returns true if the TTransportException corresponds to a TCP socket recv timeout.
-bool IsRecvTimeoutTException(const apache::thrift::transport::TTransportException& e);
+/// Returns true if the TTransportException corresponds to a TCP socket read timeout.
+bool IsReadTimeoutTException(const apache::thrift::transport::TTransportException& e);
+
+/// Returns true if the TTransportException corresponds to a TCP socket peek timeout.
+bool IsPeekTimeoutTException(const apache::thrift::transport::TTransportException& e);
 
 /// Returns true if the exception indicates the other end of the TCP socket was closed.
 bool IsConnResetTException(const apache::thrift::transport::TTransportException& e);

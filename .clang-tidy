@@ -44,9 +44,9 @@ Checks: "-*,clang*,\
 -clang-diagnostic-float-equal,\
 -clang-diagnostic-global-constructors,\
 -clang-diagnostic-gnu-anonymous-struct,\
+-clang-diagnostic-gnu-zero-variadic-macro-arguments,\
 -clang-diagnostic-header-hygiene,\
 -clang-diagnostic-implicit-fallthrough,\
--clang-diagnostic-mismatched-tags,\
 -clang-diagnostic-missing-prototypes,\
 -clang-diagnostic-missing-variable-declarations,\
 -clang-diagnostic-nested-anon-types,\
@@ -70,6 +70,7 @@ Checks: "-*,clang*,\
 -clang-diagnostic-unused-parameter,\
 -clang-diagnostic-used-but-marked-unused,\
 -clang-diagnostic-vla-extension,\
+-clang-diagnostic-weak-template-vtables,\
 -clang-diagnostic-weak-vtables"
 
 # Ignore warnings in gutil

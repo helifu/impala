@@ -31,7 +31,6 @@ DEFAULT_BEESWAX_PORT = 21000
 DEFAULT_HS2_PORT = 21050
 DEFAULT_HIVE_HS2_PORT = 10000
 
-logging.basicConfig(level=logging.INFO, format='[%(name)s] %(threadName)s: %(message)s')
 LOG = logging.getLogger('query_exec_functions')
 
 def get_hs2_hive_cursor(hiveserver, user=None, use_kerberos=False,
@@ -150,13 +149,17 @@ def establish_beeswax_connection(query_config):
     ImpalaBeeswaxClient is the connection suceeds, None otherwise.
   """
   use_kerberos = query_config.use_kerberos
+  user = query_config.user
+  password = query_config.password
+  use_ssl = query_config.use_ssl
   # If the impalad is for the form host, convert it to host:port that the Impala beeswax
   # client accepts.
   if len(query_config.impalad.split(":")) == 1:
     query_config.impalad = "{0}:{1}".format(query_config.impalad, DEFAULT_BEESWAX_PORT)
   client = None
   try:
-    client = ImpalaBeeswaxClient(query_config.impalad, use_kerberos=use_kerberos)
+    client = ImpalaBeeswaxClient(query_config.impalad, use_kerberos=use_kerberos,
+                                 user=user, password=password, use_ssl=use_ssl)
     # Try connect
     client.connect()
     # Set the exec options.
@@ -189,7 +192,7 @@ def execute_using_impala_beeswax(query, query_config):
   # create a map for query options and the query names to send to the plugin
   context = build_context(query, query_config)
   if plugin_runner: plugin_runner.run_plugins_pre(context=context, scope="Query")
-  result = ImpalaBeeswaxResult()
+  result = None
   try:
     result = client.execute(query.query_str)
   except Exception, e:
@@ -229,7 +232,7 @@ def construct_exec_result(result, exec_result):
   """
 
   # Return immedietely if the query failed.
-  if not result.success: return exec_result
+  if result is None or not result.success: return exec_result
   exec_result.success = True
   attrs = ['data', 'runtime_profile', 'start_time',
       'time_taken', 'summary', 'exec_summary']

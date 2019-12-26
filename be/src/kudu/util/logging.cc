@@ -16,30 +16,32 @@
 // under the License.
 #include "kudu/util/logging.h"
 
-#include <stdio.h>
+#include <unistd.h>
 
-#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <fstream>
-#include <iostream>
 #include <mutex>
-#include <sstream>
 #include <utility>
-#include <vector>
 
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/random_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/callback.h"
+#include "kudu/gutil/callback.h"  // IWYU pragma: keep
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/spinlock.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/async_logger.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
-#include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/logging_callback.h"
 #include "kudu/util/minidump.h"
 #include "kudu/util/signal.h"
 #include "kudu/util/status.h"
@@ -47,12 +49,12 @@
 DECLARE_string(log_filename);
 TAG_FLAG(log_filename, stable);
 
-DEFINE_bool_hidden(log_async, true,
+DEFINE_bool(log_async, true,
             "Enable asynchronous writing to log files. This improves "
             "latency and stability.");
 TAG_FLAG(log_async, hidden);
 
-DEFINE_int32_hidden(log_async_buffer_bytes_per_level, 2 * 1024 * 1024,
+DEFINE_int32(log_async_buffer_bytes_per_level, 2 * 1024 * 1024,
              "The number of bytes of buffer space used by each log "
              "level. Only relevant when --log_async is enabled.");
 TAG_FLAG(log_async_buffer_bytes_per_level, hidden);
@@ -74,8 +76,7 @@ using base::SpinLockHolder;
 namespace kudu {
 
 __thread bool tls_redact_user_data = true;
-bool g_should_redact_log;
-bool g_should_redact_flag;
+kudu::RedactContext g_should_redact;
 const char* const kRedactionMessage = "<redacted>";
 
 namespace {
@@ -337,6 +338,21 @@ void GetFullLogFilename(google::LogSeverity severity, string* filename) {
   ss << FLAGS_log_dir << "/" << FLAGS_log_filename << "."
      << google::GetLogSeverityName(severity);
   *filename = ss.str();
+}
+
+std::string FormatTimestampForLog(MicrosecondsInt64 micros_since_epoch) {
+  time_t secs_since_epoch = micros_since_epoch / 1000000;
+  int usecs = micros_since_epoch % 1000000;
+  struct tm tm_time;
+  localtime_r(&secs_since_epoch, &tm_time);
+
+  return StringPrintf("%02d%02d %02d:%02d:%02d.%06d",
+                      1 + tm_time.tm_mon,
+                      tm_time.tm_mday,
+                      tm_time.tm_hour,
+                      tm_time.tm_min,
+                      tm_time.tm_sec,
+                      usecs);
 }
 
 void ShutdownLoggingSafe() {

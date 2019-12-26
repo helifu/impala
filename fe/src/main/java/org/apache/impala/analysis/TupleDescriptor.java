@@ -26,16 +26,15 @@ import java.util.Map;
 
 import org.apache.commons.lang.StringUtils;
 import org.apache.impala.catalog.ColumnStats;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.thrift.TTupleDescriptor;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * A collection of slots that are organized in a CPU-friendly memory layout. A slot is
@@ -70,12 +69,15 @@ import com.google.common.collect.Lists;
  *
  * Example: select bool_col, int_col, string_col, smallint_col from functional.alltypes
  * Slots:   string_col|int_col|smallint_col|bool_col|null_byte
- * Offsets: 0          16      20           22       23
+ * Offsets: 0          12      16           18       19
  */
 public class TupleDescriptor {
+  // Padding size in bytes for Kudu string slots.
+  private static final int KUDU_STRING_PADDING = 4;
+
   private final TupleId id_;
   private final String debugName_;  // debug-only
-  private final ArrayList<SlotDescriptor> slots_ = Lists.newArrayList();
+  private final List<SlotDescriptor> slots_ = new ArrayList<>();
 
   // Resolved path to the collection corresponding to this tuple descriptor, if any,
   // Only set for materialized tuples.
@@ -114,10 +116,10 @@ public class TupleDescriptor {
   }
 
   public TupleId getId() { return id_; }
-  public ArrayList<SlotDescriptor> getSlots() { return slots_; }
+  public List<SlotDescriptor> getSlots() { return slots_; }
 
-  public ArrayList<SlotDescriptor> getMaterializedSlots() {
-    ArrayList<SlotDescriptor> result = Lists.newArrayList();
+  public List<SlotDescriptor> getMaterializedSlots() {
+    List<SlotDescriptor> result = new ArrayList<>();
     for (SlotDescriptor slot: slots_) {
       if (slot.isMaterialized()) result.add(slot);
     }
@@ -128,10 +130,11 @@ public class TupleDescriptor {
    * Returns all materialized slots ordered by their offset. Valid to call after the
    * mem layout has been computed.
    */
-  public ArrayList<SlotDescriptor> getSlotsOrderedByOffset() {
+  public List<SlotDescriptor> getSlotsOrderedByOffset() {
     Preconditions.checkState(hasMemLayout_);
-    ArrayList<SlotDescriptor> result = getMaterializedSlots();
+    List<SlotDescriptor> result = getMaterializedSlots();
     Collections.sort(result, new Comparator<SlotDescriptor> () {
+      @Override
       public int compare(SlotDescriptor a, SlotDescriptor b) {
         return Integer.compare(a.getByteOffset(), b.getByteOffset());
       }
@@ -139,13 +142,13 @@ public class TupleDescriptor {
     return result;
   }
 
-  public Table getTable() {
+  public FeTable getTable() {
     if (path_ == null) return null;
     return path_.getRootTable();
   }
 
   public TableName getTableName() {
-    Table t = getTable();
+    FeTable t = getTable();
     return (t == null) ? null : t.getTableName();
   }
 
@@ -189,7 +192,7 @@ public class TupleDescriptor {
 
   public String debugString() {
     String tblStr = (getTable() == null ? "null" : getTable().getFullName());
-    List<String> slotStrings = Lists.newArrayList();
+    List<String> slotStrings = new ArrayList<>();
     for (SlotDescriptor slot : slots_) {
       slotStrings.add(slot.debugString());
     }
@@ -202,6 +205,9 @@ public class TupleDescriptor {
         .add("slots", "[" + Joiner.on(", ").join(slotStrings) + "]")
         .toString();
   }
+
+  @Override
+  public String toString() { return debugString(); }
 
   /**
    * Checks that this tuple is materialized and has a mem layout. Throws if this tuple
@@ -252,8 +258,7 @@ public class TupleDescriptor {
     avgSerializedSize_ = 0;
 
     // maps from slot size to slot descriptors with that size
-    Map<Integer, List<SlotDescriptor>> slotsBySize =
-        new HashMap<Integer, List<SlotDescriptor>>();
+    Map<Integer, List<SlotDescriptor>> slotsBySize = new HashMap<>();
 
     // populate slotsBySize
     int numNullBits = 0;
@@ -261,17 +266,24 @@ public class TupleDescriptor {
     for (SlotDescriptor d: slots_) {
       if (!d.isMaterialized()) continue;
       ColumnStats stats = d.getStats();
-      if (stats.hasAvgSerializedSize()) {
+      int slotSize = d.getType().getSlotSize();
+
+      if (stats.hasAvgSize()) {
         avgSerializedSize_ += d.getStats().getAvgSerializedSize();
       } else {
         // TODO: for computed slots, try to come up with stats estimates
-        avgSerializedSize_ += d.getType().getSlotSize();
+        avgSerializedSize_ += slotSize;
       }
-      if (!slotsBySize.containsKey(d.getType().getSlotSize())) {
-        slotsBySize.put(d.getType().getSlotSize(), new ArrayList<SlotDescriptor>());
+      // Add padding for a KUDU string slot.
+      if (d.isKuduStringSlot()) {
+        slotSize += KUDU_STRING_PADDING;
+        avgSerializedSize_ += KUDU_STRING_PADDING;
       }
-      totalSlotSize += d.getType().getSlotSize();
-      slotsBySize.get(d.getType().getSlotSize()).add(d);
+      if (!slotsBySize.containsKey(slotSize)) {
+        slotsBySize.put(slotSize, new ArrayList<>());
+      }
+      totalSlotSize += slotSize;
+      slotsBySize.get(slotSize).add(d);
       if (d.getIsNullable() || alwaysAddNullBit) ++numNullBits;
     }
     // we shouldn't have anything of size <= 0
@@ -287,7 +299,7 @@ public class TupleDescriptor {
     // is 0, next is 1, etc.
     int slotIdx = 0;
     // sort slots in descending order of size
-    List<Integer> sortedSizes = new ArrayList<Integer>(slotsBySize.keySet());
+    List<Integer> sortedSizes = new ArrayList<>(slotsBySize.keySet());
     Collections.sort(sortedSizes, Collections.reverseOrder());
     for (int slotSize: sortedSizes) {
       if (slotsBySize.get(slotSize).isEmpty()) continue;
@@ -323,7 +335,7 @@ public class TupleDescriptor {
    * Returns true if this tuple has at least one materialized nullable Kudu scan slot.
    */
   private boolean hasNullableKuduScanSlots() {
-    if (!(getTable() instanceof KuduTable)) return false;
+    if (!(getTable() instanceof FeKuduTable)) return false;
     for (SlotDescriptor d: slots_) {
       if (d.isMaterialized() && d.getIsNullable()) return true;
     }
@@ -334,10 +346,10 @@ public class TupleDescriptor {
    * Return true if the slots being materialized are all partition columns.
    */
   public boolean hasClusteringColsOnly() {
-    Table table = getTable();
-    if (!(table instanceof HdfsTable) || table.getNumClusteringCols() == 0) return false;
+    FeTable table = getTable();
+    if (!(table instanceof FeFsTable) || table.getNumClusteringCols() == 0) return false;
 
-    HdfsTable hdfsTable = (HdfsTable)table;
+    FeFsTable hdfsTable = (FeFsTable)table;
     for (SlotDescriptor slotDesc: getSlots()) {
       if (!slotDesc.isMaterialized()) continue;
       if (slotDesc.getColumn() == null ||
@@ -352,7 +364,7 @@ public class TupleDescriptor {
    * Returns a list of slot ids that correspond to partition columns.
    */
   public List<SlotId> getPartitionSlots() {
-    List<SlotId> partitionSlots = Lists.newArrayList();
+    List<SlotId> partitionSlots = new ArrayList<>();
     for (SlotDescriptor slotDesc: getSlots()) {
       if (slotDesc.getColumn() == null) continue;
       if (slotDesc.getColumn().getPosition() < getTable().getNumClusteringCols()) {

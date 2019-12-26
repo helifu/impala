@@ -17,12 +17,15 @@
 
 # General Impala query tests
 
-import copy
 import pytest
 import re
+from copy import deepcopy
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.test_dimensions import create_uncompressed_text_dimension
+from tests.common.skip import SkipIfEC, SkipIfCatalogV2
+from tests.common.test_dimensions import (
+    create_uncompressed_text_dimension, extend_exec_option_dimension,
+    create_client_protocol_dimension, hs2_parquet_constraint)
 from tests.common.test_vector import ImpalaTestVector
 
 class TestQueries(ImpalaTestSuite):
@@ -32,19 +35,15 @@ class TestQueries(ImpalaTestSuite):
     if cls.exploration_strategy() == 'core':
       cls.ImpalaTestMatrix.add_constraint(lambda v:\
           v.get_value('table_format').file_format == 'parquet')
+    # Run these queries through both beeswax and HS2 to get coverage of both protocols.
+    # Don't run all combinations of table format and protocol - the dimensions should
+    # be orthogonal.
+    cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
+    cls.ImpalaTestMatrix.add_constraint(hs2_parquet_constraint)
 
-    # Manually adding a test dimension here to test the small query opt
-    # in exhaustive.
-    # TODO Cleanup required, allow adding values to dimensions without having to
-    # manually explode them
+    # Adding a test dimension here to test the small query opt in exhaustive.
     if cls.exploration_strategy() == 'exhaustive':
-      dim = cls.ImpalaTestMatrix.dimensions["exec_option"]
-      new_value = []
-      for v in dim:
-        new_value.append(ImpalaTestVector.Value(v.name, copy.copy(v.value)))
-        new_value[-1].value["exec_single_node_rows_threshold"] = 100
-      dim.extend(new_value)
-      cls.ImpalaTestMatrix.add_dimension(dim)
+      extend_exec_option_dimension(cls, "exec_single_node_rows_threshold", "100")
 
   @classmethod
   def get_workload(cls):
@@ -110,6 +109,14 @@ class TestQueries(ImpalaTestSuite):
   def test_subquery(self, vector):
     self.run_test_case('QueryTest/subquery', vector)
 
+  def test_subquery_single_node(self, vector):
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/subquery-single-node', new_vector)
+
+  def test_alias(self, vector):
+    self.run_test_case('QueryTest/alias', vector)
+
   def test_subquery_in_constant_lhs(self, vector):
     self.run_test_case('QueryTest/subquery-in-constant-lhs', vector)
 
@@ -163,6 +170,7 @@ class TestQueriesTextTables(ImpalaTestSuite):
     vector.get_value('exec_option')['abort_on_error'] = 1
     self.run_test_case('QueryTest/strict-mode-abort', vector)
 
+  @SkipIfCatalogV2.data_sources_unsupported()
   def test_data_source_tables(self, vector):
     self.run_test_case('QueryTest/data-source-tables', vector)
 
@@ -172,15 +180,14 @@ class TestQueriesTextTables(ImpalaTestSuite):
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/distinct-estimate', vector)
 
+  @SkipIfEC.oom
   def test_random(self, vector):
     # These results will vary slightly depending on how the values get split up
     # so only run with 1 node and on text.
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/random', vector)
 
-  def test_mixed_format(self, vector):
-    self.run_test_case('QueryTest/mixed-format', vector)
-
+  @SkipIfEC.oom
   def test_values(self, vector):
     self.run_test_case('QueryTest/values', vector)
 
@@ -197,6 +204,7 @@ class TestQueriesParquetTables(ImpalaTestSuite):
   def get_workload(cls):
     return 'functional-query'
 
+  @SkipIfEC.oom
   @pytest.mark.execute_serially
   def test_very_large_strings(self, vector):
     """Regression test for IMPALA-1619. Doesn't need to be run on all file formats.
@@ -212,9 +220,7 @@ class TestQueriesParquetTables(ImpalaTestSuite):
     self.run_test_case('QueryTest/single-node-large-sorts', vector)
 
 # Tests for queries in HDFS-specific tables, e.g. AllTypesAggMultiFilesNoPart.
-# This is a subclass of TestQueries to get the extra test dimension for
-# exec_single_node_rows_threshold in exhaustive.
-class TestHdfsQueries(TestQueries):
+class TestHdfsQueries(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestHdfsQueries, cls).add_test_dimensions()
@@ -222,6 +228,15 @@ class TestHdfsQueries(TestQueries):
     cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('table_format').file_format != 'kudu')
 
+    # Adding a test dimension here to test the small query opt in exhaustive.
+    if cls.exploration_strategy() == 'exhaustive':
+      extend_exec_option_dimension(cls, "exec_single_node_rows_threshold", "100")
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @SkipIfEC.oom
   def test_hdfs_scan_node(self, vector):
     self.run_test_case('QueryTest/hdfs-scan-node', vector)
 

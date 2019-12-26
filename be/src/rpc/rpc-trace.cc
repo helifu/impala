@@ -22,7 +22,10 @@
 #include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
+#include "rpc/rpc-mgr.h"
 #include "util/debug-util.h"
+#include "util/histogram-metric.h"
+#include "util/pretty-printer.h"
 #include "util/time.h"
 #include "util/webserver.h"
 
@@ -39,6 +42,8 @@ const string RPC_PROCESSING_TIME_DISTRIBUTION_METRIC_KEY = "rpc-method.$0.call_d
 // web-based summary page.
 class RpcEventHandlerManager {
  public:
+  RpcEventHandlerManager(RpcMgr* rpc_mgr) : rpc_mgr_(rpc_mgr) {}
+
   // Adds an event handler to the list of those tracked
   void RegisterEventHandler(RpcEventHandler* event_handler);
 
@@ -46,13 +51,13 @@ class RpcEventHandlerManager {
   // { "servers": [
   //  .. list of output from RpcEventHandler::ToJson()
   //  ] }
-  void JsonCallback(const Webserver::ArgumentMap& args, Document* document);
+  void JsonCallback(const Webserver::WebRequest& req, Document* document);
 
   // Resets method statistics. Takes two optional arguments: 'server' and 'method'. If
   // neither are specified, all server statistics are reset. If only the former is
   // specified, all statistics for that server are reset. If both arguments are present,
   // resets the statistics for a single method only. Produces no JSON output.
-  void ResetCallback(const Webserver::ArgumentMap& args, Document* document);
+  void ResetCallback(const Webserver::WebRequest& req, Document* document);
 
  private:
   // Protects event_handlers_
@@ -64,17 +69,22 @@ class RpcEventHandlerManager {
   // after they are started, event handlers have a lifetime equivalent to the length of
   // the process.
   vector<RpcEventHandler*> event_handlers_;
+
+  // Points to an RpcMgr. If this is not null, then its metrics will be included in the
+  // output of JsonCallback. Not owned, but the object must be guaranteed to live as long
+  // as the process lives.
+  RpcMgr* rpc_mgr_ = nullptr;
 };
 
 // Only instance of RpcEventHandlerManager
 scoped_ptr<RpcEventHandlerManager> handler_manager;
 
-void impala::InitRpcEventTracing(Webserver* webserver) {
-  handler_manager.reset(new RpcEventHandlerManager());
-  if (webserver != NULL) {
+void impala::InitRpcEventTracing(Webserver* webserver, RpcMgr* rpc_mgr) {
+  handler_manager.reset(new RpcEventHandlerManager(rpc_mgr));
+  if (webserver != nullptr) {
     Webserver::UrlCallback json = bind<void>(
         mem_fn(&RpcEventHandlerManager::JsonCallback), handler_manager.get(), _1, _2);
-    webserver->RegisterUrlCallback("/rpcz", "rpcz.tmpl", json);
+    webserver->RegisterUrlCallback("/rpcz", "rpcz.tmpl", json, true);
 
     Webserver::UrlCallback reset = bind<void>(
         mem_fn(&RpcEventHandlerManager::ResetCallback), handler_manager.get(), _1, _2);
@@ -83,12 +93,12 @@ void impala::InitRpcEventTracing(Webserver* webserver) {
 }
 
 void RpcEventHandlerManager::RegisterEventHandler(RpcEventHandler* event_handler) {
-  DCHECK(event_handler != NULL);
+  DCHECK(event_handler != nullptr);
   lock_guard<mutex> l(lock_);
   event_handlers_.push_back(event_handler);
 }
 
-void RpcEventHandlerManager::JsonCallback(const Webserver::ArgumentMap& args,
+void RpcEventHandlerManager::JsonCallback(const Webserver::WebRequest& req,
     Document* document) {
   lock_guard<mutex> l(lock_);
   Value servers(kArrayType);
@@ -98,10 +108,12 @@ void RpcEventHandlerManager::JsonCallback(const Webserver::ArgumentMap& args,
     servers.PushBack(server, document->GetAllocator());
   }
   document->AddMember("servers", servers, document->GetAllocator());
+  if (rpc_mgr_ != nullptr) rpc_mgr_->ToJson(document);
 }
 
-void RpcEventHandlerManager::ResetCallback(const Webserver::ArgumentMap& args,
+void RpcEventHandlerManager::ResetCallback(const Webserver::WebRequest& req,
     Document* document) {
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator server_it = args.find("server");
   bool reset_all_servers = (server_it == args.end());
   Webserver::ArgumentMap::const_iterator method_it = args.find("method");
@@ -137,7 +149,7 @@ void RpcEventHandler::ResetAll() {
 
 RpcEventHandler::RpcEventHandler(const string& server_name, MetricGroup* metrics) :
     server_name_(server_name), metrics_(metrics) {
-  if (handler_manager.get() != NULL) handler_manager->RegisterEventHandler(this);
+  if (handler_manager.get() != nullptr) handler_manager->RegisterEventHandler(this);
 }
 
 void RpcEventHandler::ToJson(Value* server, Document* document) {
@@ -188,7 +200,7 @@ void* RpcEventHandler::getContext(const char* fn_name, void* server_context) {
   InvocationContext* ctxt_ptr =
       new InvocationContext(MonotonicMillis(), cnxn_ctx, it->second);
   VLOG_RPC << "RPC call: " << string(fn_name) << "(from "
-           << ctxt_ptr->cnxn_ctx->network_address << ")";
+           << TNetworkAddressToString(ctxt_ptr->cnxn_ctx->network_address) << ")";
   return reinterpret_cast<void*>(ctxt_ptr);
 }
 
@@ -198,7 +210,7 @@ void RpcEventHandler::postWrite(void* ctx, const char* fn_name, uint32_t bytes) 
   const string& call_name = string(fn_name);
   // TODO: bytes is always 0, how come?
   VLOG_RPC << "RPC call: " << server_name_ << ":" << call_name << " from "
-           << rpc_ctx->cnxn_ctx->network_address << " took "
+           << TNetworkAddressToString(rpc_ctx->cnxn_ctx->network_address) << " took "
            << PrettyPrinter::Print(elapsed_time * 1000L * 1000L, TUnit::TIME_NS);
   MethodDescriptor* descriptor = rpc_ctx->method_descriptor;
   delete rpc_ctx;

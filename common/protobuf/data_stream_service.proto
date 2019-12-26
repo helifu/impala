@@ -16,10 +16,14 @@
 // under the License.
 //
 
+syntax="proto2";
+
 package impala;
 
 import "common.proto";
 import "row_batch.proto";
+
+import "kudu/rpc/rpc_header.proto";
 
 // All fields are required in V1.
 message TransmitDataRequestPB {
@@ -41,7 +45,7 @@ message TransmitDataRequestPB {
   optional int32 tuple_offsets_sidecar_idx = 5;
 
   // The sidecar index of the tuple's data which is a (compressed) row batch.
-  // The details  of the row batch (e.g. # of rows) is in 'row_batch_header' above.
+  // The details of the row batch (e.g. # of rows) is in 'row_batch_header' above.
   optional int32 tuple_data_sidecar_idx = 6;
 }
 
@@ -49,6 +53,9 @@ message TransmitDataRequestPB {
 message TransmitDataResponsePB {
   // Status::OK() on success; Error status on failure.
   optional StatusPB status = 1;
+
+  // Latency for response in the receiving daemon in nanoseconds.
+  optional int64 receiver_latency_ns = 2;
 }
 
 // All fields are required in V1.
@@ -66,10 +73,16 @@ message EndDataStreamRequestPB {
 // All fields are required in V1.
 message EndDataStreamResponsePB {
   optional StatusPB status = 1;
+
+  // Latency for response in the receiving daemon in nanoseconds.
+  optional int64 receiver_latency_ns = 2;
 }
 
 // Handles data transmission between fragment instances.
 service DataStreamService {
+  // Override the default authorization method.
+  option (kudu.rpc.default_authz_method) = "Authorize";
+
   // Called by sender to transmit a single row batch. Returns error indication
   // if params.fragmentId or params.destNodeId are unknown or if data couldn't
   // be read.

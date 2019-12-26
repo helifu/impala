@@ -17,11 +17,11 @@
 
 #include "exec/kudu-scanner.h"
 
+#include <string>
+#include <vector>
 #include <kudu/client/row_result.h>
 #include <kudu/client/value.h>
 #include <thrift/protocol/TDebugProtocol.h>
-#include <vector>
-#include <string>
 
 #include "exec/kudu-util.h"
 #include "exprs/scalar-expr.h"
@@ -53,7 +53,8 @@ using kudu::client::KuduTable;
 using kudu::client::KuduValue;
 
 DEFINE_string(kudu_read_mode, "READ_LATEST", "(Advanced) Sets the Kudu scan ReadMode. "
-    "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT.");
+    "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT. Can be overridden "
+    "with the query option of the same name.");
 DEFINE_bool(pick_only_leaders_for_tests, false,
             "Whether to pick only leader replicas, for tests purposes only.");
 DEFINE_int32(kudu_scanner_keep_alive_period_sec, 15,
@@ -64,7 +65,6 @@ DECLARE_int32(kudu_operation_timeout_ms);
 
 namespace impala {
 
-const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 
 KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
@@ -105,17 +105,51 @@ void KuduScanner::KeepKuduScannerAlive() {
   last_alive_time_micros_ = now;
 }
 
+Status KuduScanner::GetNextWithCountStarOptimization(RowBatch* row_batch, bool* eos) {
+  int64_t counter = 0;
+  while (scanner_->HasMoreRows()) {
+    RETURN_IF_CANCELLED(state_);
+    RETURN_IF_ERROR(GetNextScannerBatch());
+
+    cur_kudu_batch_num_read_ = static_cast<int64_t>(cur_kudu_batch_.NumRows());
+    counter += cur_kudu_batch_num_read_;
+  }
+  *eos = true;
+  int64_t tuple_buffer_size;
+  uint8_t* tuple_buffer;
+  int capacity = 1;
+  RETURN_IF_ERROR(row_batch->ResizeAndAllocateTupleBuffer(state_,
+      row_batch->tuple_data_pool(), row_batch->row_desc()->GetRowSize(), &capacity,
+      &tuple_buffer_size, &tuple_buffer));
+  Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
+  Tuple::ClearNullBits(tuple, scan_node_->tuple_desc()->null_bytes_offset(),
+      scan_node_->tuple_desc()->num_null_bytes());
+  int64_t* counter_slot = tuple->GetBigIntSlot(scan_node_->count_star_slot_offset());
+  *counter_slot = counter;
+  TupleRow* dst_row = row_batch->GetRow(row_batch->AddRow());
+  dst_row->SetTuple(0, tuple);
+  row_batch->CommitLastRow();
+
+  CloseCurrentClientScanner();
+  return Status::OK();
+}
+
 Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
+  SCOPED_TIMER(scan_node_->materialize_tuple_timer());
+  // Optimized scanning for count(*), only write the NumRows
+  if (scan_node_->optimize_count_star()) {
+    return GetNextWithCountStarOptimization(row_batch, eos);
+  }
   int64_t tuple_buffer_size;
   uint8_t* tuple_buffer;
   RETURN_IF_ERROR(
       row_batch->ResizeAndAllocateTupleBuffer(state_, &tuple_buffer_size, &tuple_buffer));
-  Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
 
   // Main scan loop:
   // Tries to fill 'row_batch' with rows from cur_kudu_batch_.
   // If there are no rows to decode, tries to get the next row batch from kudu.
   // If this scanner has no more rows, the scanner is closed and eos is returned.
+  Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
   while (!*eos) {
     RETURN_IF_CANCELLED(state_);
 
@@ -124,7 +158,7 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
       if (row_batch->AtCapacity()) break;
     }
 
-    if (scanner_->HasMoreRows() && !scan_node_->ReachedLimit()) {
+    if (scanner_->HasMoreRows() && !scan_node_->ReachedLimitShared()) {
       RETURN_IF_ERROR(GetNextScannerBatch());
       continue;
     }
@@ -146,23 +180,28 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token, bool* eos) {
   DCHECK(scanner_ == NULL);
   kudu::client::KuduScanner* scanner;
   KUDU_RETURN_IF_ERROR(kudu::client::KuduScanToken::DeserializeIntoScanner(
-      scan_node_->kudu_client(), scan_token, &scanner),
-      "Unable to deserialize scan token");
+                           scan_node_->kudu_client(), scan_token, &scanner),
+      BuildErrorString("Unable to deserialize scan token"));
   scanner_.reset(scanner);
 
   if (UNLIKELY(FLAGS_pick_only_leaders_for_tests)) {
     KUDU_RETURN_IF_ERROR(scanner_->SetSelection(kudu::client::KuduClient::LEADER_ONLY),
-                         "Could not set replica selection.");
+        BuildErrorString("Could not set replica selection"));
   }
-  kudu::client::KuduScanner::ReadMode mode =
-      MODE_READ_AT_SNAPSHOT == FLAGS_kudu_read_mode ?
-          kudu::client::KuduScanner::READ_AT_SNAPSHOT :
-          kudu::client::KuduScanner::READ_LATEST;
-  KUDU_RETURN_IF_ERROR(scanner_->SetReadMode(mode), "Could not set scanner ReadMode");
+  kudu::client::KuduScanner::ReadMode mode;
+  RETURN_IF_ERROR(StringToKuduReadMode(FLAGS_kudu_read_mode, &mode));
+  if (state_->query_options().kudu_read_mode != TKuduReadMode::DEFAULT) {
+    RETURN_IF_ERROR(StringToKuduReadMode(
+        PrintThriftEnum(state_->query_options().kudu_read_mode), &mode));
+  }
+  KUDU_RETURN_IF_ERROR(
+      scanner_->SetReadMode(mode), BuildErrorString("Could not set scanner ReadMode"));
   KUDU_RETURN_IF_ERROR(scanner_->SetTimeoutMillis(FLAGS_kudu_operation_timeout_ms),
-      "Could not set scanner timeout");
-  VLOG_ROW << "Starting KuduScanner with ReadMode=" << mode << " timeout=" <<
-      FLAGS_kudu_operation_timeout_ms;
+      BuildErrorString("Could not set scanner timeout"));
+  VLOG_ROW << "Starting KuduScanner with ReadMode=" << mode
+           << " timeout=" << FLAGS_kudu_operation_timeout_ms
+           << " node with id=" << scan_node_->id()
+           << " Kudu table=" << scan_node_->table_->name();
 
   if (!timestamp_slots_.empty()) {
     uint64_t row_format_flags =
@@ -185,7 +224,7 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token, bool* eos) {
               ctx.filter->filter_desc().targets[it->second];
           const string& col_name = target_desc.kudu_col_name;
           DCHECK(col_name != "");
-          ColumnType col_type = ColumnType::FromThrift(target_desc.kudu_col_type);
+          const ColumnType& col_type = ColumnType::FromThrift(target_desc.kudu_col_type);
 
           void* min = filter->GetMin();
           void* max = filter->GetMax();
@@ -209,26 +248,31 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token, bool* eos) {
           }
 
           KuduValue* min_value;
-          RETURN_IF_ERROR(CreateKuduValue(filter->type(), min, &min_value));
+          RETURN_IF_ERROR(CreateKuduValue(col_type, min, &min_value));
           KUDU_RETURN_IF_ERROR(
               scanner_->AddConjunctPredicate(scan_node_->table_->NewComparisonPredicate(
                   col_name, KuduPredicate::ComparisonOp::GREATER_EQUAL, min_value)),
-              "Failed to add min predicate");
+              BuildErrorString("Failed to add min predicate"));
 
           KuduValue* max_value;
-          RETURN_IF_ERROR(CreateKuduValue(filter->type(), max, &max_value));
+          RETURN_IF_ERROR(CreateKuduValue(col_type, max, &max_value));
           KUDU_RETURN_IF_ERROR(
               scanner_->AddConjunctPredicate(scan_node_->table_->NewComparisonPredicate(
                   col_name, KuduPredicate::ComparisonOp::LESS_EQUAL, max_value)),
-              "Failed to add max predicate");
+              BuildErrorString("Failed to add max predicate"));
         }
       }
     }
   }
 
+  if (scan_node_->limit() != -1 && conjunct_evals_.empty()) {
+    KUDU_RETURN_IF_ERROR(scanner_->SetLimit(scan_node_->limit()),
+        BuildErrorString("Failed to set limit on scan"));
+  }
+
   {
-    SCOPED_TIMER(state_->total_storage_wait_timer());
-    KUDU_RETURN_IF_ERROR(scanner_->Open(), "Unable to open scanner");
+    SCOPED_TIMER2(state_->total_storage_wait_timer(), scan_node_->kudu_client_time());
+    KUDU_RETURN_IF_ERROR(scanner_->Open(), BuildErrorString("Unable to open scanner"));
   }
   *eos = false;
   return Status::OK();
@@ -255,13 +299,18 @@ Status KuduScanner::HandleEmptyProjection(RowBatch* row_batch) {
       }
     }
   }
+  for (int i = 0; i < num_to_commit; ++i) {
+    // IMPALA-6258: Initialize tuple ptrs to non-null value
+    TupleRow* row = row_batch->GetRow(row_batch->AddRow());
+    row->SetTuple(0, Tuple::POISON);
+    row_batch->CommitLastRow();
+  }
   cur_kudu_batch_num_read_ += rows_to_add;
-  row_batch->CommitRows(num_to_commit);
   return Status::OK();
 }
 
 Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_mem) {
-  // Short-circuit the count(*) case.
+  // Short-circuit for empty projection cases.
   if (scan_node_->tuple_desc()->slots().empty()) {
     return HandleEmptyProjection(row_batch);
   }
@@ -317,7 +366,7 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
     row->SetTuple(0, *tuple_mem);
     row_batch->CommitLastRow();
     // If we've reached the capacity, or the LIMIT for the scan, return.
-    if (row_batch->AtCapacity() || scan_node_->ReachedLimit()) break;
+    if (row_batch->AtCapacity() || scan_node_->ReachedLimitShared()) break;
     // Move to the next tuple in the tuple buffer.
     *tuple_mem = next_tuple(*tuple_mem);
   }
@@ -328,14 +377,20 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
 }
 
 Status KuduScanner::GetNextScannerBatch() {
-  SCOPED_TIMER(state_->total_storage_wait_timer());
+  SCOPED_TIMER2(state_->total_storage_wait_timer(), scan_node_->kudu_client_time());
   int64_t now = MonotonicMicros();
-  KUDU_RETURN_IF_ERROR(scanner_->NextBatch(&cur_kudu_batch_), "Unable to advance iterator");
+  KUDU_RETURN_IF_ERROR(scanner_->NextBatch(&cur_kudu_batch_),
+      BuildErrorString("Unable to advance iterator"));
   COUNTER_ADD(scan_node_->kudu_round_trips(), 1);
   cur_kudu_batch_num_read_ = 0;
   COUNTER_ADD(scan_node_->rows_read_counter(), cur_kudu_batch_.NumRows());
   last_alive_time_micros_ = now;
   return Status::OK();
+}
+
+string KuduScanner::BuildErrorString(const char* msg) {
+  return Substitute("$0 for node with id '$1' for Kudu table '$2'", msg, scan_node_->id(),
+      scan_node_->table_->name());
 }
 
 }  // namespace impala

@@ -15,19 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+
+#include <cstdint>
+#include <ostream>
+#include <vector>
+
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <memory>
 
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/atomic.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/striped64.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
 // These flags are used by the multi-threaded tests, can be used for microbenchmarking.
-DEFINE_int32_hidden(num_operations, 10*1000, "Number of operations to perform");
-DEFINE_int32_hidden(num_threads, 2, "Number of worker threads");
+DEFINE_int32(num_operations, 10*1000, "Number of operations to perform");
+DEFINE_int32(num_threads, 2, "Number of worker threads");
 
 namespace kudu {
 
@@ -147,6 +154,10 @@ TEST(Striped64Test, TestMultiIncrDecr) {
       "num_threads",
       strings::Substitute("$0", (FLAGS_num_threads * 4)));
   RunMultiTest(FLAGS_num_operations, FLAGS_num_threads);
+}
+
+TEST(Striped64Test, TestSize) {
+  ASSERT_EQ(16, sizeof(LongAdder));
 }
 
 }  // namespace kudu

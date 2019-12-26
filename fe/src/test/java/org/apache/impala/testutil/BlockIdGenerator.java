@@ -19,6 +19,7 @@ package org.apache.impala.testutil;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.util.Collection;
 import java.util.List;
 
 import org.apache.hadoop.fs.Path;
@@ -28,12 +29,12 @@ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 
 import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.Db;
-import org.apache.impala.catalog.HdfsPartition;
+import org.apache.impala.catalog.FeCatalogUtils;
+import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeFsPartition;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
-import org.apache.impala.thrift.ImpalaInternalServiceConstants;
 import org.apache.impala.util.PatternMatcher;
 
 /**
@@ -60,41 +61,39 @@ public class BlockIdGenerator {
       writer = new FileWriter(output);
 
       // Load all tables in the catalog
-      Catalog catalog = CatalogServiceTestCatalog.create();
-      for (Db database: catalog.getDbs(PatternMatcher.MATCHER_MATCH_ALL)) {
-        for (String tableName: database.getAllTableNames()) {
-          Table table = database.getTable(tableName);
-          // Only do this for hdfs tables
-          if (table == null || !(table instanceof HdfsTable)) {
-            continue;
-          }
-          HdfsTable hdfsTable = (HdfsTable)table;
-
-          // Write the output as <tablename>: <blockid1> <blockid2> <etc>
-          writer.write(tableName + ":");
-          for (HdfsPartition partition: hdfsTable.getPartitions()) {
-            // Ignore the default partition.
-            if (partition.getId() ==
-                    ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID) {
+      try (Catalog catalog = CatalogServiceTestCatalog.create()) {
+        for (FeDb database : catalog.getDbs(PatternMatcher.MATCHER_MATCH_ALL)) {
+          for (String tableName : database.getAllTableNames()) {
+            FeTable table = database.getTable(tableName);
+            // Only do this for hdfs tables
+            if (table == null || !(table instanceof HdfsTable)) {
               continue;
             }
-            List<FileDescriptor> fileDescriptors = partition.getFileDescriptors();
-            for (FileDescriptor fd : fileDescriptors) {
-              Path p = new Path(partition.getLocation(), fd.getFileName());
+            HdfsTable hdfsTable = (HdfsTable) table;
 
-              // Use a deprecated API to get block ids
-              DistributedFileSystem dfs =
-                  (DistributedFileSystem)p.getFileSystem(hdfsConfig);
-              LocatedBlocks locations = dfs.getClient().getNamenode().getBlockLocations(
-                  p.toUri().getPath(), 0, fd.getFileLength());
+            // Write the output as <tablename>: <blockid1> <blockid2> <etc>
+            writer.write(tableName + ":");
+            Collection<? extends FeFsPartition> parts =
+                FeCatalogUtils.loadAllPartitions(hdfsTable);
+            for (FeFsPartition partition : parts) {
+              List<FileDescriptor> fileDescriptors = partition.getFileDescriptors();
+              for (FileDescriptor fd : fileDescriptors) {
+                Path p = new Path(partition.getLocation(), fd.getRelativePath());
 
-              for (LocatedBlock lb : locations.getLocatedBlocks()) {
-                long id = lb.getBlock().getBlockId();
-                writer.write(" " + id);
+                // Use a deprecated API to get block ids
+                DistributedFileSystem dfs =
+                    (DistributedFileSystem) p.getFileSystem(hdfsConfig);
+                LocatedBlocks locations = dfs.getClient().getNamenode().getBlockLocations(
+                    p.toUri().getPath(), 0, fd.getFileLength());
+
+                for (LocatedBlock lb : locations.getLocatedBlocks()) {
+                  long id = lb.getBlock().getBlockId();
+                  writer.write(" " + id);
+                }
               }
             }
+            writer.write("\n");
           }
-          writer.write("\n");
         }
       }
     } finally {

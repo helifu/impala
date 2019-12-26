@@ -12,7 +12,7 @@ instructions.
 * Open a terminal window and run the following commands to get the Impala
   documentation source files from Git:
     ```
-    git clone https://git-wip-us.apache.org/repos/asf/impala.git/docs
+    git clone https://gitbox.apache.org/repos/asf/impala.git/docs
     cd <local_directory>
     git checkout master
     ```
@@ -107,8 +107,6 @@ Docs will end up in `docs/build` (both HTML and PDF).
     * `impala.ditamap`: Tells the DITA Open Toolkit what topics to
       include in the Impala User/Administration Guide. This guide also
       includes the Impala SQL Reference.
-    * `impala_sqlref.ditamap`: Tells the DITA Open Toolkit what topics
-      to include in the Impala SQL Reference.
     * `impala_html.ditaval`: Further defines what topics to include in
       the Impala HTML output.
     * `impala_pdf.ditaval`: Further defines what topics to include in

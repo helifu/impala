@@ -17,12 +17,14 @@
 
 #include "kudu/util/minidump.h"
 
-#include <signal.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <ostream>
 #include <string>
 
 #if defined(__linux__)
@@ -31,17 +33,19 @@
 #endif // defined(__linux__)
 
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/linux_syscall_support.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/logging.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
+#include "kudu/util/thread.h"
 
 using kudu::env_util::CreateDirIfMissing;
 using std::string;
@@ -54,7 +58,7 @@ static constexpr bool kMinidumpPlatformSupported = false;
 
 DECLARE_string(log_dir);
 
-DEFINE_bool_hidden(enable_minidumps, kMinidumpPlatformSupported,
+DEFINE_bool(enable_minidumps, kMinidumpPlatformSupported,
             "Whether to enable minidump generation upon process crash or SIGUSR1. "
             "Currently only supported on Linux systems.");
 TAG_FLAG(enable_minidumps, advanced);

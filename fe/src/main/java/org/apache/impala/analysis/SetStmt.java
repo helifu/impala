@@ -18,6 +18,7 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.thrift.TSetQueryOptionRequest;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -50,7 +51,7 @@ public class SetStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     if (key_ == null) {
       if (isSetAll_) return "SET ALL";
       return "SET";

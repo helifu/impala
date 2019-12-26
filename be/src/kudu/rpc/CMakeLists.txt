@@ -51,6 +51,7 @@ set(KRPC_SRCS
     messenger.cc
     negotiation.cc
     outbound_call.cc
+    periodic.cc
     proxy.cc
     reactor.cc
     remote_method.cc
@@ -75,6 +76,7 @@ set(KRPC_SRCS
 
 set(KRPC_LIBS
   cyrus_sasl
+  gssapi_krb5
   gutil
   kudu_util
   libev
@@ -94,14 +96,16 @@ add_executable(protoc-gen-krpc protoc-gen-krpc.cc
   # TODO: Consider either removing code that depends on these flags, or namespacing them
   # somehow.
   ${CMAKE_CURRENT_SOURCE_DIR}/../../common/global-flags.cc)
+# IMPALA-8642: kudu_version.cc depends on gen-cpp/Status_types.h in target thrift-deps
+add_dependencies(protoc-gen-krpc thrift-deps)
 target_link_libraries(protoc-gen-krpc
-  ${KUDU_BASE_LIBS}
+    ${KUDU_BASE_LIBS}
     rpc_header_proto
     protoc
     protobuf
     gutil
-    kudu_util
-    )
+    libunwind
+    kudu_util)
 
 #### RPC test
 PROTOBUF_GENERATE_CPP(
@@ -124,13 +128,20 @@ target_link_libraries(rtest_krpc
   rtest_diff_package_proto)
 
 # Tests
-set(KUDU_TEST_LINK_LIBS rtest_krpc krpc rpc_header_proto security-test ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(exactly_once_rpc-test)
+set(KUDU_TEST_LINK_LIBS
+  krpc
+  mini_kdc
+  rpc_header_proto
+  rtest_krpc
+  security_test_util
+  ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(exactly_once_rpc-test PROCESSORS 10)
 ADD_KUDU_TEST(mt-rpc-test RUN_SERIAL true)
 ADD_KUDU_TEST(negotiation-test)
+ADD_KUDU_TEST(periodic-test)
 ADD_KUDU_TEST(reactor-test)
 ADD_KUDU_TEST(request_tracker-test)
 ADD_KUDU_TEST(rpc-bench RUN_SERIAL true)
 ADD_KUDU_TEST(rpc-test)
 ADD_KUDU_TEST(rpc_stub-test)
-ADD_KUDU_TEST(service_queue-test)
+ADD_KUDU_TEST(service_queue-test RUN_SERIAL true)

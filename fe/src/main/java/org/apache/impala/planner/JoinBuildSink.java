@@ -17,6 +17,7 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.analysis.BinaryPredicate;
@@ -27,7 +28,8 @@ import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TJoinBuildSink;
 import org.apache.impala.thrift.TQueryOptions;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
+
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 
 /**
  * Sink to materialize the build side of a join.
@@ -36,7 +38,7 @@ public class JoinBuildSink extends DataSink {
   // id of join's build-side table assigned during planning
   private final JoinTableId joinTableId_;
 
-  private final List<Expr> buildExprs_ = Lists.newArrayList();
+  private final List<Expr> buildExprs_ = new ArrayList<>();
 
   /**
    * Creates sink for build side of 'joinNode' (extracts buildExprs_ from joinNode).
@@ -57,15 +59,18 @@ public class JoinBuildSink extends DataSink {
   public JoinTableId getJoinTableId() { return joinTableId_; }
 
   @Override
-  protected TDataSink toThrift() {
-    TDataSink result = new TDataSink(TDataSinkType.JOIN_BUILD_SINK);
+  protected void toThriftImpl(TDataSink tsink) {
     TJoinBuildSink tBuildSink = new TJoinBuildSink();
     tBuildSink.setJoin_table_id(joinTableId_.asInt());
     for (Expr buildExpr: buildExprs_) {
       tBuildSink.addToBuild_exprs(buildExpr.treeToThrift());
     }
-    result.setJoin_build_sink(tBuildSink);
-    return result;
+    tsink.setJoin_build_sink(tBuildSink);
+  }
+
+  @Override
+  protected TDataSinkType getSinkType() {
+    return TDataSinkType.JOIN_BUILD_SINK;
   }
 
   @Override
@@ -79,14 +84,24 @@ public class JoinBuildSink extends DataSink {
             + " cohort-id=" + fragment_.getCohortId().toString() + "\n");
       if (!buildExprs_.isEmpty()) {
         output.append(detailPrefix + "build expressions: ")
-            .append(Expr.toSql(buildExprs_) + "\n");
+            .append(Expr.toSql(buildExprs_, DEFAULT) + "\n");
       }
     }
+  }
+
+  @Override
+  protected String getLabel() {
+    return "JOIN BUILD";
   }
 
   @Override
   public void computeResourceProfile(TQueryOptions queryOptions) {
     // The memory consumption is counted against the join PlanNode.
     resourceProfile_ = ResourceProfile.noReservation(0);
+  }
+
+  @Override
+  public void collectExprs(List<Expr> exprs) {
+    exprs.addAll(buildExprs_);
   }
 }

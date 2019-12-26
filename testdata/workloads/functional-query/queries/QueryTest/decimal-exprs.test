@@ -128,12 +128,6 @@ DECIMAL
 UDF WARNING: Decimal expression overflowed, returning NULL
 ====
 ---- QUERY
-set decimal_v2=true;
-select coalesce(1.8, cast(0 as decimal(38,38)));
----- CATCH
-UDF ERROR: Decimal expression overflowed
-====
----- QUERY
 # DECIMAL v1 sum() overflow. A negative number is incorrectly returned due to overflow.
 set decimal_v2=false;
 select sum(d6 * cast(4e37 as decimal(38,0))) from decimal_tbl;
@@ -295,7 +289,7 @@ DECIMAL,DECIMAL,DECIMAL
 # Test AVG() with DECIMAL_V1
 set decimal_v2=false;
 select avg(l_extendedprice) as a from tpch_parquet.lineitem
-group by l_tax having a > 38247.190 order by 1;
+group by l_tax having avg(l_extendedprice) > 38247.190 order by 1;
 ---- RESULTS
 38250.48
 38251.62
@@ -309,7 +303,7 @@ DECIMAL
 # Test AVG() with DECIMAL_V2
 set decimal_v2=true;
 select avg(l_extendedprice) as a from tpch_parquet.lineitem
-group by l_tax having a > 38247.190 order by 1;
+group by l_tax having avg(l_extendedprice) > 38247.190 order by 1;
 ---- RESULTS
 38247.196745
 38250.487309
@@ -319,6 +313,37 @@ group by l_tax having a > 38247.190 order by 1;
 38283.541766
 ---- TYPES
 DECIMAL
+====
+---- QUERY
+# Test AVG overflow due to DECIMAL_v2
+set decimal_v2=false;
+select avg(c) from (select cast(1e32 as decimal(38,0)) - cast(1 as decimal(38,0)) as c) t
+---- RESULTS
+99999999999999999999999999999999
+---- TYPES
+DECIMAL
+====
+---- QUERY
+set decimal_v2=false;
+select avg(c) from (select cast(1e32 as decimal(38,0)) as c) t;
+---- RESULTS
+100000000000000000000000000000000
+---- TYPES
+DECIMAL
+====
+---- QUERY
+set decimal_v2=true;
+select avg(c) from (select cast(1e32 as decimal(38,0)) - cast(1 as decimal(38,0)) as c) t
+---- RESULTS
+99999999999999999999999999999999.000000
+---- TYPES
+DECIMAL
+====
+---- QUERY
+set decimal_v2=true;
+select avg(c) from (select cast(1e32 as decimal(38,0)) as c) t;
+---- CATCH
+UDF ERROR: Avg computation overflowed
 ====
 ---- QUERY
 # Test sum() and avg() analytic fns with start bounds (tests Remove() for decimal)
@@ -453,4 +478,78 @@ cast(cast(12333333333 as decimal(38, 0)) as timestamp);
 2360-10-29 21:55:33.999999999,2360-10-29 21:55:34,1970-01-01 00:05:33.999999999,1970-01-01 00:05:34,2360-10-29 21:55:33.111111111,2360-10-29 21:55:33.111111112,2360-10-29 21:55:33.111111111,2360-10-29 21:55:33.111111112,2360-10-29 21:55:33.111111111,2360-10-29 21:55:33.111111112,2360-10-29 21:55:33.111000000,2360-10-29 21:55:33
 ---- TYPES
 TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP
+====
+---- QUERY
+# Check that converting from decimal to date is not allowed
+set decimal_v2=false;
+select cast(cast(0.499 as decimal(9, 3)) as date);
+---- CATCH
+AnalysisException: Invalid type cast of CAST(0.499 AS DECIMAL(9,3)) from DECIMAL(9,3) to DATE
+====
+---- QUERY
+set decimal_v2=true;
+select cast(cast(0.499 as decimal(9, 3)) as date);
+---- CATCH
+AnalysisException: Invalid type cast of CAST(0.499 AS DECIMAL(9,3)) from DECIMAL(9,3) to DATE
+====
+---- QUERY
+# IMPALA-6405: String to Decimal conversion errors
+set decimal_v2=false;
+select cast("abc" as decimal(5, 2));
+---- RESULTS
+NULL
+---- TYPES
+DECIMAL
+---- ERRORS
+UDF WARNING: String to Decimal parse failed
+====
+---- QUERY
+set decimal_v2=true;
+select cast("abc" as decimal(5, 2));
+---- CATCH
+UDF ERROR: String to Decimal parse failed
+====
+---- QUERY
+set decimal_v2=false;
+select cast("1234.5" as decimal(5, 2));
+---- RESULTS
+NULL
+---- TYPES
+DECIMAL
+---- ERRORS
+UDF WARNING: String to Decimal cast overflowed
+====
+---- QUERY
+set decimal_v2=true;
+select cast("1234.5" as decimal(5, 2));
+---- CATCH
+UDF ERROR: String to Decimal cast overflowed
+====
+---- QUERY
+# mod and % should be equivalent in Decimal V2 mode.
+set decimal_v2=true;
+select typeof(9.8 % 3);
+---- RESULTS
+'DECIMAL(2,1)'
+====
+---- QUERY
+# mod and % should be equivalent in Decimal V2 mode.
+set decimal_v2=true;
+select typeof(mod(9.7,3));
+---- RESULTS
+'DECIMAL(2,1)'
+====
+---- QUERY
+# mod and % are different in Decimal V1 mode for this case.
+set decimal_v2=false;
+select typeof(9.6 % 3);
+---- RESULTS
+'DOUBLE'
+====
+---- QUERY
+# mod and % are different in Decimal V1 mode for this case.
+set decimal_v2=false;
+select typeof(mod(9.6, 3));
+---- RESULTS
+'DECIMAL(4,1)'
 ====

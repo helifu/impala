@@ -153,6 +153,7 @@
 
 namespace impala {
 
+template <bool>
 class DelimitedTextParser;
 
 class HdfsSequenceScanner : public BaseSequenceScanner {
@@ -222,7 +223,7 @@ class HdfsSequenceScanner : public BaseSequenceScanner {
   Status GetRecord(uint8_t** record_ptr, int64_t* record_len) WARN_UNUSED_RESULT;
 
   /// Helper class for picking fields and rows from delimited text.
-  boost::scoped_ptr<DelimitedTextParser> delimited_text_parser_;
+  boost::scoped_ptr<DelimitedTextParser<false>> delimited_text_parser_;
   std::vector<FieldLocation> field_locations_;
 
   /// Data that is fixed across headers.  This struct is shared between scan ranges.
@@ -250,8 +251,14 @@ class HdfsSequenceScanner : public BaseSequenceScanner {
   /// Buffer for data read from the 'stream_' directly or after decompression.
   uint8_t* unparsed_data_buffer_ = nullptr;
 
+  /// End of data buffer used to check out of bound error.
+  uint8_t* data_buffer_end_ = nullptr;
+
   /// Number of buffered records unparsed_data_buffer_ from block compressed data.
   int64_t num_buffered_records_in_compressed_block_ = 0;
+
+  /// Next record from block compressed data.
+  int64_t next_record_in_compressed_block_len_ = 0;
 
   /// Next record from block compressed data.
   uint8_t* next_record_in_compressed_block_ = nullptr;

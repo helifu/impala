@@ -17,34 +17,45 @@
 
 package org.apache.impala.util;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import java.util.Collection;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.Warehouse;
+import org.apache.hadoop.hive.metastore.api.ConfigValSecurityException;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.FireEventRequest;
+import org.apache.hadoop.hive.metastore.api.FireEventRequestData;
+import org.apache.hadoop.hive.metastore.api.InsertEventRequestData;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
-import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TColumn;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Utility methods for interacting with the Hive Metastore.
  */
 public class MetaStoreUtil {
-  private static final Logger LOG = Logger.getLogger(MetaStoreUtil.class);
+  private static final Logger LOG = LoggerFactory.getLogger(MetaStoreUtil.class);
 
   // Maximum comment length, e.g., for columns, that can be stored in the HMS.
   // This number is a lower bound of the constraint set in the HMS DB schema,
@@ -58,6 +69,10 @@ public class MetaStoreUtil {
   // The longest strings Hive accepts for [serde] property values.
   public static final int MAX_PROPERTY_VALUE_LENGTH = 4000;
 
+  // Maximum owner length. The owner can be user or role.
+  // https://github.com/apache/hive/blob/13fbae57321f3525cabb326df702430d61c242f9/standalone-metastore/src/main/resources/package.jdo#L63
+  public static final int MAX_OWNER_LENGTH = 128;
+
   // The default maximum number of partitions to fetch from the Hive metastore in one
   // RPC.
   private static final short DEFAULT_MAX_PARTITIONS_PER_RPC = 1000;
@@ -67,6 +82,20 @@ public class MetaStoreUtil {
   // and defaults to DEFAULT_MAX_PARTITION_BATCH_SIZE if the value is not present in the
   // Hive configuration.
   private static short maxPartitionsPerRpc_ = DEFAULT_MAX_PARTITIONS_PER_RPC;
+
+  // The configuration key that Hive uses to set the null partition key value.
+  public static final String NULL_PARTITION_KEY_VALUE_CONF_KEY =
+      "hive.exec.default.partition.name";
+  // The default value for the above configuration key.
+  public static final String DEFAULT_NULL_PARTITION_KEY_VALUE =
+      "__HIVE_DEFAULT_PARTITION__";
+
+  // The configuration key represents thrift URI for the remote Hive Metastore.
+  public static final String HIVE_METASTORE_URIS_KEY = "hive.metastore.uris";
+  // The default value for the above configuration key.
+  public static final String DEFAULT_HIVE_METASTORE_URIS = "";
+
+  public static final String hiveMetastoreUris_;
 
   static {
     // Get the value from the Hive configuration, if present.
@@ -85,6 +114,33 @@ public class MetaStoreUtil {
           "default: %d", maxPartitionsPerRpc_, DEFAULT_MAX_PARTITIONS_PER_RPC));
       maxPartitionsPerRpc_ = DEFAULT_MAX_PARTITIONS_PER_RPC;
     }
+
+    hiveMetastoreUris_ = hiveConf.get(HIVE_METASTORE_URIS_KEY,
+        DEFAULT_HIVE_METASTORE_URIS);
+  }
+
+  /**
+   * Return the value that Hive is configured to use for NULL partition key values.
+   */
+  public static String getNullPartitionKeyValue(IMetaStoreClient client)
+      throws ConfigValSecurityException, TException {
+    return client.getConfigValue(
+        NULL_PARTITION_KEY_VALUE_CONF_KEY, DEFAULT_NULL_PARTITION_KEY_VALUE);
+  }
+
+  /**
+   * Return the value of thrift URI for the remote Hive Metastore.
+   */
+  public static String getHiveMetastoreUris() {
+    return hiveMetastoreUris_;
+  }
+
+  /**
+   * Return the value set for the given config in the metastore.
+   */
+  public static String getMetastoreConfigValue(
+      IMetaStoreClient client, String config, String defaultVal) throws TException {
+    return client.getConfigValue(config, defaultVal);
   }
 
   /**
@@ -240,5 +296,63 @@ public class MetaStoreUtil {
       if (rightColNames.contains(leftCol.toLowerCase())) outputList.add(leftCol);
     }
     return Joiner.on(",").join(outputList);
+  }
+
+  public static List<String> getPartValsFromName(Table msTbl, String partName)
+      throws MetaException, CatalogException {
+    Preconditions.checkNotNull(msTbl);
+    LinkedHashMap<String, String> hm = Warehouse.makeSpecFromName(partName);
+    List<String> partVals = Lists.newArrayList();
+    for (FieldSchema field: msTbl.getPartitionKeys()) {
+      String key = field.getName();
+      String val = hm.get(key);
+      if (val == null) {
+        throw new CatalogException("Incomplete partition name - missing " + key);
+      }
+      partVals.add(val);
+    }
+    return partVals;
+  }
+
+  /**
+   *  Fires an insert event to HMS notification log. For partitioned table, each
+   *  existing partition touched by the insert will fire a separate insert event.
+   *
+   * @param msClient Metastore client
+   * @param newFiles Set of all the 'new' files added by this insert. This is empty in
+   * case of insert overwrite.
+   * @param partVals List of partition values corresponding to the partition keys in
+   * a partitioned table. This is null for non-partitioned table.
+   * @param isOverwrite If true, sets the 'replace' flag to true indicating that the
+   * operation was an insert overwrite in the notification log. Will set the same to
+   * false otherwise.
+   */
+  public static void fireInsertEvent(IMetaStoreClient msClient,
+      String dbName, String tblName, List<String> partVals,
+      Collection<String> newFiles, boolean isOverwrite) throws TException {
+    Preconditions.checkNotNull(msClient);
+    Preconditions.checkNotNull(dbName);
+    Preconditions.checkNotNull(tblName);
+    Preconditions.checkNotNull(newFiles);
+    LOG.debug("Firing an insert event for {}", tblName);
+    FireEventRequestData data = new FireEventRequestData();
+    InsertEventRequestData insertData = new InsertEventRequestData();
+    data.setInsertData(insertData);
+    FireEventRequest rqst = new FireEventRequest(true, data);
+    rqst.setDbName(dbName);
+    rqst.setTableName(tblName);
+    insertData.setFilesAdded(new ArrayList<>(newFiles));
+    insertData.setReplace(isOverwrite);
+    if (partVals != null) rqst.setPartitionVals(partVals);
+
+    msClient.fireListenerEvent(rqst);
+  }
+
+  /**
+   * Check if the hms table is a bucketed table or not
+   */
+  public static boolean isBucketedTable(Table msTbl) {
+    Preconditions.checkNotNull(msTbl);
+    return msTbl.getSd().getNumBuckets() > 0;
   }
 }

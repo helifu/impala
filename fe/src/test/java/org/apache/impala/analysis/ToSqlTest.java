@@ -17,16 +17,21 @@
 
 package org.apache.impala.analysis;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
-import org.junit.Ignore;
-import org.junit.Test;
-
-import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.Privilege;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.testutil.TestUtils;
+import org.junit.Test;
+
 import com.google.common.base.Preconditions;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
 // TODO: Expand this test, in particular, because view creation relies
 // on producing correct SQL.
@@ -67,52 +72,68 @@ public class ToSqlTest extends FrontendTestBase {
     }
   }
 
-  private static AnalysisContext.AnalysisResult analyze(String query, String defaultDb) {
-    try {
-      AnalysisContext analysisCtx = new AnalysisContext(catalog_,
-          TestUtils.createQueryContext(defaultDb, System.getProperty("user.name")),
-          AuthorizationConfig.createAuthDisabledConfig());
-      analysisCtx.analyze(query);
-      AnalysisContext.AnalysisResult analysisResult = analysisCtx.getAnalysisResult();
-      Preconditions.checkNotNull(analysisResult.getStmt());
-      return analysisResult;
-    } catch (Exception e) {
-      e.printStackTrace();
-      fail("Failed to analyze query: " + query + "\n" + e.getMessage());
-    }
-    return null;
+  /**
+   * Helper for the common case when the string should be identical after a roundtrip
+   * through the parser.
+   */
+  private void testToSql(String query) {
+    testToSql(query, query);
+  }
+
+  private void testToSql(AnalysisContext ctx, String query) {
+    testToSql(ctx, query, query, false);
   }
 
   private void testToSql(String query, String expected) {
     testToSql(query, System.getProperty("user.name"), expected);
   }
 
+  private void testToSql(String query, String expected, ToSqlOptions options) {
+    String defaultDb = System.getProperty("user.name");
+    testToSql(createAnalysisCtx(defaultDb), query, defaultDb, expected, false, options);
+  }
+
+  private void testToSql(AnalysisContext ctx, String query, String expected,
+      boolean ignoreWhiteSpace) {
+    testToSql(ctx, query, System.getProperty("user.name"), expected, ignoreWhiteSpace);
+  }
+
   private void testToSql(String query, String defaultDb, String expected) {
     testToSql(query, defaultDb, expected, false);
   }
 
+  private void testToSql(AnalysisContext ctx, String query, String defaultDb,
+      String expected, boolean ignoreWhiteSpace) {
+    testToSql(ctx, query, defaultDb, expected, ignoreWhiteSpace, ToSqlOptions.DEFAULT);
+  }
+
   private void testToSql(String query, String defaultDb, String expected,
       boolean ignoreWhitespace) {
+    testToSql(createAnalysisCtx(defaultDb), query, defaultDb, expected, ignoreWhitespace,
+        ToSqlOptions.DEFAULT);
+  }
+
+  private void testToSql(AnalysisContext ctx, String query, String defaultDb,
+      String expected, boolean ignoreWhitespace, ToSqlOptions options) {
     String actual = null;
     try {
-      ParseNode node = AnalyzesOk(query, createAnalyzer(defaultDb));
-      actual = node.toSql();
+      ParseNode node = AnalyzesOk(query, ctx);
+      if (node instanceof QueryStmt && !options.showRewritten()) {
+        actual = ((QueryStmt)node).getOrigSqlString();
+      } else {
+        actual = node.toSql(options);
+      }
       if (ignoreWhitespace) {
         // Transform whitespace to single space.
         actual = actual.replace('\n', ' ').replaceAll(" +", " ").trim();
       }
-      if (!actual.equals(expected)) {
-        String msg = "\n<<< Expected(length:" + expected.length() + "): [" + expected
-          + "]\n>>> Actual(length:" + actual.length() + "): [" + actual + "]\n";
-        System.err.println(msg);
-        fail(msg);
-      }
+      assertEquals(expected, actual);
     } catch (Exception e) {
       e.printStackTrace();
       fail("Failed to analyze query: " + query + "\n" + e.getMessage());
     }
     // Parse and analyze the resulting SQL to ensure its validity.
-    AnalyzesOk(actual, createAnalyzer(defaultDb));
+    AnalyzesOk(actual, ctx);
   }
 
   private void runTestTemplate(String sql, String expectedSql, String[]... testDims) {
@@ -151,7 +172,7 @@ public class ToSqlTest extends FrontendTestBase {
     Preconditions.checkState(query.contains("$TBL"));
     String uqQuery = query.replace("$TBL", tbl.getTbl());
     testToSql(uqQuery, tbl.getDb(), expectedSql);
-    AnalyzesOk(uqQuery, createAnalyzer(tbl.getDb()));
+    AnalyzesOk(uqQuery, createAnalysisCtx(tbl.getDb()));
     String fqQuery = query.replace("$TBL", tbl.toString());
     testToSql(fqQuery, expectedSql);
   }
@@ -193,13 +214,15 @@ public class ToSqlTest extends FrontendTestBase {
       String fqAlias = "functional." + tbl;
       boolean isCollectionTblRef = isCollectionTableRef(tbl);
       for (String col: columns) {
+        String quotedCol = ToSqlUtils.identSql(col);
         // Test implicit table aliases with unqualified and fully qualified
         // table/view names. Unqualified table/view names should be fully
         // qualified in the generated SQL (IMPALA-962).
         TblsTestToSql(String.format("select %s from $TBL", col), tblName,
-            String.format("SELECT %s FROM %s", col, fqAlias));
+            String.format("SELECT %s FROM %s", quotedCol, fqAlias));
         TblsTestToSql(String.format("select %s.%s from $TBL", uqAlias, col), tblName,
-            String.format("SELECT %s.%s FROM %s", uqAlias, col, fqAlias));
+            String.format("SELECT %s.%s FROM %s", uqAlias, quotedCol,
+            fqAlias));
         // Only references to base tables/views have a fully-qualified implicit alias.
         if (!isCollectionTblRef) {
           TblsTestToSql(String.format("select %s.%s from $TBL", fqAlias, col), tblName,
@@ -208,9 +231,9 @@ public class ToSqlTest extends FrontendTestBase {
 
         // Explicit table alias.
         TblsTestToSql(String.format("select %s from $TBL a", col), tblName,
-            String.format("SELECT %s FROM %s a", col, fqAlias));
+            String.format("SELECT %s FROM %s a", quotedCol, fqAlias));
         TblsTestToSql(String.format("select a.%s from $TBL a", col), tblName,
-            String.format("SELECT a.%s FROM %s a", col, fqAlias));
+            String.format("SELECT a.%s FROM %s a", quotedCol, fqAlias));
       }
     }
 
@@ -240,6 +263,7 @@ public class ToSqlTest extends FrontendTestBase {
     TableName tbl = new TableName("functional", "allcomplextypes");
 
     // Child table uses unqualified implicit alias of parent table.
+    childColumn = ToSqlUtils.identSql(childColumn);
     TblsTestToSql(
         String.format("select %s from $TBL, allcomplextypes.%s",
             childColumn, childTable), tbl,
@@ -297,25 +321,68 @@ public class ToSqlTest extends FrontendTestBase {
 
   @Test
   public void TestCreateTable() throws AnalysisException {
+    // Table with SORT BY clause.
     testToSql("create table p (a int) partitioned by (day string) sort by (a) " +
         "comment 'This is a test'",
         "default",
         "CREATE TABLE default.p ( a INT ) PARTITIONED BY ( day STRING ) " +
-        "SORT BY ( a ) COMMENT 'This is a test' STORED AS TEXTFILE" , true);
-    // Table with SORT BY clause.
+        "SORT BY LEXICAL ( a ) COMMENT 'This is a test' STORED AS TEXTFILE" , true);
     testToSql("create table p (a int, b int) partitioned by (day string) sort by (a ,b) ",
         "default",
         "CREATE TABLE default.p ( a INT, b INT ) PARTITIONED BY ( day STRING ) " +
-        "SORT BY ( a, b ) STORED AS TEXTFILE" , true);
-    // Kudu table with a TIMESTAMP column default value
-    testToSql("create table p (a bigint primary key, b timestamp default '1987-05-19') " +
-        "partition by hash(a) partitions 3 stored as kudu " +
-        "tblproperties ('kudu.master_addresses'='foo')",
+        "SORT BY LEXICAL ( a, b ) STORED AS TEXTFILE" , true);
+
+    // Table with SORT BY LEXICAL clause.
+    testToSql("create table p (a int) partitioned by (day string) sort by lexical (a) " +
+        "comment 'This is a test'",
         "default",
-        "CREATE TABLE default.p ( a BIGINT PRIMARY KEY, b TIMESTAMP " +
+        "CREATE TABLE default.p ( a INT ) PARTITIONED BY ( day STRING ) " +
+        "SORT BY LEXICAL ( a ) COMMENT 'This is a test' STORED AS TEXTFILE" , true);
+    testToSql("create table p (a int, b int) partitioned by (day string) sort by " +
+        "lexical (a, b)",
+        "default",
+        "CREATE TABLE default.p ( a INT, b INT ) PARTITIONED BY ( day STRING ) " +
+        "SORT BY LEXICAL ( a, b ) STORED AS TEXTFILE" , true);
+
+    // Table with SORT BY ZORDER clause.
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
+
+    testToSql("create table p (a int, b int) partitioned by (day string) sort by zorder" +
+        "(a ,b) ", "default",
+        "CREATE TABLE default.p ( a INT, b INT ) PARTITIONED BY ( day STRING ) " +
+        "SORT BY ZORDER ( a, b ) STORED AS TEXTFILE" , true);
+
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+
+    // Kudu table with a TIMESTAMP column default value
+    String kuduMasters = catalog_.getDefaultKuduMasterHosts();
+    testToSql(String.format("create table p (a bigint primary key, " +
+        "b timestamp default '1987-05-19') partition by hash(a) partitions 3 " +
+        "stored as kudu tblproperties ('kudu.master_addresses'='%s')", kuduMasters),
+        "default",
+        String.format("CREATE TABLE default.p ( a BIGINT PRIMARY KEY, b TIMESTAMP " +
         "DEFAULT '1987-05-19' ) PARTITION BY HASH (a) PARTITIONS 3 " +
-        "STORED AS KUDU TBLPROPERTIES ('kudu.master_addresses'='foo', " +
-        "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler')", true);
+        "STORED AS KUDU TBLPROPERTIES ('kudu.master_addresses'='%s', " +
+        "'storage_handler'='org.apache.hadoop.hive.kudu.KuduStorageHandler')",
+        kuduMasters),
+        true);
+
+    // Test primary key and foreign key toSqls.
+    // TODO: Add support for displaying constraint information (DISABLE, NOVALIDATE, RELY)
+    testToSql("create table pk(id int, year string, primary key (id, year))", "default",
+        "CREATE TABLE default.pk ( id INT, year STRING, PRIMARY KEY (id, year) ) "
+            + "STORED AS TEXTFILE", true);
+
+    // Foreign Key test requires a valid primary key table.
+    addTestDb("test_pk_fk", "Test DB for PK/FK tests");
+    AnalysisContext ctx = createAnalysisCtx("test_pk_fk");
+
+    testToSql(ctx, "create table fk(seq int, id int, year string, a int, "
+        + "FOREIGN KEY(id, year) REFERENCES functional.parent_table(id, year), FOREIGN "
+        + "KEY (a) REFERENCES functional.parent_table_2(a))", "CREATE TABLE "
+        + "test_pk_fk.fk ( seq INT, id INT, year STRING, a INT, FOREIGN KEY(id, year) "
+        + "REFERENCES functional.parent_table(id, year), FOREIGN KEY(a) REFERENCES "
+        + "functional.parent_table_2(a) ) STORED AS TEXTFILE", true);
   }
 
   @Test
@@ -335,20 +402,36 @@ public class ToSqlTest extends FrontendTestBase {
     // Table with SORT BY clause.
     testToSql("create table p partitioned by (int_col) sort by (string_col) as " +
         "select double_col, string_col, int_col from functional.alltypes", "default",
-        "CREATE TABLE default.p PARTITIONED BY ( int_col ) SORT BY ( string_col ) " +
-        "STORED AS TEXTFILE AS SELECT double_col, string_col, int_col FROM " +
-        "functional.alltypes", true);
-    // Kudu table with multiple partition params
-    testToSql("create table p primary key (a,b) partition by hash(a) partitions 3, " +
-        "range (b) (partition value = 1) stored as kudu " +
-        "tblproperties ('kudu.master_addresses'='foo') as select int_col a, bigint_col " +
-        "b from functional.alltypes",
+        "CREATE TABLE default.p PARTITIONED BY ( int_col ) SORT BY LEXICAL " +
+        "( string_col ) STORED AS TEXTFILE AS SELECT double_col, string_col, int_col " +
+        "FROM functional.alltypes", true);
+    // Table with SORT BY LEXICAL clause.
+    testToSql("create table p partitioned by (int_col) sort by lexical (string_col) as " +
+        "select double_col, string_col, int_col from functional.alltypes", "default",
+        "CREATE TABLE default.p PARTITIONED BY ( int_col ) SORT BY LEXICAL " +
+        "( string_col ) STORED AS TEXTFILE AS SELECT double_col, string_col, int_col " +
+        "FROM functional.alltypes", true);
+    // Table with SORT BY ZORDER clause.
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
+    testToSql("create table p partitioned by (string_col) sort by zorder (int_col, " +
+        "bool_col) as select int_col, bool_col, string_col from functional.alltypes",
         "default",
-        "CREATE TABLE default.p PRIMARY KEY (a, b) PARTITION BY HASH (a) PARTITIONS 3, " +
-        "RANGE (b) (PARTITION VALUE = 1) STORED AS KUDU TBLPROPERTIES " +
-        "('kudu.master_addresses'='foo', " +
-        "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler') AS " +
-        "SELECT int_col a, bigint_col b FROM functional.alltypes", true);
+        "CREATE TABLE default.p PARTITIONED BY ( string_col ) SORT BY ZORDER " +
+        "( int_col, bool_col ) STORED AS TEXTFILE AS SELECT " +
+        "int_col, bool_col, string_col FROM functional.alltypes", true);
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+    // Kudu table with multiple partition params
+    String kuduMasters = catalog_.getDefaultKuduMasterHosts();
+    testToSql(String.format("create table p primary key (a,b) " +
+        "partition by hash(a) partitions 3, range (b) (partition value = 1) " +
+        "stored as kudu tblproperties ('kudu.master_addresses'='%s') as select " +
+        "int_col a, bigint_col b from functional.alltypes", kuduMasters),
+        "default",
+        String.format("CREATE TABLE default.p PRIMARY KEY (a, b) " +
+        "PARTITION BY HASH (a) PARTITIONS 3, RANGE (b) (PARTITION VALUE = 1) " +
+        "STORED AS KUDU TBLPROPERTIES ('kudu.master_addresses'='%s', " +
+        "'storage_handler'='org.apache.hadoop.hive.kudu.KuduStorageHandler') AS SELECT " +
+        "int_col a, bigint_col b FROM functional.alltypes", kuduMasters), true);
   }
 
   @Test
@@ -357,7 +440,16 @@ public class ToSqlTest extends FrontendTestBase {
         "CREATE TABLE p LIKE functional.alltypes");
     // Table with sort columns.
     testToSql("create table p sort by (id) like functional.alltypes", "default",
-        "CREATE TABLE p SORT BY (id) LIKE functional.alltypes");
+        "CREATE TABLE p SORT BY LEXICAL (id) LIKE functional.alltypes");
+    // Table with LEXICAL sort columns.
+    testToSql("create table p sort by LEXICAL (id) like functional.alltypes", "default",
+        "CREATE TABLE p SORT BY LEXICAL (id) LIKE functional.alltypes");
+    // Table with ZORDER sort columns.
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
+    testToSql("create table p sort by zorder (bool_col, int_col) like " +
+        "functional.alltypes",  "default",
+        "CREATE TABLE p SORT BY ZORDER (bool_col,int_col) LIKE functional.alltypes");
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
   }
 
   @Test
@@ -372,7 +464,87 @@ public class ToSqlTest extends FrontendTestBase {
         "'/test-warehouse/schemas/alltypestiny.parquet' sort by (int_col, id)", "default",
         "CREATE TABLE IF NOT EXISTS default.p LIKE PARQUET " +
         "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
-        "SORT BY ( int_col, id ) STORED AS TEXTFILE", true);
+        "SORT BY LEXICAL ( int_col, id ) STORED AS TEXTFILE", true);
+    // Table with sort LEXICAL columns.
+    testToSql("create table if not exists p like parquet " +
+        "'/test-warehouse/schemas/alltypestiny.parquet' sort by lexical (int_col, id)",
+        "default",
+        "CREATE TABLE IF NOT EXISTS default.p LIKE PARQUET " +
+        "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
+        "SORT BY LEXICAL ( int_col, id ) STORED AS TEXTFILE", true);
+    // Table with ZORDER sort columns.
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(true);
+    testToSql("create table if not exists p like parquet " +
+        "'/test-warehouse/schemas/alltypestiny.parquet' sort by zorder (int_col, id)",
+        "default", "CREATE TABLE IF NOT EXISTS default.p LIKE PARQUET " +
+        "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
+        "SORT BY ZORDER ( int_col, id ) STORED AS TEXTFILE", true);
+    BackendConfig.INSTANCE.setZOrderSortUnlocked(false);
+  }
+
+  @Test
+  public void TestCreateView() throws AnalysisException {
+    testToSql(
+      "create view foo_new as select int_col, string_col from functional.alltypes",
+      "default",
+      "CREATE VIEW foo_new AS SELECT int_col, string_col FROM functional.alltypes");
+    testToSql("create view if not exists foo as select * from functional.alltypes",
+        "default", "CREATE VIEW IF NOT EXISTS foo AS SELECT * FROM functional.alltypes");
+    testToSql("create view functional.foo (a, b) as select int_col x, double_col y " +
+        "from functional.alltypes", "default",
+        "CREATE VIEW functional.foo(a, b) AS SELECT int_col x, double_col y " +
+        "FROM functional.alltypes");
+    testToSql("create view foo (aaa, bbb) as select * from functional.complex_view",
+        "default", "CREATE VIEW foo(aaa, bbb) AS SELECT * FROM functional.complex_view");
+    testToSql("create view foo as select trim('abc'), 17 * 7", "default",
+        "CREATE VIEW foo AS SELECT trim('abc'), 17 * 7");
+    testToSql("create view foo (cnt) as " +
+        "select count(distinct x.int_col) from functional.alltypessmall x " +
+        "inner join functional.alltypessmall y on (x.id = y.id) group by x.bigint_col",
+        "default", "CREATE VIEW foo(cnt) AS "+
+        "SELECT count(DISTINCT x.int_col) FROM functional.alltypessmall x " +
+        "INNER JOIN functional.alltypessmall y ON (x.id = y.id) GROUP BY x.bigint_col");
+    testToSql("create view foo (a, b) as values(1, 'a'), (2, 'b')", "default",
+        "CREATE VIEW foo(a, b) AS VALUES((1, 'a'), (2, 'b'))");
+    testToSql("create view foo (a, b) as select 1, 'a' union all select 2, 'b'",
+      "default", "CREATE VIEW foo(a, b) AS SELECT 1, 'a' UNION ALL SELECT 2, 'b'");
+    testToSql("create view test_view_with_subquery as " +
+        "select * from functional.alltypestiny t where exists " +
+        "(select * from functional.alltypessmall s where s.id = t.id)", "default",
+        "CREATE VIEW test_view_with_subquery AS " +
+        "SELECT * FROM functional.alltypestiny t WHERE EXISTS " +
+        "(SELECT * FROM functional.alltypessmall s WHERE s.id = t.id)");
+  }
+
+  @Test
+  public void TestAlterView() throws AnalysisException{
+    testToSql("alter view functional.alltypes_view as " +
+        "select * from functional.alltypesagg", "default",
+        "ALTER VIEW functional.alltypes_view AS SELECT * FROM functional.alltypesagg");
+    testToSql("alter view functional.alltypes_view (a, b) as " +
+        "select int_col, string_col from functional.alltypes", "default",
+        "ALTER VIEW functional.alltypes_view(a, b) AS " +
+        "SELECT int_col, string_col FROM functional.alltypes");
+    testToSql("alter view functional.alltypes_view (a, b) as " +
+        "select int_col x, string_col y from functional.alltypes", "default",
+        "ALTER VIEW functional.alltypes_view(a, b) AS " +
+        "SELECT int_col x, string_col y FROM functional.alltypes");
+    testToSql("alter view functional.alltypes_view as select trim('abc'), 17 * 7",
+        "default", "ALTER VIEW functional.alltypes_view AS SELECT trim('abc'), 17 * 7");
+    testToSql("alter view functional.alltypes_view (aaa, bbb) as " +
+        "select * from functional.complex_view", "default",
+        "ALTER VIEW functional.alltypes_view(aaa, bbb) AS " +
+        "SELECT * FROM functional.complex_view");
+    testToSql("alter view functional.complex_view (abc, xyz) as " +
+        "select year, month from functional.alltypes_view", "default",
+        "ALTER VIEW functional.complex_view(abc, xyz) AS " +
+        "SELECT `year`, `month` FROM functional.alltypes_view");
+    testToSql("alter view functional.alltypes_view (cnt) as " +
+        "select count(distinct x.int_col) from functional.alltypessmall x " +
+        "inner join functional.alltypessmall y on (x.id = y.id) group by x.bigint_col",
+        "default", "ALTER VIEW functional.alltypes_view(cnt) AS "+
+        "SELECT count(DISTINCT x.int_col) FROM functional.alltypessmall x " +
+        "INNER JOIN functional.alltypessmall y ON (x.id = y.id) GROUP BY x.bigint_col");
   }
 
   @Test
@@ -525,8 +697,8 @@ public class ToSqlTest extends FrontendTestBase {
             "select int_col, bool_col, year, month from functional.alltypes",
           String.format(" %snoshuffle%s", prefix, suffix), loc),
           InjectInsertHint("INSERT%s INTO TABLE functional.alltypes(int_col, " +
-            "bool_col) PARTITION (year, month)%s " +
-            "SELECT int_col, bool_col, year, month FROM functional.alltypes",
+            "bool_col) PARTITION (`year`, `month`)%s " +
+            "SELECT int_col, bool_col, `year`, `month` FROM functional.alltypes",
             " \n-- +noshuffle\n", loc));
       testToSql(InjectInsertHint(
             "insert%s into functional.alltypes(int_col, bool_col) " +
@@ -534,8 +706,8 @@ public class ToSqlTest extends FrontendTestBase {
             "select int_col, bool_col, year, month from functional.alltypes",
           String.format(" %sshuffle,clustered%s", prefix, suffix), loc),
           InjectInsertHint("INSERT%s INTO TABLE functional.alltypes(int_col, " +
-            "bool_col) PARTITION (year, month)%s " +
-            "SELECT int_col, bool_col, year, month FROM functional.alltypes",
+            "bool_col) PARTITION (`year`, `month`)%s " +
+            "SELECT int_col, bool_col, `year`, `month` FROM functional.alltypes",
             " \n-- +shuffle,clustered\n", loc));
 
       // Upsert hint.
@@ -563,12 +735,7 @@ public class ToSqlTest extends FrontendTestBase {
    */
   @Test
   public void planHintsTest() {
-    String[][] hintStyles = new String[][] {
-        new String[] { "/* +", "*/" }, // traditional commented hint
-        new String[] { "\n-- +", "\n" }, // eol commented hint
-        new String[] { "[", "]" } // legacy style
-    };
-    for (String[] hintStyle: hintStyles) {
+    for (String[] hintStyle: hintStyles_) {
       String prefix = hintStyle[0];
       String suffix = hintStyle[1];
 
@@ -584,9 +751,9 @@ public class ToSqlTest extends FrontendTestBase {
 
       // Table hint
       testToSql(String.format(
-          "select * from functional.alltypes at %sschedule_random_replica%s", prefix,
+          "select * from functional.alltypes atp %sschedule_random_replica%s", prefix,
           suffix),
-          "SELECT * FROM functional.alltypes at\n-- +schedule_random_replica\n");
+          "SELECT * FROM functional.alltypes atp\n-- +schedule_random_replica\n");
       testToSql(String.format(
           "select * from functional.alltypes %sschedule_random_replica%s", prefix,
           suffix),
@@ -597,9 +764,9 @@ public class ToSqlTest extends FrontendTestBase {
           "SELECT * FROM functional.alltypes\n-- +schedule_random_replica," +
           "schedule_disk_local\n");
       testToSql(String.format(
-          "select c1 from (select at.tinyint_col as c1 from functional.alltypes at " +
+          "select c1 from (select atp.tinyint_col as c1 from functional.alltypes atp " +
           "%sschedule_random_replica%s) s1", prefix, suffix),
-          "SELECT c1 FROM (SELECT at.tinyint_col c1 FROM functional.alltypes at\n-- +" +
+          "SELECT c1 FROM (SELECT atp.tinyint_col c1 FROM functional.alltypes atp\n-- +" +
           "schedule_random_replica\n) s1");
 
       // Select-list hint. The legacy-style hint has no prefix and suffix.
@@ -615,6 +782,23 @@ public class ToSqlTest extends FrontendTestBase {
           String.format("select distinct %sstraight_join%s * from functional.alltypes",
           prefix, suffix),
           "SELECT DISTINCT \n-- +straight_join\n * FROM functional.alltypes");
+
+      // Tests for analyzed/rewritten sql.
+      // First test the test by passing ToSqlOptions.DEFAULT which should result in the
+      // hints appearing with '--' style comments.
+      testToSql(
+          String.format("select distinct %sstraight_join%s * from functional.alltypes",
+              prefix, suffix),
+          "SELECT DISTINCT \n-- +straight_join\n * FROM functional.alltypes",
+          ToSqlOptions.DEFAULT);
+      // Test that analyzed queries use the '/*' style comments.
+      testToSql(
+          String.format("select distinct %sstraight_join%s * from functional.alltypes "
+                  + "where bool_col = false and id <= 5 and id >= 2",
+              prefix, suffix),
+          "SELECT DISTINCT /* +straight_join */ * FROM functional.alltypes "
+              + "WHERE bool_col = FALSE AND id <= 5 AND id >= 2",
+          ToSqlOptions.REWRITTEN);
     }
   }
 
@@ -763,10 +947,16 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql("values(1, 'a'), (2, 'b') union all values(3, 'c')",
         "VALUES((1, 'a'), (2, 'b')) UNION ALL (VALUES(3, 'c'))");
     testToSql("insert into table functional.alltypessmall " +
-        "partition (year=2009, month=4) " +
+        "partition (`year`=2009, `month`=4) " +
         "values(1, true, 1, 1, 10, 10, 10.0, 10.0, 'a', 'a', cast (0 as timestamp))",
-        "INSERT INTO TABLE functional.alltypessmall PARTITION (year=2009, month=4) " +
+        "INSERT INTO TABLE functional.alltypessmall PARTITION (`year`=2009, `month`=4) " +
         "VALUES(1, TRUE, 1, 1, 10, 10, 10.0, 10.0, 'a', 'a', CAST(0 AS TIMESTAMP))");
+    testToSql("insert into table functional.date_tbl " +
+        "partition (date_part='9999-12-31') " +
+        "values(112, DATE '1970-01-01')",
+        "INSERT INTO TABLE functional.date_tbl " +
+        "PARTITION (date_part='9999-12-31') " +
+        "VALUES(112, DATE '1970-01-01')");
     testToSql("upsert into table functional_kudu.testtbl values(1, 'a', 1)",
         "UPSERT INTO TABLE functional_kudu.testtbl VALUES(1, 'a', 1)");
   }
@@ -853,8 +1043,8 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql(
         "select key, item from functional.allcomplextypes t, " +
         "(select a1.key, value.item from t.array_map_col a1, a1.value) v",
-        "SELECT key, item FROM functional.allcomplextypes t, " +
-        "(SELECT a1.key, value.item FROM t.array_map_col a1, a1.value) v");
+        "SELECT `key`, item FROM functional.allcomplextypes t, " +
+        "(SELECT a1.`key`, value.item FROM t.array_map_col a1, a1.value) v");
     // Correlated table refs in a union.
     testToSql(
         "select item from functional.allcomplextypes t, " +
@@ -867,7 +1057,7 @@ public class ToSqlTest extends FrontendTestBase {
         "(select count(a1.key) c from t.array_map_col a1) v1) " +
         "select * from w",
         "WITH w AS (SELECT c FROM functional.allcomplextypes t, " +
-        "(SELECT count(a1.key) c FROM t.array_map_col a1) v1) " +
+        "(SELECT count(a1.`key`) c FROM t.array_map_col a1) v1) " +
         "SELECT * FROM w");
   }
 
@@ -908,9 +1098,6 @@ public class ToSqlTest extends FrontendTestBase {
   /**
    * Tests that toSql() properly handles subqueries in the where clause.
    */
-  // TODO Fix testToSql to print the stmt after the first analysis phase and not
-  // after the rewrite.
-  @Ignore("Prints the rewritten statement")
   @Test
   public void subqueryTest() {
     // Nested predicates
@@ -934,13 +1121,6 @@ public class ToSqlTest extends FrontendTestBase {
             "(select * from functional.alltypestiny)",
         "SELECT * FROM functional.alltypes WHERE NOT EXISTS " +
             "(SELECT * FROM functional.alltypestiny)");
-    // Multiple nested predicates in the WHERE clause
-    testToSql("select * from functional.alltypes where not (id < 10 and " +
-            "(int_col in (select int_col from functional.alltypestiny)) and " +
-            "(string_col = (select max(string_col) from functional.alltypestiny)))",
-        "SELECT * FROM functional.alltypes WHERE NOT (id < 10 AND " +
-            "(int_col IN (SELECT int_col FROM functional.alltypestiny)) AND " +
-        "(string_col = (SELECT max(string_col) FROM functional.alltypestiny)))");
     // Multiple nesting levels
     testToSql("select * from functional.alltypes where id in " +
         "(select id from functional.alltypestiny where int_col = " +
@@ -1015,7 +1195,7 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql("with t1 as (select * from functional.alltypes) " +
             "insert into functional.alltypes partition(year, month) select * from t1",
         "WITH t1 AS (SELECT * FROM functional.alltypes) " +
-        "INSERT INTO TABLE functional.alltypes PARTITION (year, month) " +
+        "INSERT INTO TABLE functional.alltypes PARTITION (`year`, `month`) " +
             "SELECT * FROM t1");
     // WITH clause in upsert stmt.
     testToSql("with t1 as (select * from functional.alltypes) upsert into " +
@@ -1084,10 +1264,16 @@ public class ToSqlTest extends FrontendTestBase {
         "float_col, double_col, date_string_col, string_col, timestamp_col " +
         "from functional.alltypes",
         "INSERT INTO TABLE functional.alltypessmall " +
-        "PARTITION (year=2009, month=4) SELECT id, " +
+        "PARTITION (`year`=2009, `month`=4) SELECT id, " +
         "bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, " +
         "double_col, date_string_col, string_col, timestamp_col " +
         "FROM functional.alltypes");
+    testToSql("insert into table functional.date_tbl " +
+        "partition (date_part='2009-10-30') " +
+        "select id, cast(timestamp_col as date) from functional.alltypes",
+        "INSERT INTO TABLE functional.date_tbl " +
+        "PARTITION (date_part='2009-10-30') " +
+        "SELECT id, CAST(timestamp_col AS DATE) FROM functional.alltypes");
     // Fully dynamic partitions.
     testToSql("insert into table functional.alltypessmall " +
         "partition (year, month)" +
@@ -1095,9 +1281,19 @@ public class ToSqlTest extends FrontendTestBase {
         "float_col, double_col, date_string_col, string_col, timestamp_col, year, " +
         "month from functional.alltypes",
         "INSERT INTO TABLE functional.alltypessmall " +
-        "PARTITION (year, month) SELECT id, bool_col, " +
+        "PARTITION (`year`, `month`) SELECT id, bool_col, " +
         "tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, " +
-        "date_string_col, string_col, timestamp_col, year, month " +
+        "date_string_col, string_col, timestamp_col, `year`, `month` " +
+        "FROM functional.alltypes");
+    testToSql("insert into table functional.date_tbl " +
+        "partition (date_part) " +
+        "select id, cast(timestamp_col as date) date_col, " +
+        "cast(timestamp_col as date) date_part " +
+        "from functional.alltypes",
+        "INSERT INTO TABLE functional.date_tbl " +
+        "PARTITION (date_part) " +
+        "SELECT id, CAST(timestamp_col AS DATE) date_col, " +
+        "CAST(timestamp_col AS DATE) date_part " +
         "FROM functional.alltypes");
     // Partially dynamic partitions.
     testToSql("insert into table functional.alltypessmall " +
@@ -1106,9 +1302,9 @@ public class ToSqlTest extends FrontendTestBase {
         "float_col, double_col, date_string_col, string_col, timestamp_col, month " +
         "from functional.alltypes",
         "INSERT INTO TABLE functional.alltypessmall " +
-        "PARTITION (year=2009, month) SELECT id, " +
+        "PARTITION (`year`=2009, `month`) SELECT id, " +
         "bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, " +
-        "double_col, date_string_col, string_col, timestamp_col, month " +
+        "double_col, date_string_col, string_col, timestamp_col, `month` " +
         "FROM functional.alltypes");
 
     // Permutations
@@ -1120,7 +1316,7 @@ public class ToSqlTest extends FrontendTestBase {
     // Permutations that mention partition column
     testToSql("insert into table functional.alltypes(id, year, month) " +
         " values(1, 1990, 12)",
-        "INSERT INTO TABLE functional.alltypes(id, year, month) " +
+        "INSERT INTO TABLE functional.alltypes(id, `year`, `month`) " +
         "VALUES(1, 1990, 12)");
 
     // Empty permutation with no select statement
@@ -1131,7 +1327,7 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql("insert into table functional.alltypes(id) " +
         " partition (year=2009, month) values(1, 12)",
         "INSERT INTO TABLE functional.alltypes(id) " +
-        "PARTITION (year=2009, month) VALUES(1, 12)");
+        "PARTITION (`year`=2009, `month`) VALUES(1, 12)");
   }
 
   @Test
@@ -1323,6 +1519,7 @@ public class ToSqlTest extends FrontendTestBase {
          "string_col, (string_col), timestamp_col, (timestamp_col) " +
         "FROM functional.alltypes");
 
+
     // TimestampArithmeticExpr.
     // Non-function-call like version.
     testToSql("select timestamp_col + interval 10 years, " +
@@ -1386,14 +1583,175 @@ public class ToSqlTest extends FrontendTestBase {
         "SELECT * FROM t");
   }
 
+  @Test
+  public void testCreateDropRole() {
+    String testRole = "test_role";
+    AnalysisContext ctx = createAnalysisCtx(createAuthorizationFactory());
+
+    testToSql(ctx, String.format("CREATE ROLE %s", testRole));
+    try {
+      catalog_.addRole(testRole);
+      testToSql(ctx, String.format("DROP ROLE %s", testRole));
+    } finally {
+      catalog_.removeRole(testRole);
+    }
+  }
+
+  @Test
+  public void testGrantRevokePrivStmt() {
+    AnalysisContext ctx = createAnalysisCtx(createAuthorizationFactory());
+    List<String> principalTypes = Arrays.asList("USER", "ROLE", "GROUP");
+    String testRole = System.getProperty("user.name");
+    String testUri = "hdfs://localhost:20500/test-warehouse";
+
+    for (String pt : principalTypes) {
+      try {
+        catalog_.addRole(testRole);
+        List<Privilege> privileges = Arrays.stream(Privilege.values())
+            .filter(p -> p != Privilege.OWNER &&
+                p != Privilege.VIEW_METADATA &&
+                p != Privilege.ANY)
+            .collect(Collectors.toList());
+
+        for (Privilege p : privileges) {
+          // Server
+          testToSql(ctx, String.format("GRANT %s ON SERVER server1 TO %s %s", p,
+              pt, testRole));
+          testToSql(ctx, String.format("GRANT %s ON SERVER TO %s", p, testRole),
+              String.format("GRANT %s ON SERVER server1 TO ROLE %s", p, testRole), false);
+          testToSql(ctx, String.format(
+              "GRANT %s ON SERVER server1 TO %s %s WITH GRANT OPTION", p, pt,
+              testRole));
+          testToSql(ctx, String.format("REVOKE %s ON SERVER server1 FROM %s %s", p,
+              pt, testRole));
+          testToSql(ctx, String.format("REVOKE %s ON SERVER FROM %s %s", p, pt,
+              testRole),
+              String.format("REVOKE %s ON SERVER server1 FROM %s %s", p, pt,
+                  testRole), false);
+          testToSql(ctx, String.format(
+              "REVOKE GRANT OPTION FOR %s ON SERVER server1 FROM %s %s", p, pt,
+              testRole));
+
+          // Database
+          testToSql(ctx, String.format("GRANT %s ON DATABASE functional TO %s %s",
+              p, pt, testRole));
+          testToSql(ctx, String.format(
+              "GRANT %s ON DATABASE functional TO %s %s WITH GRANT OPTION", p, pt,
+              testRole));
+          testToSql(ctx, String.format("REVOKE %s ON DATABASE functional FROM %s %s",
+              p, pt, testRole));
+          testToSql(ctx, String.format(
+              "REVOKE GRANT OPTION FOR %s ON DATABASE functional FROM %s %s", p, pt,
+              testRole));
+
+        }
+
+        privileges = Arrays.stream(Privilege.values())
+            .filter(p -> p != Privilege.OWNER &&
+                p != Privilege.CREATE &&
+                p != Privilege.VIEW_METADATA &&
+                p != Privilege.ANY)
+            .collect(Collectors.toList());
+
+        for (Privilege p : privileges) {
+          // Table
+          testToSql(ctx, String.format("GRANT %s ON TABLE functional.alltypes TO %s %s",
+              p, pt, testRole));
+          testToSql(ctx, String.format(
+              "GRANT %s ON TABLE functional.alltypes TO %s %s WITH GRANT OPTION", p,
+              pt, testRole));
+          testToSql(ctx, String.format(
+              "REVOKE %s ON TABLE functional.alltypes FROM %s %s", p, pt,
+              testRole));
+          testToSql(ctx, String.format(
+              "REVOKE GRANT OPTION FOR %s ON TABLE functional.alltypes FROM %s %s", p,
+              pt, testRole));
+        }
+
+        // Uri (Only ALL is supported)
+        testToSql(ctx, String.format("GRANT ALL ON URI '%s' TO %s %s", testUri, pt,
+            testRole));
+        testToSql(ctx, String.format("GRANT ALL ON URI '%s' TO %s %s WITH GRANT OPTION",
+            testUri, pt, testRole));
+        testToSql(ctx, String.format("REVOKE ALL ON URI '%s' FROM %s %s", testUri,
+            pt, testRole));
+        testToSql(ctx, String.format("REVOKE GRANT OPTION FOR ALL ON URI '%s' FROM %s %s",
+            testUri, pt, testRole));
+
+        // Column (Only SELECT is supported)
+        testToSql(ctx, String.format(
+            "GRANT SELECT (id) ON TABLE functional.alltypes TO %s %s", pt,
+            testRole));
+        testToSql(ctx, String.format(
+            "GRANT SELECT (id) ON TABLE functional.alltypes TO %s %s WITH GRANT OPTION",
+            pt, testRole));
+        testToSql(ctx, String.format(
+            "REVOKE SELECT (id) ON TABLE functional.alltypes FROM %s %s", pt,
+            testRole));
+        testToSql(ctx, String.format(
+            "REVOKE GRANT OPTION FOR SELECT (id) ON TABLE functional.alltypes FROM %s %s",
+            pt, testRole));
+      } finally {
+        catalog_.removeRole(testRole);
+      }
+    }
+  }
+
+  @Test
+  public void testGrantRevokeRoleStmt() {
+    AnalysisContext ctx = createAnalysisCtx(createAuthorizationFactory());
+    String testRole = "test_role";
+    String testGroup = "test_group";
+
+    try {
+      catalog_.addRole(testRole);
+      testToSql(ctx, String.format("GRANT ROLE %s TO GROUP %s", testRole, testGroup));
+      testToSql(ctx, String.format("REVOKE ROLE %s FROM GROUP %s", testRole, testGroup));
+    } finally {
+      catalog_.removeRole(testRole);
+    }
+  }
+
+  @Test
+  public void testShowGrantPrincipalStmt() {
+    AnalysisContext ctx = createAnalysisCtx(createAuthorizationFactory());
+    String testRole = "test_role";
+    String testUser = System.getProperty("user.name");
+    String testUri = "hdfs://localhost:20500/test-warehouse";
+
+    try {
+      catalog_.addRole(testRole);
+      testToSql(ctx, String.format("SHOW GRANT ROLE %s", testRole));
+      testToSql(ctx, String.format("SHOW GRANT USER %s", testUser));
+      testToSql(ctx, String.format("SHOW GRANT ROLE %s ON SERVER", testRole));
+      testToSql(ctx, String.format("SHOW GRANT ROLE %s ON DATABASE functional",
+          testRole));
+      testToSql(ctx, String.format("SHOW GRANT ROLE %s ON TABLE functional.alltypes",
+          testRole));
+      testToSql(ctx, String.format("SHOW GRANT ROLE %s ON URI '%s'",
+          testRole, testUri));
+    } finally {
+      catalog_.removeRole(testRole);
+    }
+  }
+
+  @Test
+  public void testShowRolesStmt() {
+    AnalysisContext ctx = createAnalysisCtx(createAuthorizationFactory());
+    String testGroup = "test_group";
+
+    testToSql(ctx, "SHOW CURRENT ROLES");
+    testToSql(ctx, "SHOW ROLES");
+    testToSql(ctx, String.format("SHOW ROLE GRANT GROUP %s", testGroup));
+  }
+
   /**
    * Tests invalidate statements are output correctly.
    */
   @Test
   public void testInvalidate() {
-    testToSql("INVALIDATE METADATA", "INVALIDATE METADATA");
-    testToSql("INVALIDATE METADATA functional.alltypes",
-        "INVALIDATE METADATA functional.alltypes");
+    testToSql("INVALIDATE METADATA");
+    testToSql("INVALIDATE METADATA functional.alltypes");
   }
 
   /**
@@ -1401,9 +1759,20 @@ public class ToSqlTest extends FrontendTestBase {
    */
   @Test
   public void testRefresh() {
-    testToSql("REFRESH functional.alltypes", "REFRESH functional.alltypes");
-    testToSql("REFRESH functional.alltypes PARTITION (year=2009, month=1)",
-        "REFRESH functional.alltypes PARTITION (year=2009, month=1)");
-    testToSql("REFRESH FUNCTIONS functional", "REFRESH FUNCTIONS functional");
+    testToSql("REFRESH functional.alltypes");
+    testToSql("REFRESH functional.alltypes PARTITION (year=2009, month=1)");
+    testToSql("REFRESH FUNCTIONS functional");
+    testToSql(createAnalysisCtx(createAuthorizationFactory()), "REFRESH AUTHORIZATION");
+  }
+
+  /**
+   * Test admin functions are output correctly.
+   */
+  @Test
+  public void testAdminFn() {
+    testToSql(":shutdown()");
+    testToSql(":shutdown('hostname')");
+    testToSql(":shutdown('hostname', 1000)");
+    testToSql(":shutdown(1000)");
   }
 }

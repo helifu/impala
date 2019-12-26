@@ -15,21 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_EXEC_KUDU_SCAN_NODE_H_
-#define IMPALA_EXEC_KUDU_SCAN_NODE_H_
+#pragma once
 
 #include <boost/scoped_ptr.hpp>
 #include <gtest/gtest.h>
 #include <kudu/client/client.h>
 
 #include "exec/kudu-scan-node-base.h"
-#include "runtime/thread-resource-mgr.h"
 #include "gutil/gscoped_ptr.h"
-#include "util/thread.h"
 
 namespace impala {
 
 class KuduScanner;
+class ThreadResourcePool;
 
 /// A scan node that scans a Kudu table.
 ///
@@ -38,33 +36,32 @@ class KuduScanner;
 /// are used to retrieve the rows for this scan.
 class KuduScanNode : public KuduScanNodeBase {
  public:
-  KuduScanNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  KuduScanNode(ObjectPool* pool, const ScanPlanNode& pnode, const DescriptorTbl& descs);
 
   ~KuduScanNode();
 
-  virtual Status Open(RuntimeState* state);
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
-  virtual void Close(RuntimeState* state);
+  virtual Status Prepare(RuntimeState* state) override;
+  virtual Status Open(RuntimeState* state) override;
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
+  virtual void Close(RuntimeState* state) override;
+  virtual ExecutionModel getExecutionModel() const override {
+    return NON_TASK_BASED_SYNC;
+  }
 
  private:
   friend class KuduScanner;
 
-  // Outgoing row batches queue. Row batches are produced asynchronously by the scanner
-  // threads and consumed by the main thread.
-  boost::scoped_ptr<RowBatchQueue> materialized_row_batches_;
+  ScannerThreadState thread_state_;
 
-  /// Protects access to state accessed by scanner threads, such as 'status_' or
-  /// 'num_active_scanners_'.
+  /// Protects access to state accessed by scanner threads, such as 'status_' and 'done_'.
+  /// Writers to 'done_' must hold lock to prevent races when updating, but readers can
+  /// read without holding lock, provided they can tolerate stale reads.
   boost::mutex lock_;
 
   /// The current status of the scan, set to non-OK if any problems occur, e.g. if an
   /// error occurs in a scanner.
   /// Protected by lock_
   Status status_;
-
-  /// Number of active running scanner threads.
-  /// Protected by lock_
-  int num_active_scanners_;
 
   /// Set to true when the scan is complete (either because all scan tokens have been
   /// processed, the limit was reached or some error occurred).
@@ -74,26 +71,32 @@ class KuduScanNode : public KuduScanNodeBase {
   /// contention.
   volatile bool done_;
 
-  /// Thread group for all scanner worker threads
-  ThreadGroup scanner_threads_;
-
   /// The id of the callback added to the thread resource manager when a thread
   /// is available. Used to remove the callback before this scan node is destroyed.
   /// -1 if no callback is registered.
   int thread_avail_cb_id_;
 
+  /// Compute the estimated memory consumption of each Kudu scanner thread.
+  int64_t EstimateScannerThreadMemConsumption();
+
   /// Called when scanner threads are available for this scan node. This will
   /// try to spin up as many scanner threads as the quota allows.
-  void ThreadAvailableCb(ThreadResourceMgr::ResourcePool* pool);
+  void ThreadAvailableCb(ThreadResourcePool* pool);
 
   /// Main function for scanner thread which executes a KuduScanner. Begins by processing
-  /// 'initial_token', and continues processing scan tokens returned by
-  /// 'GetNextScanToken()' until there are none left, an error occurs, or the limit is
-  /// reached.
-  void RunScannerThread(const std::string& name, const std::string* initial_token);
+  /// 'initial_token', and continues processing scan tokens returned by GetNextScanToken()
+  /// until there are none left, an error occurs, or the limit is reached. The caller must
+  /// have acquired a thread token from the ThreadResourceMgr for this thread. The token
+  /// is released before this function returns. 'first_thread' is true if this was the
+  /// first scanner thread to start and it acquired a "required" thread token. The first
+  /// thread will continue running until 'done_' is true or an error is encountered. Other
+  /// threads may terminate early if the optional tokens in
+  /// runtime_state_->resource_pool() are exceeded.
+  void RunScannerThread(
+      bool first_thread, const std::string& name, const std::string* initial_token);
 
   /// Processes a single scan token. Row batches are fetched using 'scanner' and enqueued
-  /// in 'materialized_row_batches_' until the scanner reports eos, an error occurs, or
+  /// in the row batch queue until the scanner reports eos, an error occurs, or
   /// the limit is reached.
   Status ProcessScanToken(KuduScanner* scanner, const std::string& scan_token);
 
@@ -106,5 +109,3 @@ class KuduScanNode : public KuduScanNodeBase {
 };
 
 }
-
-#endif

@@ -35,7 +35,7 @@
 #include <thrift/transport/TBufferTransports.h>
 #pragma clang diagnostic pop
 
-#include "exec/parquet-common.h"
+#include "exec/parquet/parquet-common.h"
 #include "runtime/mem-pool.h"
 #include "util/codec.h"
 #include "util/rle-encoding.h"
@@ -137,7 +137,7 @@ int CheckDataPage(const ColumnChunk& col, const PageHeader& header, const uint8_
 
     boost::scoped_ptr<impala::Codec> decompressor;
     ABORT_IF_ERROR(impala::Codec::CreateDecompressor(NULL, false,
-        impala::PARQUET_TO_IMPALA_CODEC[col.meta_data.codec], &decompressor));
+        impala::ConvertParquetToImpalaCodec(col.meta_data.codec), &decompressor));
 
     uint8_t* buffer_ptr = decompressed_buffer.data();
     int uncompressed_page_size = header.uncompressed_page_size;

@@ -17,41 +17,55 @@
 
 #include "kudu/rpc/rpc-test-base.h"
 
-#include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sasl/sasl.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/rpc/client_negotiation.h"
-#include "kudu/rpc/constants.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/negotiation.h"
+#include "kudu/rpc/remote_user.h"
+#include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/server_negotiation.h"
+#include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
 #include "kudu/security/security-test-util.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/tls_socket.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/security/token_signer.h"
 #include "kudu/security/token_signing_key.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/user.h"
 
@@ -66,7 +80,7 @@
 #define KRB5_VERSION_LE_1_10
 #endif
 
-DEFINE_bool_hidden(is_test_child, false,
+DEFINE_bool(is_test_child, false,
             "Used by tests which require clean processes. "
             "See TestDisableInit.");
 DECLARE_bool(rpc_encrypt_loopback_connections);
@@ -75,6 +89,7 @@ DECLARE_bool(rpc_trace_negotiation);
 using std::string;
 using std::thread;
 using std::unique_ptr;
+using std::vector;
 
 using kudu::security::Cert;
 using kudu::security::PkiConfig;
@@ -538,7 +553,7 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
           },
           false,
           false,
-          Status::NotAuthorized(".*client does not have Kerberos enabled"),
+          Status::NotAuthorized(".*client does not have Kerberos credentials available"),
           Status::NetworkError(""),
           AuthenticationType::INVALID,
           SaslMechanism::INVALID,
@@ -1061,7 +1076,6 @@ TEST_F(TestNegotiation, TestGSSAPIInvalidNegotiation) {
 #endif
                 }));
 
-
   // Create the server principal and keytab.
   string kt_path;
   ASSERT_OK(kdc.CreateServiceKeytab("kudu/127.0.0.1", &kt_path));
@@ -1080,10 +1094,9 @@ TEST_F(TestNegotiation, TestGSSAPIInvalidNegotiation) {
       std::bind(RunGSSAPINegotiationClient, std::placeholders::_1,
                 [](const Status& s, ClientNegotiation& client) {
                   CHECK(s.IsNotAuthorized());
-#ifndef KRB5_VERSION_LE_1_10
                   ASSERT_STR_MATCHES(s.ToString(),
-                                     "Not authorized: No Kerberos credentials available.*");
-#endif
+                                     "Not authorized: server requires authentication, "
+                                     "but client does not have Kerberos credentials available");
                 }));
 
   // Create and kinit as a client user.

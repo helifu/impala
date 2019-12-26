@@ -21,94 +21,115 @@
 # over which archive type is downloaded and what post-download steps are executed.
 # This script requires Python 2.6+.
 
-import json
+from __future__ import print_function
+import hashlib
+import multiprocessing.pool
 import os
 import os.path
 import re
 import sys
-from hashlib import md5
 from random import randint
 from time import sleep
-from urllib import urlopen, URLopener
+# The path to import is different for libraries in Python 2 & 3 - this try/catch ensures
+# that this code runs in both
+try:
+  # This should be removed when support for Python2 is dropped
+  from urllib import urlopen, FancyURLopener
+except ImportError:
+  from urllib.request import urlopen, FancyURLopener
 
 NUM_DOWNLOAD_ATTEMPTS = 8
 
 PYPI_MIRROR = os.environ.get('PYPI_MIRROR', 'https://pypi.python.org')
 
 # The requirement files that list all of the required packages and versions.
-REQUIREMENTS_FILES = ['requirements.txt', 'compiled-requirements.txt',
-                      'kudu-requirements.txt', 'adls-requirements.txt']
+REQUIREMENTS_FILES = ['requirements.txt', 'stage2-requirements.txt',
+                      'compiled-requirements.txt', 'kudu-requirements.txt',
+                      'adls-requirements.txt']
 
-def check_md5sum(filename, expected_md5):
-  actual_md5 = md5(open(filename).read()).hexdigest()
-  return actual_md5 == expected_md5
+
+def check_digest(filename, algorithm, expected_digest):
+  try:
+    supported_algorithms = hashlib.algorithms_available
+  except AttributeError:
+    # Fallback to hardcoded set if hashlib.algorithms_available doesn't exist.
+    supported_algorithms = set(['md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512'])
+  if algorithm not in supported_algorithms:
+    print('Hash algorithm {0} is not supported by hashlib'.format(algorithm))
+    return False
+  h = hashlib.new(algorithm)
+  h.update(open(filename).read())
+  actual_digest = h.hexdigest()
+  return actual_digest == expected_digest
+
 
 def retry(func):
   '''Retry decorator.'''
 
   def wrapper(*args, **kwargs):
-    for try_num in xrange(NUM_DOWNLOAD_ATTEMPTS):
+    for try_num in range(NUM_DOWNLOAD_ATTEMPTS):
       if try_num > 0:
         sleep_len = randint(5, 10 * 2 ** try_num)
-        print 'Sleeping for {0} seconds before retrying'.format(sleep_len)
+        print('Sleeping for {0} seconds before retrying'.format(sleep_len))
         sleep(sleep_len)
       try:
         result = func(*args, **kwargs)
         if result:
           return result
       except Exception as e:
-        print e
-    print 'Download failed after several attempts.'
+        print(e)
+    print('Download failed after several attempts.')
     sys.exit(1)
 
   return wrapper
 
 def get_package_info(pkg_name, pkg_version):
-  '''Returns the file name, path and md5 digest of the package.'''
+  '''Returns the file name, path, hash algorithm and digest of the package.'''
   # We store the matching result in the candidates list instead of returning right away
   # to sort them and return the first value in alphabetical order. This ensures that the
   # same result is always returned even if the ordering changed on the server.
   candidates = []
   url = '{0}/simple/{1}/'.format(PYPI_MIRROR, pkg_name)
-  print 'Getting package info from {0}'.format(url)
+  print('Getting package info from {0}'.format(url))
   # The web page should be in PEP 503 format (https://www.python.org/dev/peps/pep-0503/).
   # We parse the page with regex instead of an html parser because that requires
   # downloading an extra package before running this script. Since the HTML is guaranteed
   # to be formatted according to PEP 503, this is acceptable.
   pkg_info = urlopen(url).read()
-  # We assume that the URL includes a hash and the hash function is md5. This not strictly
-  # required by PEP 503.
-  regex = r'<a href=\".*?packages/(.*?)#md5=(.*?)\".*?>(.*?)<\/a>'
+  regex = r'<a .*?href=\".*?packages/(.*?)#(.*?)=(.*?)\".*?>(.*?)<\/a>'
   for match in re.finditer(regex, pkg_info):
     path = match.group(1)
-    md5_digest = match.group(2)
-    file_name = match.group(3)
+    hash_algorithm = match.group(2)
+    digest = match.group(3)
+    file_name = match.group(4)
     # Make sure that we consider only non Wheel archives, because those are not supported.
     if (file_name.endswith('-{0}.tar.gz'.format(pkg_version)) or
         file_name.endswith('-{0}.tar.bz2'.format(pkg_version)) or
         file_name.endswith('-{0}.zip'.format(pkg_version))):
-      candidates.append((file_name, path, md5_digest))
+      candidates.append((file_name, path, hash_algorithm, digest))
   if not candidates:
-    print 'Could not find archive to download for {0} {1}'.format(pkg_name, pkg_version)
-    return (None, None, None)
+    print('Could not find archive to download for {0} {1}'.format(pkg_name, pkg_version))
+    return (None, None, None, None)
   return sorted(candidates)[0]
 
 @retry
 def download_package(pkg_name, pkg_version):
-  file_name, path, expected_md5 = get_package_info(pkg_name, pkg_version)
+  file_name, path, hash_algorithm, expected_digest = get_package_info(pkg_name,
+      pkg_version)
   if not file_name:
     return False
-  if os.path.isfile(file_name) and check_md5sum(file_name, expected_md5):
-    print 'File with matching md5sum already exists, skipping {0}'.format(file_name)
+  if os.path.isfile(file_name) and check_digest(file_name, hash_algorithm,
+      expected_digest):
+    print('File with matching digest already exists, skipping {0}'.format(file_name))
     return True
-  downloader = URLopener()
+  downloader = FancyURLopener()
   pkg_url = '{0}/packages/{1}'.format(PYPI_MIRROR, path)
-  print 'Downloading {0} from {1}'.format(file_name, pkg_url)
+  print('Downloading {0} from {1}'.format(file_name, pkg_url))
   downloader.retrieve(pkg_url, file_name)
-  if check_md5sum(file_name, expected_md5):
+  if check_digest(file_name, hash_algorithm, expected_digest):
     return True
   else:
-    print 'MD5 mismatch in file {0}.'.format(file_name)
+    print('Hash digest check failed in file {0}.'.format(file_name))
     return False
 
 def main():
@@ -117,30 +138,29 @@ def main():
     download_package(pkg_name, pkg_version)
     return
 
+  pool = multiprocessing.pool.ThreadPool(processes=min(multiprocessing.cpu_count(), 4))
+  results = []
+
   for requirements_file in REQUIREMENTS_FILES:
     # If the package name and version are not specified in the command line arguments,
     # download the packages that in requirements.txt.
-    f = open(requirements_file, 'r')
-    try:
-      # requirements.txt follows the standard pip grammar.
-      for line in f:
-        # A hash symbol ("#") represents a comment that should be ignored.
-        hash_index = line.find('#')
-        if hash_index != -1:
-          line = line[:hash_index]
-        # A semi colon (";") specifies some additional condition for when the package
-        # should be installed (for example a specific OS). We can ignore this and download
-        # the package anyways because the installation script(bootstrap_virtualenv.py) can
-        # take it into account.
-        semi_colon_index = line.find(';')
-        if semi_colon_index != -1:
-          line = line[:semi_colon_index]
-        l = line.strip()
-        if len(l) > 0:
-          pkg_name, pkg_version = l.split('==')
-          download_package(pkg_name.strip(), pkg_version.strip())
-    finally:
-      f.close()
+    # requirements.txt follows the standard pip grammar.
+    for line in open(requirements_file):
+      # A hash symbol ("#") represents a comment that should be ignored.
+      line = line.split("#")[0]
+      # A semi colon (";") specifies some additional condition for when the package
+      # should be installed (for example a specific OS). We can ignore this and download
+      # the package anyways because the installation script(bootstrap_virtualenv.py) can
+      # take it into account.
+      l = line.split(";")[0].strip()
+      if not l:
+        continue
+      pkg_name, pkg_version = l.split('==')
+      results.append(pool.apply_async(
+        download_package, args=[pkg_name.strip(), pkg_version.strip()]))
+
+    for x in results:
+      x.get()
 
 if __name__ == '__main__':
   main()

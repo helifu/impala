@@ -21,18 +21,20 @@ import com.google.common.base.Preconditions;
 
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.TPartitionDef;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 /**
  * Represents a partition definition used in ALTER TABLE ADD PARTITION consisting of
  * partition key-value pairs and an optional location and optional caching options.
  */
-public class PartitionDef implements ParseNode {
+public class PartitionDef extends StmtNode {
   private final PartitionSpec partitionSpec_;
   private final HdfsUri location_;
   private final HdfsCachingOp cacheOp_;
@@ -57,10 +59,15 @@ public class PartitionDef implements ParseNode {
   public PartitionSpec getPartitionSpec() { return partitionSpec_; }
 
   @Override
-  public String toSql() {
-    StringBuilder sb = new StringBuilder(partitionSpec_.toSql());
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  @Override
+  public String toSql(ToSqlOptions options) {
+    StringBuilder sb = new StringBuilder(partitionSpec_.toSql(options));
     if (location_ != null) sb.append(String.format(" LOCATION '%s'", location_));
-    if (cacheOp_ != null) sb.append(" " + cacheOp_.toSql());
+    if (cacheOp_ != null) sb.append(" " + cacheOp_.toSql(options));
     return sb.toString();
   }
 
@@ -81,16 +88,17 @@ public class PartitionDef implements ParseNode {
       location_.analyze(analyzer, Privilege.ALL, FsAction.READ_WRITE);
     }
 
-    Table table;
+    FeTable table;
     try {
-      table = analyzer.getTable(partitionSpec_.getTableName(), Privilege.ALTER,
-          false);
+      table = analyzer.getTable(partitionSpec_.getTableName(),
+          /* add access event */ false, /* add column-level privilege */ false,
+          Privilege.ALTER);
     } catch (TableLoadingException e) {
       throw new AnalysisException(e.getMessage(), e);
     }
 
-    Preconditions.checkState(table instanceof HdfsTable);
-    HdfsTable hdfsTable = (HdfsTable)table;
+    Preconditions.checkState(table instanceof FeFsTable);
+    FeFsTable hdfsTable = (FeFsTable)table;
 
     boolean shouldCache;
     if (cacheOp_ != null) {

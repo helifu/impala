@@ -17,7 +17,11 @@
 
 #include "kudu/rpc/connection_id.h"
 
-#include <boost/functional/hash.hpp>
+#include <cstddef>
+#include <utility>
+
+#include <boost/functional/hash/hash.hpp>
+#include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
 
@@ -29,7 +33,7 @@ namespace rpc {
 ConnectionId::ConnectionId() {}
 
 ConnectionId::ConnectionId(const Sockaddr& remote,
-                           std::string hostname,
+                           string hostname,
                            UserCredentials user_credentials)
     : remote_(remote),
       hostname_(std::move(hostname)),
@@ -38,7 +42,12 @@ ConnectionId::ConnectionId(const Sockaddr& remote,
 }
 
 void ConnectionId::set_user_credentials(UserCredentials user_credentials) {
+  DCHECK(user_credentials.has_real_user());
   user_credentials_ = std::move(user_credentials);
+}
+
+void ConnectionId::set_network_plane(string network_plane) {
+  network_plane_ = std::move(network_plane);
 }
 
 string ConnectionId::ToString() const {
@@ -49,9 +58,15 @@ string ConnectionId::ToString() const {
     remote = remote_.ToString();
   }
 
-  return strings::Substitute("{remote=$0, user_credentials=$1}",
+  string network_plane;
+  if (!network_plane_.empty()) {
+    network_plane = strings::Substitute(", network_plane=$0", network_plane_);
+  }
+
+  return strings::Substitute("{remote=$0, user_credentials=$1$2}",
                              remote,
-                             user_credentials_.ToString());
+                             user_credentials_.ToString(),
+                             network_plane);
 }
 
 size_t ConnectionId::HashCode() const {
@@ -59,13 +74,15 @@ size_t ConnectionId::HashCode() const {
   boost::hash_combine(seed, remote_.HashCode());
   boost::hash_combine(seed, hostname_);
   boost::hash_combine(seed, user_credentials_.HashCode());
+  boost::hash_combine(seed, network_plane_);
   return seed;
 }
 
 bool ConnectionId::Equals(const ConnectionId& other) const {
   return remote() == other.remote() &&
       hostname_ == other.hostname_ &&
-      user_credentials().Equals(other.user_credentials());
+      user_credentials().Equals(other.user_credentials()) &&
+      network_plane_ == other.network_plane_;
 }
 
 size_t ConnectionIdHash::operator() (const ConnectionId& conn_id) const {

@@ -17,9 +17,11 @@
 
 #include "service/query-options.h"
 
+#include <zstd.h>
 #include <boost/preprocessor/seq/for_each.hpp>
 #include <boost/preprocessor/tuple/to_seq.hpp>
 
+#include "gutil/strings/substitute.h"
 #include "runtime/runtime-filter.h"
 #include "testutil/gtest-util.h"
 #include "util/mem-info.h"
@@ -27,6 +29,7 @@
 using namespace boost;
 using namespace impala;
 using namespace std;
+using namespace strings;
 
 constexpr int32_t I32_MAX = numeric_limits<int32_t>::max();
 constexpr int64_t I64_MAX = numeric_limits<int64_t>::max();
@@ -79,7 +82,8 @@ auto MakeTestOkFn(TQueryOptions& options, OptionDef<T> option_def) {
 template<typename T>
 auto MakeTestErrFn(TQueryOptions& options, OptionDef<T> option_def) {
   return [&options, option_def](const char* str) {
-    EXPECT_FALSE(SetQueryOption(option_def.option_name, str, &options, nullptr).ok());
+    EXPECT_FALSE(SetQueryOption(option_def.option_name, str, &options, nullptr).ok())
+      << option_def.option_name << " " << str;
   };
 }
 
@@ -107,7 +111,7 @@ void TestByteCaseSet(TQueryOptions& options,
     }
     TestError(to_string(range.lower_bound - 1).c_str());
     TestError(to_string(static_cast<uint64_t>(range.upper_bound) + 1).c_str());
-    TestError("1tb");
+    TestError("1pb");
     TestError("1%");
     TestError("1%B");
     TestError("1B%");
@@ -117,6 +121,7 @@ void TestByteCaseSet(TQueryOptions& options,
         {"1 B", 1},
         {"0Kb", 0},
         {"4G",  4ll * 1024 * 1024 * 1024},
+        {"4tb",  4ll * 1024 * 1024 * 1024 * 1024},
         {"-1M", -1024 * 1024}
     };
     for (const auto& value_def : common_values) {
@@ -135,24 +140,32 @@ void TestByteCaseSet(TQueryOptions& options,
 TEST(QueryOptions, SetByteOptions) {
   TQueryOptions options;
   // key and its valid range: [(key, (min, max))]
-  vector<pair<OptionDef<int64_t>, Range<int64_t>>> case_set_i64 {
-      {MAKE_OPTIONDEF(mem_limit),             {-1, I64_MAX}},
+  vector<pair<OptionDef<int64_t>, Range<int64_t>>> case_set_i64{
+      {MAKE_OPTIONDEF(mem_limit), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(max_scan_range_length), {-1, I64_MAX}},
-      {MAKE_OPTIONDEF(rm_initial_mem),        {-1, I64_MAX}},
-      {MAKE_OPTIONDEF(buffer_pool_limit),     {-1, I64_MAX}},
-      {MAKE_OPTIONDEF(max_row_size),          {1, ROW_SIZE_LIMIT}},
-      {MAKE_OPTIONDEF(parquet_file_size),     {-1, I32_MAX}}
+      {MAKE_OPTIONDEF(buffer_pool_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(max_row_size), {1, ROW_SIZE_LIMIT}},
+      {MAKE_OPTIONDEF(parquet_file_size), {-1, I32_MAX}},
+      {MAKE_OPTIONDEF(compute_stats_min_sample_size), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(max_mem_estimate_for_admission), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(scan_bytes_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(topn_bytes_limit), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(mem_limit_executors), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(broadcast_bytes_limit), {-1, I64_MAX}},
   };
-  vector<pair<OptionDef<int32_t>, Range<int32_t>>> case_set_i32 {
+  vector<pair<OptionDef<int32_t>, Range<int32_t>>> case_set_i32{
       {MAKE_OPTIONDEF(runtime_filter_min_size),
           {RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE,
               RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE}},
+      // Lower limit for runtime_filter_max_size is FLAGS_min_buffer_size which has a
+      // default value of is 8KB.
       {MAKE_OPTIONDEF(runtime_filter_max_size),
-          {RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE,
-              RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE}},
+          {8 * 1024, RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE}},
       {MAKE_OPTIONDEF(runtime_bloom_filter_size),
           {RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE,
-              RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE}}
+              RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE}},
+      {MAKE_OPTIONDEF(max_statement_length_bytes),
+          {MIN_MAX_STATEMENT_LENGTH_BYTES, I32_MAX}},
   };
   TestByteCaseSet(options, case_set_i64);
   TestByteCaseSet(options, case_set_i32);
@@ -206,10 +219,12 @@ TEST(QueryOptions, SetEnumOptions) {
       TParquetFallbackSchemaResolution, (POSITION, NAME)), true);
   TestEnumCase(options, CASE(parquet_array_resolution, TParquetArrayResolution,
       (THREE_LEVEL, TWO_LEVEL, TWO_LEVEL_THEN_THREE_LEVEL)), true);
-  TestEnumCase(options, CASE(seq_compression_mode, THdfsSeqCompressionMode,
-      (BLOCK, RECORD)), false);
-  TestEnumCase(options, CASE(compression_codec, THdfsCompression,
-      (NONE, GZIP, BZIP2, DEFAULT, SNAPPY, SNAPPY_BLOCKED)), false);
+  TestEnumCase(options, CASE(default_file_format, THdfsFileFormat,
+      (TEXT, RC_FILE, SEQUENCE_FILE, AVRO, PARQUET, KUDU, ORC)), true);
+  TestEnumCase(options, CASE(runtime_filter_mode, TRuntimeFilterMode,
+      (OFF, LOCAL, GLOBAL)), true);
+  TestEnumCase(options, CASE(kudu_read_mode, TKuduReadMode,
+      (DEFAULT, READ_LATEST, READ_AT_SNAPSHOT)), true);
 #undef CASE
 #undef ENTRIES
 #undef ENTRY
@@ -219,12 +234,18 @@ TEST(QueryOptions, SetEnumOptions) {
 TEST(QueryOptions, SetIntOptions) {
   TQueryOptions options;
   // List of pairs of Key and its valid range
-  pair<OptionDef<int32_t>, Range<int32_t>> case_set[] {
+  pair<OptionDef<int32_t>, Range<int32_t>> case_set[]{
       {MAKE_OPTIONDEF(runtime_filter_wait_time_ms),    {0, I32_MAX}},
       {MAKE_OPTIONDEF(mt_dop),                         {0, 64}},
       {MAKE_OPTIONDEF(disable_codegen_rows_threshold), {0, I32_MAX}},
       {MAKE_OPTIONDEF(max_num_runtime_filters),        {0, I32_MAX}},
-      {MAKE_OPTIONDEF(batch_size),                     {0, 65536}}
+      {MAKE_OPTIONDEF(batch_size),                     {0, 65536}},
+      {MAKE_OPTIONDEF(query_timeout_s),                {0, I32_MAX}},
+      {MAKE_OPTIONDEF(exec_time_limit_s),              {0, I32_MAX}},
+      {MAKE_OPTIONDEF(thread_reservation_limit),       {-1, I32_MAX}},
+      {MAKE_OPTIONDEF(thread_reservation_aggregate_limit), {-1, I32_MAX}},
+      {MAKE_OPTIONDEF(statement_expression_limit),
+          {MIN_STATEMENT_EXPRESSION_LIMIT, I32_MAX}},
   };
   for (const auto& test_case : case_set) {
     const OptionDef<int32_t>& option_def = test_case.first;
@@ -241,21 +262,40 @@ TEST(QueryOptions, SetIntOptions) {
   }
 }
 
+// Test integer options. Some of them have lower/upper bounds.
+TEST(QueryOptions, SetBigIntOptions) {
+  TQueryOptions options;
+  // List of pairs of Key and its valid range
+  pair<OptionDef<int64_t>, Range<int64_t>> case_set[] {
+      {MAKE_OPTIONDEF(cpu_limit_s), {0, I64_MAX}},
+      {MAKE_OPTIONDEF(num_rows_produced_limit), {0, I64_MAX}},
+  };
+  for (const auto& test_case : case_set) {
+    const OptionDef<int64_t>& option_def = test_case.first;
+    const Range<int64_t>& range = test_case.second;
+    auto TestOk = MakeTestOkFn(options, option_def);
+    auto TestError = MakeTestErrFn(options, option_def);
+    TestError("1M");
+    TestError("0B");
+    TestError("1%");
+    TestOk(to_string(range.lower_bound).c_str(), range.lower_bound);
+    TestOk(to_string(range.upper_bound).c_str(), range.upper_bound);
+    TestError(to_string(int64_t(range.lower_bound) - 1).c_str());
+    // 2^63 is I64_MAX + 1.
+    TestError("9223372036854775808");
+  }
+}
+
 // Test options with non regular validation rule
 TEST(QueryOptions, SetSpecialOptions) {
-  // REPLICA_PREFERENCE cannot be set to 0 if DISABLE_CACHED_READS is true
-  // It also has unsettable enum values: cache_rack(1) & disk_rack(3)
+  // REPLICA_PREFERENCE has unsettable enum values: cache_rack(1) & disk_rack(3)
   TQueryOptions options;
   {
     OptionDef<TReplicaPreference::type> key_def = MAKE_OPTIONDEF(replica_preference);
     auto TestOk = MakeTestOkFn(options, key_def);
     auto TestError = MakeTestErrFn(options, key_def);
-    EXPECT_OK(SetQueryOption("DISABLE_CACHED_READS", "false", &options, nullptr));
     TestOk("cache_local", TReplicaPreference::CACHE_LOCAL);
     TestOk("0", TReplicaPreference::CACHE_LOCAL);
-    EXPECT_OK(SetQueryOption("DISABLE_CACHED_READS", "true", &options, nullptr));
-    TestError("cache_local");
-    TestError("0");
     TestError("cache_rack");
     TestError("1");
     TestOk("disk_local", TReplicaPreference::DISK_LOCAL);
@@ -276,7 +316,7 @@ TEST(QueryOptions, SetSpecialOptions) {
     TestOk("0", 0);
     TestOk("4GB", 4ll * 1024 * 1024 * 1024);
     TestError("-1MB");
-    TestError("1tb");
+    TestError("1pb");
     TestError("1%");
     TestError("1%B");
     TestError("1B%");
@@ -313,6 +353,15 @@ TEST(QueryOptions, SetSpecialOptions) {
     TestError("-1");
     TestError("0");
     TestError(to_string(ROW_SIZE_LIMIT + 1).c_str());
+  }
+  // RUNTIME_FILTER_MAX_SIZE should not be less than FLAGS_min_buffer_size
+  {
+    OptionDef<int32_t> key_def = MAKE_OPTIONDEF(runtime_filter_max_size);
+    auto TestOk = MakeTestOkFn(options, key_def);
+    auto TestError = MakeTestErrFn(options, key_def);
+    TestOk("128KB", 128 * 1024);
+    TestError("8191"); // default value of FLAGS_min_buffer_size is 8KB
+    TestOk("64KB", 64 * 1024);
   }
 }
 
@@ -352,7 +401,7 @@ TEST(QueryOptions, MapOptionalDefaultlessToEmptyString) {
   EXPECT_EQ(map["COMPRESSION_CODEC"], "");
   EXPECT_EQ(map["MT_DOP"], "");
   // Has defaults
-  EXPECT_EQ(map["EXPLAIN_LEVEL"], "1");
+  EXPECT_EQ(map["EXPLAIN_LEVEL"], "STANDARD");
 }
 
 /// Overlay a with b. batch_size is set in both places.
@@ -422,4 +471,93 @@ TEST(QueryOptions, ResetToDefaultViaEmptyString) {
   }
 }
 
-IMPALA_TEST_MAIN();
+TEST(QueryOptions, CompressionCodec) {
+#define ENTRY(_, prefix, entry) (prefix::entry),
+#define ENTRIES(prefix, name) BOOST_PP_SEQ_FOR_EACH(ENTRY, prefix, name)
+#define CASE(enumtype, enums) {ENTRIES(enumtype, BOOST_PP_TUPLE_TO_SEQ(enums))}
+  TQueryOptions options;
+  vector<THdfsCompression::type> codecs = CASE(THdfsCompression, (NONE, DEFAULT, GZIP,
+      DEFLATE, BZIP2, SNAPPY, SNAPPY_BLOCKED, LZO, LZ4, ZLIB, ZSTD, BROTLI, LZ4_BLOCKED));
+  // Test valid values for compression_codec.
+  for (auto& codec : codecs) {
+    EXPECT_TRUE(SetQueryOption("compression_codec", Substitute("$0",codec), &options,
+        nullptr).ok());
+    // Test that compression level is only supported for ZSTD.
+    if (codec != THdfsCompression::ZSTD) {
+      EXPECT_FALSE(SetQueryOption("compression_codec", Substitute("$0:1",codec),
+        &options, nullptr).ok());
+    }
+    else {
+      EXPECT_TRUE(SetQueryOption("compression_codec",
+          Substitute("zstd:$0",ZSTD_CLEVEL_DEFAULT), &options, nullptr).ok());
+    }
+  }
+
+  // Test invalid values for compression_codec.
+  EXPECT_FALSE(SetQueryOption("compression_codec", Substitute("$0", codecs.back() + 1),
+      &options, nullptr).ok());
+  EXPECT_FALSE(SetQueryOption("compression_codec", "foo", &options, nullptr).ok());
+  EXPECT_FALSE(SetQueryOption("compression_codec", "1%", &options, nullptr).ok());
+  EXPECT_FALSE(SetQueryOption("compression_codec", "-1", &options, nullptr).ok());
+  EXPECT_FALSE(SetQueryOption("compression_codec", ":", &options, nullptr).ok());
+  EXPECT_FALSE(SetQueryOption("compression_codec", ":1", &options, nullptr).ok());
+
+  // Test compression levels for ZSTD.
+  const int zstd_min_clevel = 1;
+  const int zstd_max_clevel = ZSTD_maxCLevel();
+  for (int i = zstd_min_clevel; i <= zstd_max_clevel; i++)
+  {
+    EXPECT_TRUE(SetQueryOption("compression_codec", Substitute("ZSTD:$0",i), &options,
+      nullptr).ok());
+  }
+  EXPECT_FALSE(SetQueryOption("compression_codec",
+    Substitute("ZSTD:$0", zstd_min_clevel - 1), &options, nullptr).ok());
+  EXPECT_FALSE(SetQueryOption("compression_codec",
+    Substitute("ZSTD:$0", zstd_max_clevel + 1), &options, nullptr).ok());
+#undef CASE
+#undef ENTRIES
+#undef ENTRY
+}
+
+// Tests for setting of MAX_RESULT_SPOOLING_MEM and
+// MAX_SPILLED_RESULT_SPOOLING_MEM. Setting of these options must maintain the
+// condition 'MAX_RESULT_SPOOLING_MEM <= MAX_SPILLED_RESULT_SPOOLING_MEM'.
+// A value of 0 for each of these parameters means the memory is unbounded.
+TEST(QueryOptions, ResultSpooling) {
+  {
+    TQueryOptions options;
+    // Setting the memory to 0 (unbounded) should fail with the default spilled value.
+    options.__set_max_result_spooling_mem(0);
+    EXPECT_FALSE(ValidateQueryOptions(&options).ok());
+    // Setting the spilled memory to 0 (unbounded) should always work.
+    options.__set_max_spilled_result_spooling_mem(0);
+    EXPECT_TRUE(ValidateQueryOptions(&options).ok());
+    // Setting the memory to 0 (unbounded) should work if the spilled memory is unbounded
+    // as well.
+    options.__set_max_result_spooling_mem(0);
+    EXPECT_TRUE(ValidateQueryOptions(&options).ok());
+    // Setting the spilled memory to a bounded value should fail if the memory is bounded.
+    options.__set_max_spilled_result_spooling_mem(1);
+    EXPECT_FALSE(ValidateQueryOptions(&options).ok());
+  }
+
+  {
+    TQueryOptions options;
+    // Setting the spilled memory to a value lower than the memory should fail.
+    options.__set_max_result_spooling_mem(2);
+    EXPECT_TRUE(ValidateQueryOptions(&options).ok());
+    options.__set_max_spilled_result_spooling_mem(1);
+    EXPECT_FALSE(ValidateQueryOptions(&options).ok());
+  }
+
+  {
+    TQueryOptions options;
+    // Setting the memory to a value higher than the spilled memory should fail.
+    options.__set_max_result_spooling_mem(1);
+    EXPECT_TRUE(ValidateQueryOptions(&options).ok());
+    options.__set_max_spilled_result_spooling_mem(2);
+    EXPECT_TRUE(ValidateQueryOptions(&options).ok());
+    options.__set_max_result_spooling_mem(3);
+    EXPECT_FALSE(ValidateQueryOptions(&options).ok());
+  }
+}

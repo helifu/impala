@@ -20,10 +20,13 @@ package org.apache.impala.planner;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import org.apache.impala.analysis.AnalysisContext;
+import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.ColumnLineageGraph;
+import org.apache.impala.analysis.ColumnLineageGraph.ColumnLabel;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprSubstitutionMap;
 import org.apache.impala.analysis.InsertStmt;
@@ -31,10 +34,11 @@ import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.SortInfo;
 import org.apache.impala.analysis.TupleId;
-import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.service.BackendConfig;
@@ -44,7 +48,9 @@ import org.apache.impala.thrift.TQueryExecRequest;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TRuntimeFilterMode;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.KuduUtil;
+import org.apache.impala.util.MathUtil;
 import org.apache.impala.util.MaxRowsProcessedVisitor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,6 +58,8 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+
+import static org.apache.impala.analysis.ToSqlOptions.SHOW_IMPLICIT_CASTS;
 
 /**
  * Creates an executable plan from an analyzed parse tree and query options.
@@ -63,14 +71,26 @@ public class Planner {
   // estimates of zero, even if the contained PlanNodes have estimates of zero.
   public static final long MIN_PER_HOST_MEM_ESTIMATE_BYTES = 10 * 1024 * 1024;
 
+  // The amount of memory added to a dedicated coordinator's memory estimate to
+  // compensate for underestimation. In the general case estimates for exec
+  // nodes tend to overestimate and should work fine but for estimates in the
+  // 100-500 MB space, underestimates can be a problem. We pick a value of 100MB
+  // because it is trivial for large estimates and small enough to not make a
+  // huge impact on the coordinator's process memory (which ideally would be
+  // large).
+  public static final long DEDICATED_COORD_SAFETY_BUFFER_BYTES = 100 * 1024 * 1024;
+
   public static final ResourceProfile MIN_PER_HOST_RESOURCES =
-      new ResourceProfileBuilder().setMemEstimateBytes(MIN_PER_HOST_MEM_ESTIMATE_BYTES)
-      .setMinReservationBytes(0).build();
+      new ResourceProfileBuilder()
+          .setMemEstimateBytes(MIN_PER_HOST_MEM_ESTIMATE_BYTES)
+          .setMinMemReservationBytes(0)
+          .build();
 
   private final PlannerContext ctx_;
 
-  public Planner(AnalysisContext.AnalysisResult analysisResult, TQueryCtx queryCtx) {
-    ctx_ = new PlannerContext(analysisResult, queryCtx);
+  public Planner(AnalysisResult analysisResult, TQueryCtx queryCtx,
+      EventSequence timeline) {
+    ctx_ = new PlannerContext(analysisResult, queryCtx, timeline);
   }
 
   public TQueryCtx getQueryCtx() { return ctx_.getQueryCtx(); }
@@ -92,18 +112,39 @@ public class Planner {
    *    that such an expr substitution during plan generation never fails. If it does,
    *    that typically means there is a bug in analysis, or a broken/missing smap.
    */
-  public ArrayList<PlanFragment> createPlan() throws ImpalaException {
+  public List<PlanFragment> createPlan() throws ImpalaException {
     SingleNodePlanner singleNodePlanner = new SingleNodePlanner(ctx_);
     DistributedPlanner distributedPlanner = new DistributedPlanner(ctx_);
     PlanNode singleNodePlan = singleNodePlanner.createSingleNodePlan();
-    ctx_.getAnalysisResult().getTimeline().markEvent("Single node plan created");
-    ArrayList<PlanFragment> fragments = null;
+    ctx_.getTimeline().markEvent("Single node plan created");
+    List<PlanFragment> fragments = null;
 
     checkForSmallQueryOptimization(singleNodePlan);
 
     // Join rewrites.
     invertJoins(singleNodePlan, ctx_.isSingleNodeExec());
     singleNodePlan = useNljForSingularRowBuilds(singleNodePlan, ctx_.getRootAnalyzer());
+
+    // MT_DOP > 0 is not supported by default for plans with base table joins or table
+    // sinks: we only allow MT_DOP > 0 with such plans if --unlock_mt_dop=true is
+    // specified. We allow single node plans with mt_dop since there is no actual
+    // parallelism.
+    if (!ctx_.isSingleNodeExec() && ctx_.getQueryOptions().mt_dop > 0
+        && (!RuntimeEnv.INSTANCE.isTestEnv()
+               || RuntimeEnv.INSTANCE.isMtDopValidationEnabled())
+        && !BackendConfig.INSTANCE.isMtDopUnlocked()
+        && (ctx_.hasTableSink()
+               || singleNodePlanner.hasUnsupportedMtDopJoin(singleNodePlan))) {
+      if (BackendConfig.INSTANCE.mtDopAutoFallback()) {
+        // Fall back to non-dop mode. This assumes that the mt_dop value is only used
+        // in the distributed planning process, which should be generally true as long
+        // as the value isn't cached in any plan nodes.
+        ctx_.getQueryOptions().setMt_dop(0);
+      } else {
+        throw new NotImplementedException(
+            "MT_DOP not supported for plans with base table joins or table sinks.");
+      }
+    }
 
     singleNodePlanner.validatePlan(singleNodePlan);
 
@@ -120,12 +161,11 @@ public class Planner {
     PlanFragment rootFragment = fragments.get(fragments.size() - 1);
     if (ctx_.getQueryOptions().getRuntime_filter_mode() != TRuntimeFilterMode.OFF) {
       RuntimeFilterGenerator.generateRuntimeFilters(ctx_, rootFragment.getPlanRoot());
-      ctx_.getAnalysisResult().getTimeline().markEvent("Runtime filters computed");
+      ctx_.getTimeline().markEvent("Runtime filters computed");
     }
 
     rootFragment.verifyTree();
     ExprSubstitutionMap rootNodeSmap = rootFragment.getPlanRoot().getOutputSmap();
-    List<Expr> resultExprs = null;
     if (ctx_.isInsertOrCtas()) {
       InsertStmt insertStmt = ctx_.getAnalysisResult().getInsertStmt();
       insertStmt.substituteResultExprs(rootNodeSmap, ctx_.getRootAnalyzer());
@@ -138,22 +178,23 @@ public class Planner {
       createPreInsertSort(insertStmt, rootFragment, ctx_.getRootAnalyzer());
       // set up table sink for root fragment
       rootFragment.setSink(insertStmt.createDataSink());
-      resultExprs = insertStmt.getResultExprs();
     } else {
-      if (ctx_.isUpdate()) {
-        // Set up update sink for root fragment
-        rootFragment.setSink(ctx_.getAnalysisResult().getUpdateStmt().createDataSink());
-      } else if (ctx_.isDelete()) {
-        // Set up delete sink for root fragment
-        rootFragment.setSink(ctx_.getAnalysisResult().getDeleteStmt().createDataSink());
-      } else if (ctx_.isQuery()) {
-        rootFragment.setSink(ctx_.getAnalysisResult().getQueryStmt().createDataSink());
-      }
       QueryStmt queryStmt = ctx_.getQueryStmt();
       queryStmt.substituteResultExprs(rootNodeSmap, ctx_.getRootAnalyzer());
-      resultExprs = queryStmt.getResultExprs();
+      List<Expr> resultExprs = queryStmt.getResultExprs();
+      if (ctx_.isUpdate()) {
+        // Set up update sink for root fragment
+        rootFragment.setSink(
+            ctx_.getAnalysisResult().getUpdateStmt().createDataSink(resultExprs));
+      } else if (ctx_.isDelete()) {
+        // Set up delete sink for root fragment
+        rootFragment.setSink(
+            ctx_.getAnalysisResult().getDeleteStmt().createDataSink(resultExprs));
+      } else if (ctx_.isQuery()) {
+        rootFragment.setSink(
+            ctx_.getAnalysisResult().getQueryStmt().createDataSink(resultExprs));
+      }
     }
-    rootFragment.setOutputExprs(resultExprs);
 
     // The check for disabling codegen uses estimates of rows per node so must be done
     // on the distributed plan.
@@ -161,7 +202,8 @@ public class Planner {
 
     if (LOG.isTraceEnabled()) {
       LOG.trace("desctbl: " + ctx_.getRootAnalyzer().getDescTbl().debugString());
-      LOG.trace("resultexprs: " + Expr.debugString(rootFragment.getOutputExprs()));
+      LOG.trace("root sink: " + rootFragment.getSink().getExplainString(
+            "", "", ctx_.getQueryOptions(), TExplainLevel.VERBOSE));
       LOG.trace("finalize plan fragments");
     }
     for (PlanFragment fragment: fragments) {
@@ -169,7 +211,7 @@ public class Planner {
     }
 
     Collections.reverse(fragments);
-    ctx_.getAnalysisResult().getTimeline().markEvent("Distributed plan created");
+    ctx_.getTimeline().markEvent("Distributed plan created");
 
     ColumnLineageGraph graph = ctx_.getRootAnalyzer().getColumnLineageGraph();
     if (BackendConfig.INSTANCE.getComputeLineage() || RuntimeEnv.INSTANCE.isTestEnv()) {
@@ -178,41 +220,38 @@ public class Planner {
       // Compute the column lineage graph
       if (ctx_.isInsertOrCtas()) {
         InsertStmt insertStmt = ctx_.getAnalysisResult().getInsertStmt();
-        List<Expr> exprs = Lists.newArrayList();
-        Table targetTable = insertStmt.getTargetTable();
+        FeTable targetTable = insertStmt.getTargetTable();
         Preconditions.checkNotNull(targetTable);
-        if (targetTable instanceof KuduTable) {
+        if (targetTable instanceof FeKuduTable) {
           if (ctx_.isInsert()) {
             // For insert statements on Kudu tables, we only need to consider
             // the labels of columns mentioned in the column list.
             List<String> mentionedColumns = insertStmt.getMentionedColumns();
             Preconditions.checkState(!mentionedColumns.isEmpty());
-            List<String> targetColLabels = Lists.newArrayList();
+            List<ColumnLabel> targetColLabels = new ArrayList<>();
             String tblFullName = targetTable.getFullName();
             for (String column: mentionedColumns) {
-              targetColLabels.add(tblFullName + "." + column);
+              targetColLabels.add(new ColumnLabel(column, targetTable.getTableName()));
             }
             graph.addTargetColumnLabels(targetColLabels);
           } else {
             graph.addTargetColumnLabels(targetTable);
           }
-          exprs.addAll(resultExprs);
-        } else if (targetTable instanceof HBaseTable) {
+        } else if (targetTable instanceof FeHBaseTable) {
           graph.addTargetColumnLabels(targetTable);
-          exprs.addAll(resultExprs);
         } else {
           graph.addTargetColumnLabels(targetTable);
-          exprs.addAll(ctx_.getAnalysisResult().getInsertStmt().getPartitionKeyExprs());
-          exprs.addAll(resultExprs.subList(0,
-              targetTable.getNonClusteringColumns().size()));
         }
-        graph.computeLineageGraph(exprs, ctx_.getRootAnalyzer());
       } else {
-        graph.addTargetColumnLabels(ctx_.getQueryStmt().getColLabels());
-        graph.computeLineageGraph(resultExprs, ctx_.getRootAnalyzer());
+        graph.addTargetColumnLabels(ctx_.getQueryStmt().getColLabels().stream()
+            .map(col -> new ColumnLabel(col))
+            .collect(Collectors.toList()));
       }
+      List<Expr> outputExprs = new ArrayList<>();
+      rootFragment.getSink().collectExprs(outputExprs);
+      graph.computeLineageGraph(outputExprs, ctx_.getRootAnalyzer());
       if (LOG.isTraceEnabled()) LOG.trace("lineage: " + graph.debugString());
-      ctx_.getAnalysisResult().getTimeline().markEvent("Lineage info computed");
+      ctx_.getTimeline().markEvent("Lineage info computed");
     }
 
     return fragments;
@@ -224,14 +263,17 @@ public class Planner {
    */
   public List<PlanFragment> createParallelPlans() throws ImpalaException {
     Preconditions.checkState(ctx_.getQueryOptions().mt_dop > 0);
-    ArrayList<PlanFragment> distrPlan = createPlan();
+    List<PlanFragment> distrPlan = createPlan();
     Preconditions.checkNotNull(distrPlan);
-    ParallelPlanner planner = new ParallelPlanner(ctx_);
-    List<PlanFragment> parallelPlans = planner.createPlans(distrPlan.get(0));
-    // Only use one scanner thread per scan-node instance since intra-node
-    // parallelism is achieved via multiple fragment instances.
-    ctx_.getQueryOptions().setNum_scanner_threads(1);
-    ctx_.getAnalysisResult().getTimeline().markEvent("Parallel plans created");
+    List<PlanFragment> parallelPlans;
+    // TODO: IMPALA-4224: Parallel plans are not executable
+    if (RuntimeEnv.INSTANCE.isTestEnv()) {
+      ParallelPlanner planner = new ParallelPlanner(ctx_);
+      parallelPlans = planner.createPlans(distrPlan.get(0));
+    } else {
+      parallelPlans = Collections.singletonList(distrPlan.get(0));
+    }
+    ctx_.getTimeline().markEvent("Parallel plans created");
     return parallelPlans;
   }
 
@@ -241,7 +283,7 @@ public class Planner {
    * Uses a default level of EXTENDED, unless overriden by the
    * 'explain_level' query option.
    */
-  public String getExplainString(ArrayList<PlanFragment> fragments,
+  public String getExplainString(List<PlanFragment> fragments,
       TQueryExecRequest request) {
     // use EXTENDED by default for all non-explain statements
     TExplainLevel explainLevel = TExplainLevel.EXTENDED;
@@ -257,19 +299,32 @@ public class Planner {
    * explicit explain level.
    * Includes the estimated resource requirements from the request if set.
    */
-  public String getExplainString(ArrayList<PlanFragment> fragments,
+  public String getExplainString(List<PlanFragment> fragments,
       TQueryExecRequest request, TExplainLevel explainLevel) {
     StringBuilder str = new StringBuilder();
     boolean hasHeader = false;
-    if (request.isSetMax_per_host_min_reservation()) {
-      str.append(String.format("Max Per-Host Resource Reservation: Memory=%s\n",
-          PrintUtils.printBytes(request.getMax_per_host_min_reservation())));
+
+    // Only some requests (queries, DML, etc) have a resource profile.
+    if (request.isSetMax_per_host_min_mem_reservation()) {
+      Preconditions.checkState(request.isSetMax_per_host_thread_reservation());
+      Preconditions.checkState(request.isSetPer_host_mem_estimate());
+      str.append(String.format(
+          "Max Per-Host Resource Reservation: Memory=%s Threads=%d\n",
+          PrintUtils.printBytes(request.getMax_per_host_min_mem_reservation()),
+          request.getMax_per_host_thread_reservation()));
+      str.append(String.format("Per-Host Resource Estimates: Memory=%s\n",
+          PrintUtils.printBytesRoundedToMb(request.getPer_host_mem_estimate())));
+      if (BackendConfig.INSTANCE.useDedicatedCoordinatorEstimates()) {
+        str.append(String.format("Dedicated Coordinator Resource Estimate: Memory=%s\n",
+            PrintUtils.printBytesRoundedToMb(request.getDedicated_coord_mem_estimate())));
+      }
       hasHeader = true;
     }
-    if (request.isSetPer_host_mem_estimate()) {
-      str.append(String.format("Per-Host Resource Estimates: Memory=%s\n",
-          PrintUtils.printBytes(request.getPer_host_mem_estimate())));
-      hasHeader = true;
+    // Warn if the planner is running in DEBUG mode.
+    if (request.query_ctx.client_request.query_options.planner_testcase_mode) {
+      str.append("WARNING: The planner is running in TESTCASE mode. This should only be "
+          + "used by developers for debugging.\nTo disable it, do SET " +
+          "PLANNER_TESTCASE_MODE=false.\n");
     }
     if (request.query_ctx.disable_codegen_hint) {
       str.append("Codegen disabled by planner\n");
@@ -280,7 +335,7 @@ public class Planner {
     if (!request.query_ctx.isSetParent_query_id() &&
         request.query_ctx.isSetTables_with_corrupt_stats() &&
         !request.query_ctx.getTables_with_corrupt_stats().isEmpty()) {
-      List<String> tableNames = Lists.newArrayList();
+      List<String> tableNames = new ArrayList<>();
       for (TTableName tableName: request.query_ctx.getTables_with_corrupt_stats()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
@@ -296,7 +351,7 @@ public class Planner {
     if (!request.query_ctx.isSetParent_query_id() &&
         request.query_ctx.isSetTables_missing_stats() &&
         !request.query_ctx.getTables_missing_stats().isEmpty()) {
-      List<String> tableNames = Lists.newArrayList();
+      List<String> tableNames = new ArrayList<>();
       for (TTableName tableName: request.query_ctx.getTables_missing_stats()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
@@ -306,7 +361,7 @@ public class Planner {
     }
 
     if (request.query_ctx.isSetTables_missing_diskids()) {
-      List<String> tableNames = Lists.newArrayList();
+      List<String> tableNames = new ArrayList<>();
       for (TTableName tableName: request.query_ctx.getTables_missing_diskids()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
@@ -321,6 +376,18 @@ public class Planner {
           "is missing relevant stats, and no plan hints were given.\n");
       hasHeader = true;
     }
+
+    if (explainLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+      // In extended explain include the analyzed query text showing implicit casts
+      String queryText = ctx_.getQueryStmt().toSql(SHOW_IMPLICIT_CASTS);
+      String wrappedText = PrintUtils.wrapString("Analyzed query: " + queryText, 80);
+      str.append(wrappedText).append("\n");
+      hasHeader = true;
+    }
+    // Note that the analyzed query text must be the last thing in the header.
+    // This is to help tests that parse the header.
+
+    // Add the blank line that indicates the end of the header
     if (hasHeader) str.append("\n");
 
     if (explainLevel.ordinal() < TExplainLevel.VERBOSE.ordinal()) {
@@ -353,10 +420,12 @@ public class Planner {
     // are scheduled on all nodes. The actual per-host resource requirements are computed
     // after scheduling.
     ResourceProfile maxPerHostPeakResources = ResourceProfile.invalid();
+    long totalRuntimeFilterMemBytes = 0;
 
     // Do a pass over all the fragments to compute resource profiles. Compute the
     // profiles bottom-up since a fragment's profile may depend on its descendants.
-    List<PlanFragment> allFragments = planRoots.get(0).getNodesPostOrder();
+    PlanFragment rootFragment = planRoots.get(0);
+    List<PlanFragment> allFragments = rootFragment.getNodesPostOrder();
     for (PlanFragment fragment: allFragments) {
       // Compute the per-node, per-sink and aggregate profiles for the fragment.
       fragment.computeResourceProfile(ctx_.getRootAnalyzer());
@@ -369,25 +438,41 @@ public class Planner {
       // per-fragment-instance peak resources.
       maxPerHostPeakResources = maxPerHostPeakResources.sum(
           fragment.getResourceProfile().multiply(fragment.getNumInstancesPerHost(mtDop)));
+      // Coordinator has to have a copy of each of the runtime filters to perform filter
+      // aggregation.
+      totalRuntimeFilterMemBytes += fragment.getRuntimeFiltersMemReservationBytes();
     }
+    rootFragment.computePipelineMembership();
 
     Preconditions.checkState(maxPerHostPeakResources.getMemEstimateBytes() >= 0,
         maxPerHostPeakResources.getMemEstimateBytes());
-    Preconditions.checkState(maxPerHostPeakResources.getMinReservationBytes() >= 0,
-        maxPerHostPeakResources.getMinReservationBytes());
+    Preconditions.checkState(maxPerHostPeakResources.getMinMemReservationBytes() >= 0,
+        maxPerHostPeakResources.getMinMemReservationBytes());
 
     maxPerHostPeakResources = MIN_PER_HOST_RESOURCES.max(maxPerHostPeakResources);
 
-    // TODO: Remove per_host_mem_estimate from the TQueryExecRequest when AC no longer
-    // needs it.
     request.setPer_host_mem_estimate(maxPerHostPeakResources.getMemEstimateBytes());
-    request.setMax_per_host_min_reservation(
-        maxPerHostPeakResources.getMinReservationBytes());
+    request.setMax_per_host_min_mem_reservation(
+        maxPerHostPeakResources.getMinMemReservationBytes());
+    request.setMax_per_host_thread_reservation(
+        maxPerHostPeakResources.getThreadReservation());
+    if (getAnalysisResult().isQueryStmt()) {
+      request.setDedicated_coord_mem_estimate(MathUtil.saturatingAdd(rootFragment
+          .getResourceProfile().getMemEstimateBytes(), totalRuntimeFilterMemBytes +
+          DEDICATED_COORD_SAFETY_BUFFER_BYTES));
+    } else {
+      // For queries that don't have a coordinator fragment, estimate a small
+      // amount of memory that the query state spwaned on the coordinator can use.
+      request.setDedicated_coord_mem_estimate(totalRuntimeFilterMemBytes +
+          DEDICATED_COORD_SAFETY_BUFFER_BYTES);
+    }
     if (LOG.isTraceEnabled()) {
       LOG.trace("Max per-host min reservation: " +
-          maxPerHostPeakResources.getMinReservationBytes());
+          maxPerHostPeakResources.getMinMemReservationBytes());
       LOG.trace("Max estimated per-host memory: " +
           maxPerHostPeakResources.getMemEstimateBytes());
+      LOG.trace("Max estimated per-host thread reservation: " +
+          maxPerHostPeakResources.getThreadReservation());
     }
   }
 
@@ -570,6 +655,8 @@ public class Planner {
     int threshold = ctx_.getQueryOptions().exec_single_node_rows_threshold;
     if (maxRowsProcessed < threshold) {
       // Execute on a single node and disable codegen for small results
+      LOG.trace("Query is small enough to execute on a single node: maxRowsProcessed = "
+          + maxRowsProcessed);
       ctx_.getQueryOptions().setNum_nodes(1);
       ctx_.getQueryCtx().disable_codegen_hint = true;
       if (maxRowsProcessed < ctx_.getQueryOptions().batch_size ||
@@ -608,10 +695,10 @@ public class Planner {
    */
   public void createPreInsertSort(InsertStmt insertStmt, PlanFragment inputFragment,
        Analyzer analyzer) throws ImpalaException {
-    List<Expr> orderingExprs = Lists.newArrayList();
+    List<Expr> orderingExprs = new ArrayList<>();
 
     boolean partialSort = false;
-    if (insertStmt.getTargetTable() instanceof KuduTable) {
+    if (insertStmt.getTargetTable() instanceof FeKuduTable) {
       // Always sort if the 'clustered' hint is present. Otherwise, don't sort if either
       // the 'noclustered' hint is present, or this is a single node exec, or if the
       // target table is unpartitioned.
@@ -622,10 +709,7 @@ public class Planner {
         orderingExprs.addAll(insertStmt.getPrimaryKeyExprs());
         partialSort = true;
       }
-    } else if (insertStmt.hasClusteredHint() || !insertStmt.getSortExprs().isEmpty()) {
-      // NOTE: If the table has a 'sort.columns' property and the query has a
-      // 'noclustered' hint, we issue a warning during analysis and ignore the
-      // 'noclustered' hint.
+    } else if (insertStmt.requiresClustering()) {
       orderingExprs.addAll(insertStmt.getPartitionKeyExprs());
     }
     orderingExprs.addAll(insertStmt.getSortExprs());
@@ -637,13 +721,11 @@ public class Planner {
     // Build sortinfo to sort by the ordering exprs.
     List<Boolean> isAscOrder = Collections.nCopies(orderingExprs.size(), true);
     List<Boolean> nullsFirstParams = Collections.nCopies(orderingExprs.size(), false);
-    SortInfo sortInfo = new SortInfo(orderingExprs, isAscOrder, nullsFirstParams);
-
-    ExprSubstitutionMap smap = sortInfo.createSortTupleInfo(
-        insertStmt.getResultExprs(), analyzer);
+    SortInfo sortInfo = new SortInfo(orderingExprs, isAscOrder, nullsFirstParams,
+        insertStmt.getSortingOrder());
+    sortInfo.createSortTupleInfo(insertStmt.getResultExprs(), analyzer);
     sortInfo.getSortTupleDescriptor().materializeSlots();
-
-    insertStmt.substituteResultExprs(smap, analyzer);
+    insertStmt.substituteResultExprs(sortInfo.getOutputSmap(), analyzer);
 
     PlanNode node = null;
     if (partialSort) {

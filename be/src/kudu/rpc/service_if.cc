@@ -18,21 +18,32 @@
 #include "kudu/rpc/service_if.h"
 
 #include <memory>
+#include <ostream>
 #include <string>
-#include <google/protobuf/descriptor.pb.h>
+#include <utility>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/remote_method.h"
+#include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 // TODO remove this once we have fully cluster-tested this.
 // Despite being on by default, this is left in in case we discover
 // any issues in 0.10.0, we'll have an easy workaround to disable the feature.
-DEFINE_bool_hidden(enable_exactly_once, true, "Whether to enable exactly once semantics.");
+DEFINE_bool(enable_exactly_once, true, "Whether to enable exactly once semantics.");
 TAG_FLAG(enable_exactly_once, hidden);
 
 using google::protobuf::Message;

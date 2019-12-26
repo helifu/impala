@@ -23,14 +23,13 @@
 #include <sasl/sasl.h>
 
 #include "common/status.h"
+#include "rpc/thrift-server.h"
+#include "util/openssl-util.h"
 #include "util/promise.h"
-#include "util/thread.h"
 
 namespace sasl { class TSasl; }
 
 namespace impala {
-
-class Thread;
 
 /// An AuthProvider creates Thrift transports that are set up to authenticate themselves
 /// using a protocol such as Kerberos or PLAIN/SASL. Both server and client transports are
@@ -42,37 +41,53 @@ class AuthProvider {
   virtual Status Start() WARN_UNUSED_RESULT = 0;
 
   /// Creates a new Thrift transport factory in the out parameter that performs
-  /// authorisation per this provider's protocol.
+  /// authorisation per this provider's protocol. The type of the transport returned is
+  /// determined by 'underlying_transport_type' and there may be multiple levels of
+  /// wrapped transports, eg. a TBufferedTransport around a TSaslServerTransport.
   virtual Status GetServerTransportFactory(
+      ThriftServer::TransportType underlying_transport_type,
+      const std::string& server_name, MetricGroup* metrics,
       boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory)
       WARN_UNUSED_RESULT = 0;
 
   /// Called by Thrift clients to wrap a raw transport with any intermediate transport
   /// that an auth protocol requires.
+  /// TODO: Return the correct clients for HTTP base transport. At this point, no clients
+  /// for HTTP endpoints are internal to the Impala service, so it should be OK.
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
       boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport)
       WARN_UNUSED_RESULT = 0;
 
+  /// Setup 'connection_ptr' to get its username with the given transports and sets
+  /// 'network_address' based on the underlying socket. The transports should be generated
+  /// by the factory returned by GetServerTransportFactory() when called with the same
+  /// 'underlying_transport_type'.
+  virtual void SetupConnectionContext(
+      const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+      ThriftServer::TransportType underlying_transport_type,
+      apache::thrift::transport::TTransport* input_transport,
+      apache::thrift::transport::TTransport* output_transport) = 0;
+
   /// Returns true if this provider uses Sasl at the transport layer.
-  virtual bool is_sasl() = 0;
+  virtual bool is_secure() = 0;
 
   virtual ~AuthProvider() { }
 };
 
-/// If either (or both) Kerberos and LDAP auth are desired, we use Sasl for the
-/// communication.  This "wraps" the underlying communication, in thrift-speak.
-/// This is used for both client and server contexts; there is one for internal
-/// and one for external communication.
-class SaslAuthProvider : public AuthProvider {
+/// Used if either (or both) Kerberos and LDAP auth are desired. For BINARY connections we
+/// use Sasl for the communication, and for HTTP connections we use Basic or SPNEGO auth.
+/// This "wraps" the underlying communication, in thrift-speak. This is used for both
+/// client and server contexts; there is one for internal and one for external
+/// communication.
+class SecureAuthProvider : public AuthProvider {
  public:
-  SaslAuthProvider(bool is_internal) : has_ldap_(false), is_internal_(is_internal),
-      needs_kinit_(false) {}
+  SecureAuthProvider(bool is_internal)
+    : has_ldap_(false), is_internal_(is_internal), needs_kinit_(false) {}
 
-  /// Performs initialization of external state.  If we're using kerberos and
-  /// need to kinit, start that thread.  If we're using ldap, set up appropriate
-  /// certificate usage.
+  /// Performs initialization of external state. Kinit if configured to use kerberos.
+  /// If we're using ldap, set up appropriate certificate usage.
   virtual Status Start();
 
   /// Wrap the client transport with a new TSaslClientTransport.  This is only for
@@ -90,9 +105,21 @@ class SaslAuthProvider : public AuthProvider {
   /// Then presto! You've got authentication for the connection.
   /// This is only applicable to Thrift connections and not KRPC connections.
   virtual Status GetServerTransportFactory(
+      ThriftServer::TransportType underlying_transport_type,
+      const std::string& server_name, MetricGroup* metrics,
       boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
 
-  virtual bool is_sasl() { return true; }
+  /// IF sasl was used, the username will be available from the handshake, and we set it
+  /// here. If HTTP Basic or SPNEGO auth was used, the username won't be available until
+  /// one or more packets are received, so we register a callback with the transport that
+  /// will set the username when it's available.
+  virtual void SetupConnectionContext(
+      const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+      ThriftServer::TransportType underlying_transport_type,
+      apache::thrift::transport::TTransport* input_transport,
+      apache::thrift::transport::TTransport* output_transport);
+
+  virtual bool is_secure() { return true; }
 
   /// Initializes kerberos items and checks for sanity.  Failures can occur on a
   /// malformed principal or when setting some environment variables.  Called
@@ -143,18 +170,8 @@ class SaslAuthProvider : public AuthProvider {
   /// function as a client.
   bool needs_kinit_;
 
-  /// Runs "RunKinit" below if needs_kinit_ is true and FLAGS_use_kudu_kinit is false.
-  /// Once started, this thread lives as long as the process does and periodically forks
-  /// impalad and execs the 'kinit' process.
-  std::unique_ptr<Thread> kinit_thread_;
-
-  /// Periodically (roughly once every FLAGS_kerberos_reinit_interval minutes) calls kinit
-  /// to get a ticket granting ticket from the kerberos server for principal_, which is
-  /// kept in the kerberos cache associated with this process. This ensures that we have
-  /// valid kerberos credentials when operating as a client. Once the first attempt to
-  /// obtain a ticket has completed, first_kinit is Set() with the status of the operation.
-  /// Additionally, if the first attempt fails, this method will return.
-  void RunKinit(Promise<Status>* first_kinit);
+  /// Used to generate and verify signatures for cookies.
+  AuthenticationHash hash_;
 
   /// One-time kerberos-specific environment variable setup.  Called by InitKerberos().
   Status InitKerberosEnv() WARN_UNUSED_RESULT;
@@ -169,6 +186,8 @@ class NoAuthProvider : public AuthProvider {
   virtual Status Start() { return Status::OK(); }
 
   virtual Status GetServerTransportFactory(
+      ThriftServer::TransportType underlying_transport_type,
+      const std::string& server_name, MetricGroup* metrics,
       boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
 
   virtual Status WrapClientTransport(const std::string& hostname,
@@ -176,7 +195,14 @@ class NoAuthProvider : public AuthProvider {
       const std::string& service_name,
       boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport);
 
-  virtual bool is_sasl() { return false; }
+  /// If there is no auth, then we don't have a username available.
+  virtual void SetupConnectionContext(
+      const boost::shared_ptr<ThriftServer::ConnectionContext>& connection_ptr,
+      ThriftServer::TransportType underlying_transport_type,
+      apache::thrift::transport::TTransport* input_transport,
+      apache::thrift::transport::TTransport* output_transport);
+
+  virtual bool is_secure() { return false; }
 };
 
 /// The first entry point to the authentication subsystem.  Performs initialization

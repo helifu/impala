@@ -46,8 +46,6 @@ under the License.
 </table>
 
 <script>
-document.getElementById("finstances-tab").className = "active";
-
 var intervalId = 0;
 var table = null;
 var refresh = function () {
@@ -90,7 +88,7 @@ function unpackJson(json) {
 
 $(document).ready(function() {
     table = $('#finstances').DataTable({
-        ajax: { url: "/query_finstances?query_id={{query_id}}&json",
+        ajax: { url: make_url("/query_finstances?query_id={{query_id}}&json"),
                 dataSrc: unpackJson,
               },
         "columns": [ {data: 'host'},
@@ -125,5 +123,9 @@ Query <strong>{{query_id}}</strong> has completed, or has not started any backen
 {{^backend_instances}}
 <script>$("#query_finished_alert").css("visibility", "visible");</script>
 {{/backend_instances}}
+
+<script>
+$("#finstances-tab").addClass("active");
+</script>
 
 {{> www/common-footer.tmpl }}

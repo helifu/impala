@@ -53,6 +53,7 @@
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "service/fe-support.h"
+#include "service/frontend.h"
 #include "service/impala-server.h"
 
 #include "common/names.h"
@@ -74,7 +75,8 @@ class Planner {
     query_ctx.client_request.stmt = stmt;
     query_ctx.client_request.query_options = query_options_;
     query_ctx.__set_session(session_state_);
-    ImpalaServer::PrepareQueryContext(&query_ctx);
+    TNetworkAddress dummy;
+    ImpalaServer::PrepareQueryContext(dummy, dummy, &query_ctx);
     runtime_state_.reset(new RuntimeState(query_ctx, &exec_env_));
 
     return frontend_.GetExecRequest(query_ctx, result);
@@ -108,7 +110,7 @@ MemPool mem_pool(&tracker);
 static Status PrepareSelectList(
     const TExecRequest& request, ScalarExprEvaluator** eval) {
   const TQueryExecRequest& query_request = request.query_exec_request;
-  vector<TExpr> texprs = query_request.plan_exec_info[0].fragments[0].output_exprs;
+  vector<TExpr> texprs = query_request.plan_exec_info[0].fragments[0].output_sink.output_exprs;
   DCHECK_EQ(texprs.size(), 1);
   RuntimeState* state = planner->GetRuntimeState();
   ScalarExpr* expr;

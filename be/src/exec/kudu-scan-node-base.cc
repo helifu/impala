@@ -42,17 +42,23 @@
 using kudu::client::KuduClient;
 using kudu::client::KuduTable;
 
+PROFILE_DECLARE_COUNTER(ScanRangesComplete);
+
 namespace impala {
 
 const string KuduScanNodeBase::KUDU_ROUND_TRIPS = "TotalKuduScanRoundTrips";
 const string KuduScanNodeBase::KUDU_REMOTE_TOKENS = "KuduRemoteScanTokens";
+///   KuduClientTime - total amount of time scanner threads spent in the Kudu
+///   client, either waiting for data from Kudu or processing data.
+const string KuduScanNodeBase::KUDU_CLIENT_TIME = "KuduClientTime";
 
-KuduScanNodeBase::KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode,
-    const DescriptorTbl& descs)
-    : ScanNode(pool, tnode, descs),
-      tuple_id_(tnode.kudu_scan_node.tuple_id),
-      client_(nullptr),
-      next_scan_token_idx_(0) {
+KuduScanNodeBase::KuduScanNodeBase(
+    ObjectPool* pool, const ScanPlanNode& pnode, const DescriptorTbl& descs)
+  : ScanNode(pool, pnode, descs),
+    tuple_id_(pnode.tnode_->kudu_scan_node.tuple_id),
+    count_star_slot_offset_(
+            pnode.tnode_->kudu_scan_node.__isset.count_star_slot_offset ?
+            pnode.tnode_->kudu_scan_node.count_star_slot_offset : -1) {
   DCHECK(KuduIsAvailable());
 }
 
@@ -64,9 +70,10 @@ Status KuduScanNodeBase::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ScanNode::Prepare(state));
 
   scan_ranges_complete_counter_ =
-      ADD_COUNTER(runtime_profile(), SCAN_RANGES_COMPLETE_COUNTER, TUnit::UNIT);
+      PROFILE_ScanRangesComplete.Instantiate(runtime_profile());
   kudu_round_trips_ = ADD_COUNTER(runtime_profile(), KUDU_ROUND_TRIPS, TUnit::UNIT);
   kudu_remote_tokens_ = ADD_COUNTER(runtime_profile(), KUDU_REMOTE_TOKENS, TUnit::UNIT);
+  kudu_client_time_ = ADD_TIMER(runtime_profile(), KUDU_CLIENT_TIME);
 
   DCHECK(state->desc_tbl().GetTupleDescriptor(tuple_id_) != NULL);
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
@@ -92,7 +99,7 @@ Status KuduScanNodeBase::Open(RuntimeState* state) {
   const KuduTableDescriptor* table_desc =
       static_cast<const KuduTableDescriptor*>(tuple_desc_->table_desc());
 
-  RETURN_IF_ERROR(runtime_state_->exec_env()->GetKuduClient(
+  RETURN_IF_ERROR(ExecEnv::GetInstance()->GetKuduClient(
       table_desc->kudu_master_addresses(), &client_));
 
   uint64_t latest_ts = static_cast<uint64_t>(
@@ -102,6 +109,8 @@ Status KuduScanNodeBase::Open(RuntimeState* state) {
 
   KUDU_RETURN_IF_ERROR(client_->OpenTable(table_desc->table_name(), &table_),
       "Unable to open Kudu table");
+
+  runtime_profile_->AddInfoString("Table Name", table_desc->fully_qualified_name());
   return Status::OK();
 }
 

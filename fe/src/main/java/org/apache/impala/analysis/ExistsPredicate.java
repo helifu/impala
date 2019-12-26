@@ -19,8 +19,6 @@ package org.apache.impala.analysis;
 
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
@@ -55,6 +53,12 @@ public class ExistsPredicate extends Predicate {
   }
 
   @Override
+  protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
+    super.analyzeImpl(analyzer);
+    ((Subquery)children_.get(0)).getStatement().setIsRuntimeScalar(false);
+  }
+
+  @Override
   protected void toThrift(TExprNode msg) {
     // Cannot serialize a nested predicate
     Preconditions.checkState(false);
@@ -72,11 +76,11 @@ public class ExistsPredicate extends Predicate {
   protected float computeEvalCost() { return UNKNOWN_COST; }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     StringBuilder strBuilder = new StringBuilder();
     if (notExists_) strBuilder.append("NOT ");
     strBuilder.append("EXISTS ");
-    strBuilder.append(getChild(0).toSql());
+    strBuilder.append(getChild(0).toSql(options));
     return strBuilder.toString();
   }
 }

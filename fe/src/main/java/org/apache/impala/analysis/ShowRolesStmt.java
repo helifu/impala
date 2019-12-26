@@ -46,7 +46,7 @@ public class ShowRolesStmt extends AuthorizationStmt {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     if (groupName_ == null) {
       return isShowCurrentRoles_ ? "SHOW CURRENT ROLES" : "SHOW ROLES";
     } else {
@@ -60,7 +60,6 @@ public class ShowRolesStmt extends AuthorizationStmt {
     params.setIs_show_current_roles(isShowCurrentRoles_);
     if (groupName_ != null) params.setGrant_group(groupName_);
     // Users should always be able to execute SHOW CURRENT ROLES.
-    params.setIs_admin_op(!isShowCurrentRoles_);
     return params;
   }
 

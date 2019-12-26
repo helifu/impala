@@ -19,7 +19,6 @@
 #define IMPALA_EXEC_PLAN_ROOT_SINK_H
 
 #include "exec/data-sink.h"
-#include "util/condition-variable.h"
 
 namespace impala {
 
@@ -33,93 +32,101 @@ class ScalarExprEvaluator;
 /// formed by computing a set of output expressions over the input batches, by calling
 /// GetNext(). Send() and GetNext() are called concurrently.
 ///
-/// The consumer calls GetNext() with a QueryResultSet and a requested fetch
-/// size. GetNext() shares these fields with Send(), and then signals Send() to begin
-/// populating the result set. GetNext() returns when a) the sender has sent all of its
-/// rows b) the requested fetch size has been satisfied or c) the sender calls Close().
+/// The sender uses Send() to fill in as many rows as are requested from the current
+/// batch. When the batch is exhausted - which may take several calls to GetNext() -
+/// Send() returns so that the fragment instance can produce another row batch.
 ///
-/// Send() fills in as many rows as are requested from the current batch. When the batch
-/// is exhausted - which may take several calls to GetNext() - control is returned to the
-/// sender to produce another row batch.
+/// The consumer uses GetNext() to fetch a specified number of rows into a given
+/// QueryResultSet. Calls to GetNext() block until rows are available from the sender
+/// thread.
 ///
-/// When the consumer is finished, CloseConsumer() must be called to allow the sender to
-/// exit Send(). Senders must call Close() to signal to the consumer that no more batches
-/// will be produced. CloseConsumer() may be called concurrently with GetNext(). Senders
-/// should ensure that the consumer is not blocked in GetNext() before destroying the
-/// PlanRootSink.
+/// FlushFinal() should be called by the sender to signal it has finished calling
+/// Send() for all rows. Close() should be called by the sender to release resources.
 ///
-/// The sink is thread safe up to a single producer and single consumer.
+/// When the fragment instance is cancelled, Cancel() is called to unblock both the
+/// sender and consumer. Cancel() may be called concurrently with Send(), GetNext() and
+/// Close().
 ///
-/// TODO: The consumer drives the sender in lock-step with GetNext() calls, forcing a
-/// context-switch on every invocation. Measure the impact of this, and consider moving to
-/// a fully asynchronous implementation with a queue to manage buffering between sender
-/// and consumer. See IMPALA-4268.
+/// The sink is thread safe up to a single sender and single consumer.
+///
+/// Lifetime: The sink is owned by the QueryState and has the same lifetime as
+/// QueryState. The QueryState references from the fragment instance and the Coordinator
+/// ensures that this outlives any calls to Send() and GetNext(), respectively.
 class PlanRootSink : public DataSink {
  public:
-  PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state);
+  PlanRootSink(TDataSinkId sink_id, const RowDescriptor* row_desc, RuntimeState* state);
+  virtual ~PlanRootSink();
 
-  /// Sends a new batch. Ownership of 'batch' remains with the sender. Blocks until the
-  /// consumer has consumed 'batch' by calling GetNext().
-  virtual Status Send(RuntimeState* state, RowBatch* batch);
+  /// Called before Send(), Open(), or Close(). Performs any additional setup necessary,
+  /// such as initializing runtime counters.
+  virtual Status Prepare(
+      RuntimeState* state, MemTracker* parent_mem_tracker) override = 0;
 
-  /// Sets eos and notifies consumer.
-  virtual Status FlushFinal(RuntimeState* state);
+  /// Sends a new batch. Ownership of 'batch' remains with the sender.
+  virtual Status Send(RuntimeState* state, RowBatch* batch) override = 0;
 
-  /// To be called by sender only. Signals to the consumer that no more batches will be
-  /// produced, then blocks until someone calls CloseConsumer().
-  virtual void Close(RuntimeState* state);
+  /// Indicates eos to the producer. When this method is called, all rows have
+  /// successfully been sent by the producer.
+  virtual Status FlushFinal(RuntimeState* state) override = 0;
 
-  /// Populates 'result_set' with up to 'num_rows' rows produced by the fragment instance
-  /// that calls Send(). *eos is set to 'true' when there are no more rows to consume. If
-  /// CloseConsumer() is called concurrently, GetNext() will return and may not populate
-  /// 'result_set'. All subsequent calls after CloseConsumer() will do no work.
-  Status GetNext(
-      RuntimeState* state, QueryResultSet* result_set, int num_rows, bool* eos);
+  /// To be called by sender only. Release resources and shutdowns the sink.
+  virtual void Close(RuntimeState* state) override = 0;
 
-  /// Signals to the producer that the sink will no longer be used. GetNext() may be
-  /// safely called after this returns (it does nothing), but consumers should consider
-  /// that the PlanRootSink may be undergoing destruction. May be called more than once;
-  /// only the first call has any effect.
-  void CloseConsumer();
+  /// To be called by the consumer only. 'result_set' with up to 'num_rows' rows
+  /// produced by the fragment instance that calls Send(). *eos is set to 'true' when
+  /// there are no more rows to consume. If Cancel() or Close() are called concurrently,
+  /// GetNext() will return and may not populate 'result_set'. All subsequent calls
+  /// after Cancel() or Close() set eos and then return the current query status.
+  /// 'timeout' is the amount of time (in microseonds) this method should wait for enough
+  /// rows to become available before returning (e.g. how long the consumer thread waits
+  /// for the producer thread to produce RowBatches). If the timeout is hit, GetNext() can
+  /// return before adding 'num_rows' rows to 'result_set'. It is possible 0 rows are
+  /// added to the 'result_set' if the producer thread does not produce rows within the
+  /// timeout. A timeout of 0 causes this method to wait indefinitely.
+  virtual Status GetNext(RuntimeState* state, QueryResultSet* result_set, int num_rows,
+      bool* eos, int64_t timeout_us) = 0;
 
-  static const std::string NAME;
+  /// Notifies both the consumer and sender that the query has been cancelled so they can
+  /// check the cancellation flag in the RuntimeState. The cancellation flag should be set
+  /// prior to calling this. Called by a separate cancellation thread.
+  virtual void Cancel(RuntimeState* state) = 0;
+
+ protected:
+  /// Validates that all collection-typed slots in the given batch are set to NULL
+  /// See SubplanNode for details on when collection-typed slots are set to NULL.
+  /// TODO: This validation will become obsolete when we can return collection values.
+  /// We will then need a different mechanism to assert the correct behavior of the
+  /// SubplanNode with respect to setting collection-slots to NULL.
+  void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch);
+
+  /// Check to ensure that the number of rows produced by query execution does not exceed
+  /// the NUM_ROWS_PRODUCED_LIMIT query option. Returns an error Status if the given
+  /// batch causes the limit to be exceeded. Updates the value of num_rows_produced_.
+  Status UpdateAndCheckRowsProducedLimit(RuntimeState* state, RowBatch* batch);
+
+  /// State of the sender:
+  /// - ROWS_PENDING: the sender is still producing rows; the only non-terminal state
+  /// - EOS: the sender has passed all rows to Send()
+  /// - CLOSED_NOT_EOS: the sender (i.e. sink) was closed before all rows were passed to
+  ///   Send()
+  enum class SenderState { ROWS_PENDING, EOS, CLOSED_NOT_EOS };
+  SenderState sender_state_ = SenderState::ROWS_PENDING;
+
+  /// The number of rows sent to this PlanRootSink via Send(). Initialized in
+  /// Prepare().
+  RuntimeProfile::Counter* rows_sent_counter_ = nullptr;
+
+  /// The rate at which rows are sent to this PlanRootSink via Send(). Initialized in
+  /// Prepare().
+  RuntimeProfile::Counter* rows_sent_rate_ = nullptr;
 
  private:
-  /// Protects all members, including the condition variables.
-  boost::mutex lock_;
+  /// Limit on the number of rows produced by this query, initialized by the constructor.
+  const int64_t num_rows_produced_limit_;
 
-  /// Waited on by the sender only. Signalled when the consumer has written results_ and
-  /// num_rows_requested_, and so the sender may begin satisfying that request for rows
-  /// from its current batch. Also signalled when CloseConsumer() is called, to unblock
-  /// the sender.
-  ConditionVariable sender_cv_;
-
-  /// Waited on by the consumer only. Signalled when the sender has finished serving a
-  /// request for rows. Also signalled by Close() and FlushFinal() to signal to the
-  /// consumer that no more rows are coming.
-  ConditionVariable consumer_cv_;
-
-  /// Signals to producer that the consumer is done, and the sink may be torn down.
-  bool consumer_done_ = false;
-
-  /// Signals to consumer that the sender is done, and that there are no more row batches
-  /// to consume.
-  bool sender_done_ = false;
-
-  /// The current result set passed to GetNext(), to fill in Send(). Not owned by this
-  /// sink. Reset to nullptr after Send() completes the request to signal to the consumer
-  /// that it can return.
-  QueryResultSet* results_ = nullptr;
-
-  /// Set by GetNext() to indicate to Send() how many rows it should write to results_.
-  int num_rows_requested_ = 0;
-
-  /// Set to true in Send() and FlushFinal() when the Sink() has finished producing rows.
-  bool eos_ = false;
-
-  /// Writes a single row into 'result' and 'scales' by evaluating
-  /// output_expr_evals_ over 'row'.
-  void GetRowValue(TupleRow* row, std::vector<void*>* result, std::vector<int>* scales);
+  /// Updated by CheckRowsProducedLimit() to indicate the total number of rows produced
+  /// by query execution.
+  int64_t num_rows_produced_ = 0;
 };
 }
 

@@ -19,15 +19,21 @@
 #include <boost/functional/hash.hpp>
 
 #include "runtime/collection-value.h"
+#include "runtime/date-value.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple.h"
+#include "util/ubsan.h"
 
 #include "common/names.h"
 
 namespace impala {
 
-const int RawValue::ASCII_PRECISION = 16; // print 16 digits for double/float
+const int RawValue::ASCII_PRECISION;
+constexpr double RawValue::CANONICAL_DOUBLE_NAN;
+constexpr float RawValue::CANONICAL_FLOAT_NAN;
+constexpr double RawValue::CANONICAL_DOUBLE_ZERO;
+constexpr float RawValue::CANONICAL_FLOAT_ZERO;
 
 void RawValue::PrintValueAsBytes(const void* value, const ColumnType& type,
                                  stringstream* stream) {
@@ -47,6 +53,9 @@ void RawValue::PrintValueAsBytes(const void* value, const ColumnType& type,
       break;
     case TYPE_INT:
       stream->write(chars, sizeof(int32_t));
+      break;
+    case TYPE_DATE:
+      stream->write(chars, sizeof(DateValue));
       break;
     case TYPE_BIGINT:
       stream->write(chars, sizeof(int64_t));
@@ -104,6 +113,9 @@ void RawValue::PrintValue(const void* value, const ColumnType& type, int scale,
     case TYPE_CHAR:
       *str = string(reinterpret_cast<const char*>(value), type.len);
       return;
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      *str = "Intermediate UDA step, no value printed";
+      return;
     default:
       PrintValue(value, type, scale, &out);
   }
@@ -132,6 +144,9 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
     case TYPE_INT:
       *reinterpret_cast<int32_t*>(dst) = *reinterpret_cast<const int32_t*>(value);
       break;
+    case TYPE_DATE:
+      *reinterpret_cast<DateValue*>(dst) = *reinterpret_cast<const DateValue*>(value);
+      break;
     case TYPE_BIGINT:
       *reinterpret_cast<int64_t*>(dst) = *reinterpret_cast<const int64_t*>(value);
       break;
@@ -156,7 +171,7 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
         // to reflect this change as well (the codegen'd Allocate() call is actually
         // generated in CodegenAnyVal::StoreToNativePtr()).
         dest->ptr = reinterpret_cast<char*>(pool->Allocate(dest->len));
-        memcpy(dest->ptr, src->ptr, dest->len);
+        Ubsan::MemCpy(dest->ptr, src->ptr, dest->len);
       } else {
         dest->ptr = src->ptr;
       }
@@ -190,33 +205,6 @@ void RawValue::Write(const void* value, Tuple* tuple, const SlotDescriptor* slot
   } else {
     void* slot = tuple->GetSlot(slot_desc->tuple_offset());
     RawValue::Write(value, slot, slot_desc->type(), pool);
-  }
-}
-
-uint64_t RawValue::GetHashValueFastHash(const void* v, const ColumnType& type,
-    uint64_t seed) {
-  // Hash with an arbitrary constant to ensure we don't return seed.
-  if (v == nullptr) {
-    return HashUtil::FastHash64(&HASH_VAL_NULL, sizeof(HASH_VAL_NULL), seed);
-  }
-  switch (type.type) {
-    case TYPE_STRING:
-    case TYPE_VARCHAR: {
-      const StringValue* string_value = reinterpret_cast<const StringValue*>(v);
-      return HashUtil::FastHash64(string_value->ptr,
-          static_cast<size_t>(string_value->len), seed);
-    }
-    case TYPE_BOOLEAN: return HashUtil::FastHash64(v, 1, seed);
-    case TYPE_TINYINT: return HashUtil::FastHash64(v, 1, seed);
-    case TYPE_SMALLINT: return HashUtil::FastHash64(v, 2, seed);
-    case TYPE_INT: return HashUtil::FastHash64(v, 4, seed);
-    case TYPE_BIGINT: return HashUtil::FastHash64(v, 8, seed);
-    case TYPE_FLOAT: return HashUtil::FastHash64(v, 4, seed);
-    case TYPE_DOUBLE: return HashUtil::FastHash64(v, 8, seed);
-    case TYPE_TIMESTAMP: return HashUtil::FastHash64(v, 12, seed);
-    case TYPE_CHAR: return HashUtil::FastHash64(v, type.len, seed);
-    case TYPE_DECIMAL: return HashUtil::FastHash64(v, type.GetByteSize(), seed);
-    default: DCHECK(false); return 0;
   }
 }
 
@@ -300,7 +288,11 @@ void RawValue::PrintValue(
         default: DCHECK(false) << type;
       }
       break;
-    default: DCHECK(false);
+    case TYPE_DATE: {
+        *stream << *reinterpret_cast<const DateValue*>(value);
+      }
+      break;
+    default: DCHECK(false) << "Unknown type: " << type;
   }
   stream->precision(old_precision);
   // Undo setting stream to fixed

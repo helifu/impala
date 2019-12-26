@@ -28,10 +28,12 @@ import org.apache.impala.rewrite.ExprRewriter;
 
 import com.google.common.base.Preconditions;
 
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
+
 /**
  * Base class for all Impala SQL statements.
  */
-abstract class StatementBase implements ParseNode {
+public abstract class StatementBase extends StmtNode {
 
   // True if this Stmt is the top level of an explain stmt.
   protected boolean isExplain_ = false;
@@ -56,12 +58,20 @@ abstract class StatementBase implements ParseNode {
   }
 
   /**
+   * Returns all table references in this statement and all its nested statements.
+   * The TableRefs are collected depth-first in SQL-clause order.
+   * Subclasses should override this method as necessary.
+   */
+  public void collectTableRefs(List<TableRef> tblRefs) { }
+
+  /**
    * Analyzes the statement and throws an AnalysisException if analysis fails. A failure
    * could be due to a problem with the statement or because one or more tables/views
    * were missing from the catalog.
    * It is up to the analysis() implementation to ensure the maximum number of missing
    * tables/views get collected in the Analyzer before failing analyze().
    */
+  @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     if (isAnalyzed()) return;
     if (isExplain_) analyzer.setIsExplain();
@@ -123,7 +133,20 @@ abstract class StatementBase implements ParseNode {
   public Analyzer getAnalyzer() { return analyzer_; }
   public boolean isAnalyzed() { return analyzer_ != null; }
 
-  public String toSql() { return ""; }
+  @Override
+  public final String toSql() {
+    return toSql(DEFAULT);
+  }
+
+  /**
+   * If ToSqlOptions.REWRITTEN is passed, then this returns the rewritten SQL only if
+   * the statement was rewritten. Otherwise, the original SQL will be returned instead.
+   * It is the caller's responsibility to know if/when the statement was indeed rewritten.
+   * @param options
+   */
+  @Override
+  public String toSql(ToSqlOptions options) { return ""; }
+
   public void setIsExplain() { isExplain_ = true; }
   public boolean isExplain() { return isExplain_; }
 
@@ -166,19 +189,28 @@ abstract class StatementBase implements ParseNode {
 
   /**
    * Checks that 'srcExpr' is type compatible with 'dstCol' and returns a type compatible
-   * expression by applying a CAST() if needed. Throws an AnalysisException the types
+   * expression by applying a CAST() if needed. Throws an AnalysisException if the types
    * are incompatible. 'dstTableName' is only used when constructing an AnalysisException
    * message.
+   *
+   * 'widestTypeSrcExpr' is the first widest type expression of the source expressions.
+   * This is only used when constructing an AnalysisException message to make sure the
+   * right expression is blamed in the error message.
+   *
+   * If strictDecimal is true, only consider casts that result in no loss of information
+   * when casting between decimal types.
    */
-  protected Expr checkTypeCompatibility(String dstTableName, Column dstCol, Expr srcExpr)
-      throws AnalysisException {
+  protected Expr checkTypeCompatibility(String dstTableName, Column dstCol, Expr srcExpr,
+      boolean strictDecimal, Expr widestTypeSrcExpr) throws AnalysisException {
     Type dstColType = dstCol.getType();
     Type srcExprType = srcExpr.getType();
 
+    if (widestTypeSrcExpr == null) widestTypeSrcExpr = srcExpr;
     // Trivially compatible, unless the type is complex.
     if (dstColType.equals(srcExprType) && !dstColType.isComplexType()) return srcExpr;
 
-    Type compatType = Type.getAssignmentCompatibleType(dstColType, srcExprType, false);
+    Type compatType = Type.getAssignmentCompatibleType(
+        dstColType, srcExprType, false, strictDecimal);
     if (!compatType.isValid()) {
       throw new AnalysisException(String.format(
           "Target table '%s' is incompatible with source expressions.\nExpression '%s' " +
@@ -188,10 +220,10 @@ abstract class StatementBase implements ParseNode {
     }
     if (!compatType.equals(dstColType) && !compatType.isNull()) {
       throw new AnalysisException(String.format(
-          "Possible loss of precision for target table '%s'.\nExpression '%s' (type: " +
-              "%s) would need to be cast to %s for column '%s'",
-          dstTableName, srcExpr.toSql(), srcExprType.toSql(), dstColType.toSql(),
-          dstCol.getName()));
+          "Possible loss of precision for target table '%s'.\nExpression '%s' (type: "
+              + "%s) would need to be cast to %s for column '%s'",
+          dstTableName, widestTypeSrcExpr.toSql(), srcExprType.toSql(),
+          dstColType.toSql(), dstCol.getName()));
     }
     return srcExpr.castTo(compatType);
   }

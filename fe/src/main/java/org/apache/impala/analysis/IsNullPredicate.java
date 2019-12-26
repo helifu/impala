@@ -18,11 +18,11 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Reference;
@@ -83,8 +83,8 @@ public class IsNullPredicate extends Predicate {
   }
 
   @Override
-  public String toSqlImpl() {
-    return getChild(0).toSql() + (isNotNull_ ? " IS NOT NULL" : " IS NULL");
+  public String toSqlImpl(ToSqlOptions options) {
+    return getChild(0).toSql(options) + (isNotNull_ ? " IS NOT NULL" : " IS NULL");
   }
 
   @Override
@@ -104,7 +104,8 @@ public class IsNullPredicate extends Predicate {
         // a null value.
         setChild(0, new BoolLiteral(true));
         getChild(0).analyze(analyzer);
-      } else if (!getChild(0).contains(Expr.IS_SCALAR_SUBQUERY)) {
+      } else if (!getChild(0).contains(Expr.IS_SCALAR_SUBQUERY) &&
+          !getChild(0).getSubquery().getStatement().isRuntimeScalar()) {
         // We only support scalar subqueries in an IS NULL predicate because
         // they can be rewritten into a join.
         // TODO: Add support for InPredicates and BinaryPredicates with
@@ -141,7 +142,7 @@ public class IsNullPredicate extends Predicate {
     if (isSingleColumnPredicate(slotRefRef, null)) {
       SlotDescriptor slotDesc = slotRefRef.getRef().getDesc();
       if (!slotDesc.getStats().hasNulls()) return;
-      Table table = slotDesc.getParent().getTable();
+      FeTable table = slotDesc.getParent().getTable();
       if (table != null && table.getNumRows() > 0) {
         long numRows = table.getNumRows();
         if (isNotNull_) {

@@ -19,13 +19,16 @@ package org.apache.impala.catalog;
 
 import static org.junit.Assert.fail;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Map;
 
 import org.apache.impala.analysis.LiteralExpr;
-import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.SqlCastException;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
-import org.apache.impala.thrift.ImpalaInternalServiceConstants;
+import org.apache.impala.testutil.TestUtils;
+import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.THBaseTable;
 import org.apache.impala.thrift.THdfsPartition;
@@ -34,9 +37,11 @@ import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableType;
 import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 
 /**
@@ -58,7 +63,10 @@ public class CatalogObjectToFromThriftTest {
     String[] dbNames = {"functional", "functional_avro", "functional_parquet",
                         "functional_seq"};
     for (String dbName: dbNames) {
-      Table table = catalog_.getOrLoadTable(dbName, "alltypes");
+      Table table = catalog_.getOrLoadTable(dbName, "alltypes", "test");
+      Assert.assertEquals(24, ((HdfsTable)table).getPartitions().size());
+      Assert.assertEquals(24, ((HdfsTable)table).getPartitionIds().size());
+
       TTable thriftTable = getThriftTable(table);
       Assert.assertEquals(thriftTable.tbl_name, "alltypes");
       Assert.assertEquals(thriftTable.db_name, dbName);
@@ -68,17 +76,17 @@ public class CatalogObjectToFromThriftTest {
       THdfsTable hdfsTable = thriftTable.getHdfs_table();
       Assert.assertTrue(hdfsTable.hdfsBaseDir != null);
 
-      // The table has 24 partitions + the default partition
-      Assert.assertEquals(hdfsTable.getPartitions().size(), 25);
-      Assert.assertTrue(hdfsTable.getPartitions().containsKey(
-          new Long(ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID)));
-
+      // The table has 24 partitions.
+      Assert.assertEquals(24, hdfsTable.getPartitions().size());
+      Assert.assertFalse(hdfsTable.getPartitions().containsKey(
+          CatalogObjectsConstants.PROTOTYPE_PARTITION_ID));
+      // The prototype partition should be included and set properly.
+      Assert.assertTrue(hdfsTable.isSetPrototype_partition());
+      Assert.assertEquals(CatalogObjectsConstants.PROTOTYPE_PARTITION_ID,
+          hdfsTable.getPrototype_partition().id);
+      Assert.assertNull(hdfsTable.getPrototype_partition().location);
       for (Map.Entry<Long, THdfsPartition> kv: hdfsTable.getPartitions().entrySet()) {
-        if (kv.getKey() == ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID) {
-          Assert.assertEquals(kv.getValue().getPartitionKeyExprs().size(), 0);
-        } else {
-          Assert.assertEquals(kv.getValue().getPartitionKeyExprs().size(), 2);
-        }
+        Assert.assertEquals(kv.getValue().getPartitionKeyExprs().size(), 2);
       }
 
       // Now try to load the thrift struct.
@@ -90,29 +98,28 @@ public class CatalogObjectToFromThriftTest {
       if (dbName.equals("functional")) Assert.assertEquals(7300, newTable.getNumRows());
 
       HdfsTable newHdfsTable = (HdfsTable) newTable;
-      Assert.assertEquals(newHdfsTable.getPartitions().size(), 25);
-      boolean foundDefaultPartition = false;
-      for (HdfsPartition hdfsPart: newHdfsTable.getPartitions()) {
-        if (hdfsPart.getId() == ImpalaInternalServiceConstants.DEFAULT_PARTITION_ID) {
-          Assert.assertEquals(foundDefaultPartition, false);
-          foundDefaultPartition = true;
-        } else {
-          Assert.assertEquals(hdfsPart.getFileDescriptors().size(), 1);
-          Assert.assertTrue(
-              hdfsPart.getFileDescriptors().get(0).getNumFileBlocks() > 0);
+      Assert.assertEquals(newHdfsTable.getPartitions().size(), 24);
+      Assert.assertEquals(newHdfsTable.getPartitionIds().size(), 24);
+      Collection<? extends FeFsPartition> parts =
+          FeCatalogUtils.loadAllPartitions(newHdfsTable);
+      for (FeFsPartition hdfsPart: parts) {
+        Assert.assertEquals(hdfsPart.getFileDescriptors().size(), 1);
+        Assert.assertTrue(
+            hdfsPart.getFileDescriptors().get(0).getNumFileBlocks() > 0);
 
-          // Verify the partition access level is getting set properly. The alltypes_seq
-          // table has two partitions that are read_only.
-          if (dbName.equals("functional_seq") && (
-              hdfsPart.getPartitionName().equals("year=2009/month=1") ||
-              hdfsPart.getPartitionName().equals("year=2009/month=3"))) {
-            Assert.assertEquals(TAccessLevel.READ_ONLY, hdfsPart.getAccessLevel());
-          } else {
-            Assert.assertEquals(TAccessLevel.READ_WRITE, hdfsPart.getAccessLevel());
-          }
+        // Verify the partition access level is getting set properly. The alltypes_seq
+        // table has two partitions that are read_only.
+        if (dbName.equals("functional_seq") && (
+            hdfsPart.getPartitionName().equals("year=2009/month=1") ||
+            hdfsPart.getPartitionName().equals("year=2009/month=3"))) {
+          Assert.assertEquals(TAccessLevel.READ_ONLY, hdfsPart.getAccessLevel());
+        } else {
+          Assert.assertEquals(TAccessLevel.READ_WRITE, hdfsPart.getAccessLevel());
         }
       }
-      Assert.assertEquals(foundDefaultPartition, true);
+      Assert.assertNotNull(newHdfsTable.prototypePartition_);
+      Assert.assertEquals(((HdfsTable)table).prototypePartition_.getParameters(),
+          newHdfsTable.prototypePartition_.getParameters());
     }
   }
 
@@ -124,18 +131,18 @@ public class CatalogObjectToFromThriftTest {
   @Test
   public void TestMismatchedAvroAndTableSchemas() throws CatalogException {
     Table table = catalog_.getOrLoadTable("functional_avro_snap",
-        "schema_resolution_test");
+        "schema_resolution_test", "test");
     TTable thriftTable = getThriftTable(table);
     Assert.assertEquals(thriftTable.tbl_name, "schema_resolution_test");
     Assert.assertTrue(thriftTable.isSetTable_type());
-    Assert.assertEquals(thriftTable.getColumns().size(), 8);
+    Assert.assertEquals(thriftTable.getColumns().size(), 9);
     Assert.assertEquals(thriftTable.getClustering_columns().size(), 0);
     Assert.assertEquals(thriftTable.getTable_type(), TTableType.HDFS_TABLE);
 
     // Now try to load the thrift struct.
     Table newTable = Table.fromThrift(catalog_.getDb("functional_avro_snap"),
         thriftTable);
-    Assert.assertEquals(newTable.getColumns().size(), 8);
+    Assert.assertEquals(newTable.getColumns().size(), 9);
 
     // The table schema does not match the Avro schema - it has only 2 columns.
     Assert.assertEquals(newTable.getMetaStoreTable().getSd().getCols().size(), 2);
@@ -144,7 +151,7 @@ public class CatalogObjectToFromThriftTest {
   @Test
   public void TestHBaseTables() throws CatalogException {
     String dbName = "functional_hbase";
-    Table table = catalog_.getOrLoadTable(dbName, "alltypes");
+    Table table = catalog_.getOrLoadTable(dbName, "alltypes", "test");
     TTable thriftTable = getThriftTable(table);
     Assert.assertEquals(thriftTable.tbl_name, "alltypes");
     Assert.assertEquals(thriftTable.db_name, dbName);
@@ -173,7 +180,7 @@ public class CatalogObjectToFromThriftTest {
   public void TestHBaseTableWithBinaryEncodedCols()
       throws CatalogException {
     String dbName = "functional_hbase";
-    Table table = catalog_.getOrLoadTable(dbName, "alltypessmallbinary");
+    Table table = catalog_.getOrLoadTable(dbName, "alltypessmallbinary", "test");
     TTable thriftTable = getThriftTable(table);
     Assert.assertEquals(thriftTable.tbl_name, "alltypessmallbinary");
     Assert.assertEquals(thriftTable.db_name, dbName);
@@ -204,39 +211,46 @@ public class CatalogObjectToFromThriftTest {
   }
 
   @Test
-  public void TestTableLoadingErrors() throws ImpalaException {
-    Table table = catalog_.getOrLoadTable("functional", "hive_index_tbl");
+  public void TestTableLoadingErrorsForHive2() throws ImpalaException {
+    // run the test only when it is running against Hive-2 since index tables are
+    // skipped during data-load against Hive-3
+    Assume.assumeTrue(
+        "Skipping this test since it is only supported when running against Hive-2",
+        TestUtils.getHiveMajorVersion() == 2);
+    Table table = catalog_.getOrLoadTable("functional", "hive_index_tbl", "test");
+    Assert.assertNotNull(table);
     TTable thriftTable = getThriftTable(table);
     Assert.assertEquals(thriftTable.tbl_name, "hive_index_tbl");
     Assert.assertEquals(thriftTable.db_name, "functional");
+  }
 
-    table = catalog_.getOrLoadTable("functional", "alltypes");
+  @Test
+  public void TestTableLoadingErrors() throws ImpalaException {
+    Table table = catalog_.getOrLoadTable("functional", "alltypes", "test");
     HdfsTable hdfsTable = (HdfsTable) table;
     // Get any partition with valid HMS parameters to create a
     // dummy partition.
-    HdfsPartition part = null;
-    for (HdfsPartition partition: hdfsTable.getPartitions()) {
-      if (!partition.isDefaultPartition()) {
-        part = partition;
-        break;
-      }
-    }
+    long id = Iterables.getFirst(hdfsTable.getPartitionIds(), -1L);
+    HdfsPartition part = (HdfsPartition) FeCatalogUtils.loadPartition(
+        hdfsTable, id);
+    Assert.assertNotNull(part);;
     // Create a dummy partition with an invalid decimal type.
     try {
-      HdfsPartition dummyPart = new HdfsPartition(hdfsTable, part.toHmsPartition(),
-        Lists.newArrayList(LiteralExpr.create("1.1", ScalarType.createDecimalType(1, 0)),
-            LiteralExpr.create("1.1", ScalarType.createDecimalType(1, 0))),
-        null, Lists.<HdfsPartition.FileDescriptor>newArrayList(),
+      new HdfsPartition(hdfsTable, part.toHmsPartition(),
+        Lists.newArrayList(LiteralExpr.create("11.1", ScalarType.createDecimalType(1, 0)),
+            LiteralExpr.create("11.1", ScalarType.createDecimalType(1, 0))),
+        null, new ArrayList<>(),
         TAccessLevel.READ_WRITE);
       fail("Expected metadata to be malformed.");
-    } catch (AnalysisException e) {
-      Assert.assertTrue(e.getMessage().contains("invalid DECIMAL(1,0) value: 1.1"));
+    } catch (SqlCastException e) {
+      Assert.assertTrue(e.getMessage().contains(
+          "Value 11.1 cannot be cast to type DECIMAL(1,0)"));
     }
   }
 
   @Test
   public void TestView() throws CatalogException {
-    Table table = catalog_.getOrLoadTable("functional", "view_view");
+    Table table = catalog_.getOrLoadTable("functional", "view_view", "test");
     TTable thriftTable = getThriftTable(table);
     Assert.assertEquals(thriftTable.tbl_name, "view_view");
     Assert.assertEquals(thriftTable.db_name, "functional");

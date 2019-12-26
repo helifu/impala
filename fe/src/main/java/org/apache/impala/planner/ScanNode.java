@@ -17,34 +17,67 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.impala.analysis.AggregateInfo;
+import org.apache.impala.analysis.Analyzer;
+import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.ExprSubstitutionMap;
+import org.apache.impala.analysis.FunctionCallExpr;
+import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.analysis.FunctionParams;
 import org.apache.impala.analysis.SlotDescriptor;
+import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.common.PrintUtils;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TNetworkAddress;
-import org.apache.impala.thrift.TScanRangeLocationList;
+import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TTableStats;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Representation of the common elements of all scan nodes.
  */
 abstract public class ScanNode extends PlanNode {
+
+  // Factor capturing the worst-case deviation from a uniform distribution of scan ranges
+  // among nodes. The factor of 1.2 means that a particular node may have 20% more
+  // scan ranges than would have been estimated assuming a uniform distribution.
+  // Used for HDFS and Kudu Scan node estimations.
+  protected static final double SCAN_RANGE_SKEW_FACTOR = 1.2;
+
   protected final TupleDescriptor desc_;
 
   // Total number of rows this node is expected to process
   protected long inputCardinality_ = -1;
 
-  // List of scan-range locations. Populated in init().
-  protected List<TScanRangeLocationList> scanRanges_;
+  // Scan-range specs. Populated in init().
+  protected TScanRangeSpec scanRangeSpecs_;
+
+  // The AggregationInfo from the query block of this scan node. Used for determining if
+  // the count(*) optimization can be applied.
+  // Count(*) aggregation optimization flow:
+  // The caller passes in an AggregateInfo to the constructor that this scan node uses to
+  // determine whether to apply the optimization or not. The produced smap must then be
+  // applied to the AggregateInfo in this query block. We do not apply the smap in this
+  // class directly to avoid side effects and make it easier to reason about.
+  protected AggregateInfo aggInfo_ = null;
+  protected static final String STATS_NUM_ROWS = "stats: num_rows";
+
+  // Should be applied to the AggregateInfo from the same query block. We cannot use the
+  // PlanNode.outputSmap_ for this purpose because we don't want the smap entries to be
+  // propagated outside the query block.
+  protected ExprSubstitutionMap optimizedAggSmap_;
 
   public ScanNode(PlanNodeId id, TupleDescriptor desc, String displayName) {
     super(id, desc.getId().asList(), displayName);
@@ -78,12 +111,54 @@ abstract public class ScanNode extends PlanNode {
     }
   }
 
+  protected boolean isCountStarOptimizationDescriptor(SlotDescriptor desc) {
+    return desc.getLabel().equals(STATS_NUM_ROWS);
+  }
+
   /**
-   * Returns all scan ranges plus their locations.
+   * Adds a new slot descriptor to the tuple descriptor of this scan. The new slot will be
+   * used for storing the data extracted from the Kudu num rows statistic. Also adds an
+   * entry to 'optimizedAggSmap_' that substitutes count(*) with
+   * sum_init_zero(<new-slotref>). Returns the new slot descriptor.
    */
-  public List<TScanRangeLocationList> getScanRangeLocations() {
-    Preconditions.checkNotNull(scanRanges_, "Need to call init() first.");
-    return scanRanges_;
+  protected SlotDescriptor applyCountStarOptimization(Analyzer analyzer) {
+    FunctionCallExpr countFn = new FunctionCallExpr(new FunctionName("count"),
+        FunctionParams.createStarParam());
+    countFn.analyzeNoThrow(analyzer);
+
+    // Create the sum function.
+    SlotDescriptor sd = analyzer.addSlotDescriptor(getTupleDesc());
+    sd.setType(Type.BIGINT);
+    sd.setIsMaterialized(true);
+    sd.setIsNullable(false);
+    sd.setLabel(STATS_NUM_ROWS);
+    List<Expr> args = new ArrayList<>();
+    args.add(new SlotRef(sd));
+    FunctionCallExpr sumFn = new FunctionCallExpr("sum_init_zero", args);
+    sumFn.analyzeNoThrow(analyzer);
+
+    optimizedAggSmap_ = new ExprSubstitutionMap();
+    optimizedAggSmap_.put(countFn, sumFn);
+    return sd;
+  }
+
+  /**
+   * Returns true if the count(*) optimization can be applied to the query block
+   * of this scan node.
+   */
+  protected boolean canApplyCountStarOptimization(Analyzer analyzer) {
+    if (analyzer.getNumTableRefs() != 1)  return false;
+    if (aggInfo_ == null || !aggInfo_.hasCountStarOnly()) return false;
+    if (!conjuncts_.isEmpty()) return false;
+    return desc_.getMaterializedSlots().isEmpty() || desc_.hasClusteringColsOnly();
+  }
+
+  /**
+   * Returns all scan range specs.
+   */
+  public TScanRangeSpec getScanRangeSpecs() {
+    Preconditions.checkNotNull(scanRangeSpecs_, "Need to call init() first.");
+    return scanRangeSpecs_;
   }
 
   @Override
@@ -102,12 +177,12 @@ abstract public class ScanNode extends PlanNode {
    * when the string returned by this method is embedded in a query's explain plan.
    */
   protected String getTableStatsExplainString(String prefix) {
-    StringBuilder output = new StringBuilder();
     TTableStats tblStats = desc_.getTable().getTTableStats();
-    String numRows = String.valueOf(tblStats.num_rows);
-    if (tblStats.num_rows == -1) numRows = "unavailable";
-    output.append(prefix + "table: rows=" + numRows);
-    return output.toString();
+    return new StringBuilder()
+      .append(prefix)
+      .append("table: rows=")
+      .append(PrintUtils.printEstCardinality(tblStats.num_rows))
+      .toString();
   }
 
   /**
@@ -117,18 +192,19 @@ abstract public class ScanNode extends PlanNode {
    */
   protected String getColumnStatsExplainString(String prefix) {
     StringBuilder output = new StringBuilder();
-    List<String> columnsMissingStats = Lists.newArrayList();
+    List<String> columnsMissingStats = new ArrayList<>();
     for (SlotDescriptor slot: desc_.getSlots()) {
       if (!slot.getStats().hasStats() && slot.getColumn() != null) {
         columnsMissingStats.add(slot.getColumn().getName());
       }
     }
+    output.append(prefix);
     if (columnsMissingStats.isEmpty()) {
-      output.append(prefix + "columns: all");
+      output.append("columns: all");
     } else if (columnsMissingStats.size() == desc_.getSlots().size()) {
-      output.append(prefix + "columns: unavailable");
+      output.append("columns: unavailable");
     } else {
-      output.append(String.format("%scolumns missing stats: %s", prefix,
+      output.append(String.format("columns missing stats: %s",
           Joiner.on(", ").join(columnsMissingStats)));
     }
     return output.toString();
@@ -169,9 +245,15 @@ abstract public class ScanNode extends PlanNode {
     return false;
   }
 
+  /**
+   * Returns true if the column does not have stats, complex type columns are skipped.
+   */
   public boolean isTableMissingColumnStats() {
     for (SlotDescriptor slot: desc_.getSlots()) {
-      if (slot.getColumn() != null && !slot.getStats().hasStats()) return true;
+      if (slot.getColumn() != null && !slot.getStats().hasStats() &&
+          !slot.getColumn().getType().isComplexType()) {
+        return true;
+      }
     }
     return false;
   }
@@ -204,8 +286,8 @@ abstract public class ScanNode extends PlanNode {
 
   @Override
   protected String getDisplayLabelDetail() {
-    Table table = desc_.getTable();
-    List<String> path = Lists.newArrayList();
+    FeTable table = desc_.getTable();
+    List<String> path = new ArrayList<>();
     path.add(table.getDb().getName());
     path.add(table.getName());
     Preconditions.checkNotNull(desc_.getPath());
@@ -216,6 +298,35 @@ abstract public class ScanNode extends PlanNode {
     }
   }
 
+  /**
+   * Helper function that returns the estimated number of scan ranges that would
+   * be assigned to each host based on the total number of scan ranges.
+   */
+  protected int estimatePerHostScanRanges(long totalNumOfScanRanges) {
+    return (int) Math.ceil(((double) totalNumOfScanRanges / (double) numNodes_) *
+        SCAN_RANGE_SKEW_FACTOR);
+  }
+
+  /**
+   * Helper function that returns the max number of scanner threads that can be
+   * spawned by a scan node.
+   */
+  protected int computeMaxNumberOfScannerThreads(TQueryOptions queryOptions,
+      int perHostScanRanges) {
+    // The non-MT scan node requires at least one scanner thread.
+    if (queryOptions.getMt_dop() >= 1) {
+      return 1;
+    }
+    int maxScannerThreads = Math.min(perHostScanRanges,
+        RuntimeEnv.INSTANCE.getNumCores());
+    // Account for the max scanner threads query option.
+    if (queryOptions.isSetNum_scanner_threads() &&
+        queryOptions.getNum_scanner_threads() > 0) {
+      maxScannerThreads = Math.min(maxScannerThreads,
+          queryOptions.getNum_scanner_threads());
+    }
+    return maxScannerThreads;
+  }
   /**
    * Returns true if this node has conjuncts to be evaluated by Impala against the scan
    * tuple.

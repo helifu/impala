@@ -17,11 +17,14 @@
 #ifndef KUDU_UTIL_LOCKS_H
 #define KUDU_UTIL_LOCKS_H
 
-#include <algorithm>
-#include <glog/logging.h>
+#include <sched.h>
+
+#include <algorithm>  // IWYU pragma: keep
+#include <cstddef>
 #include <mutex>
 
-#include "kudu/gutil/atomicops.h"
+#include <glog/logging.h>
+
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
@@ -30,10 +33,6 @@
 #include "kudu/util/rw_semaphore.h"
 
 namespace kudu {
-
-using base::subtle::Acquire_CompareAndSwap;
-using base::subtle::NoBarrier_Load;
-using base::subtle::Release_Store;
 
 // Wrapper around the Google SpinLock class to adapt it to the method names
 // expected by Boost.
@@ -133,9 +132,12 @@ class rw_spinlock {
 // A reader-writer lock implementation which is biased for use cases where
 // the write lock is taken infrequently, but the read lock is used often.
 //
-// Internally, this creates N underlying mutexes, one per CPU. When a thread
-// wants to lock in read (shared) mode, it locks only its own CPU's mutex. When it
-// wants to lock in write (exclusive) mode, it locks all CPU's mutexes.
+// Internally, this creates N underlying reader-writer locks, one per CPU. When a thread
+// wants to lock in read (shared) mode, it locks only its own CPU's lock in read
+// mode. When it wants to lock in write (exclusive) mode, it locks all CPUs' rwlocks in
+// write mode. The use of reader-writer locks ensures that, even if a thread gets
+// preempted when holding one of the per-CPU locks in read mode, the next thread
+// scheduled onto that CPU will not need to block on the first thread.
 //
 // This means that in the read-mostly case, different readers will not cause any
 // cacheline contention.
@@ -145,14 +147,14 @@ class rw_spinlock {
 //
 //   // Lock shared:
 //   {
-//     boost::shared_lock<rw_spinlock> lock(mylock.get_lock());
+//     kudu::shared_lock<rw_spinlock> lock(mylock.get_lock());
 //     ...
 //   }
 //
 //   // Lock exclusive:
 //
 //   {
-//     boost::lock_guard<percpu_rwlock> lock(mylock);
+//     std::lock_guard<percpu_rwlock> lock(mylock);
 //     ...
 //   }
 class percpu_rwlock {
@@ -178,7 +180,7 @@ class percpu_rwlock {
   }
 
   rw_spinlock &get_lock() {
-#if defined(__APPLE__) || defined(THREAD_SANITIZER) || !defined(HAVE_SCHED_GETCPU)
+#if defined(__APPLE__) || defined(THREAD_SANITIZER)
     int cpu = 0;
 #else
     int cpu = sched_getcpu();
@@ -206,6 +208,13 @@ class percpu_rwlock {
       if (locks_[i].lock.is_locked()) return true;
     }
     return false;
+  }
+
+  bool is_write_locked() const {
+    for (int i = 0; i < n_cpus_; i++) {
+      if (!locks_[i].lock.is_write_locked()) return false;
+    }
+    return true;
   }
 
   void lock() {

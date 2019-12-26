@@ -18,11 +18,12 @@
 
 package org.apache.impala.planner;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.analysis.DescriptorTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.analysis.Expr;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TDataSink;
 import org.apache.impala.thrift.TDataSinkType;
 import org.apache.impala.thrift.TExplainLevel;
@@ -41,11 +42,11 @@ public class KuduTableSink extends TableSink {
 
   // Optional list of referenced Kudu table column indices. The position of a result
   // expression i matches a column index into the Kudu schema at targetColdIdxs[i].
-  private final ArrayList<Integer> targetColIdxs_;
+  private final List<Integer> targetColIdxs_;
 
-  public KuduTableSink(Table targetTable, Op sinkOp,
-      List<Integer> referencedColumns) {
-    super(targetTable, sinkOp);
+  public KuduTableSink(FeTable targetTable, Op sinkOp,
+      List<Integer> referencedColumns, List<Expr> outputExprs) {
+    super(targetTable, sinkOp, outputExprs);
     targetColIdxs_ = referencedColumns != null
         ? Lists.newArrayList(referencedColumns) : null;
   }
@@ -55,23 +56,49 @@ public class KuduTableSink extends TableSink {
       TQueryOptions queryOptions, TExplainLevel explainLevel, StringBuilder output) {
     output.append(prefix + sinkOp_.toExplainString());
     output.append(" KUDU [" + targetTable_.getFullName() + "]\n");
+    if (explainLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+      output.append(detailPrefix + "output exprs: ")
+          .append(Expr.getExplainString(outputExprs_, explainLevel) + "\n");
+    }
+  }
+
+  @Override
+  protected String getLabel() {
+    return "KUDU WRITER";
   }
 
   @Override
   public void computeResourceProfile(TQueryOptions queryOptions) {
-    // TODO: add a memory estimate
-    resourceProfile_ = ResourceProfile.noReservation(0);
+    // The major chunk of memory used by this node is untracked. Part of which
+    // is allocated by the KuduSession on the write path and the rest is the
+    // memory used to store kudu client error messages. Fortunately, both of
+    // them have an upper limit which is used directly to set the estimates here.
+    long kuduMutationBufferSize = BackendConfig.INSTANCE.getBackendCfg().
+        kudu_mutation_buffer_size;
+    long kuduErrorBufferSize = BackendConfig.INSTANCE.getBackendCfg().
+        kudu_error_buffer_size;
+    resourceProfile_ = ResourceProfile.noReservation(kuduMutationBufferSize +
+        kuduErrorBufferSize);
   }
 
   @Override
-  protected TDataSink toThrift() {
-    TDataSink result = new TDataSink(TDataSinkType.TABLE_SINK);
+  protected void toThriftImpl(TDataSink tsink) {
     TTableSink tTableSink = new TTableSink(DescriptorTable.TABLE_SINK_ID,
         TTableSinkType.KUDU, sinkOp_.toThrift());
     TKuduTableSink tKuduSink = new TKuduTableSink();
     tKuduSink.setReferenced_columns(targetColIdxs_);
     tTableSink.setKudu_table_sink(tKuduSink);
-    result.table_sink = tTableSink;
-    return result;
+    tsink.table_sink = tTableSink;
+    tsink.output_exprs = Expr.treesToThrift(outputExprs_);
+  }
+
+  @Override
+  protected TDataSinkType getSinkType() {
+    return TDataSinkType.TABLE_SINK;
+  }
+
+  @Override
+  public void collectExprs(List<Expr> exprs) {
+    exprs.addAll(outputExprs_);
   }
 }

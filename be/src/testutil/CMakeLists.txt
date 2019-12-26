@@ -26,7 +26,6 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/testutil")
 
 add_library(TestUtil
   desc-tbl-builder.cc
-  fault-injection-util.cc
   impalad-query-executor.cc
   in-process-servers.cc
   mini-kdc-wrapper.cc
@@ -37,10 +36,12 @@ add_dependencies(TestUtil gen-deps)
 target_link_libraries(TestUtil security-test-for-impala)
 
 add_library(TestUdfs SHARED test-udfs.cc)
+set_target_properties(TestUdfs PROPERTIES COMPILE_FLAGS "${HIDE_SYMBOLS}")
 add_dependencies(TestUdfs gen-deps)
 
 COMPILE_TO_IR(test-udfs.cc)
 add_dependencies(test-udfs-ir gen-deps)
 
 add_library(TestUdas SHARED test-udas.cc)
+set_target_properties(TestUdas PROPERTIES COMPILE_FLAGS "${HIDE_SYMBOLS}")
 add_dependencies(TestUdas gen-deps)

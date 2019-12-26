@@ -17,9 +17,11 @@
 
 package org.apache.impala.analysis;
 
+import java.util.List;
+
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TTruncateParams;
 
@@ -37,7 +39,7 @@ public class TruncateStmt extends StatementBase {
   private final boolean ifExists_;
 
   // Set in analyze().
-  private Table table_;
+  private FeTable table_;
 
   public TruncateStmt(TableName tableName, boolean ifExists) {
     Preconditions.checkNotNull(tableName);
@@ -47,23 +49,29 @@ public class TruncateStmt extends StatementBase {
   }
 
   @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
+  }
+
+  @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     tableName_ = analyzer.getFqTableName(tableName_);
     try {
       table_ = analyzer.getTable(tableName_, Privilege.INSERT);
     } catch (AnalysisException e) {
-      if (ifExists_ && analyzer.getMissingTbls().isEmpty()) return;
+      if (ifExists_) return;
       throw e;
     }
     // We only support truncating hdfs tables now.
-    if (!(table_ instanceof HdfsTable)) {
+    if (!(table_ instanceof FeFsTable)) {
       throw new AnalysisException(String.format(
           "TRUNCATE TABLE not supported on non-HDFS table: %s", table_.getFullName()));
     }
+    analyzer.checkTableCapability(table_, Analyzer.OperationType.WRITE);
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     return "TRUNCATE TABLE " + (ifExists_ ? " IF EXISTS " : "") + tableName_;
   }
 

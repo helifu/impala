@@ -17,23 +17,25 @@
 
 package org.apache.impala.analysis;
 
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.avro.SchemaParseException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
-import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.HBaseTable;
-import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableSetTblPropertiesParams;
 import org.apache.impala.thrift.TAlterTableType;
+import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTablePropertyType;
 import org.apache.impala.util.AvroSchemaParser;
 import org.apache.impala.util.AvroSchemaUtils;
@@ -50,10 +52,10 @@ import com.google.common.collect.Lists;
 */
 public class AlterTableSetTblProperties extends AlterTableSetStmt {
   private final TTablePropertyType targetProperty_;
-  private final HashMap<String, String> tblProperties_;
+  private final Map<String, String> tblProperties_;
 
   public AlterTableSetTblProperties(TableName tableName, PartitionSet partitionSet,
-      TTablePropertyType targetProperty, HashMap<String, String> tblProperties) {
+      TTablePropertyType targetProperty, Map<String, String> tblProperties) {
     super(tableName, partitionSet);
     Preconditions.checkNotNull(tblProperties);
     Preconditions.checkNotNull(targetProperty);
@@ -62,7 +64,7 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
     CreateTableStmt.unescapeProperties(tblProperties_);
   }
 
-  public HashMap<String, String> getTblProperties() { return tblProperties_; }
+  public Map<String, String> getTblProperties() { return tblProperties_; }
 
   @Override
   public TAlterTableParams toThrift() {
@@ -91,7 +93,7 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
           hive_metastoreConstants.META_TABLE_STORAGE));
     }
 
-    if (getTargetTable() instanceof KuduTable) analyzeKuduTable(analyzer);
+    if (getTargetTable() instanceof FeKuduTable) analyzeKuduTable(analyzer);
 
     // Check avro schema when it is set in avro.schema.url or avro.schema.literal to
     // avoid potential metadata corruption (see IMPALA-2042).
@@ -112,25 +114,27 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
   }
 
   private void analyzeKuduTable(Analyzer analyzer) throws AnalysisException {
-    // Checking for 'EXTERNAL' is case-insensitive, see IMPALA-5637.
-    String keyForExternalProperty =
-        MetaStoreUtil.findTblPropKeyCaseInsensitive(tblProperties_, "EXTERNAL");
-
-    // Throw error if kudu.table_name is provided for managed Kudu tables
-    // TODO IMPALA-6375: Allow setting kudu.table_name for managed Kudu tables
-    // if the 'EXTERNAL' property is set to TRUE in the same step.
-    if (!Table.isExternalTable(table_.getMetaStoreTable())) {
+    // Throw error if kudu.table_name is provided for synchronized Kudu tables.
+    // TODO IMPALA-6375: Allow setting kudu.table_name for synchronized Kudu tables
+    if (KuduTable.isSynchronizedTable(table_.getMetaStoreTable())) {
       AnalysisUtils.throwIfNotNull(tblProperties_.get(KuduTable.KEY_TABLE_NAME),
-          String.format("Not allowed to set '%s' manually for managed Kudu tables .",
+          String.format("Not allowed to set '%s' manually for synchronized Kudu tables .",
               KuduTable.KEY_TABLE_NAME));
     }
-    if (analyzer.getAuthzConfig().isEnabled()) {
+    // Throw error if kudu.table_id is provided for Kudu tables.
+    AnalysisUtils.throwIfNotNull(tblProperties_.get(KuduTable.KEY_TABLE_ID),
+        String.format("Property '%s' cannot be altered for Kudu tables",
+            KuduTable.KEY_TABLE_ID));
+    AuthorizationConfig authzConfig = analyzer.getAuthzConfig();
+    if (authzConfig.isEnabled()) {
+      // Checking for 'EXTERNAL' is case-insensitive, see IMPALA-5637.
+      String keyForExternalProperty =
+          MetaStoreUtil.findTblPropKeyCaseInsensitive(tblProperties_, "EXTERNAL");
       if (keyForExternalProperty != null ||
           tblProperties_.containsKey(KuduTable.KEY_MASTER_HOSTS)) {
-        String authzServer = analyzer.getAuthzConfig().getServerName();
+        String authzServer = authzConfig.getServerName();
         Preconditions.checkNotNull(authzServer);
-        analyzer.registerPrivReq(new PrivilegeRequestBuilder().onServer(
-            authzServer).all().toRequest());
+        analyzer.registerPrivReq(builder -> builder.onServer(authzServer).all().build());
       }
     }
   }
@@ -142,7 +146,7 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
    */
   private void analyzeAvroSchema(Analyzer analyzer)
       throws AnalysisException {
-    List<Map<String, String>> schemaSearchLocations = Lists.newArrayList();
+    List<Map<String, String>> schemaSearchLocations = new ArrayList<>();
     schemaSearchLocations.add(tblProperties_);
 
     String avroSchema = AvroSchemaUtils.getAvroSchema(schemaSearchLocations);
@@ -177,15 +181,15 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
    * null, then the method ensures that 'skip.header.line.count' is supported for its
    * table type. If it is null, then this check is omitted.
    */
-  public static void analyzeSkipHeaderLineCount(Table table,
+  public static void analyzeSkipHeaderLineCount(FeTable table,
       Map<String, String> tblProperties) throws AnalysisException {
-    if (tblProperties.containsKey(HdfsTable.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
-      if (table != null && !(table instanceof HdfsTable)) {
+    if (tblProperties.containsKey(FeFsTable.Utils.TBL_PROP_SKIP_HEADER_LINE_COUNT)) {
+      if (table != null && !(table instanceof FeFsTable)) {
         throw new AnalysisException(String.format("Table property " +
             "'skip.header.line.count' is only supported for HDFS tables."));
       }
       StringBuilder error = new StringBuilder();
-      HdfsTable.parseSkipHeaderLineCount(tblProperties, error);
+      FeFsTable.Utils.parseSkipHeaderLineCount(tblProperties, error);
       if (error.length() > 0) throw new AnalysisException(error.toString());
     }
   }
@@ -195,30 +199,42 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
    * 'table'. The property must store a list of column names separated by commas, and each
    * column in the property must occur in 'table' as a non-partitioning column. If there
    * are errors during the analysis, this function will throw an AnalysisException.
-   * Returns a list of positions of the sort columns within the table's list of
-   * columns.
+   * Returns a pair of list of positions of the sort columns within the table's list of
+   * columns and the corresponding sorting order.
    */
-  public static List<Integer> analyzeSortColumns(Table table,
+  public static Pair<List<Integer>, TSortingOrder> analyzeSortColumns(FeTable table,
       Map<String, String> tblProperties) throws AnalysisException {
-    if (!tblProperties.containsKey(
-        AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS)) {
-      return Lists.newArrayList();
+
+    boolean containsOrderingProperties =
+        tblProperties.containsKey(AlterTableSortByStmt.TBL_PROP_SORT_ORDER);
+    boolean containsSortingColumnProperties = tblProperties
+        .containsKey(AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS);
+
+    if ((containsOrderingProperties || containsSortingColumnProperties) &&
+        table instanceof FeKuduTable) {
+      throw new AnalysisException("'sort.*' table properties are not "
+          + "supported for Kudu tables.");
+    }
+
+    TSortingOrder sortingOrder = TSortingOrder.LEXICAL;
+    if (containsOrderingProperties) {
+      sortingOrder = TSortingOrder.valueOf(tblProperties.get(
+          AlterTableSortByStmt.TBL_PROP_SORT_ORDER));
+    }
+    if (!containsSortingColumnProperties) {
+      return new Pair<List<Integer>, TSortingOrder>(new ArrayList<Integer>(),
+          sortingOrder);
     }
 
     // ALTER TABLE SET is not supported on HBase tables at all, see
     // AlterTableSetStmt::analyze().
-    Preconditions.checkState(!(table instanceof HBaseTable));
-
-    if (table instanceof KuduTable) {
-      throw new AnalysisException(String.format("'%s' table property is not supported " +
-          "for Kudu tables.", AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS));
-    }
+    Preconditions.checkState(!(table instanceof FeHBaseTable));
 
     List<String> sortCols = Lists.newArrayList(
         Splitter.on(",").trimResults().omitEmptyStrings().split(
         tblProperties.get(AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS)));
-    return TableDef.analyzeSortColumns(sortCols,
-        Column.toColumnNames(table.getNonClusteringColumns()),
-        Column.toColumnNames(table.getClusteringColumns()));
+
+    return new Pair<>(TableDef.analyzeSortColumns(sortCols, table, sortingOrder),
+        sortingOrder);
   }
 }

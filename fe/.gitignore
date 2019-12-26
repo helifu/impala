@@ -1,3 +1,4 @@
+bin
 target
 
 # Eclipse artifacts
@@ -18,8 +19,10 @@ target
 # emacs backup files
 *~
 
-# Generated hive-site.xml file
+# Generated hive-site.xml files
 src/test/resources/hive-site.xml
+src/test/resources/hive-site-ext/
+src/test/resources/hive-site_ext.xml
 
 # Generated hbase-site.xml file
 src/test/resources/hbase-site.xml
@@ -27,11 +30,14 @@ src/test/resources/hbase-site.xml
 # Generated core-site.xml file
 src/test/resources/core-site.xml
 
-# Generated authorization policy file
-src/test/resources/authz-policy.ini
-
 # Generated minicluster config
 src/test/resources/minicluster-conf.xml
+
+# Generated hive-log4j2.properties file
+src/test/resources/hive-log4j2.properties
+
+# Generated authorization policy
+src/test/resources/authz-policy.ini
 
 # Generated thrift files
 generated-sources

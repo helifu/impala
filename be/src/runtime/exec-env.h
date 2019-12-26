@@ -41,8 +41,10 @@ namespace impala {
 class AdmissionController;
 class BufferPool;
 class CallableThreadPool;
-class DataStreamMgrBase;
+class ClusterMembershipMgr;
+class ControlService;
 class DataStreamMgr;
+class DataStreamService;
 class QueryExecMgr;
 class Frontend;
 class HBaseTableFactory;
@@ -60,6 +62,7 @@ class ReservationTracker;
 class RpcMgr;
 class Scheduler;
 class StatestoreSubscriber;
+class SystemStateInfo;
 class ThreadResourceMgr;
 class TmpFileMgr;
 class Webserver;
@@ -78,11 +81,11 @@ class ExecEnv {
  public:
   ExecEnv();
 
-  ExecEnv(const std::string& hostname, int backend_port, int krpc_port,
+  ExecEnv(int backend_port, int krpc_port,
       int subscriber_port, int webserver_port, const std::string& statestore_host,
       int statestore_port);
 
-  /// Returns the first created exec env instance. In a normal impalad, this is
+  /// Returns the most recently created exec env instance. In a normal impalad, this is
   /// the only instance. In test setups with multiple ExecEnv's per process,
   /// we return the most recently created instance.
   static ExecEnv* GetInstance() { return exec_env_; }
@@ -102,15 +105,15 @@ class ExecEnv {
   Status StartKrpcService() WARN_UNUSED_RESULT;
 
   /// TODO: Should ExecEnv own the ImpalaServer as well?
-  void SetImpalaServer(ImpalaServer* server) { impala_server_ = server; }
+  /// Registers the ImpalaServer 'server' with this ExecEnv instance. May only be called
+  /// once.
+  void SetImpalaServer(ImpalaServer* server);
 
-  DataStreamMgrBase* stream_mgr() { return stream_mgr_.get(); }
+  /// Get the address of the thrift backend service. Only valid to call if
+  /// StartServices() was successful.
+  TNetworkAddress GetThriftBackendAddress() const;
 
-  /// TODO: Remove once a single DataStreamMgrBase implementation is standardized on.
-  /// Clients of DataStreamMgrBase should use stream_mgr() unless they need to access
-  /// members that are not a part of the DataStreamMgrBase interface.
-  DataStreamMgr* ThriftStreamMgr();
-  KrpcDataStreamMgr* KrpcStreamMgr();
+  KrpcDataStreamMgr* stream_mgr() { return stream_mgr_.get(); }
 
   ImpalaBackendClientCache* impalad_client_cache() {
     return impalad_client_cache_.get();
@@ -122,6 +125,7 @@ class ExecEnv {
   io::DiskIoMgr* disk_io_mgr() { return disk_io_mgr_.get(); }
   Webserver* webserver() { return webserver_.get(); }
   MetricGroup* metrics() { return metrics_.get(); }
+  MetricGroup* rpc_metrics() { return rpc_metrics_; }
   MemTracker* process_mem_tracker() { return mem_tracker_.get(); }
   ThreadResourceMgr* thread_mgr() { return thread_mgr_.get(); }
   HdfsOpThreadPool* hdfs_op_thread_pool() { return hdfs_op_thread_pool_.get(); }
@@ -136,14 +140,14 @@ class ExecEnv {
   PoolMemTrackerRegistry* pool_mem_trackers() { return pool_mem_trackers_.get(); }
   ReservationTracker* buffer_reservation() { return buffer_reservation_.get(); }
   BufferPool* buffer_pool() { return buffer_pool_.get(); }
+  SystemStateInfo* system_state_info() { return system_state_info_.get(); }
 
   void set_enable_webserver(bool enable) { enable_webserver_ = enable; }
 
+  ClusterMembershipMgr* cluster_membership_mgr() { return cluster_membership_mgr_.get(); }
   Scheduler* scheduler() { return scheduler_.get(); }
   AdmissionController* admission_controller() { return admission_controller_.get(); }
   StatestoreSubscriber* subscriber() { return statestore_subscriber_.get(); }
-
-  const TNetworkAddress& backend_address() const { return backend_address_; }
 
   const IpAddr& ip_address() const { return ip_address_; }
 
@@ -167,10 +171,14 @@ class ExecEnv {
   Status GetKuduClient(const std::vector<std::string>& master_addrs,
       kudu::client::KuduClient** client) WARN_UNUSED_RESULT;
 
+  int64_t admit_mem_limit() const { return admit_mem_limit_; }
+  int64_t admission_slots() const { return admission_slots_; }
+
  private:
   boost::scoped_ptr<ObjectPool> obj_pool_;
   boost::scoped_ptr<MetricGroup> metrics_;
-  boost::scoped_ptr<DataStreamMgrBase> stream_mgr_;
+  boost::scoped_ptr<KrpcDataStreamMgr> stream_mgr_;
+  boost::scoped_ptr<ClusterMembershipMgr> cluster_membership_mgr_;
   boost::scoped_ptr<Scheduler> scheduler_;
   boost::scoped_ptr<AdmissionController> admission_controller_;
   boost::scoped_ptr<StatestoreSubscriber> statestore_subscriber_;
@@ -198,6 +206,8 @@ class ExecEnv {
   boost::scoped_ptr<CallableThreadPool> async_rpc_pool_;
   boost::scoped_ptr<QueryExecMgr> query_exec_mgr_;
   boost::scoped_ptr<RpcMgr> rpc_mgr_;
+  boost::scoped_ptr<ControlService> control_svc_;
+  boost::scoped_ptr<DataStreamService> data_svc_;
 
   /// Query-wide buffer pool and the root reservation tracker for the pool. The
   /// reservation limit is equal to the maximum capacity of the pool. Created in
@@ -205,19 +215,25 @@ class ExecEnv {
   boost::scoped_ptr<ReservationTracker> buffer_reservation_;
   boost::scoped_ptr<BufferPool> buffer_pool_;
 
+  /// Tracks system resource usage which we then include in profiles.
+  boost::scoped_ptr<SystemStateInfo> system_state_info_;
+
   /// Not owned by this class
   ImpalaServer* impala_server_ = nullptr;
+  MetricGroup* rpc_metrics_ = nullptr;
 
   bool enable_webserver_;
 
  private:
   friend class TestEnv;
+  friend class DataStreamTest;
 
   static ExecEnv* exec_env_;
   bool is_fe_tests_ = false;
 
-  /// Address of the thrift based ImpalaInternalService
-  TNetworkAddress backend_address_;
+  /// Address of the thrift based ImpalaInternalService. In backend tests we allow
+  /// wildcard port 0, so this may not be the actual backend address.
+  TNetworkAddress configured_backend_address_;
 
   /// Resolved IP address of the host name.
   IpAddr ip_address_;
@@ -243,8 +259,36 @@ class ExecEnv {
   /// address lists be identical in order to share a KuduClient.
   KuduClientMap kudu_client_map_;
 
+  /// Return the bytes of memory available for queries to execute with - i.e.
+  /// mem_tracker()->limit() with any overhead that can't be used subtracted out,
+  /// such as the JVM if --mem_limit_includes_jvm=true. Set in Init().
+  int64_t admit_mem_limit_;
+
+  /// The maximum number of admission slots that should be used on this host. This
+  /// only takes effect if the admission slot functionality is enabled in admission
+  /// control. Until IMPALA-8757 is fixed, the slots are only checked for non-default
+  /// executor groups.
+  ///
+  /// By default, the number of slots is based on the number of cores in the system.
+  /// The number of slots limits the number of queries that can run concurrently on
+  /// this backend. Queries take up multiple slots only when mt_dop > 1.
+  int64_t admission_slots_;
+
+  /// Choose a memory limit (returned in *bytes_limit) based on the --mem_limit flag and
+  /// the memory available to the daemon process. Returns an error if the memory limit is
+  /// invalid or another error is encountered that should prevent starting up the daemon.
+  /// Logs the memory limit chosen and any relevant diagnostics related to that choice.
+  Status ChooseProcessMemLimit(int64_t* bytes_limit);
+
   /// Initialise 'buffer_pool_' and 'buffer_reservation_' with given capacity.
   void InitBufferPool(int64_t min_page_len, int64_t capacity, int64_t clean_pages_limit);
+
+  /// Initialise 'mem_tracker_' with a limit of 'bytes_limit'. Must be called after
+  /// InitBufferPool() and RegisterMemoryMetrics().
+  void InitMemTracker(int64_t bytes_limit);
+
+  /// Initialize 'system_state_info_' to track system resource usage.
+  void InitSystemStateInfo();
 };
 
 } // namespace impala

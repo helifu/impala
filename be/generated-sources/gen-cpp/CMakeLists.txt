@@ -85,6 +85,8 @@ set(SRC_FILES
   Planner_types.cpp
   parquet_constants.cpp
   parquet_types.cpp
+  ResourceProfile_constants.cpp
+  ResourceProfile_types.cpp
   RuntimeProfile_constants.cpp
   RuntimeProfile_types.cpp
   StatestoreService.cpp
@@ -95,6 +97,8 @@ set(SRC_FILES
   Status_types.cpp
   Types_constants.cpp
   Types_types.cpp
+  Zip_constants.cpp
+  Zip_types.cpp
 )
 
 # keep everything in one library, the object files reference

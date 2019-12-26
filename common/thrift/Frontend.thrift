@@ -98,6 +98,26 @@ struct TGetTableMetricsResponse {
   1: required string metrics
 }
 
+// Response from a call to getCatalogMetrics.
+struct TGetCatalogMetricsResult {
+  1: required i32 num_dbs
+  2: required i32 num_tables
+  // Following cache metrics are set only in local catalog mode. These map to Guava's
+  // CacheStats. Accounts for all the cache requests since the process boot time.
+  3: optional i64 cache_eviction_count
+  4: optional i64 cache_hit_count
+  5: optional i64 cache_load_count
+  6: optional i64 cache_load_exception_count
+  7: optional i64 cache_load_success_count
+  8: optional i64 cache_miss_count
+  9: optional i64 cache_request_count
+  10: optional i64 cache_total_load_time
+  11: optional double cache_avg_load_time
+  12: optional double cache_hit_rate
+  13: optional double cache_load_exception_rate
+  14: optional double cache_miss_rate
+}
+
 // Arguments to getDbs, which returns a list of dbs that match an optional pattern
 struct TGetDbsParams {
   // If not set, match every database
@@ -134,13 +154,13 @@ struct TGetDataSrcsResult {
 enum TDescribeOutputStyle {
   // The default output style if no options are specified for
   // DESCRIBE DATABASE <db> and DESCRIBE <table>.
-  MINIMAL,
+  MINIMAL = 0
 
   // Output additional information on the database or table.
   // Set for both DESCRIBE DATABASE FORMATTED|EXTENDED <db>
   // and DESCRIBE FORMATTED|EXTENDED <table> statements.
-  EXTENDED,
-  FORMATTED
+  EXTENDED = 1
+  FORMATTED = 2
 }
 
 // Arguments to DescribeDb, which returns a list of properties for a given database.
@@ -166,6 +186,9 @@ struct TDescribeTableParams {
 
   // Set when describing a path to a nested collection.
   3: optional Types.TColumnType result_struct
+
+  // Session state for the user who initiated this request.
+  4: optional ImpalaInternalService.TSessionState session
 }
 
 // Results of a call to describeDb() and describeTable()
@@ -190,10 +213,10 @@ struct TShowDbsParams {
 
 // Used by SHOW STATS and SHOW PARTITIONS to control what information is returned.
 enum TShowStatsOp {
-  TABLE_STATS,
-  COLUMN_STATS,
-  PARTITIONS,
-  RANGE_PARTITIONS
+  TABLE_STATS = 0
+  COLUMN_STATS = 1
+  PARTITIONS = 2
+  RANGE_PARTITIONS = 3
 }
 
 // Parameters for SHOW TABLE/COLUMN STATS and SHOW PARTITIONS commands
@@ -241,7 +264,7 @@ struct TShowRolesParams {
   // True if this opertion requires admin privileges on the Sentry Service. This is
   // needed to check for the case where an operation is_user_scope, but the user does
   // not belong to the specified grant_group.
-  2: required bool is_admin_op
+  // REMOVED: 2: required bool is_admin_op
 
   // True if the statement is "SHOW CURRENT ROLES".
   3: required bool is_show_current_roles
@@ -256,20 +279,23 @@ struct TShowRolesResult {
   1: required list<string> role_names
 }
 
-// Parameters for SHOW GRANT ROLE commands
-struct TShowGrantRoleParams {
+// Parameters for SHOW GRANT ROLE/USER commands
+struct TShowGrantPrincipalParams {
   // The effective user who submitted this request.
   1: optional string requesting_user
 
-  // The target role name.
-  2: required string role_name
+  // The target name.
+  2: required string name
+
+  // The principal type.
+  3: required CatalogObjects.TPrincipalType principal_type;
 
   // True if this operation requires admin privileges on the Sentry Service (when
   // the requesting user has not been granted the target role name).
-  3: required bool is_admin_op
+  // REMOVED: 4: required bool is_admin_op
 
   // An optional filter to show grants that match a specific privilege spec.
-  4: optional CatalogObjects.TPrivilege privilege
+  5: optional CatalogObjects.TPrivilege privilege
 }
 
 // Arguments to getFunctions(), which returns a list of non-qualified function
@@ -331,6 +357,12 @@ struct TFinalizeParams {
   // Identifier for the target table in the query-wide descriptor table (see
   // TDescriptorTable and TTableDescriptor).
   6: optional i64 table_id;
+
+  // Stores the ACID transaction id of the target table for transactional INSERTs.
+  7: optional i64 transaction_id;
+
+  // Stores the ACID write id of the target table for transactional INSERTs.
+  8: optional i64 write_id;
 }
 
 // Request for a LOAD DATA statement. LOAD DATA is only supported for HDFS backed tables.
@@ -366,9 +398,9 @@ struct TPlanExecInfo {
   // it is unpartitioned.
   1: required list<Planner.TPlanFragment> fragments
 
-  // A map from scan node ids to a list of scan range locations.
+  // A map from scan node ids to a scan range specification.
   // The node ids refer to scan nodes in fragments[].plan
-  2: optional map<Types.TPlanNodeId, list<Planner.TScanRangeLocationList>>
+  2: optional map<Types.TPlanNodeId, Planner.TScanRangeSpec>
       per_node_scan_ranges
 }
 
@@ -405,26 +437,36 @@ struct TQueryExecRequest {
   9: optional i64 per_host_mem_estimate
 
   // Maximum possible (in the case all fragments are scheduled on all hosts with
-  // max DOP) minimum reservation required per host, in bytes.
-  10: optional i64 max_per_host_min_reservation;
+  // max DOP) minimum memory reservation required per host, in bytes.
+  10: optional i64 max_per_host_min_mem_reservation;
+
+  // Maximum possible (in the case all fragments are scheduled on all hosts with
+  // max DOP) required threads per host, i.e. the number of threads that this query
+  // needs to execute successfully. Does not include "optional" threads.
+  11: optional i64 max_per_host_thread_reservation;
+
+  // Estimated coordinator's memory consumption in bytes assuming that the coordinator
+  // fragment will run on a dedicated coordinator. Set by the planner and used by
+  // admission control.
+  12: optional i64 dedicated_coord_mem_estimate;
 }
 
 enum TCatalogOpType {
-  SHOW_TABLES,
-  SHOW_DBS,
-  SHOW_STATS,
-  USE,
-  DESCRIBE_TABLE,
-  DESCRIBE_DB,
-  SHOW_FUNCTIONS,
-  RESET_METADATA,
-  DDL,
-  SHOW_CREATE_TABLE,
-  SHOW_DATA_SRCS,
-  SHOW_ROLES,
-  SHOW_GRANT_ROLE,
-  SHOW_FILES,
-  SHOW_CREATE_FUNCTION
+  SHOW_TABLES = 0
+  SHOW_DBS = 1
+  SHOW_STATS = 2
+  USE = 3
+  DESCRIBE_TABLE = 4
+  DESCRIBE_DB = 5
+  SHOW_FUNCTIONS = 6
+  RESET_METADATA = 7
+  DDL = 8
+  SHOW_CREATE_TABLE = 9
+  SHOW_DATA_SRCS = 10
+  SHOW_ROLES = 11
+  SHOW_GRANT_PRINCIPAL = 12
+  SHOW_FILES = 13
+  SHOW_CREATE_FUNCTION = 14
 }
 
 // TODO: Combine SHOW requests with a single struct that contains a field
@@ -459,8 +501,8 @@ struct TCatalogOpRequest {
   // Parameters for SHOW ROLES
   10: optional TShowRolesParams show_roles_params
 
-  // Parameters for SHOW GRANT ROLE
-  11: optional TShowGrantRoleParams show_grant_role_params
+  // Parameters for SHOW GRANT ROLE/USER
+  11: optional TShowGrantPrincipalParams show_grant_principal_params
 
   // Parameters for DDL requests executed using the CatalogServer
   // such as CREATE, ALTER, and DROP. See CatalogService.TDdlExecRequest
@@ -496,15 +538,42 @@ struct TSetQueryOptionRequest {
   3: optional bool is_set_all
 }
 
+struct TShutdownParams {
+  // Set if a backend was specified as an argument to the shutdown function. If not set,
+  // the current impala daemon will be shut down. If the port was specified, it is set
+  // in 'backend'. If it was not specified, it is 0 and the port configured for this
+  // Impala daemon is assumed.
+  1: optional Types.TNetworkAddress backend
+
+  // Deadline in seconds for shutting down.
+  2: optional i64 deadline_s
+}
+
+// The type of administrative function to be executed.
+enum TAdminRequestType {
+  SHUTDOWN = 0
+}
+
+// Parameters for administrative function statement. This is essentially a tagged union
+// that contains parameters for the type of administrative statement to be executed.
+struct TAdminRequest {
+  1: required TAdminRequestType type
+
+  // The below member corresponding to 'type' should be set.
+  2: optional TShutdownParams shutdown_params
+}
+
 // HiveServer2 Metadata operations (JniFrontend.hiveServer2MetadataOperation)
 enum TMetadataOpcode {
-  GET_TYPE_INFO,
-  GET_CATALOGS,
-  GET_SCHEMAS,
-  GET_TABLES,
-  GET_TABLE_TYPES,
-  GET_COLUMNS,
-  GET_FUNCTIONS
+  GET_TYPE_INFO = 0
+  GET_CATALOGS = 1
+  GET_SCHEMAS = 2
+  GET_TABLES = 3
+  GET_TABLE_TYPES = 4
+  GET_COLUMNS = 5
+  GET_FUNCTIONS = 6
+  GET_PRIMARY_KEYS = 7
+  GET_CROSS_REFERENCE = 8
 }
 
 // Input parameter to JniFrontend.hiveServer2MetadataOperation
@@ -527,6 +596,8 @@ struct TMetadataOpRequest {
   // enabled, only the server objects this user has access to will be returned.
   // If not set, access checks will be skipped (used for internal Impala requests)
   10: optional ImpalaInternalService.TSessionState session
+  11: optional TCLIService.TGetPrimaryKeysReq get_primary_keys_req
+  12: optional TCLIService.TGetCrossReferenceReq get_cross_reference_req
 }
 
 // Tracks accesses to Catalog objects for use during auditing. This information, paired
@@ -569,7 +640,7 @@ struct TExecRequest {
 
   // List of catalog objects accessed by this request. May be empty in this
   // case that the query did not access any Catalog objects.
-  8: optional set<TAccessEvent> access_events
+  8: optional list<TAccessEvent> access_events
 
   // List of warnings that were generated during analysis. May be empty.
   9: required list<string> analysis_warnings
@@ -578,12 +649,22 @@ struct TExecRequest {
   10: optional TSetQueryOptionRequest set_query_option_request
 
   // Timeline of planner's operation, for profiling
+  // TODO(todd): should integrate this with the 'profile' member instead.
   11: optional RuntimeProfile.TEventSequence timeline
 
   // If false, the user that runs this statement doesn't have access to the runtime
   // profile. For example, a user can't access the runtime profile of a query
   // that has a view for which the user doesn't have access to the underlying tables.
   12: optional bool user_has_profile_access
+
+  // Set iff stmt_type is ADMIN_FN.
+  13: optional TAdminRequest admin_request
+
+  // Profile information from the planning process.
+  14: optional RuntimeProfile.TRuntimeProfileNode profile
+
+  // Set iff stmt_type is TESTCASE
+  15: optional string testcase_data_path
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -603,9 +684,9 @@ struct TCacheJarResult {
 // A UDF may include optional prepare and close functions in addition the main evaluation
 // function. This enum distinguishes between these when doing a symbol lookup.
 enum TSymbolType {
-  UDF_EVALUATE,
-  UDF_PREPARE,
-  UDF_CLOSE,
+  UDF_EVALUATE = 0
+  UDF_PREPARE = 1
+  UDF_CLOSE = 2
 }
 
 // Parameters to pass to validate that the binary contains the symbol. If the
@@ -634,13 +715,19 @@ struct TSymbolLookupParams {
   6: optional Types.TColumnType ret_arg_type
 
   // Determines the signature of the mangled symbol
-  7: required TSymbolType symbol_type;
+  7: required TSymbolType symbol_type
+
+  // Does the lookup require the backend lib-cache entry be refreshed?
+  // If so, the file system is checked for a newer version of the file
+  // referenced by 'location'. If not, the entry in the lib-cache is used
+  // if present, otherwise the file is read from file-system.
+  8: required bool needs_refresh
 }
 
 enum TSymbolLookupResultCode {
-  SYMBOL_FOUND,
-  BINARY_NOT_FOUND,
-  SYMBOL_NOT_FOUND,
+  SYMBOL_FOUND = 0
+  BINARY_NOT_FOUND = 1
+  SYMBOL_NOT_FOUND = 2
 }
 
 struct TSymbolLookupResult {
@@ -652,23 +739,31 @@ struct TSymbolLookupResult {
 
   // The error message if the symbol found not be found.
   3: optional string error_msg
+
+  // Last modified time in backend lib-cache entry for the file referenced by 'location'.
+  4: optional i64 last_modified_time
 }
 
 // Sent from the impalad BE to FE with the results of each CatalogUpdate heartbeat.
-// Contains details on all catalog objects that need to be updated.
+// The catalog object updates are passed separately via NativeGetCatalogUpdate() callback.
 struct TUpdateCatalogCacheRequest {
   // True if update only contains entries changed from the previous update. Otherwise,
   // contains the entire topic.
   1: required bool is_delta
 
-  // The Catalog Service ID this update came from.
-  2: required Types.TUniqueId catalog_service_id
+  // The Catalog Service ID this update came from. A request should has either this field
+  // set or a Catalog typed catalog object in the update list.
+  2: optional Types.TUniqueId catalog_service_id
 
-  // New or modified items. Empty list if no items were updated.
-  3: required list<CatalogObjects.TCatalogObject> updated_objects
+  // New or modified items. Empty list if no items were updated. Deprecated after
+  // IMPALA-5990.
+  3: optional list<CatalogObjects.TCatalogObject> updated_objects_deprecated
 
-  // Empty if no items were removed or is_delta is false.
-  4: required list<CatalogObjects.TCatalogObject> removed_objects
+  // Empty if no items were removed or is_delta is false. Deprecated after IMPALA-5990.
+  4: optional list<CatalogObjects.TCatalogObject> removed_objects_deprecated
+
+  // The native ptr for calling back NativeGetCatalogUpdate().
+  5: required i64 native_iterator_ptr
 }
 
 // Response from a TUpdateCatalogCacheRequest.
@@ -676,16 +771,25 @@ struct TUpdateCatalogCacheResponse {
   // The catalog service id this version is from.
   1: required Types.TUniqueId catalog_service_id
 
-  // The minimum catalog object version after CatalogUpdate() was processed.
-  2: required i64 min_catalog_object_version
+  // The lower bound of catalog object versions after CatalogUpdate() was processed.
+  2: required i64 catalog_object_version_lower_bound
+
+  // The updated catalog version needed by the backend.
+  3: required i64 new_catalog_version
 }
 
-// Sent from the impalad BE to FE with the latest cluster membership snapshot resulting
-// from the Membership heartbeat.
-struct TUpdateMembershipRequest {
+// Sent from the impalad BE to FE with the latest membership snapshot of the
+// executors on the cluster resulting from the Membership heartbeat.
+struct TUpdateExecutorMembershipRequest {
+  // The hostnames of the executor nodes.
   1: required set<string> hostnames
+
+  // The ip addresses of the executor nodes.
   2: required set<string> ip_addresses
-  3: i32 num_nodes
+
+  // The number of executors on a cluster, needed since there can be multiple
+  // impalads running on the same host.
+  3: i32 num_executors
 }
 
 // Contains all interesting statistics from a single 'memory pool' in the JVM.
@@ -720,20 +824,23 @@ struct TJvmMemoryPool {
   9: required string name
 }
 
-// Request to get one or all sets of memory pool metrics.
-struct TGetJvmMetricsRequest {
-  // If set, return all pools
-  1: required bool get_all
-
-  // If get_all is false, this must be set to the name of the memory pool to return.
-  2: optional string memory_pool
-}
-
-// Response from JniUtil::GetJvmMetrics()
-struct TGetJvmMetricsResponse {
+// Response from JniUtil::GetJvmMemoryMetrics()
+struct TGetJvmMemoryMetricsResponse {
   // One entry for every pool tracked by the Jvm, plus a synthetic aggregate pool called
   // 'total'
   1: required list<TJvmMemoryPool> memory_pools
+
+  // Metrics from JvmPauseMonitor, measuring how much time is spend
+  // pausing, presumably because of Garbage Collection. These
+  // names are consistent with Hadoop's metric names.
+  2: required i64 gc_num_warn_threshold_exceeded
+  3: required i64 gc_num_info_threshold_exceeded
+  4: required i64 gc_total_extra_sleep_time_millis
+
+  // Metrics for JVM Garbage Collection, from the management beans;
+  // these are cumulative across all types of GCs.
+  5: required i64 gc_count
+  6: required i64 gc_time_millis
 }
 
 // Contains information about a JVM thread
@@ -781,6 +888,11 @@ struct TGetJvmThreadsInfoResponse {
   4: optional list<TJvmThreadInfo> threads
 }
 
+struct TGetJMXJsonResponse {
+  // JMX of the JVM serialized to a json string.
+  1: required string jmx_json
+}
+
 struct TGetHadoopConfigRequest {
   // The value of the <name> in the config <property>
   1: required string name
@@ -795,9 +907,53 @@ struct TGetAllHadoopConfigsResponse {
   1: optional map<string, string> configs;
 }
 
+struct TGetHadoopGroupsRequest {
+  // The user name to get the groups from.
+  1: required string user
+}
+
+struct TGetHadoopGroupsResponse {
+  // The list of groups that the user belongs to.
+  1: required list<string> groups
+}
+
 // For creating a test descriptor table. The tuples and their memory layout are computed
 // in the FE.
 struct TBuildTestDescriptorTableParams {
   // Every entry describes the slot types of one tuple.
   1: required list<list<Types.TColumnType>> slot_types
+}
+
+// Output format for generating a testcase for a given query_stmt. The resulting bytes
+// are compressed before writing to a file.
+// TODO: Add the EXPLAIN string from the source cluster on which the testcase was
+// collected.
+struct TTestCaseData {
+  // Query statemnt for which this test case data is generated.
+  1: required string query_stmt
+
+  // All referenced table and view defs.
+  2: optional list<CatalogObjects.TTable> tables_and_views
+
+  // All databases referenced in the query.
+  3: optional list<CatalogObjects.TDatabase> dbs
+
+  // Output path
+  4: required string testcase_data_path
+
+  // Impala version that was used to generate this testcase.
+  // TODO: How to deal with version incompatibilities? E.g: A testcase collected on
+  // Impala version v1 may or may not be compatible to Impala version v2 if the
+  // underlying thrift layout changes.
+  5: required string impala_version
+}
+
+// Information about a query sent to the FE QueryEventHooks
+// after query execution
+struct TQueryCompleteContext {
+  // the serialized lineage graph of the query, with optional BE-populated information
+  //
+  // this is an experimental feature and the format will likely change
+  // in a future version
+  1: required string lineage_string
 }

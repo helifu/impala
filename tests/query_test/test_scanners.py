@@ -33,22 +33,39 @@ from subprocess import check_call
 from testdata.common import widetable
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
 from tests.common.skip import (
+    SkipIf,
     SkipIfS3,
+    SkipIfABFS,
     SkipIfADLS,
+    SkipIfEC,
     SkipIfIsilon,
-    SkipIfLocal)
-from tests.common.test_dimensions import create_single_exec_option_dimension
+    SkipIfLocal,
+    SkipIfNotHdfsMinicluster)
+from tests.common.test_dimensions import (
+    create_single_exec_option_dimension,
+    create_exec_option_dimension,
+    create_uncompressed_text_dimension)
+from tests.common.file_utils import (
+    create_table_from_parquet,
+    create_table_and_copy_files)
 from tests.common.test_result_verifier import (
-    parse_column_types,
-    parse_column_labels,
     QueryTestResult,
     parse_result_rows)
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import WAREHOUSE, get_fs_path
 from tests.util.hdfs_util import NAMENODE
 from tests.util.get_parquet_metadata import get_parquet_metadata
+from tests.util.parse_util import get_bytes_summary_stats_counter
 from tests.util.test_file_parser import QueryTestSectionReader
 
+# Test scanners with denial of reservations at varying frequency. This will affect the
+# number of scanner threads that can be spun up.
+DEBUG_ACTION_DIMS = [None,
+  '-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@0.5',
+  '-1:OPEN:SET_DENY_RESERVATION_PROBABILITY@1.0']
+
+# Trigger injected soft limit failures when scanner threads check memory limit.
+DEBUG_ACTION_DIMS.append('HDFS_SCANNER_THREAD_CHECK_SOFT_MEM_LIMIT:FAIL@0.5')
 
 class TestScannersAllTableFormats(ImpalaTestSuite):
   BATCH_SIZES = [0, 1, 16]
@@ -66,18 +83,39 @@ class TestScannersAllTableFormats(ImpalaTestSuite):
       cls.ImpalaTestMatrix.add_dimension(cls.create_table_info_dimension('pairwise'))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('batch_size', *TestScannersAllTableFormats.BATCH_SIZES))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('debug_action', *DEBUG_ACTION_DIMS))
 
   def test_scanners(self, vector):
     new_vector = deepcopy(vector)
+    # Copy over test dimensions to the matching query options.
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['debug_action'] = vector.get_value('debug_action')
     self.run_test_case('QueryTest/scanners', new_vector)
 
-  def test_hdfs_scanner_profile(self, vector):
-    if vector.get_value('table_format').file_format in ('kudu', 'hbase'):
+  def test_many_nulls(self, vector):
+    if vector.get_value('table_format').file_format == 'hbase':
+      # manynulls table not loaded for HBase
       pytest.skip()
+    # Copy over test dimensions to the matching query options.
     new_vector = deepcopy(vector)
-    new_vector.get_value('exec_option')['num_nodes'] = 0
-    self.run_test_case('QueryTest/hdfs_scanner_profile', new_vector)
+    new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['debug_action'] = vector.get_value('debug_action')
+    self.run_test_case('QueryTest/scanners-many-nulls', new_vector)
+
+  def test_hdfs_scanner_profile(self, vector):
+    if vector.get_value('table_format').file_format in ('kudu', 'hbase') or \
+       vector.get_value('exec_option')['num_nodes'] != 0:
+      pytest.skip()
+    self.run_test_case('QueryTest/hdfs_scanner_profile', vector)
+
+  def test_string_escaping(self, vector):
+    """Test handling of string escape sequences."""
+    if vector.get_value('table_format').file_format == 'rc':
+      # IMPALA-7778: RCFile scanner incorrectly ignores escapes for now.
+      self.run_test_case('QueryTest/string-escaping-rcfile-bug', vector)
+    else:
+      self.run_test_case('QueryTest/string-escaping', vector)
 
 # Test all the scanners with a simple limit clause. The limit clause triggers
 # cancellation in the scanner code paths.
@@ -105,13 +143,37 @@ class TestScannersAllTableFormatsWithLimit(ImpalaTestSuite):
     query_template = "select * from alltypes limit %s"
     for i in range(1, iterations):
       # Vary the limit to vary the timing of cancellation
-      limit = (iterations * 100) % 1000 + 1
+      limit = (i * 100) % 1001 + 1
       query = query_template % limit
       result = self.execute_query(query, vector.get_value('exec_option'),
           table_format=vector.get_value('table_format'))
       assert len(result.data) == limit
       # IMPALA-3337: The error log should be empty.
       assert not result.log
+
+class TestScannersMixedTableFormats(ImpalaTestSuite):
+  BATCH_SIZES = [0, 1, 16]
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestScannersMixedTableFormats, cls).add_test_dimensions()
+    # Only run with a single dimension format, since the table includes mixed formats.
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('batch_size', *TestScannersAllTableFormats.BATCH_SIZES))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('debug_action', *DEBUG_ACTION_DIMS))
+
+  def test_mixed_format(self, vector):
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
+    new_vector.get_value('exec_option')['debug_action'] = vector.get_value('debug_action')
+    self.run_test_case('QueryTest/mixed-format', new_vector)
 
 # Test case to verify the scanners work properly when the table metadata (specifically the
 # number of columns in the table) does not match the number of columns in the data file.
@@ -171,6 +233,8 @@ class TestWideRow(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestWideRow, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension(debug_action_options=DEBUG_ACTION_DIMS))
     # I can't figure out how to load a huge row into hbase
     cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format != 'hbase')
@@ -202,6 +266,8 @@ class TestWideTable(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestWideTable, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension(debug_action_options=DEBUG_ACTION_DIMS))
     cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension("num_cols", *cls.NUM_COLS))
     # To cut down on test execution time, only run in exhaustive.
     if cls.exploration_strategy() != 'exhaustive':
@@ -228,8 +294,8 @@ class TestWideTable(ImpalaTestSuite):
       assert len(result.data) == NUM_ROWS
       return
 
-    types = parse_column_types(result.schema)
-    labels = parse_column_labels(result.schema)
+    types = result.column_types
+    labels = result.column_labels
     expected = QueryTestResult(expected_result, types, labels, order_matters=False)
     actual = QueryTestResult(parse_result_rows(result), types, labels,
         order_matters=False)
@@ -244,6 +310,8 @@ class TestParquet(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestParquet, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_exec_option_dimension(debug_action_options=DEBUG_ACTION_DIMS))
     cls.ImpalaTestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format == 'parquet')
 
@@ -251,20 +319,23 @@ class TestParquet(ImpalaTestSuite):
     self.run_test_case('QueryTest/parquet', vector)
 
   def test_corrupt_files(self, vector):
-    vector.get_value('exec_option')['abort_on_error'] = 0
-    self.run_test_case('QueryTest/parquet-continue-on-error', vector)
-    vector.get_value('exec_option')['abort_on_error'] = 1
-    self.run_test_case('QueryTest/parquet-abort-on-error', vector)
+    new_vector = deepcopy(vector)
+    del new_vector.get_value('exec_option')['num_nodes']  # .test file sets num_nodes
+    new_vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case('QueryTest/parquet-continue-on-error', new_vector)
+    new_vector.get_value('exec_option')['abort_on_error'] = 1
+    self.run_test_case('QueryTest/parquet-abort-on-error', new_vector)
 
   def test_timestamp_out_of_range(self, vector, unique_database):
-    """IMPALA-4363: Test scanning parquet files with an out of range timestamp."""
-    self.client.execute(("create table {0}.out_of_range_timestamp (ts timestamp) "
-        "stored as parquet").format(unique_database))
-    out_of_range_timestamp_loc = get_fs_path(
-        "/test-warehouse/{0}.db/{1}".format(unique_database, "out_of_range_timestamp"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/out_of_range_timestamp.parquet",
-        out_of_range_timestamp_loc])
+    """IMPALA-4363: Test scanning parquet files with an out of range timestamp.
+       Also tests IMPALA-7595: Test Parquet timestamp columns where the time part
+       is out of the valid range [0..24H).
+    """
+    # out of range date part
+    create_table_from_parquet(self.client, unique_database, "out_of_range_timestamp")
+
+    # out of range time part
+    create_table_from_parquet(self.client, unique_database, "out_of_range_time_of_day")
 
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('QueryTest/out-of-range-timestamp-continue-on-error',
@@ -273,25 +344,29 @@ class TestParquet(ImpalaTestSuite):
     self.run_test_case('QueryTest/out-of-range-timestamp-abort-on-error',
         vector, unique_database)
 
+  def test_date_out_of_range(self, vector, unique_database):
+    """Test scanning parquet files with an out of range date."""
+    create_table_from_parquet(self.client, unique_database, "out_of_range_date")
+
+    new_vector = deepcopy(vector)
+    del new_vector.get_value('exec_option')['abort_on_error']
+    self.run_test_case('QueryTest/out-of-range-date', new_vector, unique_database)
+
+  def test_pre_gregorian_date(self, vector, unique_database):
+    """Test date interoperability issues between Impala and Hive 2.1.1 when scanning
+       a parquet table that contains dates that precede the introduction of Gregorian
+       calendar in 1582-10-15.
+    """
+    create_table_from_parquet(self.client, unique_database, "hive2_pre_gregorian")
+    self.run_test_case('QueryTest/hive2-pre-gregorian-date', vector, unique_database)
+
   def test_zero_rows(self, vector, unique_database):
     """IMPALA-3943: Tests that scanning files with num_rows=0 in the file footer
     succeeds without errors."""
     # Create test table with a file that has 0 rows and 0 row groups.
-    self.client.execute("create table %s.zero_rows_zero_row_groups (c int) "
-        "stored as parquet" % unique_database)
-    zero_rows_zero_row_groups_loc = get_fs_path(
-        "/test-warehouse/%s.db/%s" % (unique_database, "zero_rows_zero_row_groups"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/zero_rows_zero_row_groups.parquet",
-        zero_rows_zero_row_groups_loc])
+    create_table_from_parquet(self.client, unique_database, "zero_rows_zero_row_groups")
     # Create test table with a file that has 0 rows and 1 row group.
-    self.client.execute("create table %s.zero_rows_one_row_group (c int) "
-        "stored as parquet" % unique_database)
-    zero_rows_one_row_group_loc = get_fs_path(
-        "/test-warehouse/%s.db/%s" % (unique_database, "zero_rows_one_row_group"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/zero_rows_one_row_group.parquet",
-        zero_rows_one_row_group_loc])
+    create_table_from_parquet(self.client, unique_database, "zero_rows_one_row_group")
 
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('QueryTest/parquet-zero-rows', vector, unique_database)
@@ -301,13 +376,7 @@ class TestParquet(ImpalaTestSuite):
   def test_repeated_root_schema(self, vector, unique_database):
     """IMPALA-4826: Tests that running a scan on a schema where the root schema's
        repetetion level is set to REPEATED succeeds without errors."""
-    self.client.execute("create table %s.repeated_root_schema (i int) "
-        "stored as parquet" % unique_database)
-    repeated_root_schema_loc = get_fs_path(
-        "/test-warehouse/%s.db/%s" % (unique_database, "repeated_root_schema"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/repeated_root_schema.parquet",
-        repeated_root_schema_loc])
+    create_table_from_parquet(self.client, unique_database, "repeated_root_schema")
 
     result = self.client.execute("select * from %s.repeated_root_schema" % unique_database)
     assert len(result.data) == 300
@@ -315,18 +384,13 @@ class TestParquet(ImpalaTestSuite):
   def test_huge_num_rows(self, vector, unique_database):
     """IMPALA-5021: Tests that a zero-slot scan on a file with a huge num_rows in the
     footer succeeds without errors."""
-    self.client.execute("create table %s.huge_num_rows (i int) stored as parquet"
-      % unique_database)
-    huge_num_rows_loc = get_fs_path(
-        "/test-warehouse/%s.db/%s" % (unique_database, "huge_num_rows"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/huge_num_rows.parquet",
-        huge_num_rows_loc])
+    create_table_from_parquet(self.client, unique_database, "huge_num_rows")
     result = self.client.execute("select count(*) from %s.huge_num_rows"
       % unique_database)
     assert len(result.data) == 1
     assert "4294967294" in result.data
 
+  @SkipIfABFS.hive
   @SkipIfADLS.hive
   @SkipIfIsilon.hive
   @SkipIfLocal.hive
@@ -346,19 +410,15 @@ class TestParquet(ImpalaTestSuite):
         "    float_col, double_col,date_string_col,string_col,timestamp_col" \
         "  from functional_parquet.alltypes" \
         "  where year = {year} and month = {month}" % unique_database
-    check_call(['hive', '-e', hql_format.format(codec="snappy", year=2010, month=1)])
-    check_call(['hive', '-e', hql_format.format(codec="gzip", year=2010, month=2)])
+    self.run_stmt_in_hive(hql_format.format(codec="snappy", year=2010, month=1))
+    self.run_stmt_in_hive(hql_format.format(codec="gzip", year=2010, month=2))
 
-    self.client.execute("create table %s.multi_compression (a string, b string)"
-        " stored as parquet" % unique_database)
-    multi_compression_tbl_loc =\
-        get_fs_path("/test-warehouse/%s.db/%s" % (unique_database, "multi_compression"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
-        "/testdata/multi_compression_parquet_data/tinytable_0_gzip_snappy.parq",
-        multi_compression_tbl_loc])
-    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
-        "/testdata/multi_compression_parquet_data/tinytable_1_snappy_gzip.parq",
-        multi_compression_tbl_loc])
+    test_files = ["testdata/multi_compression_parquet_data/tinytable_0_gzip_snappy.parq",
+                  "testdata/multi_compression_parquet_data/tinytable_1_snappy_gzip.parq"]
+    create_table_and_copy_files(self.client, "create table {db}.{tbl} "
+                                             "(a string, b string) stored as parquet",
+                                unique_database, "multi_compression",
+                                test_files)
 
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/hdfs_parquet_scan_node_profile',
@@ -371,16 +431,11 @@ class TestParquet(ImpalaTestSuite):
     - incorrect repeat count of 0 for the RLE encoded dictionary indexes
     """
     # Create test table and copy the corrupt files into it.
-    self.client.execute(
-        "create table %s.bad_rle_counts (c bigint) stored as parquet" % unique_database)
-    bad_rle_counts_tbl_loc =\
-        get_fs_path("/test-warehouse/%s.db/%s" % (unique_database, "bad_rle_counts"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/bad_rle_literal_count.parquet",
-        bad_rle_counts_tbl_loc])
-    check_call(['hdfs', 'dfs', '-copyFromLocal',
-        os.environ['IMPALA_HOME'] + "/testdata/data/bad_rle_repeat_count.parquet",
-        bad_rle_counts_tbl_loc])
+    test_files = ["testdata/data/bad_rle_literal_count.parquet",
+                  "testdata/data/bad_rle_repeat_count.parquet"]
+    create_table_and_copy_files(self.client,
+                                "create table {db}.{tbl} (c bigint) stored as parquet",
+                                unique_database, "bad_rle_counts", test_files)
     # Querying the corrupted files should not DCHECK or crash.
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('QueryTest/parquet-corrupt-rle-counts', vector, unique_database)
@@ -388,39 +443,81 @@ class TestParquet(ImpalaTestSuite):
     self.run_test_case('QueryTest/parquet-corrupt-rle-counts-abort',
                        vector, unique_database)
 
+  def corrupt_footer_len_common(self, vector, unique_database, testname_postfix):
+    """Common code shared by some tests (such as the ones included in IMPALA-6442 patch).
+       It creates a simple table then loads manually corrupted Parquet file, and runs
+       simple query to trigger the printing of related messages. Individual test checks if
+       the printed messageses are expected.
+    """
+    test_file = "testdata/data/corrupt_footer_len_" + testname_postfix + ".parquet"
+    test_table = "corrupt_footer_len_" + testname_postfix
+    test_spec = "QueryTest/parquet-corrupt-footer-len-" + testname_postfix
+    # Create test table and copy the corrupt files into it.
+    test_files = [test_file]
+    create_table_and_copy_files(self.client,
+                                "create table {db}.{tbl} (c bigint) stored as parquet",
+                                unique_database, test_table, test_files)
+    # Querying the corrupted files should not DCHECK or crash.
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case(test_spec, vector, unique_database)
+    vector.get_value('exec_option')['abort_on_error'] = 1
+    self.run_test_case(test_spec, vector, unique_database)
+
+  def test_corrupt_footer_len_decr(self, vector, unique_database):
+    """IMPALA-6442: Misleading file offset reporting in error messages.
+       Case tested: decrease the original Parquet footer size by 1, thus metadata
+       deserialization fails and prints expected error message with correct file offset of
+       the Parquet file metadata (footer).
+    """
+    self.corrupt_footer_len_common(vector, unique_database, "decr")
+
+  def test_corrupt_footer_len_incr(self, vector, unique_database):
+    """IMPALA-6442: Misleading file offset reporting in error messages.
+       Case tested: make the Parquet footer size bigger than the file, thus the footer
+       can not be loaded and corresponding error message is printed.
+    """
+    self.corrupt_footer_len_common(vector, unique_database, "incr")
+
   def test_bad_compressed_page_size(self, vector, unique_database):
     """IMPALA-6353: Tests that a parquet dict page with 0 compressed_page_size is
     gracefully handled. """
-    self.client.execute(
-        "create table %s.bad_compressed_dict_page_size (col string) stored as parquet"
-        % unique_database)
-    tbl_loc = get_fs_path("/test-warehouse/%s.db/%s" % (unique_database,
-        "bad_compressed_dict_page_size"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
-        "/testdata/data/bad_compressed_dict_page_size.parquet", tbl_loc])
+    create_table_from_parquet(self.client, unique_database,
+                              "bad_compressed_dict_page_size")
     self.run_test_case('QueryTest/parquet-bad-compressed-dict-page-size', vector,
         unique_database)
 
-  def test_bitpacked_def_levels(self, vector, unique_database):
-    """Test that Impala can read a Parquet file with the deprecated bit-packed def
-       level encoding."""
-    self.client.execute(("""CREATE TABLE {0}.alltypesagg (
+  def test_def_levels(self, vector, unique_database):
+    """Test that Impala behaves as expected when decoding def levels with different
+       encodings - RLE, BIT_PACKED, etc."""
+    create_table_from_parquet(self.client, unique_database,
+                              "alltypes_agg_bitpacked_def_levels")
+    self.run_test_case('QueryTest/parquet-def-levels', vector, unique_database)
+
+  def test_bad_compression_codec(self, vector, unique_database):
+    """IMPALA-6593: test the bad compression codec is handled gracefully. """
+    test_files = ["testdata/data/bad_codec.parquet"]
+    create_table_and_copy_files(self.client, """CREATE TABLE {db}.{tbl} (
           id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT,
           int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE,
           date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP,
-          year INT, month INT, day INT) STORED AS PARQUET""").format(unique_database))
-    alltypesagg_loc = get_fs_path(
-        "/test-warehouse/{0}.db/{1}".format(unique_database, "alltypesagg"))
-    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
-        "/testdata/data/alltypes_agg_bitpacked_def_levels.parquet", alltypesagg_loc])
-    self.client.execute("refresh {0}.alltypesagg".format(unique_database));
+          year INT, month INT) STORED AS PARQUET""",
+                                unique_database, "bad_codec",
+                                test_files)
+    self.run_test_case('QueryTest/parquet-bad-codec', vector, unique_database)
 
-    self.run_test_case('QueryTest/parquet-def-levels', vector, unique_database)
+  def test_num_values_def_levels_mismatch(self, vector, unique_database):
+    """IMPALA-6589: test the bad num_values handled correctly. """
+    create_table_from_parquet(self.client, unique_database,
+                              "num_values_def_levels_mismatch")
+    self.run_test_case('QueryTest/parquet-num-values-def-levels-mismatch',
+        vector, unique_database)
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfABFS.hdfs_block_size
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
+  @SkipIfEC.fix_later
   def test_misaligned_parquet_row_groups(self, vector):
     """IMPALA-3989: Test that no warnings are issued when misaligned row groups are
     encountered. Make sure that 'NumScannersWithNoReads' counters are set to the number of
@@ -457,9 +554,8 @@ class TestParquet(ImpalaTestSuite):
     assert (not result.log and not log_prefix) or \
         (log_prefix and result.log.startswith(log_prefix))
 
-    runtime_profile = str(result.runtime_profile)
     num_scanners_with_no_reads_list = re.findall(
-        'NumScannersWithNoReads: ([0-9]*)', runtime_profile)
+        'NumScannersWithNoReads: ([0-9]*)', result.runtime_profile)
 
     # This will fail if the number of impalads != 3
     # The fourth fragment is the "Averaged Fragment"
@@ -474,9 +570,11 @@ class TestParquet(ImpalaTestSuite):
     assert total == num_scanners_with_no_reads
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfABFS.hdfs_block_size
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
+  @SkipIfEC.fix_later
   def test_multiple_blocks(self, vector):
     # For IMPALA-1881. The table functional_parquet.lineitem_multiblock has 3 blocks, so
     # each impalad should read 1 scan range.
@@ -488,9 +586,11 @@ class TestParquet(ImpalaTestSuite):
     self._multiple_blocks_helper(table_name, 40000, ranges_per_node=2)
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfABFS.hdfs_block_size
   @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
+  @SkipIfEC.fix_later
   def test_multiple_blocks_one_row_group(self, vector):
     # For IMPALA-1881. The table functional_parquet.lineitem_multiblock_one_row_group has
     # 3 blocks but only one row group across these blocks. We test to see that only one
@@ -512,11 +612,11 @@ class TestParquet(ImpalaTestSuite):
     assert len(result.data) == 1
     assert result.data[0] == str(rows_in_table)
 
-    runtime_profile = str(result.runtime_profile)
-    num_row_groups_list = re.findall('NumRowGroups: ([0-9]*)', runtime_profile)
+    num_row_groups_list = re.findall('NumRowGroups: ([0-9]*)', result.runtime_profile)
     scan_ranges_complete_list = re.findall(
-        'ScanRangesComplete: ([0-9]*)', runtime_profile)
-    num_rows_read_list = re.findall('RowsRead: [0-9.K]* \(([0-9]*)\)', runtime_profile)
+        'ScanRangesComplete: ([0-9]*)', result.runtime_profile)
+    num_rows_read_list = re.findall('RowsRead: [0-9.K]* \(([0-9]*)\)',
+        result.runtime_profile)
 
     REGEX_UNIT_SECOND = "[0-9]*[s]*[0-9]*[.]*[0-9]*[nm]*[s]*"
     REGEX_MIN_MAX_FOOTER_PROCESSING_TIME = \
@@ -524,7 +624,7 @@ class TestParquet(ImpalaTestSuite):
             "Number of samples: %s\)" % (REGEX_UNIT_SECOND, REGEX_UNIT_SECOND,
             REGEX_UNIT_SECOND, "[0-9]*"))
     footer_processing_time_list = re.findall(
-        REGEX_MIN_MAX_FOOTER_PROCESSING_TIME, runtime_profile)
+        REGEX_MIN_MAX_FOOTER_PROCESSING_TIME, result.runtime_profile)
 
     # This will fail if the number of impalads != 3
     # The fourth fragment is the "Averaged Fragment"
@@ -621,20 +721,195 @@ class TestParquet(ImpalaTestSuite):
   def test_decimal_encodings(self, vector, unique_database):
     # Create a table using an existing data file with dictionary-encoded, variable-length
     # physical encodings for decimals.
-    TABLE_NAME = "decimal_encodings"
-    self.client.execute('''create table if not exists %s.%s
-    (small_dec decimal(9,2), med_dec decimal(18,2), large_dec decimal(38,2))
-    STORED AS PARQUET''' % (unique_database, TABLE_NAME))
+    test_files = ["testdata/data/binary_decimal_dictionary.parquet",
+                  "testdata/data/binary_decimal_no_dictionary.parquet"]
+    create_table_and_copy_files(self.client, """create table if not exists {db}.{tbl}
+        (small_dec decimal(9,2), med_dec decimal(18,2), large_dec decimal(38,2))
+         STORED AS PARQUET""", unique_database, "decimal_encodings", test_files)
 
-    table_loc = get_fs_path(
-      "/test-warehouse/%s.db/%s" % (unique_database, TABLE_NAME))
-    for file_name in ["binary_decimal_dictionary.parquet",
-                      "binary_decimal_no_dictionary.parquet"]:
-      data_file_path = os.path.join(os.environ['IMPALA_HOME'],
-                                    "testdata/data/", file_name)
-      check_call(['hdfs', 'dfs', '-copyFromLocal', data_file_path, table_loc])
+    create_table_from_parquet(self.client, unique_database, 'decimal_stored_as_int32')
+    create_table_from_parquet(self.client, unique_database, 'decimal_stored_as_int64')
 
     self.run_test_case('QueryTest/parquet-decimal-formats', vector, unique_database)
+
+  def test_rle_encoded_bools(self, vector, unique_database):
+    """IMPALA-6324: Test that Impala decodes RLE encoded booleans correctly."""
+    create_table_from_parquet(self.client, unique_database, "rle_encoded_bool")
+    self.run_test_case(
+        'QueryTest/parquet-rle-encoded-bool', vector, unique_database)
+
+  def test_dict_encoding_with_large_bit_width(self, vector, unique_database):
+    """IMPALA-7147: Test that Impala can decode dictionary encoded pages where the
+       dictionary index bit width is larger than the encoded byte's bit width.
+    """
+    TABLE_NAME = "dict_encoding_with_large_bit_width"
+    create_table_from_parquet(self.client, unique_database, TABLE_NAME)
+    result = self.execute_query(
+        "select * from {0}.{1}".format(unique_database, TABLE_NAME))
+    assert(len(result.data) == 33)
+
+  def test_type_widening(self, vector, unique_database):
+    """IMPALA-6373: Test that Impala can read parquet file with column types smaller than
+       the schema with larger types"""
+    TABLE_NAME = "primitive_type_widening"
+    create_table_and_copy_files(self.client, """CREATE TABLE {db}.{tbl} (
+        a smallint, b int, c bigint, d double, e int, f bigint, g double, h int,
+        i double, j double) STORED AS PARQUET""", unique_database, TABLE_NAME,
+        ["/testdata/data/{0}.parquet".format(TABLE_NAME)])
+
+    self.run_test_case("QueryTest/parquet-type-widening", vector, unique_database)
+
+  def test_error_propagation_race(self, vector, unique_database):
+    """IMPALA-7662: failed scan signals completion before error is propagated. To
+    reproduce, we construct a table with two Parquet files, one valid and another
+    invalid. The scanner thread for the invalid file must propagate the error
+    before we mark the whole scan complete."""
+    if vector.get_value('exec_option')['debug_action'] is not None:
+      pytest.skip(".test file needs to override debug action")
+    new_vector = deepcopy(vector)
+    del new_vector.get_value('exec_option')['debug_action']
+    create_table_and_copy_files(self.client,
+        "CREATE TABLE {db}.{tbl} (s STRING) STORED AS PARQUET",
+        unique_database, "bad_magic_number", ["testdata/data/bad_magic_number.parquet"])
+    # We need the ranges to all be scheduled on the same impalad.
+    new_vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case("QueryTest/parquet-error-propagation-race", new_vector,
+                       unique_database)
+
+  def test_int64_timestamps(self, vector, unique_database):
+    """IMPALA-5050: Test that Parquet columns with int64 physical type and
+       timestamp_millis/timestamp_micros logical type can be read both as
+       int64 and as timestamp.
+    """
+    # Tiny plain encoded parquet file.
+    TABLE_NAME = "int64_timestamps_plain"
+    create_table_from_parquet(self.client, unique_database, TABLE_NAME)
+
+    TABLE_NAME = "int64_bigints_plain"
+    CREATE_SQL = """CREATE TABLE {0}.{1} (
+                      new_logical_milli_utc BIGINT,
+                      new_logical_milli_local BIGINT,
+                      new_logical_micro_utc BIGINT,
+                      new_logical_micro_local BIGINT
+                     ) STORED AS PARQUET""".format(unique_database, TABLE_NAME)
+    create_table_and_copy_files(self.client, CREATE_SQL, unique_database, TABLE_NAME,
+        ["/testdata/data/int64_timestamps_plain.parquet"])
+
+    # Larger dictionary encoded parquet file.
+    TABLE_NAME = "int64_timestamps_dict"
+    CREATE_SQL = """CREATE TABLE {0}.{1} (
+                      id INT,
+                      new_logical_milli_utc TIMESTAMP,
+                      new_logical_milli_local TIMESTAMP,
+                      new_logical_micro_utc TIMESTAMP,
+                      new_logical_micro_local TIMESTAMP
+                     ) STORED AS PARQUET""".format(unique_database, TABLE_NAME)
+    create_table_and_copy_files(self.client, CREATE_SQL, unique_database, TABLE_NAME,
+        ["/testdata/data/{0}.parquet".format(TABLE_NAME)])
+
+    TABLE_NAME = "int64_bigints_dict"
+    CREATE_SQL = """CREATE TABLE {0}.{1} (
+                      id INT,
+                      new_logical_milli_utc BIGINT,
+                      new_logical_milli_local BIGINT,
+                      new_logical_micro_utc BIGINT,
+                      new_logical_micro_local BIGINT
+                     ) STORED AS PARQUET""".format(unique_database, TABLE_NAME)
+    create_table_and_copy_files(self.client, CREATE_SQL, unique_database, TABLE_NAME,
+        ["/testdata/data/int64_timestamps_dict.parquet"])
+
+    TABLE_NAME = "int64_timestamps_at_dst_changes"
+    create_table_from_parquet(self.client, unique_database, TABLE_NAME)
+
+    TABLE_NAME = "int64_timestamps_nano"
+    create_table_from_parquet(self.client, unique_database, TABLE_NAME)
+
+    self.run_test_case(
+        'QueryTest/parquet-int64-timestamps', vector, unique_database)
+
+  def _is_summary_stats_counter_empty(self, counter):
+    """Returns true if the given TSummaryStatCounter is empty, false otherwise"""
+    return counter.max_value == counter.min_value == counter.sum ==\
+           counter.total_num_values == 0
+
+  def test_page_size_counters(self, vector):
+    """IMPALA-6964: Test that the counter Parquet[Un]compressedPageSize is updated
+       when reading [un]compressed Parquet files, and that the counter
+       Parquet[Un]compressedPageSize is not updated."""
+    # lineitem_sixblocks is not compressed so ParquetCompressedPageSize should be empty,
+    # but ParquetUncompressedPageSize should have been updated
+    result = self.client.execute("select * from functional_parquet.lineitem_sixblocks"
+                                 " limit 10")
+
+    compressed_page_size_summaries = get_bytes_summary_stats_counter(
+        "ParquetCompressedPageSize", result.runtime_profile)
+
+    assert len(compressed_page_size_summaries) > 0
+    for summary in compressed_page_size_summaries:
+      assert self._is_summary_stats_counter_empty(summary)
+
+    uncompressed_page_size_summaries = get_bytes_summary_stats_counter(
+        "ParquetUncompressedPageSize", result.runtime_profile)
+
+    # validate that some uncompressed data has been read; we don't validate the exact
+    # amount as the value can change depending on Parquet format optimizations, Impala
+    # scanner optimizations, etc.
+    assert len(uncompressed_page_size_summaries) > 0
+    for summary in uncompressed_page_size_summaries:
+      assert not self._is_summary_stats_counter_empty(summary)
+
+    # alltypestiny is compressed so both ParquetCompressedPageSize and
+    # ParquetUncompressedPageSize should have been updated
+    result = self.client.execute("select * from functional_parquet.alltypestiny"
+                                 " limit 10")
+
+    for summary_name in ("ParquetCompressedPageSize", "ParquetUncompressedPageSize"):
+      page_size_summaries = get_bytes_summary_stats_counter(
+          summary_name, result.runtime_profile)
+      assert len(page_size_summaries) > 0
+      for summary in page_size_summaries:
+        assert not self._is_summary_stats_counter_empty(summary)
+
+  def test_bytes_read_per_column(self, vector):
+    """IMPALA-6964: Test that the counter Parquet[Un]compressedBytesReadPerColumn is
+       updated when reading [un]compressed Parquet files, and that the counter
+       Parquet[Un]CompressedBytesReadPerColumn is not updated."""
+    # lineitem_sixblocks is not compressed so ParquetCompressedBytesReadPerColumn should
+    # be empty, but ParquetUncompressedBytesReadPerColumn should have been updated
+    result = self.client.execute("select * from functional_parquet.lineitem_sixblocks"
+                                 " limit 10")
+
+    compressed_bytes_read_per_col_summaries = get_bytes_summary_stats_counter(
+        "ParquetCompressedBytesReadPerColumn", result.runtime_profile)
+
+    assert len(compressed_bytes_read_per_col_summaries) > 0
+    for summary in compressed_bytes_read_per_col_summaries:
+      assert self._is_summary_stats_counter_empty(summary)
+
+    uncompressed_bytes_read_per_col_summaries = get_bytes_summary_stats_counter(
+        "ParquetUncompressedBytesReadPerColumn", result.runtime_profile)
+
+    assert len(uncompressed_bytes_read_per_col_summaries) > 0
+    for summary in uncompressed_bytes_read_per_col_summaries:
+      assert not self._is_summary_stats_counter_empty(summary)
+      # There are 16 columns in lineitem_sixblocks so there should be 16 samples
+      assert summary.total_num_values == 16
+
+    # alltypestiny is compressed so both ParquetCompressedBytesReadPerColumn and
+    # ParquetUncompressedBytesReadPerColumn should have been updated
+    result = self.client.execute("select * from functional_parquet.alltypestiny"
+                                 " limit 10")
+
+    for summary_name in ("ParquetCompressedBytesReadPerColumn",
+                         "ParquetUncompressedBytesReadPerColumn"):
+      bytes_read_per_col_summaries = get_bytes_summary_stats_counter(summary_name,
+          result.runtime_profile)
+      assert len(bytes_read_per_col_summaries) > 0
+      for summary in bytes_read_per_col_summaries:
+        assert not self._is_summary_stats_counter_empty(summary)
+        # There are 11 columns in alltypestiny so there should be 11 samples
+        assert summary.total_num_values == 11
+
 
 # We use various scan range lengths to exercise corner cases in the HDFS scanner more
 # thoroughly. In particular, it will exercise:
@@ -642,7 +917,8 @@ class TestParquet(ImpalaTestSuite):
 # 2. scan range with no tuple
 # 3. tuple that span across multiple scan ranges
 # 4. scan range length = 16 for ParseSse() execution path
-MAX_SCAN_RANGE_LENGTHS = [0, 1, 2, 5, 16, 17, 32]
+# 5. scan range fits at least one row
+MAX_SCAN_RANGE_LENGTHS = [0, 1, 2, 5, 16, 17, 32, 512]
 
 class TestScanRangeLengths(ImpalaTestSuite):
   @classmethod
@@ -659,6 +935,80 @@ class TestScanRangeLengths(ImpalaTestSuite):
     vector.get_value('exec_option')['max_scan_range_length'] =\
         vector.get_value('max_scan_range_length')
     self.run_test_case('QueryTest/hdfs-tiny-scan', vector)
+
+
+# Scan range lengths for TPC-H data sets. Test larger scan range sizes. Random
+# variation to the length is added by the test in order to exercise edge cases.
+TPCH_SCAN_RANGE_LENGTHS = [128 * 1024, 16 * 1024 * 1024]
+
+class TestTpchScanRangeLengths(ImpalaTestSuite):
+  """Exercise different scan range lengths on the larger TPC-H data sets."""
+  @classmethod
+  def get_workload(cls):
+    return 'tpch'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestTpchScanRangeLengths, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('scan_range_length', *TPCH_SCAN_RANGE_LENGTHS))
+
+  def test_tpch_scan_ranges(self, vector):
+    # Randomly adjust the scan range length to exercise different code paths.
+    max_scan_range_length = \
+        int(vector.get_value('scan_range_length') * (random.random() + 0.5))
+    LOG.info("max_scan_range_length={0}".format(max_scan_range_length))
+    vector.get_value('exec_option')['max_scan_range_length'] = max_scan_range_length
+    self.run_test_case('tpch-scan-range-lengths', vector)
+
+
+@SkipIf.not_s3
+class TestParquetScanRangeAssigment(ImpalaTestSuite):
+  """Test scan range assignment for Parquet files on S3. Since scan range assignment
+  cannot be validated in the S3PlannerTest (see IMPALA-8942), validate it here."""
+
+  @classmethod
+  def get_workload(cls):
+    return 'tpch'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestParquetScanRangeAssigment, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'parquet')
+
+  def test_scan_range_skew(self, vector):
+    """Validate that each scanner reads an even number of row groups (e.g. there is no
+    skew). While scan ranges might be assigned evenly, scanners skip Parquet scan ranges
+    that do not process a range that overlaps the Parquet row-group midpoint."""
+
+    # Run TPC-H Q6, which re-produces the scan range assignment bug described in
+    # IMPALA-3453.
+    result = self.execute_query("select sum(l_extendedprice * l_discount) as revenue "
+        "from tpch_parquet.lineitem where l_shipdate >= '1994-01-01' and "
+        "l_shipdate < '1995-01-01' and l_discount between 0.05 and 0.07 and "
+        "l_quantity < 24")
+
+    # NumRowGroups tracks the number of row groups actually read, not necessarily the
+    # number assigned. Assert that each fragment processed exactly one row group.
+    self.__assert_counter_equals(r'NumRowGroups: (\d+)', 1, result.runtime_profile)
+    # ScanRangesComplete tracks the number of scan ranges assigned to each fragment.
+    # Assert that each fragment was assigned exactly one scan range.
+    self.__assert_counter_equals(r'ScanRangesComplete: (\d+)', 1, result.runtime_profile)
+    # NumScannersWithNoReads tracks the number of scan ranges that did not trigger any
+    # reads. In the case of Parquet, this counter would be > 0 if a fragment was assigned
+    # a scan range that does *not* contain the midpoint of a Parquet row group. Assert
+    # that this value is always 0.
+    self.__assert_counter_equals(r'NumScannersWithNoReads: (\d+)', 0,
+        result.runtime_profile)
+
+  def __assert_counter_equals(self, counter_regex, value, runtime_profile):
+    """Helper method that asserts that the given counter_regex is in the given
+    runtime_profile and that each occurence of the counter matches the expected value."""
+    num_row_groups_counters = re.findall(counter_regex, runtime_profile)
+    assert len(num_row_groups_counters) > 1
+    for num_row_groups in num_row_groups_counters: assert int(num_row_groups) == value
+
 
 # More tests for text scanner
 # 1. Test file that ends w/o tuple delimiter
@@ -766,7 +1116,7 @@ class TestTextSplitDelimiters(ImpalaTestSuite):
     with tempfile.NamedTemporaryFile() as f:
       f.write(data)
       f.flush()
-      check_call(['hadoop', 'fs', '-copyFromLocal', f.name, location])
+      self.filesystem_client.copy_from_local(f.name, location)
     self.client.execute("refresh %s" % qualified_table_name);
 
     vector.get_value('exec_option')['max_scan_range_length'] = max_scan_range_length
@@ -790,18 +1140,22 @@ class TestTextScanRangeLengths(ImpalaTestSuite):
         v.get_value('table_format').compression_codec in ['none', 'gzip'])
 
   def test_text_scanner_with_header(self, vector, unique_database):
-    self.run_test_case('QueryTest/hdfs-text-scan-with-header', vector,
+    # Remove to allow .test file to set abort_on_error.
+    new_vector = deepcopy(vector)
+    del new_vector.get_value('exec_option')['abort_on_error']
+    self.run_test_case('QueryTest/hdfs-text-scan-with-header', new_vector,
                        test_file_vars={'$UNIQUE_DB': unique_database})
 
 
 # Missing Coverage: No coverage for truncated files errors or scans.
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 class TestScanTruncatedFiles(ImpalaTestSuite):
   @classmethod
-  def get_workload(self):
+  def get_workload(cls):
     return 'functional-query'
 
   @classmethod
@@ -839,6 +1193,169 @@ class TestScanTruncatedFiles(ImpalaTestSuite):
     self.run_stmt_in_hive("insert overwrite table %s select string_col from "
         "functional.alltypes limit %s" % (fq_tbl_name, num_rows))
 
+    # The file will not exist if the table is empty and the insert is done by Hive 3, so
+    # another refresh is needed.
+    self.execute_query("refresh %s" % fq_tbl_name)
+
     result = self.execute_query("select count(*) from %s" % fq_tbl_name)
     assert(len(result.data) == 1)
     assert(result.data[0] == str(num_rows))
+
+class TestUncompressedText(ImpalaTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestUncompressedText, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
+        v.get_value('table_format').compression_codec == 'none')
+
+  # IMPALA-5315: Test support for date/time in unpadded format
+  def test_scan_lazy_timestamp(self, vector, unique_database):
+    test_files = ["testdata/data/lazy_timestamp.csv"]
+    create_table_and_copy_files(self.client, """CREATE TABLE {db}.{tbl} (ts TIMESTAMP)""",
+                                unique_database, "lazy_ts", test_files)
+    self.run_test_case('QueryTest/select-lazy-timestamp', vector, unique_database)
+
+class TestOrc(ImpalaTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestOrc, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(
+      lambda v: v.get_value('table_format').file_format == 'orc')
+
+  @SkipIfS3.hdfs_block_size
+  @SkipIfABFS.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
+  @SkipIfEC.fix_later
+  @SkipIfIsilon.hdfs_block_size
+  @SkipIfLocal.multiple_impalad
+  def test_misaligned_orc_stripes(self, vector, unique_database):
+    self._build_lineitem_table_helper(unique_database, 'lineitem_threeblocks',
+        'lineitem_threeblocks.orc')
+    self._build_lineitem_table_helper(unique_database, 'lineitem_sixblocks',
+        'lineitem_sixblocks.orc')
+    self._build_lineitem_table_helper(unique_database,
+        'lineitem_orc_multiblock_one_stripe',
+        'lineitem_orc_multiblock_one_stripe.orc')
+
+    # functional_orc.alltypes is well-formatted. 'NumScannersWithNoReads' counters are
+    # set to 0.
+    table_name = 'functional_orc_def.alltypes'
+    self._misaligned_orc_stripes_helper(table_name, 7300)
+    # lineitem_threeblock.orc is ill-formatted but every scanner reads some stripes.
+    # 'NumScannersWithNoReads' counters are set to 0.
+    table_name = unique_database + '.lineitem_threeblocks'
+    self._misaligned_orc_stripes_helper(table_name, 16000)
+    # lineitem_sixblocks.orc is ill-formatted but every scanner reads some stripes.
+    # 'NumScannersWithNoReads' counters are set to 0.
+    table_name = unique_database + '.lineitem_sixblocks'
+    self._misaligned_orc_stripes_helper(table_name, 30000)
+    # Scanning lineitem_orc_multiblock_one_stripe.orc finds two scan ranges that end up
+    # doing no reads because the file is poorly formatted.
+    table_name = unique_database + '.lineitem_orc_multiblock_one_stripe'
+    self._misaligned_orc_stripes_helper(
+      table_name, 16000, num_scanners_with_no_reads=2)
+
+  def _build_lineitem_table_helper(self, db, tbl, file):
+    self.client.execute("create table %s.%s like tpch.lineitem stored as orc" % (db, tbl))
+    tbl_loc = get_fs_path("/test-warehouse/%s.db/%s" % (db, tbl))
+    # set block size to 156672 so lineitem_threeblocks.orc occupies 3 blocks,
+    # lineitem_sixblocks.orc occupies 6 blocks.
+    check_call(['hdfs', 'dfs', '-Ddfs.block.size=156672', '-copyFromLocal', '-d', '-f',
+        os.environ['IMPALA_HOME'] + "/testdata/LineItemMultiBlock/" + file, tbl_loc])
+
+  def _misaligned_orc_stripes_helper(
+          self, table_name, rows_in_table, num_scanners_with_no_reads=0):
+    """Checks if 'num_scanners_with_no_reads' indicates the expected number of scanners
+    that don't read anything because the underlying file is poorly formatted
+    """
+    query = 'select * from %s' % table_name
+    result = self.client.execute(query)
+    assert len(result.data) == rows_in_table
+
+    num_scanners_with_no_reads_list = re.findall(
+      'NumScannersWithNoReads: ([0-9]*)', result.runtime_profile)
+
+    # This will fail if the number of impalads != 3
+    # The fourth fragment is the "Averaged Fragment"
+    assert len(num_scanners_with_no_reads_list) == 4
+
+    # Calculate the total number of scan ranges that ended up not reading anything because
+    # an underlying file was poorly formatted.
+    # Skip the Averaged Fragment; it comes first in the runtime profile.
+    total = 0
+    for n in num_scanners_with_no_reads_list[1:]:
+      total += int(n)
+    assert total == num_scanners_with_no_reads
+
+  def test_type_conversions(self, vector, unique_database):
+    # Create an "illtypes" table whose columns can't match the underlining ORC file's.
+    # Create an "safetypes" table likes above but ORC columns can still fit into it.
+    # Reuse the data files of functional_orc_def.alltypestiny
+    tbl_loc = get_fs_path("/test-warehouse/alltypestiny_orc_def")
+    self.client.execute("""create external table %s.illtypes (c1 boolean, c2 float,
+        c3 boolean, c4 tinyint, c5 smallint, c6 int, c7 boolean, c8 string, c9 int,
+        c10 float, c11 bigint) partitioned by (year int, month int) stored as ORC
+        location '%s';""" % (unique_database, tbl_loc))
+    self.client.execute("""create external table %s.safetypes (c1 bigint, c2 boolean,
+        c3 smallint, c4 int, c5 bigint, c6 bigint, c7 double, c8 double, c9 char(3),
+        c10 varchar(3), c11 timestamp) partitioned by (year int, month int) stored as ORC
+        location '%s';""" % (unique_database, tbl_loc))
+    self.client.execute("alter table %s.illtypes recover partitions" % unique_database)
+    self.client.execute("alter table %s.safetypes recover partitions" % unique_database)
+
+    # Create a decimal table whose precisions don't match the underlining orc files.
+    # Reuse the data files of functional_orc_def.decimal_tbl.
+    decimal_loc = get_fs_path("/test-warehouse/decimal_tbl_orc_def")
+    self.client.execute("""create external table %s.mismatch_decimals (d1 decimal(8,0),
+        d2 decimal(8,0), d3 decimal(19,10), d4 decimal(20,20), d5 decimal(2,0))
+        partitioned by (d6 decimal(9,0)) stored as orc location '%s'"""
+        % (unique_database, decimal_loc))
+    self.client.execute("alter table %s.mismatch_decimals recover partitions" % unique_database)
+
+    self.run_test_case('DataErrorsTest/orc-type-checks', vector, unique_database)
+
+  def test_orc_timestamp_out_of_range(self, vector, unique_database):
+      """Test the validation of out-of-range timestamps."""
+      test_files = ["testdata/data/out_of_range_timestamp.orc"]
+      create_table_and_copy_files(self.client, "create table {db}.{tbl} "
+                                               "(ts timestamp) stored as orc",
+                                  unique_database, "out_of_range_timestamp", test_files)
+      new_vector = deepcopy(vector)
+      del new_vector.get_value('exec_option')['abort_on_error']
+      self.run_test_case('DataErrorsTest/orc-out-of-range-timestamp',
+                         new_vector, unique_database)
+
+class TestScannerReservation(ImpalaTestSuite):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestScannerReservation, cls).add_test_dimensions()
+    # Only run with a single dimension - all queries are format-specific and
+    # reference tpch or tpch_parquet directly.
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+
+  @SkipIfNotHdfsMinicluster.tuned_for_minicluster
+  def test_scanners(self, vector):
+    self.run_test_case('QueryTest/scanner-reservation', vector)
+
+class TestErasureCoding(ImpalaTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @SkipIf.not_ec
+  def test_erasure_coding(self, vector):
+    self.run_test_case('QueryTest/hdfs-erasure-coding', vector)

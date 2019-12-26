@@ -106,6 +106,36 @@ TEST_F(MetricsTest, GaugeMetrics) {
   AssertValue(int_gauge_with_units, 10, "10s000ms");
 }
 
+TEST_F(MetricsTest, AtomicHighWaterMarkGauge) {
+  MetricGroup metrics("IntHWMGauge");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::NONE);
+  AddMetricDef("hwm_gauge", TMetricKind::GAUGE, TUnit::NONE);
+  AtomicHighWaterMarkGauge* int_hwm_gauge = metrics.AddHWMGauge("hwm_gauge", "gauge", 0);
+  IntGauge* int_gauge = int_hwm_gauge->current_value_;
+  AssertValue(int_hwm_gauge, 0, "0");
+  AssertValue(int_gauge, 0, "0");
+  int_hwm_gauge->Increment(-1);
+  AssertValue(int_hwm_gauge, 0, "0");
+  AssertValue(int_gauge, -1, "-1");
+  int_hwm_gauge->Increment(10);
+  AssertValue(int_hwm_gauge, 9, "9");
+  AssertValue(int_gauge, 9, "9");
+  int_hwm_gauge->SetValue(3456);
+  AssertValue(int_hwm_gauge, 3456, "3456");
+  AssertValue(int_gauge, 3456, "3456");
+  int_hwm_gauge->SetValue(100);
+  AssertValue(int_hwm_gauge, 3456, "3456");
+  AssertValue(int_gauge, 100, "100");
+
+  AddMetricDef("hwm_gauge_with_units", TMetricKind::GAUGE, TUnit::BYTES);
+  AddMetricDef("gauge_with_units", TMetricKind::GAUGE, TUnit::BYTES);
+  AtomicHighWaterMarkGauge* int_hwm_gauge_with_units =
+      metrics.AddHWMGauge("hwm_gauge_with_units", "gauge_with_units", 10);
+  IntGauge* int_gauge_with_units = int_hwm_gauge_with_units->current_value_;
+  AssertValue(int_hwm_gauge_with_units, 10, "10.00 B");
+  AssertValue(int_gauge_with_units, 10, "10.00 B");
+}
+
 TEST_F(MetricsTest, SumGauge) {
   MetricGroup metrics("SumGauge");
   AddMetricDef("gauge1", TMetricKind::GAUGE, TUnit::NONE);
@@ -202,9 +232,9 @@ TEST_F(MetricsTest, StatsMetrics) {
 
 TEST_F(MetricsTest, StatsMetricsSingle) {
   MetricGroup metrics("StatsMetrics");
-  StatsMetric<int, StatsType::MAX | StatsType::MEAN>*
+  StatsMetric<uint64_t, StatsType::MAX | StatsType::MEAN>*
       stats_metric =
-      StatsMetric<int, StatsType::MAX | StatsType::MEAN>::CreateAndRegister(&metrics,
+      StatsMetric<uint64_t, StatsType::MAX | StatsType::MEAN>::CreateAndRegister(&metrics,
           "impala-server.io.mgr.cached-file-handles-hit-ratio");
   EXPECT_EQ(stats_metric->ToHumanReadable(), "");
   stats_metric->Update(3);
@@ -247,8 +277,8 @@ TEST_F(MetricsTest, MemMetric) {
 #endif
 }
 
-TEST_F(MetricsTest, JvmMetrics) {
-  MetricGroup metrics("JvmMetrics");
+TEST_F(MetricsTest, JvmMemoryMetrics) {
+  MetricGroup metrics("JvmMemoryMetrics");
   ASSERT_OK(RegisterMemoryMetrics(&metrics, true, nullptr, nullptr));
   IntGauge* jvm_total_used =
       metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<IntGauge>(
@@ -267,8 +297,12 @@ void AssertJson(const Value& val, const string& name, const string& value,
   EXPECT_EQ(val["name"].GetString(), name);
   EXPECT_EQ(val["human_readable"].GetString(), value);
   EXPECT_EQ(val["description"].GetString(), description);
-  if (!kind.empty()) EXPECT_EQ(val["kind"].GetString(), kind);
-  if (!units.empty()) EXPECT_EQ(val["units"].GetString(), units);
+  if (!kind.empty()) {
+    EXPECT_EQ(val["kind"].GetString(), kind);
+  }
+  if (!units.empty()) {
+    EXPECT_EQ(val["units"].GetString(), units);
+  }
 }
 
 TEST_F(MetricsTest, CountersJson) {
@@ -415,10 +449,15 @@ TEST_F(MetricsTest, MetricGroupJson) {
   EXPECT_EQ(val["name"].GetString(), string("JsonTest"));
 
   EXPECT_EQ(val["child_groups"].Size(), 2);
-  EXPECT_EQ(val["child_groups"][0u]["name"].GetString(), string("child1"));
-  EXPECT_EQ(val["child_groups"][0u]["metrics"].Size(), 0);
-  EXPECT_EQ(val["child_groups"][1]["name"].GetString(), string("child2"));
-  EXPECT_EQ(val["child_groups"][1]["metrics"].Size(), 1);
+  std::unordered_map<string, int64_t> group_to_num_metrics_map = {
+      {val["child_groups"][0u]["name"].GetString(),
+          val["child_groups"][0u]["metrics"].Size()},
+      {val["child_groups"][1]["name"].GetString(),
+          val["child_groups"][1]["metrics"].Size()}};
+  EXPECT_TRUE(group_to_num_metrics_map.find("child1") != group_to_num_metrics_map.end());
+  EXPECT_EQ(group_to_num_metrics_map["child1"], 0);
+  EXPECT_TRUE(group_to_num_metrics_map.find("child2") != group_to_num_metrics_map.end());
+  EXPECT_EQ(group_to_num_metrics_map["child2"], 1);
 
   find_result = metrics.FindChildGroup("child1");
   ASSERT_NE(find_result, reinterpret_cast<MetricGroup*>(NULL));
@@ -429,10 +468,453 @@ TEST_F(MetricsTest, MetricGroupJson) {
   EXPECT_EQ(val2["name"].GetString(), string("child1"));
 }
 
+TEST_F(MetricsTest, RegisterAndRemoveMetric) {
+  MetricGroup metrics("Metrics");
+
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::NONE);
+  IntGauge* int_gauge = metrics.AddGauge("gauge", 0);
+  AssertValue(int_gauge, 0, "0");
+  int_gauge->Increment(-1);
+  AssertValue(int_gauge, -1, "-1");
+
+  // Now try removing the metric from the metric group.
+  int_gauge = nullptr;
+  metrics.RemoveMetric("gauge");
+  EXPECT_EQ(metrics.FindMetricForTesting<IntGauge*>("gauge"), nullptr);
 }
 
-int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-  impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
-  return RUN_ALL_TESTS();
+// Test the mapping of Impala's metric names into prometheus names.
+TEST_F(MetricsTest, PrometheusMetricNames) {
+  // Test that metrics get prefixed with impala_ if needed and don't get
+  // prefixed if they already start with impala.
+  EXPECT_EQ("impala_metric", MetricGroup::ImpalaToPrometheusName("impala_metric"));
+  EXPECT_EQ(
+      "impala_an_impala_metric", MetricGroup::ImpalaToPrometheusName("an_impala_metric"));
+  EXPECT_EQ("impala_IMPALA_METRIC", MetricGroup::ImpalaToPrometheusName("IMPALA_METRIC"));
+  EXPECT_EQ("impala_random_metric", MetricGroup::ImpalaToPrometheusName("random_metric"));
+  EXPECT_EQ("impala_impal_random_metric",
+      MetricGroup::ImpalaToPrometheusName("impal_random_metric"));
+  EXPECT_EQ(
+      "impala_impalas_metric", MetricGroup::ImpalaToPrometheusName("impalas_metric"));
+  EXPECT_EQ("impala_impalametric", MetricGroup::ImpalaToPrometheusName("impalametric"));
+  EXPECT_EQ("impala_server_metric",
+      MetricGroup::ImpalaToPrometheusName("impala-server-metric"));
+
+  // Test that . and - get transformed to _.
+  EXPECT_EQ("impala_metric_name_with_punctuation_",
+      MetricGroup::ImpalaToPrometheusName("metric-name.with-punctuation_"));
+
+  // Other special characters are unmodified
+  EXPECT_EQ("impala_!@#$%*", MetricGroup::ImpalaToPrometheusName("!@#$%*"));
 }
+
+void AssertPrometheus(const std::stringstream& val, const string& name,
+    const string& value, const string& desc, const string& kind = "") {
+  std::stringstream exp_val;
+  // convert to all values to expected format
+  exp_val << "# HELP " << name << " " << desc << "\n"
+          << "# TYPE " << name << " " << kind << "\n";
+  if (name == "impala_stats_metric" || name == "impala_histogram_metric") {
+    exp_val << value + "\n";
+  } else {
+    exp_val << name << " " << value + "\n";
+  }
+  EXPECT_EQ(val.str(), exp_val.str());
+}
+
+TEST_F(MetricsTest, CountersPrometheus) {
+  MetricGroup metrics("CounterMetrics");
+  AddMetricDef("counter", TMetricKind::COUNTER, TUnit::UNIT, "description");
+  metrics.AddCounter("counter", 0);
+  std::stringstream counter_val;
+  metrics.ToPrometheus(true, &counter_val);
+  AssertPrometheus(counter_val, "impala_counter", "0", "description", "counter");
+}
+
+TEST_F(MetricsTest, CountersBytesPrometheus) {
+  MetricGroup metrics("CounterMetrics");
+  AddMetricDef("counter", TMetricKind::COUNTER, TUnit::BYTES, "description");
+  metrics.AddCounter("counter", 555);
+  std::stringstream counter_val;
+  metrics.ToPrometheus(true, &counter_val);
+  AssertPrometheus(counter_val, "impala_counter", "555", "description", "counter");
+}
+
+TEST_F(MetricsTest, CountersNonePrometheus) {
+  MetricGroup metrics("CounterMetrics");
+  AddMetricDef("counter", TMetricKind::COUNTER, TUnit::NONE, "description");
+  metrics.AddCounter("counter", 0);
+  std::stringstream counter_val;
+  metrics.ToPrometheus(true, &counter_val);
+  AssertPrometheus(counter_val, "impala_counter", "0", "description", "counter");
+}
+
+TEST_F(MetricsTest, CountersTimeMSPrometheus) {
+  MetricGroup metrics("CounterMetrics");
+  AddMetricDef("counter", TMetricKind::COUNTER, TUnit::TIME_MS, "description");
+  metrics.AddCounter("counter", 4354364);
+  std::stringstream counter_val;
+  metrics.ToPrometheus(true, &counter_val);
+  AssertPrometheus(counter_val, "impala_counter", "4354.36", "description", "counter");
+}
+
+TEST_F(MetricsTest, CountersTimeNSPrometheus) {
+  MetricGroup metrics("CounterMetrics");
+  AddMetricDef("counter", TMetricKind::COUNTER, TUnit::TIME_NS, "description");
+  metrics.AddCounter("counter", 4354364234);
+  std::stringstream counter_val;
+  metrics.ToPrometheus(true, &counter_val);
+  AssertPrometheus(counter_val, "impala_counter", "4.35436", "description", "counter");
+}
+
+TEST_F(MetricsTest, CountersTimeSPrometheus) {
+  MetricGroup metrics("CounterMetrics");
+  AddMetricDef("counter", TMetricKind::COUNTER, TUnit::TIME_S, "description");
+  metrics.AddCounter("counter", 120);
+  std::stringstream counter_val;
+  metrics.ToPrometheus(true, &counter_val);
+  AssertPrometheus(counter_val, "impala_counter", "120", "description", "counter");
+}
+
+TEST_F(MetricsTest, GaugesPrometheus) {
+  MetricGroup metrics("GaugeMetrics");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::NONE);
+  metrics.AddGauge("gauge", 10);
+  std::stringstream gauge_val;
+  metrics.ToPrometheus(true, &gauge_val);
+  AssertPrometheus(gauge_val, "impala_gauge", "10", "", "gauge");
+}
+
+TEST_F(MetricsTest, GaugesBytesPrometheus) {
+  MetricGroup metrics("GaugeMetrics");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::BYTES);
+  metrics.AddGauge("gauge", 150000);
+  std::stringstream gauge_val;
+  metrics.ToPrometheus(true, &gauge_val);
+  AssertPrometheus(gauge_val, "impala_gauge", "150000", "", "gauge");
+}
+
+TEST_F(MetricsTest, GaugesTimeMSPrometheus) {
+  MetricGroup metrics("GaugeMetrics");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::TIME_MS);
+  metrics.AddGauge("gauge", 10000);
+  std::stringstream gauge_val;
+  metrics.ToPrometheus(true, &gauge_val);
+  AssertPrometheus(gauge_val, "impala_gauge", "10", "", "gauge");
+}
+
+TEST_F(MetricsTest, GaugesTimeNSPrometheus) {
+  MetricGroup metrics("GaugeMetrics");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::TIME_NS);
+  metrics.AddGauge("gauge", 2334123456);
+  std::stringstream gauge_val;
+  metrics.ToPrometheus(true, &gauge_val);
+  AssertPrometheus(gauge_val, "impala_gauge", "2.33412", "", "gauge");
+}
+
+TEST_F(MetricsTest, GaugesTimeSPrometheus) {
+  MetricGroup metrics("GaugeMetrics");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::TIME_S);
+  metrics.AddGauge("gauge", 1500);
+  std::stringstream gauge_val;
+  metrics.ToPrometheus(true, &gauge_val);
+  AssertPrometheus(gauge_val, "impala_gauge", "1500", "", "gauge");
+}
+
+TEST_F(MetricsTest, GaugesUnitPrometheus) {
+  MetricGroup metrics("GaugeMetrics");
+  AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::UNIT);
+  metrics.AddGauge("gauge", 111);
+  std::stringstream gauge_val;
+  metrics.ToPrometheus(true, &gauge_val);
+  AssertPrometheus(gauge_val, "impala_gauge", "111", "", "gauge");
+}
+
+TEST_F(MetricsTest, StatsMetricsPrometheus) {
+  MetricGroup metrics("StatsMetrics");
+  AddMetricDef("stats_metric", TMetricKind::STATS, TUnit::UNIT);
+  StatsMetric<double>* metric =
+      StatsMetric<double>::CreateAndRegister(&metrics, "stats_metric");
+  metric->Update(10.0);
+  metric->Update(20.0);
+  std::stringstream stats_val;
+  metrics.ToPrometheus(true, &stats_val);
+  AssertPrometheus(stats_val, "impala_stats_metric",
+      "impala_stats_metric_total 2\n"
+      "impala_stats_metric_last 20\n"
+      "impala_stats_metric_min 10\n"
+      "impala_stats_metric_max 20\n"
+      "impala_stats_metric_mean 15\n"
+      "impala_stats_metric_stddev 5\n",
+      "", "counter");
+}
+
+TEST_F(MetricsTest, StatsMetricsBytesPrometheus) {
+  MetricGroup metrics("StatsMetrics");
+  AddMetricDef("stats_metric", TMetricKind::STATS, TUnit::BYTES);
+  StatsMetric<double>* metric =
+      StatsMetric<double>::CreateAndRegister(&metrics, "stats_metric");
+  metric->Update(10.0);
+  metric->Update(2230.1234567);
+  std::stringstream stats_val;
+  metrics.ToPrometheus(true, &stats_val);
+  AssertPrometheus(stats_val, "impala_stats_metric",
+      "impala_stats_metric_total 2\n"
+      "impala_stats_metric_last 2230.12\n"
+      "impala_stats_metric_min 10\n"
+      "impala_stats_metric_max 2230.12\n"
+      "impala_stats_metric_mean 1120.06\n"
+      "impala_stats_metric_stddev 1110.06\n",
+      "", "counter");
+}
+
+TEST_F(MetricsTest, StatsMetricsNonePrometheus) {
+  MetricGroup metrics("StatsMetrics");
+  AddMetricDef("stats_metric", TMetricKind::STATS, TUnit::NONE);
+  StatsMetric<double>* metric =
+      StatsMetric<double>::CreateAndRegister(&metrics, "stats_metric");
+  metric->Update(10.0);
+  metric->Update(20.0);
+  std::stringstream stats_val;
+  metrics.ToPrometheus(true, &stats_val);
+  AssertPrometheus(stats_val, "impala_stats_metric",
+      "impala_stats_metric_total 2\n"
+      "impala_stats_metric_last 20\n"
+      "impala_stats_metric_min 10\n"
+      "impala_stats_metric_max 20\n"
+      "impala_stats_metric_mean 15\n"
+      "impala_stats_metric_stddev 5\n",
+      "", "counter");
+}
+
+TEST_F(MetricsTest, StatsMetricsTimeMSPrometheus) {
+  MetricGroup metrics("StatsMetrics");
+  AddMetricDef("stats_metric", TMetricKind::STATS, TUnit::TIME_MS);
+  StatsMetric<double>* metric =
+      StatsMetric<double>::CreateAndRegister(&metrics, "stats_metric");
+  metric->Update(10.0);
+  metric->Update(20.0);
+  std::stringstream stats_val;
+  metrics.ToPrometheus(true, &stats_val);
+  AssertPrometheus(stats_val, "impala_stats_metric",
+      "impala_stats_metric_total 2\n"
+      "impala_stats_metric_last 0.02\n"
+      "impala_stats_metric_min 0.01\n"
+      "impala_stats_metric_max 0.02\n"
+      "impala_stats_metric_mean 0.015\n"
+      "impala_stats_metric_stddev 0.005\n",
+      "", "counter");
+}
+
+TEST_F(MetricsTest, StatsMetricsTimeNSPrometheus) {
+  MetricGroup metrics("StatsMetrics");
+  AddMetricDef("stats_metric", TMetricKind::STATS, TUnit::TIME_NS);
+  StatsMetric<double>* metric =
+      StatsMetric<double>::CreateAndRegister(&metrics, "stats_metric");
+  metric->Update(10.12345);
+  metric->Update(20.567);
+  std::stringstream stats_val;
+  metrics.ToPrometheus(true, &stats_val);
+  AssertPrometheus(stats_val, "impala_stats_metric",
+      "impala_stats_metric_total 2\n"
+      "impala_stats_metric_last 2.0567e-08\n"
+      "impala_stats_metric_min 1.01235e-08\n"
+      "impala_stats_metric_max 2.0567e-08\n"
+      "impala_stats_metric_mean 1.53452e-08\n"
+      "impala_stats_metric_stddev 5.22178e-09\n",
+      "", "counter");
+}
+
+TEST_F(MetricsTest, StatsMetricsTimeSPrometheus) {
+  MetricGroup metrics("StatsMetrics");
+  AddMetricDef("stats_metric", TMetricKind::STATS, TUnit::TIME_S);
+  StatsMetric<double>* metric =
+      StatsMetric<double>::CreateAndRegister(&metrics, "stats_metric");
+  metric->Update(10.22);
+  metric->Update(20.22);
+  std::stringstream stats_val;
+  metrics.ToPrometheus(true, &stats_val);
+  AssertPrometheus(stats_val, "impala_stats_metric",
+      "impala_stats_metric_total 2\n"
+      "impala_stats_metric_last 20.22\n"
+      "impala_stats_metric_min 10.22\n"
+      "impala_stats_metric_max 20.22\n"
+      "impala_stats_metric_mean 15.22\n"
+      "impala_stats_metric_stddev 5\n",
+      "", "counter");
+}
+
+TEST_F(MetricsTest, HistogramPrometheus) {
+  MetricGroup metrics("HistoMetrics");
+  TMetricDef metric_def =
+      MakeTMetricDef("histogram-metric", TMetricKind::HISTOGRAM, TUnit::TIME_MS);
+  constexpr int MAX_VALUE = 10000;
+  HistogramMetric* metric =
+      metrics.RegisterMetric(new HistogramMetric(metric_def, MAX_VALUE, 3));
+
+  // Add value beyond limit to make sure it's recorded accurately.
+  for (int i = 0; i <= MAX_VALUE + 1; ++i) metric->Update(i);
+
+  std::stringstream val;
+  metrics.ToPrometheus(true, &val);
+  AssertPrometheus(val, "impala_histogram_metric",
+      "impala_histogram_metric{quantile=\"0.2\"} 2.5\n"
+      "impala_histogram_metric{quantile=\"0.5\"} 5\n"
+      "impala_histogram_metric{quantile=\"0.7\"} 7.5\n"
+      "impala_histogram_metric{quantile=\"0.9\"} 9\n"
+      "impala_histogram_metric{quantile=\"0.95\"} 9.496\n"
+      "impala_histogram_metric{quantile=\"0.999\"} 9.984\n"
+      "impala_histogram_metric_count 10002\n"
+      "impala_histogram_metric_sum 50015",
+      "", "summary");
+}
+
+TEST_F(MetricsTest, HistogramTimeNSPrometheus) {
+  MetricGroup metrics("HistoMetrics");
+  TMetricDef metric_def =
+      MakeTMetricDef("histogram-metric", TMetricKind::HISTOGRAM, TUnit::TIME_NS);
+  constexpr int MAX_VALUE = 10000;
+  HistogramMetric* metric =
+      metrics.RegisterMetric(new HistogramMetric(metric_def, MAX_VALUE, 3));
+
+  // Add value beyond limit to make sure it's recorded accurately.
+  for (int i = 0; i <= MAX_VALUE + 1; ++i) metric->Update(i);
+
+  std::stringstream val;
+  metrics.ToPrometheus(true, &val);
+  AssertPrometheus(val, "impala_histogram_metric",
+      "impala_histogram_metric{quantile=\"0.2\"} 2.5e-06\n"
+      "impala_histogram_metric{quantile=\"0.5\"} 5e-06\n"
+      "impala_histogram_metric{quantile=\"0.7\"} 7.5e-06\n"
+      "impala_histogram_metric{quantile=\"0.9\"} 9e-06\n"
+      "impala_histogram_metric{quantile=\"0.95\"} 9.496e-06\n"
+      "impala_histogram_metric{quantile=\"0.999\"} 9.984e-06\n"
+      "impala_histogram_metric_count 10002\n"
+      "impala_histogram_metric_sum 0.050015",
+      "", "summary");
+}
+
+TEST_F(MetricsTest, HistogramTimeSPrometheus) {
+  MetricGroup metrics("HistoMetrics");
+  TMetricDef metric_def =
+      MakeTMetricDef("histogram-metric", TMetricKind::HISTOGRAM, TUnit::TIME_S);
+  constexpr int MAX_VALUE = 10000;
+  HistogramMetric* metric =
+      metrics.RegisterMetric(new HistogramMetric(metric_def, MAX_VALUE, 3));
+
+  // Add value beyond limit to make sure it's recorded accurately.
+  for (int i = 0; i <= MAX_VALUE + 1; ++i) metric->Update(i);
+
+  std::stringstream val;
+  metrics.ToPrometheus(true, &val);
+  AssertPrometheus(val, "impala_histogram_metric",
+      "impala_histogram_metric{quantile=\"0.2\"} 2500\n"
+      "impala_histogram_metric{quantile=\"0.5\"} 5000\n"
+      "impala_histogram_metric{quantile=\"0.7\"} 7500\n"
+      "impala_histogram_metric{quantile=\"0.9\"} 9000\n"
+      "impala_histogram_metric{quantile=\"0.95\"} 9496\n"
+      "impala_histogram_metric{quantile=\"0.999\"} 9984\n"
+      "impala_histogram_metric_count 10002\n"
+      "impala_histogram_metric_sum 50015001",
+      "", "summary");
+}
+
+TEST_F(MetricsTest, HistogramBytesPrometheus) {
+  MetricGroup metrics("HistoMetrics");
+  TMetricDef metric_def =
+      MakeTMetricDef("histogram-metric", TMetricKind::HISTOGRAM, TUnit::BYTES);
+  constexpr int MAX_VALUE = 10000;
+  HistogramMetric* metric =
+      metrics.RegisterMetric(new HistogramMetric(metric_def, MAX_VALUE, 3));
+
+  // Add value beyond limit to make sure it's recorded accurately.
+  for (int i = 0; i <= MAX_VALUE + 1; ++i) metric->Update(i);
+
+  std::stringstream val;
+  metrics.ToPrometheus(true, &val);
+  AssertPrometheus(val, "impala_histogram_metric",
+      "impala_histogram_metric{quantile=\"0.2\"} 2500\n"
+      "impala_histogram_metric{quantile=\"0.5\"} 5000\n"
+      "impala_histogram_metric{quantile=\"0.7\"} 7500\n"
+      "impala_histogram_metric{quantile=\"0.9\"} 9000\n"
+      "impala_histogram_metric{quantile=\"0.95\"} 9496\n"
+      "impala_histogram_metric{quantile=\"0.999\"} 9984\n"
+      "impala_histogram_metric_count 10002\n"
+      "impala_histogram_metric_sum 50015001",
+      "", "summary");
+}
+
+TEST_F(MetricsTest, HistogramUnitPrometheus) {
+  MetricGroup metrics("HistoMetrics");
+  TMetricDef metric_def =
+      MakeTMetricDef("histogram-metric", TMetricKind::HISTOGRAM, TUnit::UNIT);
+  constexpr int MAX_VALUE = 10000;
+  HistogramMetric* metric =
+      metrics.RegisterMetric(new HistogramMetric(metric_def, MAX_VALUE, 3));
+
+  // Add value beyond limit to make sure it's recorded accurately.
+  for (int i = 0; i <= MAX_VALUE + 1; ++i) metric->Update(i);
+
+  std::stringstream val;
+  metrics.ToPrometheus(true, &val);
+  AssertPrometheus(val, "impala_histogram_metric",
+      "impala_histogram_metric{quantile=\"0.2\"} 2500\n"
+      "impala_histogram_metric{quantile=\"0.5\"} 5000\n"
+      "impala_histogram_metric{quantile=\"0.7\"} 7500\n"
+      "impala_histogram_metric{quantile=\"0.9\"} 9000\n"
+      "impala_histogram_metric{quantile=\"0.95\"} 9496\n"
+      "impala_histogram_metric{quantile=\"0.999\"} 9984\n"
+      "impala_histogram_metric_count 10002\n"
+      "impala_histogram_metric_sum 50015001",
+      "", "summary");
+}
+
+TEST_F(MetricsTest, MetricGroupPrometheus) {
+  std::stringstream exp_val_counter1, exp_val_counter2, exp_val_child_counter;
+  exp_val_counter1 << "# HELP impala_counter1 description\n"
+                      "# TYPE impala_counter1 counter\n"
+                      "impala_counter1 2048\n";
+  exp_val_counter2 << "# HELP impala_counter2 description\n"
+                      "# TYPE impala_counter2 counter\n"
+                      "impala_counter2 2048\n";
+  exp_val_child_counter << "# HELP impala_child_counter description\n"
+                           "# TYPE impala_child_counter counter\n"
+                           "impala_child_counter 0\n";
+  MetricGroup metrics("PrometheusTest");
+  AddMetricDef("counter1", TMetricKind::COUNTER, TUnit::BYTES, "description");
+  AddMetricDef("counter2", TMetricKind::COUNTER, TUnit::BYTES, "description");
+  metrics.AddCounter("counter1", 2048);
+  metrics.AddCounter("counter2", 2048);
+
+  MetricGroup* find_result = metrics.FindChildGroup("child1");
+  EXPECT_EQ(find_result, reinterpret_cast<MetricGroup*>(NULL));
+
+  metrics.GetOrCreateChildGroup("child1");
+  AddMetricDef("child_counter", TMetricKind::COUNTER, TUnit::BYTES, "description");
+  metrics.GetOrCreateChildGroup("child2")->AddCounter("child_counter", 0);
+
+  IntCounter* counter = metrics.FindMetricForTesting<IntCounter>(string("child_counter"));
+  ASSERT_NE(counter, reinterpret_cast<IntCounter*>(NULL));
+
+  std::stringstream val;
+  metrics.ToPrometheus(true, &val);
+  EXPECT_STR_CONTAINS(val.str(), exp_val_counter1.str());
+  EXPECT_STR_CONTAINS(val.str(), exp_val_counter2.str());
+  EXPECT_STR_CONTAINS(val.str(), exp_val_child_counter.str());
+}
+
+// test with null metrics
+TEST_F(MetricsTest, StatsMetricsNullPrometheus) {
+  MetricGroup nullMetrics("StatsMetrics");
+  AddMetricDef("", TMetricKind::STATS, TUnit::TIME_S);
+  std::stringstream stats_val;
+  nullMetrics.ToPrometheus(true, &stats_val);
+  EXPECT_EQ("", stats_val.str());
+
+  MetricGroup metrics("Metrics");
+  AddMetricDef("test", TMetricKind::STATS, TUnit::TIME_S);
+  metrics.ToPrometheus(true, &stats_val);
+  EXPECT_EQ("", stats_val.str());
+}
+}
+

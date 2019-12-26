@@ -3,81 +3,91 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <fts.h>
 #include <glob.h>
-#include <limits.h>
 #include <pthread.h>
-#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <memory>
 #include <numeric>
+#include <ostream>
 #include <string>
 #include <type_traits>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/bind.h"
-#include "kudu/gutil/callback.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/once.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/atomic.h"
+#include "kudu/gutil/strings/util.h"
+#include "kudu/util/array_view.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/env.h"
 #include "kudu/util/errno.h"
-#include "kudu/util/flags.h"
-#include "kudu/util/flag_tags.h"
 #include "kudu/util/fault_injection.h"
+#include "kudu/util/flag_tags.h"
+#include "kudu/util/flags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/malloc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/thread_restrictions.h"
 #include "kudu/util/trace.h"
-
-// Compile-time checks for fallocate(), pread(), pwritev() etc.
-#include "common/config.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <sys/sysctl.h>
 #else
 #include <linux/falloc.h>
-
-// On RHEL5 this header causes compilation errors, due to issues with linux/types.h. There
-// is not an obvious good way to detect this issue at compile time, so instead use
-// IMPALA_HAVE_FALLOCATE as a proxy for RHEL5, and disable fiemap.h usage if fallocate()
-// is not available.
-#if defined(IMPALA_HAVE_FALLOCATE)
 #include <linux/fiemap.h>
-#endif
-
 #include <linux/fs.h>
-#if defined HAVE_MAGIC_H
+#include <linux/ioctl.h>
+#include <linux/kernel.h>
 #include <linux/magic.h>
-#endif
+#include <linux/types.h>
 #include <sys/ioctl.h>
 #include <sys/sysinfo.h>
 #include <sys/vfs.h>
 #endif  // defined(__APPLE__)
+
+using base::subtle::Atomic64;
+using base::subtle::Barrier_AtomicIncrement;
+using std::accumulate;
+using std::string;
+using std::unique_ptr;
+using std::vector;
+using strings::Substitute;
 
 // Copied from falloc.h. Useful for older kernels that lack support for
 // hole punching; fallocate(2) will return EOPNOTSUPP.
@@ -88,65 +98,103 @@
 #define FALLOC_FL_PUNCH_HOLE  0x02 /* de-allocates range */
 #endif
 
-// For platforms without fdatasync (like OS X)
-#ifndef fdatasync
-#define fdatasync fsync
+
+#ifndef __APPLE__
+// These struct and ioctl definitions were copied verbatim from xfsprogs.
+typedef struct xfs_flock64 {
+        __s16           l_type;
+        __s16           l_whence;
+        __s64           l_start;
+        __s64           l_len;          /* len == 0 means until end of file */
+        __s32           l_sysid;
+        __u32           l_pid;
+        __s32           l_pad[4];       /* reserve area                     */
+} xfs_flock64_t;
+#define XFS_IOC_UNRESVSP64      _IOW ('X', 43, struct xfs_flock64)
 #endif
 
-// For platforms without unlocked_stdio (like OS X)
-#ifndef fread_unlocked
+// OSX does not have fdatasync or fread_unlocked.
+#ifdef __APPLE__
+#define fdatasync fsync
 #define fread_unlocked fread
 #endif
 
-// Retry on EINTR for functions like read() that return -1 on error.
-#define RETRY_ON_EINTR(err, expr) do { \
-  static_assert(std::is_signed<decltype(err)>::value == true, \
-                #err " must be a signed integer"); \
-  (err) = (expr); \
-} while ((err) == -1 && errno == EINTR)
+// With some probability, if 'filename_expr' matches the glob pattern specified
+// by the 'env_inject_eio_globs' flag, calls RETURN_NOT_OK on 'error_expr'.
+#define MAYBE_RETURN_EIO(filename_expr, error_expr) do { \
+  const string& f_ = (filename_expr); \
+  MAYBE_RETURN_FAILURE(FLAGS_env_inject_eio, \
+      ShouldInject(f_, FLAGS_env_inject_eio_globs) ? (error_expr) : Status::OK()) \
+} while (0);
 
-// Same as the above, but for stream API calls like fread() and fwrite().
-#define STREAM_RETRY_ON_EINTR(nread, stream, expr) do { \
-  static_assert(std::is_unsigned<decltype(nread)>::value == true, \
-                #nread " must be an unsigned integer"); \
-  (nread) = (expr); \
-} while ((nread) == 0 && ferror(stream) == EINTR)
+bool ShouldInject(const string& candidate, const string& glob_patterns) {
+  // Never inject on /proc/ file accesses regardless of the configured flag,
+  // since it's not possible for /proc to "go bad".
+  //
+  // NB: it's important that this is done here _before_ consulting glob_patterns
+  // since some background threads read /proc/ after gflags have already been
+  // destructed.
+  if (HasPrefixString(candidate, "/proc/")) {
+    return false;
+  }
+
+  vector<string> globs = strings::Split(glob_patterns, ",", strings::SkipEmpty());
+  for (const auto& glob : globs) {
+    if (fnmatch(glob.c_str(), candidate.c_str(), 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // See KUDU-588 for details.
-DEFINE_bool_hidden(env_use_fsync, false,
+DEFINE_bool(env_use_fsync, false,
             "Use fsync(2) instead of fdatasync(2) for synchronizing dirty "
             "data to disk.");
 TAG_FLAG(env_use_fsync, advanced);
 TAG_FLAG(env_use_fsync, evolving);
 
-DEFINE_bool_hidden(suicide_on_eio, true,
-            "Kill the process if an I/O operation results in EIO");
-TAG_FLAG(suicide_on_eio, advanced);
+// See KUDU-2052 for details.
+DEFINE_bool(env_use_ioctl_hole_punch_on_xfs, true,
+            "Use the XFS_IOC_UNRESVSP64 ioctl instead of fallocate(2) to "
+            "punch holes on XFS filesystems.");
+TAG_FLAG(env_use_ioctl_hole_punch_on_xfs, advanced);
+TAG_FLAG(env_use_ioctl_hole_punch_on_xfs, experimental);
 
-DEFINE_bool_hidden(never_fsync, false,
+DEFINE_bool(crash_on_eio, false,
+            "Kill the process if an I/O operation results in EIO. If false, "
+            "I/O resulting in EIOs will return the status IOError and leave "
+            "error-handling up to the caller.");
+TAG_FLAG(crash_on_eio, advanced);
+TAG_FLAG(crash_on_eio, experimental);
+
+DEFINE_bool(never_fsync, false,
             "Never fsync() anything to disk. This is used by certain test cases to "
             "speed up runtime. This is very unsafe to use in production.");
 TAG_FLAG(never_fsync, advanced);
 TAG_FLAG(never_fsync, unsafe);
 
-DEFINE_double_hidden(env_inject_io_error, 0.0,
-              "Fraction of the time that certain I/O operations will fail");
-TAG_FLAG(env_inject_io_error, hidden);
-
-DEFINE_int32_hidden(env_inject_short_read_bytes, 0,
+DEFINE_int32(env_inject_short_read_bytes, 0,
              "The number of bytes less than the requested bytes to read");
 TAG_FLAG(env_inject_short_read_bytes, hidden);
-DEFINE_int32_hidden(env_inject_short_write_bytes, 0,
+DEFINE_int32(env_inject_short_write_bytes, 0,
              "The number of bytes less than the requested bytes to write");
 TAG_FLAG(env_inject_short_write_bytes, hidden);
 
-using base::subtle::Atomic64;
-using base::subtle::Barrier_AtomicIncrement;
-using std::accumulate;
-using std::string;
-using std::unique_ptr;
-using std::vector;
-using strings::Substitute;
+DEFINE_double(env_inject_eio, 0.0,
+              "Fraction of the time that operations on certain files will fail "
+              "with the posix code EIO.");
+TAG_FLAG(env_inject_eio, hidden);
+DEFINE_string(env_inject_eio_globs, "*",
+              "Comma-separated list of glob patterns specifying files on which "
+              "I/O will fail. By default, all files may cause a failure.");
+TAG_FLAG(env_inject_eio_globs, hidden);
+
+DEFINE_string(env_inject_lock_failure_globs, "",
+              "Comma-separated list of glob patterns specifying files on which "
+              "attempts to obtain a file lock will fail. By default, no files "
+              "will fail.");
+TAG_FLAG(env_inject_lock_failure_globs, hidden);
 
 static __thread uint64_t thread_local_id;
 static Atomic64 cur_thread_local_id_;
@@ -192,13 +240,7 @@ int fallocate(int fd, int mode, off_t offset, off_t len) {
   }
   return 0;
 }
-#elif !defined(IMPALA_HAVE_FALLOCATE)
-int fallocate(int fd, int mode, off_t offset, off_t len) {
-  return EOPNOTSUPP;
-}
-#endif
 
-#if !defined(HAVE_PREADV)
 // Simulates Linux's preadv API on OS X.
 ssize_t preadv(int fd, const struct iovec* iovec, int count, off_t offset) {
   ssize_t total_read_bytes = 0;
@@ -246,7 +288,8 @@ class ScopedFdCloser {
 
   ~ScopedFdCloser() {
     ThreadRestrictions::AssertIOAllowed();
-    int err = ::close(fd_);
+    int err;
+    RETRY_ON_EINTR(err, ::close(fd_));
     if (PREDICT_FALSE(err != 0)) {
       PLOG(WARNING) << "Failed to close fd " << fd_;
     }
@@ -265,18 +308,20 @@ Status IOError(const std::string& context, int err_number) {
     case EOPNOTSUPP:
       return Status::NotSupported(context, ErrnoToString(err_number), err_number);
     case EIO:
-      if (FLAGS_suicide_on_eio) {
-        // TODO: This is very, very coarse-grained. A more comprehensive
+      if (FLAGS_crash_on_eio) {
+        // TODO(awong): This is very, very coarse-grained. A more comprehensive
         // approach is described in KUDU-616.
         LOG(FATAL) << "Fatal I/O error, context: " << context;
+      } else {
+        LOG(ERROR) << "I/O error, context: " << context;
       }
   }
   return Status::IOError(context, ErrnoToString(err_number), err_number);
 }
 
 Status DoSync(int fd, const string& filename) {
-  MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                       Status::IOError(Env::kInjectedFailureStatusMsg));
+  MAYBE_RETURN_EIO(filename, IOError(Env::kInjectedFailureStatusMsg, EIO));
+
   ThreadRestrictions::AssertIOAllowed();
   if (FLAGS_never_fsync) return Status::OK();
   if (FLAGS_env_use_fsync) {
@@ -296,6 +341,7 @@ Status DoSync(int fd, const string& filename) {
 }
 
 Status DoOpen(const string& filename, Env::CreateMode mode, int* fd) {
+  MAYBE_RETURN_EIO(filename, IOError(Env::kInjectedFailureStatusMsg, EIO));
   ThreadRestrictions::AssertIOAllowed();
   int flags = O_RDWR;
   switch (mode) {
@@ -310,7 +356,8 @@ Status DoOpen(const string& filename, Env::CreateMode mode, int* fd) {
     default:
       return Status::NotSupported(Substitute("Unknown create mode $0", mode));
   }
-  const int f = open(filename.c_str(), flags, 0666);
+  int f;
+  RETRY_ON_EINTR(f, open(filename.c_str(), flags, 0666));
   if (f < 0) {
     return IOError(filename, errno);
   }
@@ -318,16 +365,18 @@ Status DoOpen(const string& filename, Env::CreateMode mode, int* fd) {
   return Status::OK();
 }
 
-Status DoReadV(int fd, const string& filename, uint64_t offset, vector<Slice>* results) {
+Status DoReadV(int fd, const string& filename, uint64_t offset,
+               ArrayView<Slice> results) {
+  MAYBE_RETURN_EIO(filename, IOError(Env::kInjectedFailureStatusMsg, EIO));
   ThreadRestrictions::AssertIOAllowed();
 
   // Convert the results into the iovec vector to request
   // and calculate the total bytes requested
   size_t bytes_req = 0;
-  size_t iov_size = results->size();
+  size_t iov_size = results.size();
   struct iovec iov[iov_size];
   for (size_t i = 0; i < iov_size; i++) {
-    Slice& result = (*results)[i];
+    Slice& result = results[i];
     bytes_req += result.size();
     iov[i] = { result.mutable_data(), result.size() };
   }
@@ -353,7 +402,7 @@ Status DoReadV(int fd, const string& filename, uint64_t offset, vector<Slice>* r
     }
     if (PREDICT_FALSE(r == 0)) {
       // EOF.
-      return Status::IOError(
+      return Status::EndOfFile(
           Substitute("EOF trying to read $0 bytes at offset $1", bytes_req, offset));
     }
     if (PREDICT_TRUE(r == rem)) {
@@ -383,10 +432,8 @@ Status DoReadV(int fd, const string& filename, uint64_t offset, vector<Slice>* r
   return Status::OK();
 }
 
-Status DoWriteV(int fd, const string& filename, uint64_t offset,
-                const vector<Slice>& data) {
-  MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                       Status::IOError(Env::kInjectedFailureStatusMsg));
+Status DoWriteV(int fd, const string& filename, uint64_t offset, ArrayView<const Slice> data) {
+  MAYBE_RETURN_EIO(filename, IOError(Env::kInjectedFailureStatusMsg, EIO));
   ThreadRestrictions::AssertIOAllowed();
 
   // Convert the results into the iovec vector to request
@@ -448,6 +495,53 @@ Status DoWriteV(int fd, const string& filename, uint64_t offset,
   return Status::OK();
 }
 
+Status DoIsOnXfsFilesystem(const string& path, bool* result) {
+#ifdef __APPLE__
+  *result = false;
+#else
+  struct statfs buf;
+  int ret;
+  RETRY_ON_EINTR(ret, statfs(path.c_str(), &buf));
+  if (ret == -1) {
+    return IOError(Substitute("statfs: $0", path), errno);
+  }
+  // This magic number isn't defined in any header but is the value of the
+  // US-ASCII string 'XFSB' expressed in hexadecimal.
+  *result = (buf.f_type == 0x58465342);
+#endif
+  return Status::OK();
+}
+
+const char* ResourceLimitTypeToString(Env::ResourceLimitType t) {
+  switch (t) {
+    case Env::ResourceLimitType::OPEN_FILES_PER_PROCESS:
+      return "open files per process";
+    case Env::ResourceLimitType::RUNNING_THREADS_PER_EUID:
+      return "running threads per effective uid";
+    default: LOG(FATAL) << "Unknown resource limit type";
+  }
+}
+
+int ResourceLimitTypeToUnixRlimit(Env::ResourceLimitType t) {
+  switch (t) {
+    case Env::ResourceLimitType::OPEN_FILES_PER_PROCESS: return RLIMIT_NOFILE;
+    case Env::ResourceLimitType::RUNNING_THREADS_PER_EUID: return RLIMIT_NPROC;
+    default: LOG(FATAL) << "Unknown resource limit type: " << t;
+  }
+}
+
+#ifdef __APPLE__
+const char* ResourceLimitTypeToMacosRlimit(Env::ResourceLimitType t) {
+  switch (t) {
+    case Env::ResourceLimitType::OPEN_FILES_PER_PROCESS:
+      return "kern.maxfilesperproc";
+    case Env::ResourceLimitType::RUNNING_THREADS_PER_EUID:
+      return "kern.maxprocperuid";
+    default: LOG(FATAL) << "Unknown resource limit type: " << t;
+  }
+}
+#endif
+
 class PosixSequentialFile: public SequentialFile {
  private:
   std::string filename_;
@@ -456,9 +550,16 @@ class PosixSequentialFile: public SequentialFile {
  public:
   PosixSequentialFile(std::string fname, FILE* f)
       : filename_(std::move(fname)), file_(f) {}
-  virtual ~PosixSequentialFile() { fclose(file_); }
+  virtual ~PosixSequentialFile() {
+    int err;
+    RETRY_ON_EINTR(err, fclose(file_));
+    if (PREDICT_FALSE(err != 0)) {
+      PLOG(WARNING) << "Failed to close " << filename_;
+    }
+  }
 
   virtual Status Read(Slice* result) OVERRIDE {
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     size_t r;
     STREAM_RETRY_ON_EINTR(r, file_, fread_unlocked(result->mutable_data(), 1,
@@ -477,6 +578,7 @@ class PosixSequentialFile: public SequentialFile {
   }
 
   virtual Status Skip(uint64_t n) OVERRIDE {
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     TRACE_EVENT1("io", "PosixSequentialFile::Skip", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
     if (fseek(file_, n, SEEK_CUR)) {
@@ -497,18 +599,24 @@ class PosixRandomAccessFile: public RandomAccessFile {
  public:
   PosixRandomAccessFile(std::string fname, int fd)
       : filename_(std::move(fname)), fd_(fd) {}
-  virtual ~PosixRandomAccessFile() { close(fd_); }
-
-  virtual Status Read(uint64_t offset, Slice* result) const OVERRIDE {
-    vector<Slice> results = { *result };
-    return ReadV(offset, &results);
+  virtual ~PosixRandomAccessFile() {
+    int err;
+    RETRY_ON_EINTR(err, close(fd_));
+    if (PREDICT_FALSE(err != 0)) {
+      PLOG(WARNING) << "Failed to close " << filename_;
+    }
   }
 
-  virtual Status ReadV(uint64_t offset, vector<Slice>* results) const OVERRIDE {
+  virtual Status Read(uint64_t offset, Slice result) const OVERRIDE {
+    return DoReadV(fd_, filename_, offset, ArrayView<Slice>(&result, 1));
+  }
+
+  virtual Status ReadV(uint64_t offset, ArrayView<Slice> results) const OVERRIDE {
     return DoReadV(fd_, filename_, offset, results);
   }
 
   virtual Status Size(uint64_t *size) const OVERRIDE {
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     TRACE_EVENT1("io", "PosixRandomAccessFile::Size", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
     struct stat st;
@@ -548,10 +656,10 @@ class PosixWritableFile : public WritableFile {
   }
 
   virtual Status Append(const Slice& data) OVERRIDE {
-    return AppendV({ data });
+    return AppendV(ArrayView<const Slice>(&data, 1));
   }
 
-  virtual Status AppendV(const vector<Slice> &data) OVERRIDE {
+  virtual Status AppendV(ArrayView<const Slice> data) OVERRIDE {
     ThreadRestrictions::AssertIOAllowed();
     RETURN_NOT_OK(DoWriteV(fd_, filename_, filesize_, data));
     // Calculate the amount of data written
@@ -565,12 +673,14 @@ class PosixWritableFile : public WritableFile {
   }
 
   virtual Status PreAllocate(uint64_t size) OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
+
     TRACE_EVENT1("io", "PosixWritableFile::PreAllocate", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
     uint64_t offset = std::max(filesize_, pre_allocated_size_);
-    if (fallocate(fd_, 0, offset, size) < 0) {
+    int ret;
+    RETRY_ON_EINTR(ret, fallocate(fd_, 0, offset, size));
+    if (ret != 0) {
       if (errno == EOPNOTSUPP) {
         KLOG_FIRST_N(WARNING, 1) << "The filesystem does not support fallocate().";
       } else if (errno == ENOSYS) {
@@ -584,10 +694,9 @@ class PosixWritableFile : public WritableFile {
   }
 
   virtual Status Close() OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT1("io", "PosixWritableFile::Close", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     Status s;
 
     // If we've allocated more space than we used, truncate to the
@@ -611,7 +720,9 @@ class PosixWritableFile : public WritableFile {
       }
     }
 
-    if (close(fd_) < 0) {
+    int ret;
+    RETRY_ON_EINTR(ret, close(fd_));
+    if (ret < 0) {
       if (s.ok()) {
         s = IOError(filename_, errno);
       }
@@ -622,11 +733,10 @@ class PosixWritableFile : public WritableFile {
   }
 
   virtual Status Flush(FlushMode mode) OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT1("io", "PosixWritableFile::Flush", "path", filename_);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
-#if defined(HAVE_SYNC_FILE_RANGE)
+#if defined(__linux__)
     int flags = SYNC_FILE_RANGE_WRITE;
     if (mode == FLUSH_SYNC) {
       flags |= SYNC_FILE_RANGE_WAIT_BEFORE;
@@ -677,44 +787,43 @@ class PosixRWFile : public RWFile {
       : filename_(std::move(fname)),
         fd_(fd),
         sync_on_close_(sync_on_close),
-        pending_sync_(false),
+        is_on_xfs_(false),
         closed_(false) {}
 
   ~PosixRWFile() {
     WARN_NOT_OK(Close(), "Failed to close " + filename_);
   }
 
-  virtual Status Read(uint64_t offset, Slice* result) const OVERRIDE {
-    vector<Slice> results = { *result };
-    return ReadV(offset, &results);
+  virtual Status Read(uint64_t offset, Slice result) const OVERRIDE {
+    return DoReadV(fd_, filename_, offset, ArrayView<Slice>(&result, 1));
   }
 
-  virtual Status ReadV(uint64_t offset, vector<Slice>* results) const OVERRIDE {
+  virtual Status ReadV(uint64_t offset, ArrayView<Slice> results) const OVERRIDE {
     return DoReadV(fd_, filename_, offset, results);
   }
 
   virtual Status Write(uint64_t offset, const Slice& data) OVERRIDE {
-    return WriteV(offset, { data });
+    return WriteV(offset, ArrayView<const Slice>(&data, 1));
   }
 
-  virtual Status WriteV(uint64_t offset, const vector<Slice> &data) OVERRIDE {
-    Status s = DoWriteV(fd_, filename_, offset, data);
-    pending_sync_.Store(true);
-    return s;
+  virtual Status WriteV(uint64_t offset, ArrayView<const Slice> data) OVERRIDE {
+    return DoWriteV(fd_, filename_, offset, data);
   }
 
   virtual Status PreAllocate(uint64_t offset,
                              size_t length,
                              PreAllocateMode mode) OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
+
     TRACE_EVENT1("io", "PosixRWFile::PreAllocate", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
     int falloc_mode = 0;
     if (mode == DONT_CHANGE_FILE_SIZE) {
       falloc_mode = FALLOC_FL_KEEP_SIZE;
     }
-    if (fallocate(fd_, falloc_mode, offset, length) < 0) {
+    int ret;
+    RETRY_ON_EINTR(ret, fallocate(fd_, falloc_mode, offset, length));
+    if (ret != 0) {
       if (errno == EOPNOTSUPP) {
         KLOG_FIRST_N(WARNING, 1) << "The filesystem does not support fallocate().";
       } else if (errno == ENOSYS) {
@@ -727,9 +836,8 @@ class PosixRWFile : public RWFile {
   }
 
   virtual Status Truncate(uint64_t length) OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT2("io", "PosixRWFile::Truncate", "path", filename_, "length", length);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     int ret;
     RETRY_ON_EINTR(ret, ftruncate(fd_, length));
@@ -744,12 +852,35 @@ class PosixRWFile : public RWFile {
 
   virtual Status PunchHole(uint64_t offset, size_t length) OVERRIDE {
 #if defined(__linux__)
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT1("io", "PosixRWFile::PunchHole", "path", filename_);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
-    if (fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, length) < 0) {
-      return IOError(filename_, errno);
+
+    // KUDU-2052: xfs in el6 systems induces an fsync in the kernel whenever it
+    // performs a hole punch through the fallocate() syscall, even if the file
+    // range was already punched out. The older xfs-specific hole punching
+    // ioctl doesn't do this, despite eventually executing the same xfs code.
+    // To keep the code simple, we'll use this ioctl on any xfs system (not
+    // just on el6) and fallocate() on all other filesystems.
+    //
+    // Note: the cast to void* here (and back to PosixRWFile*, in InitIsOnXFS)
+    // is needed to avoid an undefined behavior warning from UBSAN.
+    once_.Init(&InitIsOnXFS, reinterpret_cast<void*>(this));
+    if (is_on_xfs_ && FLAGS_env_use_ioctl_hole_punch_on_xfs) {
+      xfs_flock64_t cmd;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.l_start = offset;
+      cmd.l_len = length;
+      if (ioctl(fd_, XFS_IOC_UNRESVSP64, &cmd) < 0) {
+        return IOError(filename_, errno);
+      }
+    } else {
+      int ret;
+      RETRY_ON_EINTR(ret, fallocate(
+          fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, length));
+      if (ret != 0) {
+        return IOError(filename_, errno);
+      }
     }
     return Status::OK();
 #else
@@ -758,11 +889,10 @@ class PosixRWFile : public RWFile {
   }
 
   virtual Status Flush(FlushMode mode, uint64_t offset, size_t length) OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT1("io", "PosixRWFile::Flush", "path", filename_);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
-#if defined(HAVE_SYNC_FILE_RANGE)
+#if defined(__linux__)
     int flags = SYNC_FILE_RANGE_WRITE;
     if (mode == FLUSH_SYNC) {
       flags |= SYNC_FILE_RANGE_WAIT_AFTER;
@@ -779,10 +909,6 @@ class PosixRWFile : public RWFile {
   }
 
   virtual Status Sync() OVERRIDE {
-    if (!pending_sync_.CompareAndSwap(true, false)) {
-      return Status::OK();
-    }
-
     TRACE_EVENT1("io", "PosixRWFile::Sync", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
     LOG_SLOW_EXECUTION(WARNING, 1000, Substitute("sync call for $0", filename())) {
@@ -795,9 +921,8 @@ class PosixRWFile : public RWFile {
     if (closed_) {
       return Status::OK();
     }
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT1("io", "PosixRWFile::Close", "path", filename_);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status s;
 
@@ -808,7 +933,9 @@ class PosixRWFile : public RWFile {
       }
     }
 
-    if (close(fd_) < 0) {
+    int ret;
+    RETRY_ON_EINTR(ret, close(fd_));
+    if (ret < 0) {
       if (s.ok()) {
         s = IOError(filename_, errno);
       }
@@ -820,6 +947,7 @@ class PosixRWFile : public RWFile {
 
   virtual Status Size(uint64_t* size) const OVERRIDE {
     TRACE_EVENT1("io", "PosixRWFile::Size", "path", filename_);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     struct stat st;
     if (fstat(fd_, &st) == -1) {
@@ -830,10 +958,11 @@ class PosixRWFile : public RWFile {
   }
 
   virtual Status GetExtentMap(ExtentMap* out) const OVERRIDE {
-#if !defined(__linux__) || !defined(IMPALA_HAVE_FALLOCATE)
+#if !defined(__linux__)
     return Status::NotSupported("GetExtentMap not supported on this platform");
 #else
     TRACE_EVENT1("io", "PosixRWFile::GetExtentMap", "path", filename_);
+    MAYBE_RETURN_EIO(filename_, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
 
     // This allocation size is arbitrary.
@@ -891,11 +1020,25 @@ class PosixRWFile : public RWFile {
   }
 
  private:
+  static void InitIsOnXFS(void* arg) {
+    PosixRWFile* rwf = reinterpret_cast<PosixRWFile*>(arg);
+    bool result;
+    Status s = DoIsOnXfsFilesystem(rwf->filename_, &result);
+    if (s.ok()) {
+      rwf->is_on_xfs_ = result;
+    } else {
+      KLOG_EVERY_N_SECS(WARNING, 1) <<
+          Substitute("Could not determine whether file is on xfs, assuming not: $0",
+                     s.ToString());
+    }
+  }
+
   const std::string filename_;
   const int fd_;
   const bool sync_on_close_;
 
-  AtomicBool pending_sync_;
+  GoogleOnceDynamic once_;
+  bool is_on_xfs_;
   bool closed_;
 };
 
@@ -908,7 +1051,9 @@ int LockOrUnlock(int fd, bool lock) {
   f.l_whence = SEEK_SET;
   f.l_start = 0;
   f.l_len = 0;        // Lock/unlock entire file
-  return fcntl(fd, F_SETLK, &f);
+  int ret;
+  RETRY_ON_EINTR(ret, fcntl(fd, F_SETLK, &f));
+  return ret;
 }
 
 class PosixFileLock : public FileLock {
@@ -927,14 +1072,15 @@ class PosixEnv : public Env {
   virtual Status NewSequentialFile(const std::string& fname,
                                    unique_ptr<SequentialFile>* result) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::NewSequentialFile", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
-    FILE* f = fopen(fname.c_str(), "r");
+    FILE* f;
+    POINTER_RETRY_ON_EINTR(f, fopen(fname.c_str(), "r"));
     if (f == nullptr) {
       return IOError(fname, errno);
-    } else {
-      result->reset(new PosixSequentialFile(fname, f));
-      return Status::OK();
     }
+    result->reset(new PosixSequentialFile(fname, f));
+    return Status::OK();
   }
 
   virtual Status NewRandomAccessFile(const std::string& fname,
@@ -946,8 +1092,10 @@ class PosixEnv : public Env {
                                      const std::string& fname,
                                      unique_ptr<RandomAccessFile>* result) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::NewRandomAccessFile", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
-    int fd = open(fname.c_str(), O_RDONLY);
+    int fd;
+    RETRY_ON_EINTR(fd, open(fname.c_str(), O_RDONLY));
     if (fd < 0) {
       return IOError(fname, errno);
     }
@@ -1016,6 +1164,7 @@ class PosixEnv : public Env {
   virtual Status GetChildren(const std::string& dir,
                              std::vector<std::string>* result) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::GetChildren", "path", dir);
+    MAYBE_RETURN_EIO(dir, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     result->clear();
     DIR* d = opendir(dir.c_str());
@@ -1033,6 +1182,7 @@ class PosixEnv : public Env {
 
   virtual Status DeleteFile(const std::string& fname) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::DeleteFile", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status result;
     if (unlink(fname.c_str()) != 0) {
@@ -1043,6 +1193,7 @@ class PosixEnv : public Env {
 
   virtual Status CreateDir(const std::string& name) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::CreateDir", "path", name);
+    MAYBE_RETURN_EIO(name, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status result;
     if (mkdir(name.c_str(), 0777) != 0) {
@@ -1053,6 +1204,7 @@ class PosixEnv : public Env {
 
   virtual Status DeleteDir(const std::string& name) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::DeleteDir", "path", name);
+    MAYBE_RETURN_EIO(name, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status result;
     if (rmdir(name.c_str()) != 0) {
@@ -1069,11 +1221,14 @@ class PosixEnv : public Env {
       return IOError("getcwd()", errno);
     }
     cwd->assign(wd.get());
+
+    MAYBE_RETURN_EIO(*cwd, IOError(Env::kInjectedFailureStatusMsg, EIO));
     return Status::OK();
   }
 
   Status ChangeDir(const string& dest) override {
     TRACE_EVENT1("io", "PosixEnv::ChangeDir", "dest", dest);
+    MAYBE_RETURN_EIO(dest, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status result;
     if (chdir(dest.c_str()) != 0) {
@@ -1084,10 +1239,12 @@ class PosixEnv : public Env {
 
   virtual Status SyncDir(const std::string& dirname) OVERRIDE {
     TRACE_EVENT1("io", "SyncDir", "path", dirname);
+    MAYBE_RETURN_EIO(dirname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     if (FLAGS_never_fsync) return Status::OK();
     int dir_fd;
-    if ((dir_fd = open(dirname.c_str(), O_DIRECTORY|O_RDONLY)) == -1) {
+    RETRY_ON_EINTR(dir_fd, open(dirname.c_str(), O_DIRECTORY|O_RDONLY));
+    if (dir_fd < 0) {
       return IOError(dirname, errno);
     }
     ScopedFdCloser fd_closer(dir_fd);
@@ -1104,6 +1261,7 @@ class PosixEnv : public Env {
 
   virtual Status GetFileSize(const std::string& fname, uint64_t* size) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::GetFileSize", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status s;
     struct stat sbuf;
@@ -1117,6 +1275,7 @@ class PosixEnv : public Env {
 
   virtual Status GetFileSizeOnDisk(const std::string& fname, uint64_t* size) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::GetFileSizeOnDisk", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status s;
     struct stat sbuf;
@@ -1146,6 +1305,7 @@ class PosixEnv : public Env {
 
   virtual Status GetBlockSize(const string& fname, uint64_t* block_size) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::GetBlockSize", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status s;
     struct stat sbuf;
@@ -1159,6 +1319,7 @@ class PosixEnv : public Env {
 
   virtual Status GetFileModifiedTime(const string& fname, int64_t* timestamp) override {
     TRACE_EVENT1("io", "PosixEnv::GetFileModifiedTime", "fname", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
 
     struct stat s;
@@ -1166,15 +1327,16 @@ class PosixEnv : public Env {
       return IOError(fname, errno);
     }
 #ifdef __APPLE__
-    *timestamp = s.st_mtimespec.tv_sec * 1e6 + s.st_mtimespec.tv_nsec / 1e3;
+    *timestamp = s.st_mtimespec.tv_sec * 1000000 + s.st_mtimespec.tv_nsec / 1000;
 #else
-    *timestamp = s.st_mtim.tv_sec * 1e6 + s.st_mtim.tv_nsec / 1e3;
+    *timestamp = s.st_mtim.tv_sec * 1000000 + s.st_mtim.tv_nsec / 1000;
 #endif
     return Status::OK();
   }
 
   // Local convenience function for safely running statvfs().
   static Status StatVfs(const string& path, struct statvfs* buf) {
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     int ret;
     RETRY_ON_EINTR(ret, statvfs(path.c_str(), buf));
@@ -1194,9 +1356,9 @@ class PosixEnv : public Env {
   }
 
   virtual Status RenameFile(const std::string& src, const std::string& target) OVERRIDE {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     TRACE_EVENT2("io", "PosixEnv::RenameFile", "src", src, "dst", target);
+    MAYBE_RETURN_EIO(src, IOError(Env::kInjectedFailureStatusMsg, EIO));
+    MAYBE_RETURN_EIO(target, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status result;
     if (rename(src.c_str(), target.c_str()) != 0) {
@@ -1207,15 +1369,24 @@ class PosixEnv : public Env {
 
   virtual Status LockFile(const std::string& fname, FileLock** lock) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::LockFile", "path", fname);
+    MAYBE_RETURN_EIO(fname, IOError(Env::kInjectedFailureStatusMsg, EIO));
+    if (ShouldInject(fname, FLAGS_env_inject_lock_failure_globs)) {
+      return IOError("lock " + fname, EAGAIN);
+    }
     ThreadRestrictions::AssertIOAllowed();
     *lock = nullptr;
     Status result;
-    int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0666);
+    int fd;
+    RETRY_ON_EINTR(fd, open(fname.c_str(), O_RDWR | O_CREAT, 0666));
     if (fd < 0) {
       result = IOError(fname, errno);
     } else if (LockOrUnlock(fd, true) == -1) {
       result = IOError("lock " + fname, errno);
-      close(fd);
+      int err;
+      RETRY_ON_EINTR(err, close(fd));
+      if (PREDICT_FALSE(err != 0)) {
+        PLOG(WARNING) << "Failed to close fd " << fd;
+      }
     } else {
       auto my_lock = new PosixFileLock;
       my_lock->fd_ = fd;
@@ -1227,13 +1398,16 @@ class PosixEnv : public Env {
   virtual Status UnlockFile(FileLock* lock) OVERRIDE {
     TRACE_EVENT0("io", "PosixEnv::UnlockFile");
     ThreadRestrictions::AssertIOAllowed();
-    PosixFileLock* my_lock = reinterpret_cast<PosixFileLock*>(lock);
+    unique_ptr<PosixFileLock> my_lock(reinterpret_cast<PosixFileLock*>(lock));
     Status result;
     if (LockOrUnlock(my_lock->fd_, false) == -1) {
       result = IOError("unlock", errno);
     }
-    close(my_lock->fd_);
-    delete my_lock;
+    int err;
+    RETRY_ON_EINTR(err, close(my_lock->fd_));
+    if (PREDICT_FALSE(err != 0)) {
+      PLOG(WARNING) << "Failed to close fd " << my_lock->fd_;
+    }
     return result;
   }
 
@@ -1275,6 +1449,7 @@ class PosixEnv : public Env {
   }
 
   virtual Status GetExecutablePath(string* path) OVERRIDE {
+    MAYBE_RETURN_EIO("/proc/self/exe", IOError(Env::kInjectedFailureStatusMsg, EIO));
     uint32_t size = 64;
     uint32_t len = 0;
     while (true) {
@@ -1307,6 +1482,7 @@ class PosixEnv : public Env {
 
   virtual Status IsDirectory(const string& path, bool* is_dir) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::IsDirectory", "path", path);
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     Status s;
     struct stat sbuf;
@@ -1320,6 +1496,7 @@ class PosixEnv : public Env {
 
   virtual Status Walk(const string& root, DirectoryOrder order, const WalkCallback& cb) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::Walk", "path", root);
+    MAYBE_RETURN_EIO(root, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     // Some sanity checks
     CHECK_NE(root, "/");
@@ -1333,11 +1510,13 @@ class PosixEnv : public Env {
     char *(paths[]) = { name_dup.get(), nullptr };
 
     // FTS_NOCHDIR is important here to make this thread-safe.
-    unique_ptr<FTS, FtsCloser> tree(
-        fts_open(paths, FTS_PHYSICAL | FTS_XDEV | FTS_NOCHDIR, nullptr));
-    if (!tree.get()) {
+    FTS* ret;
+    POINTER_RETRY_ON_EINTR(ret, fts_open(
+        paths, FTS_PHYSICAL | FTS_XDEV | FTS_NOCHDIR, nullptr));
+    if (ret == nullptr) {
       return IOError(root, errno);
     }
+    unique_ptr<FTS, FtsCloser> tree(ret);
 
     FTSENT *ent = nullptr;
     bool had_errors = false;
@@ -1363,7 +1542,9 @@ class PosixEnv : public Env {
           type = FILE_TYPE;
           break;
 
+        case FTS_DNR:
         case FTS_ERR:
+        case FTS_NS:
           LOG(WARNING) << "Unable to access file " << ent->fts_path
                        << " during walk: " << strerror(ent->fts_errno);
           had_errors = true;
@@ -1394,12 +1575,18 @@ class PosixEnv : public Env {
     glob_t result;
     auto cleanup = MakeScopedCleanup([&] { globfree(&result); });
 
+    errno = 0;
     int ret = glob(path_pattern.c_str(), GLOB_TILDE | GLOB_ERR , NULL, &result);
     switch (ret) {
       case 0: break;
       case GLOB_NOMATCH: return Status::OK();
       case GLOB_NOSPACE: return Status::RuntimeError("glob out of memory");
-      default: return Status::IOError("glob failure", std::to_string(ret));
+      default: {
+        string err = (errno != 0) ? ErrnoToString(errno) : "unknown error";
+        return Status::IOError(Substitute("glob failed for $0: $1",
+                                          path_pattern,
+                                          err));
+      }
     }
 
     for (size_t i = 0; i < result.gl_pathc; ++i) {
@@ -1410,6 +1597,7 @@ class PosixEnv : public Env {
 
   virtual Status Canonicalize(const string& path, string* result) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::Canonicalize", "path", path);
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
     unique_ptr<char[], FreeDeleter> r(realpath(path.c_str(), nullptr));
     if (!r) {
@@ -1438,54 +1626,62 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
-  virtual int64_t GetOpenFileLimit() OVERRIDE {
+  virtual uint64_t GetResourceLimit(ResourceLimitType t) OVERRIDE {
+    static_assert(std::is_unsigned<rlim_t>::value, "rlim_t must be unsigned");
+    static_assert(RLIM_INFINITY > 0, "RLIM_INFINITY must be positive");
+
     // There's no reason for this to ever fail.
     struct rlimit l;
-    PCHECK(getrlimit(RLIMIT_NOFILE, &l) == 0);
+    PCHECK(getrlimit(ResourceLimitTypeToUnixRlimit(t), &l) == 0);
     return l.rlim_cur;
   }
 
-  virtual void IncreaseOpenFileLimit() OVERRIDE {
+  virtual void IncreaseResourceLimit(ResourceLimitType t) OVERRIDE {
     // There's no reason for this to ever fail; any process should have
     // sufficient privilege to increase its soft limit up to the hard limit.
     //
     // This change is logged because it is process-wide.
+
+    int rlimit_type = ResourceLimitTypeToUnixRlimit(t);
     struct rlimit l;
-    PCHECK(getrlimit(RLIMIT_NOFILE, &l) == 0);
+    PCHECK(getrlimit(rlimit_type, &l) == 0);
 #if defined(__APPLE__)
     // OS X 10.11 can return RLIM_INFINITY from getrlimit, but allows rlim_cur and
     // rlim_max to be raised only as high as the value of the maxfilesperproc
-    // kernel variable. Emperically, this value is 10240 across all tested macOS
+    // kernel variable. Empirically, this value is 10240 across all tested macOS
     // versions. Testing on OS X 10.10 and macOS 10.12 revealed that getrlimit
     // returns the true limits (not RLIM_INFINITY), rlim_max can *not* be raised
     // (when running as non-root), and rlim_cur can only be raised as high as
     // rlim_max (this is consistent with Linux).
-    // TLDR; OS X 10.11 is wack.
+    // TLDR; OS X 10.11 is whack.
     if (l.rlim_max == RLIM_INFINITY) {
       uint32_t limit;
       size_t len = sizeof(limit);
-      PCHECK(sysctlbyname("kern.maxfilesperproc", &limit, &len, nullptr, 0) == 0);
+      PCHECK(sysctlbyname(ResourceLimitTypeToMacosRlimit(t), &limit, &len,
+                          nullptr, 0) == 0);
       // Make sure no uninitialized bits are present in the result.
       DCHECK_EQ(sizeof(limit), len);
       l.rlim_max = limit;
     }
 #endif
+    const char* rlimit_str = ResourceLimitTypeToString(t);
     if (l.rlim_cur < l.rlim_max) {
-      LOG(INFO) << Substitute("Raising process file limit from $0 to $1",
-                              l.rlim_cur, l.rlim_max);
+      LOG(INFO) << Substitute("Raising this process' $0 limit from $1 to $2",
+                              rlimit_str, l.rlim_cur, l.rlim_max);
       l.rlim_cur = l.rlim_max;
-      PCHECK(setrlimit(RLIMIT_NOFILE, &l) == 0);
+      PCHECK(setrlimit(rlimit_type, &l) == 0);
     } else {
-      LOG(INFO) << Substitute("Not raising process file limit of $0; it is "
-          "already as high as it can go", l.rlim_cur);
+      LOG(INFO) << Substitute("Not raising this process' $0 limit of $1; it "
+          "is already as high as it can go", rlimit_str, l.rlim_cur);
     }
   }
 
   virtual Status IsOnExtFilesystem(const string& path, bool* result) OVERRIDE {
-    TRACE_EVENT0("io", "PosixEnv::IsOnExtFilesystem");
+    TRACE_EVENT1("io", "PosixEnv::IsOnExtFilesystem", "path", path);
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
     ThreadRestrictions::AssertIOAllowed();
 
-#if defined __APPLE__ || !defined HAVE_MAGIC_H
+#ifdef __APPLE__
     *result = false;
 #else
     struct statfs buf;
@@ -1499,6 +1695,13 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  virtual Status IsOnXfsFilesystem(const string& path, bool* result) OVERRIDE {
+    TRACE_EVENT1("io", "PosixEnv::IsOnXfsFilesystem", "path", path);
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
+    ThreadRestrictions::AssertIOAllowed();
+    return DoIsOnXfsFilesystem(path, result);
+  }
+
   virtual string GetKernelRelease() OVERRIDE {
     // There's no reason for this to ever fail.
     struct utsname u;
@@ -1507,6 +1710,7 @@ class PosixEnv : public Env {
   }
 
   Status EnsureFileModeAdheresToUmask(const string& path) override {
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
     struct stat s;
     if (stat(path.c_str(), &s) != 0) {
       return IOError("stat", errno);
@@ -1528,20 +1732,37 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  Status IsFileWorldReadable(const string& path, bool* result) override {
+    ThreadRestrictions::AssertIOAllowed();
+    TRACE_EVENT1("io", "PosixEnv::IsFileWorldReadable", "path", path);
+    MAYBE_RETURN_EIO(path, IOError(Env::kInjectedFailureStatusMsg, EIO));
+    struct stat s;
+    if (stat(path.c_str(), &s) != 0) {
+      return IOError("stat", errno);
+    }
+    *result = (s.st_mode & S_IROTH) != 0;
+    return Status::OK();
+  }
+
  private:
   // unique_ptr Deleter implementation for fts_close
   struct FtsCloser {
     void operator()(FTS *fts) const {
-      if (fts) { fts_close(fts); }
+      if (fts) {
+        int err;
+        RETRY_ON_EINTR(err, fts_close(fts));
+        if (PREDICT_FALSE(err != 0)) {
+          PLOG(WARNING) << "Failed to close fts";
+        }
+      }
     }
   };
 
   Status MkTmpFile(const string& name_template, int* fd, string* created_filename) {
-    MAYBE_RETURN_FAILURE(FLAGS_env_inject_io_error,
-                         Status::IOError(Env::kInjectedFailureStatusMsg));
     ThreadRestrictions::AssertIOAllowed();
     unique_ptr<char[]> fname(new char[name_template.size() + 1]);
     ::snprintf(fname.get(), name_template.size() + 1, "%s", name_template.c_str());
+    MAYBE_RETURN_EIO(fname.get(), IOError(Env::kInjectedFailureStatusMsg, EIO));
     int created_fd = mkstemp(fname.get());
     if (created_fd < 0) {
       return IOError(Substitute("Call to mkstemp() failed on name template $0", name_template),
@@ -1622,6 +1843,10 @@ static void InitDefaultEnv() { default_env = new PosixEnv; }
 Env* Env::Default() {
   pthread_once(&once, InitDefaultEnv);
   return default_env;
+}
+
+std::ostream& operator<<(std::ostream& o, Env::ResourceLimitType t) {
+  return o << ResourceLimitTypeToString(t);
 }
 
 }  // namespace kudu

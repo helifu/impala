@@ -25,7 +25,8 @@
 # to backup any data you need before running this script.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 . ${IMPALA_HOME}/bin/impala-config.sh > /dev/null 2>&1
 : ${REMOTE_LOAD:=}
@@ -58,6 +59,14 @@ if [[ "$REPLY" =~ ^[Yy]$ ]]; then
       echo "Deleting pre-existing data in s3 failed, aborting."
       exit 1
     fi
+    if [[ "${S3GUARD_ENABLED}" = "true" ]]; then
+      # Initialize the s3guard dynamodb table and clear it out. This is valid even if
+      # the table already exists.
+      hadoop s3guard init -meta "dynamodb://${S3GUARD_DYNAMODB_TABLE}" \
+        -region "${S3GUARD_DYNAMODB_REGION}"
+      hadoop s3guard prune -seconds 1 -meta "dynamodb://${S3GUARD_DYNAMODB_TABLE}" \
+        -region "${S3GUARD_DYNAMODB_REGION}"
+    fi
   else
     # Either isilon or hdfs, no change in procedure.
     if hadoop fs -test -d ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}; then
@@ -72,6 +81,11 @@ if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     fi
     echo "Creating ${TEST_WAREHOUSE_DIR} directory"
     hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}${TEST_WAREHOUSE_DIR}
+    if [[ -n "${HDFS_ERASURECODE_POLICY:-}" ]]; then
+      hdfs ec -enablePolicy -policy "${HDFS_ERASURECODE_POLICY}"
+      hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" \
+        -path "${HDFS_ERASURECODE_PATH:=/test-warehouse}"
+    fi
 
     # TODO: commented out because of regressions in local end-to-end testing. See
     # IMPALA-4345
@@ -94,13 +108,6 @@ tar -C ${SNAPSHOT_STAGING_DIR} -xzf ${SNAPSHOT_FILE}
 if [ ! -f ${SNAPSHOT_STAGING_DIR}${TEST_WAREHOUSE_DIR}/githash.txt ]; then
   echo "The test-warehouse snapshot does not contain a githash.txt file, aborting load"
   exit 1
-fi
-
-
-# Hive builtins are already present on a pre-setup CM managed cluster.
-if [[ -z "$REMOTE_LOAD" ]]; then
-  echo "Loading hive builtins"
-  ${IMPALA_HOME}/testdata/bin/load-hive-builtins.sh
 fi
 
 echo "Copying data to ${TARGET_FILESYSTEM}"

@@ -23,6 +23,7 @@
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
+#include "util/hash-util.h"
 
 using namespace impala;
 
@@ -32,6 +33,8 @@ int IR_ALWAYS_INLINE RawValue::Compare(
   const StringValue* string_value2;
   const TimestampValue* ts_value1;
   const TimestampValue* ts_value2;
+  const DateValue* date_value1;
+  const DateValue* date_value2;
   float f1, f2;
   double d1, d2;
   int32_t i1, i2;
@@ -50,6 +53,10 @@ int IR_ALWAYS_INLINE RawValue::Compare(
       i1 = *reinterpret_cast<const int32_t*>(v1);
       i2 = *reinterpret_cast<const int32_t*>(v2);
       return i1 > i2 ? 1 : (i1 < i2 ? -1 : 0);
+    case TYPE_DATE:
+      date_value1 = reinterpret_cast<const DateValue*>(v1);
+      date_value2 = reinterpret_cast<const DateValue*>(v2);
+      return *date_value1 > *date_value2 ? 1 : (*date_value1 < *date_value2 ? -1 : 0);
     case TYPE_BIGINT:
       b1 = *reinterpret_cast<const int64_t*>(v1);
       b2 = *reinterpret_cast<const int64_t*>(v2);
@@ -132,6 +139,9 @@ uint32_t IR_ALWAYS_INLINE RawValue::GetHashValue(
     case TYPE_INT:
       return RawValue::GetHashValueNonNull<int32_t>(
         reinterpret_cast<const int32_t*>(v), type, seed);
+    case TYPE_DATE:
+      return RawValue::GetHashValueNonNull<DateValue>(
+        reinterpret_cast<const DateValue*>(v), type, seed);
     case TYPE_BIGINT:
       return RawValue::GetHashValueNonNull<int64_t>(
         reinterpret_cast<const int64_t*>(v), type, seed);
@@ -160,5 +170,33 @@ uint32_t IR_ALWAYS_INLINE RawValue::GetHashValue(
     default:
       DCHECK(false);
       return 0;
+  }
+}
+
+uint64_t IR_ALWAYS_INLINE RawValue::GetHashValueFastHash(const void* v,
+    const ColumnType& type, uint64_t seed) {
+  // Hash with an arbitrary constant to ensure we don't return seed.
+  if (v == nullptr) {
+    return HashUtil::FastHash64(&HASH_VAL_NULL, sizeof(HASH_VAL_NULL), seed);
+  }
+  switch (type.type) {
+    case TYPE_STRING:
+    case TYPE_VARCHAR: {
+      const StringValue* string_value = reinterpret_cast<const StringValue*>(v);
+      return HashUtil::FastHash64(string_value->ptr,
+          static_cast<size_t>(string_value->len), seed);
+    }
+    case TYPE_BOOLEAN: return HashUtil::FastHash64(v, 1, seed);
+    case TYPE_TINYINT: return HashUtil::FastHash64(v, 1, seed);
+    case TYPE_SMALLINT: return HashUtil::FastHash64(v, 2, seed);
+    case TYPE_INT: return HashUtil::FastHash64(v, 4, seed);
+    case TYPE_BIGINT: return HashUtil::FastHash64(v, 8, seed);
+    case TYPE_FLOAT: return HashUtil::FastHash64(v, 4, seed);
+    case TYPE_DOUBLE: return HashUtil::FastHash64(v, 8, seed);
+    case TYPE_TIMESTAMP: return HashUtil::FastHash64(v, 12, seed);
+    case TYPE_CHAR: return HashUtil::FastHash64(v, type.len, seed);
+    case TYPE_DECIMAL: return HashUtil::FastHash64(v, type.GetByteSize(), seed);
+    case TYPE_DATE: return HashUtil::FastHash64(v, 4, seed);
+    default: DCHECK(false); return 0;
   }
 }

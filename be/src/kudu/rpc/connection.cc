@@ -17,51 +17,180 @@
 
 #include "kudu/rpc/connection.h"
 
-#include <stdint.h>
+#include <netinet/in.h>
+#include <string.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <iostream>
 #include <memory>
 #include <set>
 #include <string>
-#include <unordered_set>
-#include <vector>
+#include <type_traits>
 
+#include <boost/intrusive/detail/list_iterator.hpp>
 #include <boost/intrusive/list.hpp>
-#include <gflags/gflags.h>
+#include <ev.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/rpc/client_negotiation.h"
-#include "kudu/rpc/constants.h"
+#include "kudu/rpc/inbound_call.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/reactor.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/transfer.h"
-#include "kudu/util/debug-util.h"
-#include "kudu/util/flag_tags.h"
-#include "kudu/util/logging.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
-#include "kudu/util/trace.h"
 
-using std::function;
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <linux/tcp.h>
+#endif
+
 using std::includes;
 using std::set;
 using std::shared_ptr;
 using std::unique_ptr;
-using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 namespace rpc {
 
 typedef OutboundCall::Phase Phase;
+
+namespace {
+
+// tcp_info struct duplicated from linux/tcp.h.
+//
+// This allows us to decouple the compile-time Linux headers from the
+// runtime Linux kernel. The compile-time headers (and kernel) might be
+// older than the runtime kernel, in which case an ifdef-based approach
+// wouldn't allow us to get all of the info available.
+//
+// NOTE: this struct has been annotated with some local notes about the
+// contents of each field.
+struct tcp_info {
+  // Various state-tracking information.
+  // ------------------------------------------------------------
+  uint8_t    tcpi_state;
+  uint8_t    tcpi_ca_state;
+  uint8_t    tcpi_retransmits;
+  uint8_t    tcpi_probes;
+  uint8_t    tcpi_backoff;
+  uint8_t    tcpi_options;
+  uint8_t    tcpi_snd_wscale : 4, tcpi_rcv_wscale : 4;
+  uint8_t    tcpi_delivery_rate_app_limited:1;
+
+  // Configurations.
+  // ------------------------------------------------------------
+  uint32_t   tcpi_rto;
+  uint32_t   tcpi_ato;
+  uint32_t   tcpi_snd_mss;
+  uint32_t   tcpi_rcv_mss;
+
+  // Counts of packets in various states in the outbound queue.
+  // At first glance one might think these are monotonic counters, but
+  // in fact they are instantaneous counts of queued packets and thus
+  // not very useful for our purposes.
+  // ------------------------------------------------------------
+  // Number of packets outstanding that haven't been acked.
+  uint32_t   tcpi_unacked;
+
+  // Number of packets outstanding that have been selective-acked.
+  uint32_t   tcpi_sacked;
+
+  // Number of packets outstanding that have been deemed lost (a SACK arrived
+  // for a later packet)
+  uint32_t   tcpi_lost;
+
+  // Number of packets in the queue that have been retransmitted.
+  uint32_t   tcpi_retrans;
+
+  // The number of packets towards the highest SACKed sequence number
+  // (some measure of reording, removed in later Linux versions by
+  // 737ff314563ca27f044f9a3a041e9d42491ef7ce)
+  uint32_t   tcpi_fackets;
+
+  // Times when various events occurred.
+  // ------------------------------------------------------------
+  uint32_t   tcpi_last_data_sent;
+  uint32_t   tcpi_last_ack_sent;     /* Not remembered, sorry. */
+  uint32_t   tcpi_last_data_recv;
+  uint32_t   tcpi_last_ack_recv;
+
+  // Path MTU.
+  uint32_t   tcpi_pmtu;
+
+  // Receiver slow start threshold.
+  uint32_t   tcpi_rcv_ssthresh;
+
+  // Smoothed RTT estimate and variance based on the time between sending data and receiving
+  // corresponding ACK. See https://tools.ietf.org/html/rfc2988 for details.
+  uint32_t   tcpi_rtt;
+  uint32_t   tcpi_rttvar;
+
+  // Slow start threshold.
+  uint32_t   tcpi_snd_ssthresh;
+  // Sender congestion window (in number of MSS-sized packets)
+  uint32_t   tcpi_snd_cwnd;
+  // Advertised MSS.
+  uint32_t   tcpi_advmss;
+  // Amount of packet reordering allowed.
+  uint32_t   tcpi_reordering;
+
+  // Receiver-side RTT estimate per the Dynamic Right Sizing algorithm:
+  //
+  // "A system that is only transmitting acknowledgements can still estimate the round-trip
+  // time by observing the time between when a byte is first acknowledged and the receipt of
+  // data that is at least one window beyond the sequence number that was acknowledged. If the
+  // sender is being throttled by the network, this estimate will be valid. However, if the
+  // sending application did not have any data to send, the measured time could be much larger
+  // than the actual round-trip time. Thus this measurement acts only as an upper-bound on the
+  // round-trip time and should be be used only when it is the only source of round-trip time
+  // information."
+  uint32_t   tcpi_rcv_rtt;
+  uint32_t   tcpi_rcv_space;
+
+  // Total number of retransmitted packets.
+  uint32_t   tcpi_total_retrans;
+
+  // Pacing-related metrics.
+  uint64_t   tcpi_pacing_rate;
+  uint64_t   tcpi_max_pacing_rate;
+
+  // Total bytes ACKed by remote peer.
+  uint64_t   tcpi_bytes_acked;    /* RFC4898 tcpEStatsAppHCThruOctetsAcked */
+  // Total bytes received (for which ACKs have been sent out).
+  uint64_t   tcpi_bytes_received; /* RFC4898 tcpEStatsAppHCThruOctetsReceived */
+  // Segments sent and received.
+  uint32_t   tcpi_segs_out;       /* RFC4898 tcpEStatsPerfSegsOut */
+  uint32_t   tcpi_segs_in;        /* RFC4898 tcpEStatsPerfSegsIn */
+
+  // The following metrics are quite new and not in el7.
+  // ------------------------------------------------------------
+  uint32_t   tcpi_notsent_bytes;
+  uint32_t   tcpi_min_rtt;
+  uint32_t   tcpi_data_segs_in;      /* RFC4898 tcpEStatsDataSegsIn */
+  uint32_t   tcpi_data_segs_out;     /* RFC4898 tcpEStatsDataSegsOut */
+
+  // Calculated rate at which data was delivered.
+  uint64_t   tcpi_delivery_rate;
+
+  // Timers for various states.
+  uint64_t   tcpi_busy_time;      /* Time (usec) busy sending data */
+  uint64_t   tcpi_rwnd_limited;   /* Time (usec) limited by receive window */
+  uint64_t   tcpi_sndbuf_limited; /* Time (usec) limited by send buffer */
+};
+
+} // anonymous namespace
 
 ///
 /// Connection
@@ -80,11 +209,20 @@ Connection::Connection(ReactorThread *reactor_thread,
       next_call_id_(1),
       credentials_policy_(policy),
       negotiation_complete_(false),
+      is_confidential_(false),
       scheduled_for_shutdown_(false) {
 }
 
 Status Connection::SetNonBlocking(bool enabled) {
   return socket_->SetNonBlocking(enabled);
+}
+
+Status Connection::SetTcpKeepAlive(int idle_time_s, int retry_time_s, int num_retries) {
+  DCHECK_GT(idle_time_s, 0);
+  DCHECK_GE(retry_time_s, 0);
+  DCHECK_GE(num_retries, 0);
+  return socket_->SetTcpKeepAlive(std::max(1, idle_time_s), std::max(0, retry_time_s),
+      std::max(0, num_retries));
 }
 
 void Connection::EpollRegister(ev::loop_ref& loop) {
@@ -169,7 +307,7 @@ void Connection::Shutdown(const Status &status,
       c->call->SetFailed(status,
                          negotiation_complete_ ? Phase::REMOTE_CALL
                                                : Phase::CONNECTION_NEGOTIATION,
-                         error.release());
+                         std::move(error));
     }
     // And we must return the CallAwaitingResponse to the pool
     car_pool_.Destroy(c);
@@ -311,7 +449,7 @@ struct CallTransferCallbacks : public TransferCallbacks {
   Connection* conn_;
 };
 
-void Connection::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
+void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
   DCHECK(call);
   DCHECK_EQ(direction_, CLIENT);
   DCHECK(reactor_thread_->IsCurrentThread());
@@ -392,7 +530,7 @@ void Connection::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
     car->timeout_timer.start();
   }
 
-  TransferCallbacks *cb = new CallTransferCallbacks(call, this);
+  TransferCallbacks *cb = new CallTransferCallbacks(std::move(call), this);
   awaiting_response_[call_id] = car.release();
   QueueOutbound(gscoped_ptr<OutboundTransfer>(
       OutboundTransfer::CreateForCallRequest(call_id, tmp_slices, n_slices, cb)));
@@ -478,6 +616,10 @@ void Connection::QueueResponseForCall(gscoped_ptr<InboundCall> call) {
 
   QueueTransferTask *task = new QueueTransferTask(std::move(t), this);
   reactor_thread_->reactor()->ScheduleReactorTask(task);
+}
+
+void Connection::set_confidential(bool is_confidential) {
+  is_confidential_ = is_confidential;
 }
 
 bool Connection::SatisfiesCredentialsPolicy(CredentialsPolicy policy) const {
@@ -637,8 +779,8 @@ void Connection::WriteHandler(ev::io &watcher, int revents) {
           outbound_transfers_.pop_front();
           Status s = Status::NotSupported("server does not support the required RPC features");
           transfer->Abort(s);
-          car->call->SetFailed(s, negotiation_complete_ ? Phase::REMOTE_CALL
-                                                        : Phase::CONNECTION_NEGOTIATION);
+          Phase phase = negotiation_complete_ ? Phase::REMOTE_CALL : Phase::CONNECTION_NEGOTIATION;
+          car->call->SetFailed(std::move(s), phase);
           // Test cancellation when 'call_' is in 'FINISHED_ERROR' state.
           MaybeInjectCancellation(car->call);
           car->call.reset();
@@ -729,7 +871,7 @@ void Connection::MarkNegotiationComplete() {
   negotiation_complete_ = true;
 }
 
-Status Connection::DumpPB(const DumpRunningRpcsRequestPB& req,
+Status Connection::DumpPB(const DumpConnectionsRequestPB& req,
                           RpcConnectionPB* resp) {
   DCHECK(reactor_thread_->IsCurrentThread());
   resp->set_remote_ip(remote_.ToString());
@@ -746,6 +888,8 @@ Status Connection::DumpPB(const DumpRunningRpcsRequestPB& req,
         c->call->DumpPB(req, resp->add_calls_in_flight());
       }
     }
+
+    resp->set_outbound_queue_size(num_queued_outbound_transfers());
   } else if (direction_ == SERVER) {
     if (negotiation_complete_) {
       // It's racy to dump credentials while negotiating, since the Connection
@@ -759,8 +903,95 @@ Status Connection::DumpPB(const DumpRunningRpcsRequestPB& req,
   } else {
     LOG(FATAL);
   }
+#ifdef __linux__
+  if (negotiation_complete_) {
+    // TODO(todd): it's a little strange to not set socket level stats during
+    // negotiation, but we don't have access to the socket here until negotiation
+    // is complete.
+    WARN_NOT_OK(GetSocketStatsPB(resp->mutable_socket_stats()),
+                "could not fill in TCP info for RPC connection");
+  }
+#endif // __linux__
   return Status::OK();
 }
+
+#ifdef __linux__
+Status Connection::GetSocketStatsPB(SocketStatsPB* pb) const {
+  DCHECK(reactor_thread_->IsCurrentThread());
+  int fd = socket_->GetFd();
+  CHECK_GE(fd, 0);
+
+  // Fetch TCP_INFO statistics from the kernel.
+  tcp_info ti;
+  memset(&ti, 0, sizeof(ti));
+  socklen_t len = sizeof(ti);
+  int rc = getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &len);
+  if (rc == 0) {
+#   define HAS_FIELD(field_name) \
+        (len >= offsetof(tcp_info, field_name) + sizeof(ti.field_name))
+    if (!HAS_FIELD(tcpi_total_retrans)) {
+      // All the fields up through tcpi_total_retrans were present since very old
+      // kernel versions, beyond our minimal supported. So, we can just bail if we
+      // don't get sufficient data back.
+      return Status::NotSupported("bad length returned for TCP_INFO");
+    }
+
+    pb->set_rtt(ti.tcpi_rtt);
+    pb->set_rttvar(ti.tcpi_rttvar);
+    pb->set_snd_cwnd(ti.tcpi_snd_cwnd);
+    pb->set_total_retrans(ti.tcpi_total_retrans);
+
+    // The following fields were added later in kernel development history.
+    // In RHEL6 they were backported starting in 6.8. Even though they were
+    // backported all together as a group, we'll just be safe and check for
+    // each individually.
+    if (HAS_FIELD(tcpi_pacing_rate)) {
+      pb->set_pacing_rate(ti.tcpi_pacing_rate);
+    }
+    if (HAS_FIELD(tcpi_max_pacing_rate)) {
+      pb->set_max_pacing_rate(ti.tcpi_max_pacing_rate);
+    }
+    if (HAS_FIELD(tcpi_bytes_acked)) {
+      pb->set_bytes_acked(ti.tcpi_bytes_acked);
+    }
+    if (HAS_FIELD(tcpi_bytes_received)) {
+      pb->set_bytes_received(ti.tcpi_bytes_received);
+    }
+    if (HAS_FIELD(tcpi_segs_out)) {
+      pb->set_segs_out(ti.tcpi_segs_out);
+    }
+    if (HAS_FIELD(tcpi_segs_in)) {
+      pb->set_segs_in(ti.tcpi_segs_in);
+    }
+
+    // Calculate sender bandwidth based on the same logic used by the 'ss' utility.
+    if (ti.tcpi_rtt > 0 && ti.tcpi_snd_mss && ti.tcpi_snd_cwnd) {
+      // Units:
+      //  rtt = usec
+      //  cwnd = number of MSS-size packets
+      //  mss = bytes / packet
+      //
+      // Dimensional analysis:
+      //   packets * bytes/packet * usecs/sec / usec -> bytes/sec
+      static constexpr int kUsecsPerSec = 1000000;
+      pb->set_send_bytes_per_sec(static_cast<int64_t>(ti.tcpi_snd_cwnd) *
+                                 ti.tcpi_snd_mss * kUsecsPerSec / ti.tcpi_rtt);
+    }
+  }
+
+  // Fetch the queue sizes.
+  int queue_len = 0;
+  rc = ioctl(fd, TIOCOUTQ, &queue_len);
+  if (rc == 0) {
+    pb->set_send_queue_bytes(queue_len);
+  }
+  rc = ioctl(fd, FIONREAD, &queue_len);
+  if (rc == 0) {
+    pb->set_receive_queue_bytes(queue_len);
+  }
+  return Status::OK();
+}
+#endif // __linux__
 
 } // namespace rpc
 } // namespace kudu

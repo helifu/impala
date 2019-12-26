@@ -13,14 +13,16 @@
 #ifndef STORAGE_LEVELDB_INCLUDE_ENV_H_
 #define STORAGE_LEVELDB_INCLUDE_ENV_H_
 
-#include <cstdarg>
+#include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "kudu/gutil/callback_forward.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -36,6 +38,9 @@ class WritableFile;
 struct RandomAccessFileOptions;
 struct RWFileOptions;
 struct WritableFileOptions;
+
+template <typename T>
+class ArrayView;
 
 // Returned by Env::GetSpaceInfo().
 struct SpaceInfo {
@@ -298,23 +303,44 @@ class Env {
   // All directory entries in 'path' must exist on the filesystem.
   virtual Status Canonicalize(const std::string& path, std::string* result) = 0;
 
-  // Get the total amount of RAM installed on this machine.
+  // Gets the total amount of RAM installed on this machine.
   virtual Status GetTotalRAMBytes(int64_t* ram) = 0;
 
-  // Get the max number of file descriptors that this process can open.
-  virtual int64_t GetOpenFileLimit() = 0;
+  enum class ResourceLimitType {
+    // The maximum number of file descriptors that this process can have open
+    // at any given time.
+    //
+    // Corresponds to RLIMIT_NOFILE on UNIX platforms.
+    OPEN_FILES_PER_PROCESS,
 
-  // Increase the max number of file descriptors that this process can open as
-  // much as possible. On UNIX platforms, this means increasing the
-  // RLIMIT_NOFILE resource soft limit (the limit actually enforced by the
-  // kernel) to be equal to the hard limit.
-  virtual void IncreaseOpenFileLimit() = 0;
+    // The maximum number of threads (or processes) that this process's
+    // effective user ID may have spawned and running at any given time.
+    //
+    // Corresponds to RLIMIT_NPROC on UNIX platforms.
+    RUNNING_THREADS_PER_EUID,
+  };
+
+  // Gets the process' current limit for the given resource type.
+  //
+  // On UNIX platforms, this is equivalent to the resource's soft limit.
+  virtual uint64_t GetResourceLimit(ResourceLimitType t) = 0;
+
+  // Increases the resource limit by as much as possible.
+  //
+  // On UNIX platforms, this means increasing the resource's soft limit (the
+  // limit actually enforced by the kernel) to be equal to the hard limit.
+  virtual void IncreaseResourceLimit(ResourceLimitType t) = 0;
 
   // Checks whether the given path resides on an ext2, ext3, or ext4
   // filesystem.
   //
   // On success, 'result' contains the answer. On failure, 'result' is unset.
   virtual Status IsOnExtFilesystem(const std::string& path, bool* result) = 0;
+
+  // Checks whether the given path resides on an xfs filesystem.
+  //
+  // On success, 'result' contains the answer. On failure, 'result' is unset.
+  virtual Status IsOnXfsFilesystem(const std::string& path, bool* result) = 0;
 
   // Gets the kernel release string for this machine.
   virtual std::string GetKernelRelease() = 0;
@@ -327,6 +353,11 @@ class Env {
   // Returns a bad Status if the file does not exist or the permissions cannot
   // be changed.
   virtual Status EnsureFileModeAdheresToUmask(const std::string& path) = 0;
+
+  // Checks whether the given path has world-readable permissions.
+  //
+  // On success, 'result' contains the answer. On failure, 'result' is unset.
+  virtual Status IsFileWorldReadable(const std::string& path, bool* result) = 0;
 
   // Special string injected into file-growing operations' random failures
   // (if enabled).
@@ -348,6 +379,7 @@ class SequentialFile {
 
   // Read up to "result.size" bytes from the file.
   // Sets "result.data" to the data that was read.
+  //
   // If an error was encountered, returns a non-OK status
   // and the contents of "result" are invalid.
   //
@@ -373,8 +405,9 @@ class RandomAccessFile {
   RandomAccessFile() { }
   virtual ~RandomAccessFile();
 
-  // Read up to "result.size" from the file starting at "offset".
-  // Sets "result.data" to the data that was read.
+  // Read "result.size" bytes from the file starting at "offset".
+  // Copies the resulting data into "result.data".
+  //
   // If an error was encountered, returns a non-OK status.
   //
   // This method will internally retry on EINTR and "short reads" in order to
@@ -382,11 +415,12 @@ class RandomAccessFile {
   // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
-  virtual Status Read(uint64_t offset, Slice* result) const = 0;
+  virtual Status Read(uint64_t offset, Slice result) const = 0;
 
   // Reads up to the "results" aggregate size, based on each Slice's "size",
-  // from the file starting at 'offset'.
-  // Sets each "result.data" to the data that was read.
+  // from the file starting at 'offset'. The Slices must point to already-allocated
+  // buffers for the data to be written to.
+  //
   // If an error was encountered, returns a non-OK status.
   //
   // This method will internally retry on EINTR and "short reads" in order to
@@ -394,7 +428,7 @@ class RandomAccessFile {
   // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
-  virtual Status ReadV(uint64_t offset, std::vector<Slice>* results) const = 0;
+  virtual Status ReadV(uint64_t offset, ArrayView<Slice> results) const = 0;
 
   // Returns the size of the file
   virtual Status Size(uint64_t *size) const = 0;
@@ -445,7 +479,7 @@ class WritableFile {
   //
   // For implementation specific quirks and details, see comments in
   // implementation source code (e.g., env_posix.cc)
-  virtual Status AppendV(const std::vector<Slice>& data) = 0;
+  virtual Status AppendV(ArrayView<const Slice> data) = 0;
 
   // Pre-allocates 'size' bytes for the file in the underlying filesystem.
   // size bytes are added to the current pre-allocated size or to the current
@@ -513,8 +547,8 @@ class RWFile {
 
   virtual ~RWFile();
 
-  // Read up to "result.size" from the file starting at "offset".
-  // Sets "result.data" to the data that was read.
+  // Read "result.size" bytes from the file starting at "offset".
+  // Copies the resulting data into "result.data".
   // If an error was encountered, returns a non-OK status.
   //
   // This method will internally retry on EINTR and "short reads" in order to
@@ -522,11 +556,12 @@ class RWFile {
   // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
-  virtual Status Read(uint64_t offset, Slice* result) const = 0;
+  virtual Status Read(uint64_t offset, Slice result) const = 0;
 
   // Reads up to the "results" aggregate size, based on each Slice's "size",
-  // from the file starting at 'offset'.
-  // Sets each "result.data" to the data that was read.
+  // from the file starting at 'offset'. The Slices must point to already-allocated
+  // buffers for the data to be written to.
+  //
   // If an error was encountered, returns a non-OK status.
   //
   // This method will internally retry on EINTR and "short reads" in order to
@@ -534,13 +569,13 @@ class RWFile {
   // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
-  virtual Status ReadV(uint64_t offset, std::vector<Slice>* results) const = 0;
+  virtual Status ReadV(uint64_t offset, ArrayView<Slice> results) const = 0;
 
   // Writes 'data' to the file position given by 'offset'.
   virtual Status Write(uint64_t offset, const Slice& data) = 0;
 
-  // Writes the 'data' vector to the file position given by 'offset'.
-  virtual Status WriteV(uint64_t offset, const std::vector<Slice>& data) = 0;
+  // Writes the 'data' slices to the file position given by 'offset'.
+  virtual Status WriteV(uint64_t offset, ArrayView<const Slice> data) = 0;
 
   // Preallocates 'length' bytes for the file in the underlying filesystem
   // beginning at 'offset'. It is safe to preallocate the same range
@@ -637,6 +672,9 @@ extern Status WriteStringToFile(Env* env, const Slice& data,
 // A utility routine: read contents of named file into *data
 extern Status ReadFileToString(Env* env, const std::string& fname,
                                faststring* data);
+
+// Overloaded operator for printing Env::ResourceLimitType.
+std::ostream& operator<<(std::ostream& o, Env::ResourceLimitType t);
 
 }  // namespace kudu
 

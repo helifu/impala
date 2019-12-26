@@ -34,8 +34,6 @@ from tests.performance.query_exec_functions import (
     execute_using_jdbc)
 from tests.performance.scheduler import Scheduler
 
-# Setup Logging
-logging.basicConfig(level=logging.INFO, format='[%(name)s]: %(message)s')
 LOG = logging.getLogger('workload_runner')
 
 
@@ -99,6 +97,9 @@ class WorkloadRunner(object):
           BeeswaxQueryExecConfig(plugin_runner=self.config.plugin_runner,
           exec_options=self.config.exec_options,
           use_kerberos=self.config.use_kerberos,
+          user=self.config.user if self.config.password else None,
+          password=self.config.password,
+          use_ssl=self.config.use_ssl
           )),
         'impala_jdbc': lambda: (execute_using_jdbc,
           JdbcQueryExecConfig(plugin_runner=self.config.plugin_runner)

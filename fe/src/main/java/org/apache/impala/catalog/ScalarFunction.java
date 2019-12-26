@@ -24,7 +24,6 @@ import org.apache.hadoop.hive.metastore.api.FunctionType;
 import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.ResourceType;
 import org.apache.hadoop.hive.metastore.api.ResourceUri;
-
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.analysis.HdfsUri;
 import org.apache.impala.common.AnalysisException;
@@ -32,8 +31,11 @@ import org.apache.impala.hive.executor.UdfExecutor.JavaUdfDataType;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TScalarFunction;
+import org.apache.impala.thrift.TSymbolLookupParams;
 import org.apache.impala.thrift.TSymbolType;
+
 import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
 
 /**
@@ -46,7 +48,12 @@ public class ScalarFunction extends Function {
   private String prepareFnSymbol_;
   private String closeFnSymbol_;
 
-  public ScalarFunction(FunctionName fnName, ArrayList<Type> argTypes, Type retType,
+  public ScalarFunction(FunctionName fnName, List<Type> argTypes, Type retType,
+      boolean hasVarArgs) {
+    super(fnName, argTypes, retType, hasVarArgs);
+  }
+
+  public ScalarFunction(FunctionName fnName, Type argTypes[], Type retType,
       boolean hasVarArgs) {
     super(fnName, argTypes, retType, hasVarArgs);
   }
@@ -65,12 +72,12 @@ public class ScalarFunction extends Function {
    * Creates a builtin scalar function. This is a helper that wraps a few steps
    * into one call.
    */
-  public static ScalarFunction createBuiltin(String name, ArrayList<Type> argTypes,
+  public static ScalarFunction createBuiltin(String name, List<Type> argTypes,
       boolean hasVarArgs, Type retType, String symbol,
       String prepareFnSymbol, String closeFnSymbol, boolean userVisible) {
     Preconditions.checkNotNull(symbol);
     ScalarFunction fn = new ScalarFunction(
-        new FunctionName(Catalog.BUILTINS_DB, name), argTypes, retType, hasVarArgs);
+        new FunctionName(BuiltinsDb.NAME, name), argTypes, retType, hasVarArgs);
     fn.setBinaryType(TFunctionBinaryType.BUILTIN);
     fn.setUserVisible(userVisible);
     fn.setIsPersistent(true);
@@ -120,7 +127,7 @@ public class ScalarFunction extends Function {
     // Currently we only support certain primitive types.
     JavaUdfDataType javaRetType = JavaUdfDataType.getType(fnRetType);
     if (javaRetType == JavaUdfDataType.INVALID_TYPE) return null;
-    List<Type> fnArgsList = Lists.newArrayList();
+    List<Type> fnArgsList = new ArrayList<>();
     for (Class<?> argClass: fnArgs) {
       JavaUdfDataType javaUdfType = JavaUdfDataType.getType(argClass);
       if (javaUdfType == JavaUdfDataType.INVALID_TYPE) return null;
@@ -158,7 +165,7 @@ public class ScalarFunction extends Function {
    * implementations. (gen_functions.py). Is there a better way to coordinate this.
    */
   public static ScalarFunction createBuiltinOperator(String name,
-      ArrayList<Type> argTypes, Type retType) {
+      List<Type> argTypes, Type retType) {
     // Operators have a well defined symbol based on the function name and type.
     // Convert Add(TINYINT, TINYINT) --> Add_TinyIntVal_TinyIntVal
     String beFn = Character.toUpperCase(name.charAt(0)) + name.substring(1);
@@ -200,6 +207,9 @@ public class ScalarFunction extends Function {
           beFn += "_DecimalVal";
           usesDecimal = true;
           break;
+        case DATE:
+          beFn += "_DateVal";
+          break;
         default:
           Preconditions.checkState(false,
               "Argument type not supported: " + argTypes.get(i).toSql());
@@ -211,15 +221,15 @@ public class ScalarFunction extends Function {
   }
 
   public static ScalarFunction createBuiltinOperator(String name, String symbol,
-      ArrayList<Type> argTypes, Type retType) {
+      List<Type> argTypes, Type retType) {
     return createBuiltin(name, symbol, argTypes, false, retType, false);
   }
 
   public static ScalarFunction createBuiltin(String name, String symbol,
-      ArrayList<Type> argTypes, boolean hasVarArgs, Type retType,
+      List<Type> argTypes, boolean hasVarArgs, Type retType,
       boolean userVisible) {
     ScalarFunction fn = new ScalarFunction(
-        new FunctionName(Catalog.BUILTINS_DB, name), argTypes, retType, hasVarArgs);
+        new FunctionName(BuiltinsDb.NAME, name), argTypes, retType, hasVarArgs);
     fn.setBinaryType(TFunctionBinaryType.BUILTIN);
     fn.setUserVisible(userVisible);
     fn.setIsPersistent(true);
@@ -228,8 +238,9 @@ public class ScalarFunction extends Function {
           fn.hasVarArgs(), fn.getArgs());
     } catch (AnalysisException e) {
       // This should never happen
-      Preconditions.checkState(false, "Builtin symbol '" + symbol + "'" + argTypes
-          + " not found!" + e.getStackTrace());
+      Preconditions.checkState(false, "Builtin symbol '" + symbol + "'" +
+          argTypes + " not found: " +
+          Throwables.getStackTraceAsString(e));
       throw new RuntimeException("Builtin symbol not found!", e);
     }
     return fn;
@@ -240,7 +251,7 @@ public class ScalarFunction extends Function {
    * TFunctionBinaryType.
    */
   public static ScalarFunction createForTesting(String db,
-      String fnName, ArrayList<Type> args, Type retType, String uriPath,
+      String fnName, List<Type> args, Type retType, String uriPath,
       String symbolName, String initFnSymbol, String closeFnSymbol,
       TFunctionBinaryType type) {
     ScalarFunction fn = new ScalarFunction(new FunctionName(db, fnName), args,
@@ -257,15 +268,31 @@ public class ScalarFunction extends Function {
   public String getSymbolName() { return symbolName_; }
 
   @Override
+  protected TSymbolLookupParams getLookupParams() {
+    return buildLookupParams(
+        getSymbolName(), TSymbolType.UDF_EVALUATE, null, hasVarArgs(), false, getArgs());
+  }
+
+  @Override
   public String toSql(boolean ifNotExists) {
     StringBuilder sb = new StringBuilder("CREATE FUNCTION ");
     if (ifNotExists) sb.append("IF NOT EXISTS ");
-    sb.append(dbName() + "." + signatureString() + "\n")
-      .append(" RETURNS " + getReturnType() + "\n")
-      .append(" LOCATION '" + getLocation() + "'\n")
-      .append(" SYMBOL='" + getSymbolName() + "'\n");
+    sb.append(dbName()).append(".");
+    if (binaryType_ == TFunctionBinaryType.JAVA) {
+      sb.append(name_.getFunction());
+    } else {
+      sb.append(signatureString()).append("\n");
+      sb.append(" RETURNS " + getReturnType());
+    }
+    if (getLocation() != null)
+      sb.append("\n").append(" LOCATION '" + getLocation()).append("'");
+    if (getSymbolName() != null)
+      sb.append("\n").append(" SYMBOL='" + getSymbolName()).append("'");
     return sb.toString();
   }
+
+  @Override
+  public String toString() { return toSql(false); }
 
   @Override
   public TFunction toThrift() {

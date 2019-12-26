@@ -17,16 +17,20 @@
 #ifndef KUDU_UTIL_PSTACK_WATCHER_H
 #define KUDU_UTIL_PSTACK_WATCHER_H
 
+#include <sys/types.h>
+
 #include <string>
 #include <vector>
 
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/condition_variable.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/status.h"
-#include "kudu/util/thread.h"
 
 namespace kudu {
+
+class Thread;
 
 // PstackWatcher is an object which will pstack the current process and print
 // the results to stdout.  It does this after a certain timeout has occured.
@@ -68,6 +72,10 @@ class PstackWatcher {
  private:
   // Test for the existence of the given program in the system path.
   static Status HasProgram(const char* progname);
+
+  // Check whether the system path has 'gdb' and whether it is modern enough
+  // for safe stack dump usage.
+  static Status HasGoodGdb();
 
   // Get a stack dump using GDB directly.
   static Status RunGdbStackDump(pid_t pid, int flags);

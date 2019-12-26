@@ -17,21 +17,19 @@
 #ifndef KUDU_UTIL_MEM_TRACKER_H
 #define KUDU_UTIL_MEM_TRACKER_H
 
+#include <cstdint>
 #include <list>
 #include <memory>
-#include <stdint.h>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "kudu/gutil/ref_counted.h"
+#include <glog/logging.h>
+
 #include "kudu/util/high_water_mark.h"
-#include "kudu/util/locks.h"
 #include "kudu/util/mutex.h"
 
 namespace kudu {
-
-class Status;
-class MemTracker;
 
 // A MemTracker tracks memory consumption; it contains an optional limit and is
 // arranged into a tree structure such that the consumption tracked by a
@@ -71,7 +69,7 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   static std::shared_ptr<MemTracker> CreateTracker(
       int64_t byte_limit,
       const std::string& id,
-      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>());
+      std::shared_ptr<MemTracker> parent = std::shared_ptr<MemTracker>());
 
   // If a tracker with the specified 'id' and 'parent' exists in the tree, sets
   // 'tracker' to reference that instance. Returns false if no such tracker

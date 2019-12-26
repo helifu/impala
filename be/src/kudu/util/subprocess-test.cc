@@ -17,17 +17,37 @@
 
 #include "kudu/util/subprocess.h"
 
+#include <errno.h>
+#include <pthread.h>
+#include <string.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/env.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/path_util.h"
+#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using std::atomic;
 using std::string;
+using std::thread;
 using std::vector;
 using strings::Substitute;
 
@@ -48,7 +68,8 @@ TEST_F(SubprocessTest, TestSimplePipe) {
   fprintf(out, "hello world\n");
   // We have to close 'out' or else tr won't write any output, since
   // it enters a buffered mode if it detects that its input is a FIFO.
-  fclose(out);
+  int err;
+  RETRY_ON_EINTR(err, fclose(out));
 
   char buf[1024];
   ASSERT_EQ(buf, fgets(buf, sizeof(buf), in));
@@ -69,7 +90,10 @@ TEST_F(SubprocessTest, TestErrPipe) {
   PCHECK(out);
 
   fprintf(out, "Hello, World\n");
-  fclose(out); // same reasoning as above, flush to prevent tee buffering
+
+  // Same reasoning as above, flush to prevent tee buffering.
+  int err;
+  RETRY_ON_EINTR(err, fclose(out));
 
   FILE* in = fdopen(p.from_child_stderr_fd(), "r");
   PCHECK(in);
@@ -120,6 +144,9 @@ TEST_F(SubprocessTest, TestReadFromStdoutAndStderr) {
     "dd if=/dev/urandom of=/dev/stderr bs=512 count=2048 &"
     "wait"
   }, "", &stdout, &stderr));
+
+  // Reset the alarm when the test is done
+  SCOPED_CLEANUP({ alarm(0); })
 }
 
 // Test that environment variables can be passed to the subprocess.
@@ -134,6 +161,25 @@ TEST_F(SubprocessTest, TestEnvVars) {
   ASSERT_EQ(buf, fgets(buf, sizeof(buf), in));
   ASSERT_STREQ("bar\n", &buf[0]);
   ASSERT_OK(p.Wait());
+}
+
+// Test that the the subprocesses CWD can be set.
+TEST_F(SubprocessTest, TestCurrentDir) {
+  string dir_path = GetTestPath("d");
+  string file_path = JoinPathSegments(dir_path, "f");
+  ASSERT_OK(Env::Default()->CreateDir(dir_path));
+  std::unique_ptr<WritableFile> file;
+  ASSERT_OK(Env::Default()->NewWritableFile(file_path, &file));
+
+  Subprocess p({ "/bin/ls", "f" });
+  p.SetCurrentDir(dir_path);
+  p.ShareParentStdout(false);
+  ASSERT_OK(p.Start());
+  ASSERT_OK(p.Wait());
+
+  int rc;
+  ASSERT_OK(p.GetExitStatus(&rc, nullptr));
+  EXPECT_EQ(0, rc);
 }
 
 // Tests writing to the subprocess stdin.
@@ -260,5 +306,76 @@ TEST_F(SubprocessTest, TestSubprocessDestroyWithCustomSignal) {
   // The subprocess was killed with SIGTERM, giving it a chance to delete kTestFile.
   ASSERT_FALSE(env_->FileExists(kTestFile));
 }
+
+// TEST KUDU-2208: Test subprocess interruption handling
+void handler(int /* signal */) {
+}
+
+TEST_F(SubprocessTest, TestSubprocessInterruptionHandling) {
+  // Create Subprocess thread
+  pthread_t t;
+  Subprocess p({ "/bin/sleep", "1" });
+  atomic<bool> t_started(false);
+  atomic<bool> t_finished(false);
+  thread subprocess_thread([&]() {
+    t = pthread_self();
+    t_started = true;
+    SleepFor(MonoDelta::FromMilliseconds(50));
+    CHECK_OK(p.Start());
+    CHECK_OK(p.Wait());
+    t_finished = true;
+  });
+
+  // Set up a no-op signal handler for SIGUSR2.
+  struct sigaction sa, sa_old;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = &handler;
+  sigaction(SIGUSR2, &sa, &sa_old);
+
+  SCOPED_CLEANUP({ sigaction(SIGUSR2, &sa_old, nullptr); });
+  SCOPED_CLEANUP({ subprocess_thread.join(); });
+
+  // Send kill signals to Subprocess thread
+  LOG(INFO) << "Start sending kill signals to Subprocess thread";
+  while (!t_finished) {
+    if (t_started) {
+      int err = pthread_kill(t, SIGUSR2);
+      ASSERT_TRUE(err == 0 || err == ESRCH);
+      if (err == ESRCH) {
+        LOG(INFO) << "Async kill signal failed with err=" << err <<
+            " because it tried to kill vanished subprocess_thread";
+        ASSERT_TRUE(t_finished);
+      }
+      // Add microseconds delay to make the unit test runs faster and more reliable
+      SleepFor(MonoDelta::FromMicroseconds(rand() % 1));
+    }
+  }
+}
+
+#ifdef __linux__
+// This test requires a system with /proc/<pid>/stat.
+TEST_F(SubprocessTest, TestGetProcfsState) {
+  // This test should be RUNNING.
+  Subprocess::ProcfsState state;
+  ASSERT_OK(Subprocess::GetProcfsState(getpid(), &state));
+  ASSERT_EQ(Subprocess::ProcfsState::RUNNING, state);
+
+  // When started, /bin/sleep will be RUNNING (even though it's asleep).
+  Subprocess sleep({"/bin/sleep", "1000"});
+  ASSERT_OK(sleep.Start());
+  ASSERT_OK(Subprocess::GetProcfsState(sleep.pid(), &state));
+  ASSERT_EQ(Subprocess::ProcfsState::RUNNING, state);
+
+  // After a SIGSTOP, it should be PAUSED.
+  ASSERT_OK(sleep.Kill(SIGSTOP));
+  ASSERT_OK(Subprocess::GetProcfsState(sleep.pid(), &state));
+  ASSERT_EQ(Subprocess::ProcfsState::PAUSED, state);
+
+  // After a SIGCONT, it should be RUNNING again.
+  ASSERT_OK(sleep.Kill(SIGCONT));
+  ASSERT_OK(Subprocess::GetProcfsState(sleep.pid(), &state));
+  ASSERT_EQ(Subprocess::ProcfsState::RUNNING, state);
+}
+#endif
 
 } // namespace kudu

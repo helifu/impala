@@ -23,17 +23,35 @@ under the License.
 <table id="backends" class='table table-hover table-bordered'>
   <thead>
     <tr>
+      <th></th>
       <th>Address</th>
+      <th>Krpc Address</th>
       <th>Coordinator</th>
       <th>Executor</th>
+      <th>Quiescing</th>
+      <th>Memory Limit for Admission</th>
+      <th>Memory Reserved</th>
+      <th>Memory Admitted by Queries Submitted to this Coordinator</th>
+      <th>Admission Control Slots In Use</th>
+      <th>Num. Queries Admitted by this Coordinator</th>
+      <th>Executor Groups</th>
     </tr>
   </thead>
   <tbody>
     {{#backends}}
     <tr>
+      <td><a href='{{webserver_url}}'>Web UI</a></td>
       <td>{{address}}</td>
+      <td>{{krpc_address}}</td>
       <td>{{is_coordinator}}</td>
       <td>{{is_executor}}</td>
+      <td>{{is_quiescing}}</td>
+      <td>{{admit_mem_limit}}</td>
+      <td>{{mem_reserved}}</td>
+      <td>{{mem_admitted}}</td>
+      <td>{{admission_slots_in_use}}/{{admission_slots}}</td>
+      <td>{{num_admitted}}</td>
+      <td>{{executor_groups}}</td>
     </tr>
     {{/backends}}
   </tbody>

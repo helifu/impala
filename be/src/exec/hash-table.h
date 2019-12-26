@@ -21,6 +21,7 @@
 #include <memory>
 #include <vector>
 #include <boost/cstdint.hpp>
+#include <boost/scoped_array.hpp>
 #include <boost/scoped_ptr.hpp>
 
 #include "codegen/impala-ir.h"
@@ -33,6 +34,7 @@
 #include "runtime/tuple-row.h"
 #include "util/bitmap.h"
 #include "util/hash-util.h"
+#include "util/runtime-profile.h"
 
 namespace llvm {
   class Function;
@@ -165,10 +167,10 @@ class HashTableCtx {
   Status CodegenEvalRow(LlvmCodeGen* codegen, bool build_row, llvm::Function** fn);
 
   /// Codegen for evaluating a TupleRow and comparing equality. Function signature
-  /// matches HashTable::Equals(). 'force_null_equality' is true if the generated
-  /// equality function should treat all NULLs as equal. See the template parameter
-  /// to HashTable::Equals().
-  Status CodegenEquals(LlvmCodeGen* codegen, bool force_null_equality,
+  /// matches HashTable::Equals(). 'inclusive_equality' is true if the generated
+  /// equality function should treat all NULLs as equal and all NaNs as equal.
+  /// See the template parameter to HashTable::Equals().
+  Status CodegenEquals(LlvmCodeGen* codegen, bool inclusive_equality,
       llvm::Function** fn);
 
   /// Codegen for hashing expr values. Function prototype matches HashRow identically.
@@ -431,11 +433,11 @@ class HashTableCtx {
   /// Wrapper function for calling correct HashUtil function in non-codegen'd case.
   uint32_t Hash(const void* input, int len, uint32_t hash) const;
 
-  /// Evaluate 'row' over build exprs, storing values into 'expr_values' and nullness into
-  /// 'expr_values_null'. This will be replaced by codegen. We do not want this function
-  /// inlined when cross compiled because we need to be able to differentiate between
-  /// EvalBuildRow and EvalProbeRow by name and the build/probe exprs are baked into the
-  /// codegen'd function.
+  /// Evaluate 'row' over build exprs, storing values into 'expr_values' and nullness
+  /// into 'expr_values_null'. This will be replaced by codegen. We do not want this
+  /// function inlined when cross compiled because we need to be able to differentiate
+  /// between EvalBuildRow and EvalProbeRow by name and the build/probe exprs are baked
+  /// into the codegen'd function.
   bool IR_NO_INLINE EvalBuildRow(
       const TupleRow* row, uint8_t* expr_values, uint8_t* expr_values_null) noexcept {
     return EvalRow(row, build_expr_evals_, expr_values, expr_values_null);
@@ -460,18 +462,17 @@ class HashTableCtx {
       uint8_t* expr_values, uint8_t* expr_values_null) noexcept;
 
   /// Returns true if the values of build_exprs evaluated over 'build_row' equal the
-  /// values in 'expr_values' with nullness 'expr_values_null'. FORCE_NULL_EQUALITY is
-  /// true if all nulls should be treated as equal, regardless of the values of
-  /// 'finds_nulls_'. This will be replaced by codegen.
-  template <bool FORCE_NULL_EQUALITY>
+  /// values in 'expr_values' with nullness 'expr_values_null'. INCLUSIVE_EQUALITY
+  /// means "NULL==NULL" and "NaN==NaN". This will be replaced by codegen.
+  template <bool INCLUSIVE_EQUALITY>
   bool IR_NO_INLINE Equals(const TupleRow* build_row, const uint8_t* expr_values,
       const uint8_t* expr_values_null) const noexcept;
 
   /// Helper function that calls Equals() with the current row. Always inlined so that
   /// it does not appear in cross-compiled IR.
-  template <bool FORCE_NULL_EQUALITY>
+  template <bool INCLUSIVE_EQUALITY>
   bool ALWAYS_INLINE Equals(const TupleRow* build_row) const {
-    return Equals<FORCE_NULL_EQUALITY>(build_row, expr_values_cache_.cur_expr_values(),
+    return Equals<INCLUSIVE_EQUALITY>(build_row, expr_values_cache_.cur_expr_values(),
         expr_values_cache_.cur_expr_values_null());
   }
 
@@ -526,6 +527,30 @@ class HashTableCtx {
   /// clearing them when results from the respective expr evaluators are no longer needed.
   MemPool* build_expr_results_pool_;
   MemPool* probe_expr_results_pool_;
+};
+
+/// HashTableStatsProfile encapsulates hash tables stats. It tracks the stats of all the
+/// hash tables created by a node. It should be created, stored by the node, and be
+/// released when the node is released.
+struct HashTableStatsProfile {
+  /// Profile object for HashTable Stats
+  RuntimeProfile* hashtable_profile = nullptr;
+
+  /// Number of hash collisions - unequal rows that have identical hash values
+  RuntimeProfile::Counter* num_hash_collisions_ = nullptr;
+
+  /// Number of hash table probes.
+  RuntimeProfile::Counter* num_hash_probes_ = nullptr;
+
+  /// Total distance traveled for each hash table probe.
+  RuntimeProfile::Counter* num_hash_travels_ = nullptr;
+
+  /// Number of hash table resized
+  RuntimeProfile::Counter* num_hash_resizes_ = nullptr;
+
+  /// Total number of hash buckets across all partitions.
+  RuntimeProfile::Counter* num_hash_buckets_ = nullptr;
+
 };
 
 /// The hash table consists of a contiguous array of buckets that contain a pointer to the
@@ -618,8 +643,20 @@ class HashTable {
   /// enough memory for the initial buckets was allocated from the Suballocator.
   Status Init(bool* got_memory) WARN_UNUSED_RESULT;
 
+  /// Create the counters for HashTable stats and put them into the child profile
+  /// "Hash Table".
+  /// Returns a HashTableStatsProfile object.
+  static std::unique_ptr<HashTableStatsProfile> AddHashTableCounters(
+      RuntimeProfile* parent_profile);
+
   /// Call to cleanup any resources. Must be called once.
   void Close();
+
+  /// Add operations stats of this hash table to the counters in profile.
+  /// This method should only be called once for each HashTable and be called during
+  /// closing the owner object of the HashTable. Not all the counters are added with the
+  /// method, only counters for Probes, travels, collisions and resizes are affected.
+  void StatsCountersAdd(HashTableStatsProfile* profile);
 
   /// Inserts the row to the hash table. The caller is responsible for ensuring that the
   /// table has free buckets. Returns true if the insertion was successful. Always
@@ -737,9 +774,6 @@ class HashTable {
   /// Update and print some statistics that can be used for performance debugging.
   std::string PrintStats() const;
 
-  /// Number of hash collisions so far in the lifetime of this object
-  int64_t NumHashCollisions() const { return num_hash_collisions_; }
-
   /// stl-like iterator interface.
   class Iterator {
    private:
@@ -848,14 +882,14 @@ class HashTable {
   /// this function. The values of the expression values cache in 'ht_ctx' will be
   /// used to probe the hash table.
   ///
-  /// 'FORCE_NULL_EQUALITY' is true if NULLs should always be considered equal when
-  /// comparing two rows.
+  /// 'INCLUSIVE_EQUALITY' is true if NULLs and NaNs should always be
+  /// considered equal when comparing two rows.
   ///
   /// 'hash' is the hash computed by EvalAndHashBuild() or EvalAndHashProbe().
   /// 'found' indicates that a bucket that contains an equal row is found.
   ///
   /// There are wrappers of this function that perform the Find and Insert logic.
-  template <bool FORCE_NULL_EQUALITY>
+  template <bool INCLUSIVE_EQUALITY>
   int64_t IR_ALWAYS_INLINE Probe(Bucket* buckets, int64_t num_buckets,
       HashTableCtx* ht_ctx, uint32_t hash, bool* found);
 
@@ -923,12 +957,12 @@ class HashTable {
   RuntimeState* state_;
 
   /// Suballocator to allocate data pages and hash table buckets with.
-  Suballocator* allocator_;
+  Suballocator* const allocator_;
 
   /// Stream contains the rows referenced by the hash table. Can be NULL if the
   /// row only contains a single tuple, in which case the TupleRow indirection
   /// is removed by the hash table.
-  BufferedTupleStream* tuple_stream_;
+  BufferedTupleStream* const tuple_stream_;
 
   /// Constants on how the hash table should behave.
 
@@ -946,62 +980,57 @@ class HashTable {
   std::vector<std::unique_ptr<Suballocation>> data_pages_;
 
   /// Byte size of all buffers in data_pages_.
-  int64_t total_data_page_size_;
+  int64_t total_data_page_size_ = 0;
 
   /// Next duplicate node to insert. Vaild when node_remaining_current_page_ > 0.
-  DuplicateNode* next_node_;
+  DuplicateNode* next_node_ = nullptr;
 
   /// Number of nodes left in the current page.
-  int node_remaining_current_page_;
+  int node_remaining_current_page_ = 0;
 
   /// Number of duplicate nodes.
-  int64_t num_duplicate_nodes_;
+  int64_t num_duplicate_nodes_ = 0;
 
-  const int64_t max_num_buckets_;
+  const int64_t max_num_buckets_ = 0;
 
   /// Allocation containing all buckets.
   std::unique_ptr<Suballocation> bucket_allocation_;
 
   /// Pointer to the 'buckets_' array from 'bucket_allocation_'.
-  Bucket* buckets_;
+  Bucket* buckets_ = nullptr;
 
   /// Total number of buckets (filled and empty).
   int64_t num_buckets_;
 
   /// Number of non-empty buckets.  Used to determine when to resize.
-  int64_t num_filled_buckets_;
+  int64_t num_filled_buckets_ = 0;
 
   /// Number of (non-empty) buckets with duplicates. These buckets do not point to slots
   /// in the tuple stream, rather than to a linked list of Nodes.
-  int64_t num_buckets_with_duplicates_;
+  int64_t num_buckets_with_duplicates_ = 0;
 
   /// Number of build tuples, used for constructing temp row* for probes.
   const int num_build_tuples_;
 
   /// Flag used to check that we don't lose stored matches when spilling hash tables
   /// (IMPALA-1488).
-  bool has_matches_;
+  bool has_matches_ = false;
 
   /// The stats below can be used for debugging perf.
-  /// TODO: Should we make these statistics atomic?
-  /// Number of FindProbeRow(), Insert(), or FindBuildRowBucket() calls that probe the
-  /// hash table.
-  int64_t num_probes_;
-
-  /// Number of probes that failed and had to fall back to linear probing without cap.
-  int64_t num_failed_probes_;
+  /// Number of Probe() calls that probe the hash table.
+  int64_t num_probes_ = 0;
 
   /// Total distance traveled for each probe. That is the sum of the diff between the end
   /// position of a probe (find/insert) and its start position
   /// (hash & (num_buckets_ - 1)).
-  int64_t travel_length_;
+  int64_t travel_length_ = 0;
 
   /// The number of cases where we had to compare buckets with the same hash value, but
   /// the row equality failed.
-  int64_t num_hash_collisions_;
+  int64_t num_hash_collisions_ = 0;
 
   /// How many times this table has resized so far.
-  int64_t num_resizes_;
+  int64_t num_resizes_ = 0;
 };
 
 }

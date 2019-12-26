@@ -21,33 +21,73 @@ common-footer.tmpl) }}
 <!DOCTYPE html>
 <html>
   <head><title>Apache Impala</title>
-    <script src='/www/jquery/jquery-1.12.4.min.js'></script>
-    <script src='/www/bootstrap/js/bootstrap.min.js'></script>
-    <link rel="stylesheet" type="text/css" href="/www/datatables.min.css"/>
-    <script type="text/javascript" src="/www/datatables.min.js"></script>
-    <link href='/www/bootstrap/css/bootstrap.min.css' rel='stylesheet' media='screen'>
+    <script src='{{ __common__.host-url }}/www/jquery/jquery-3.4.1.min.js'></script>
+    <script src='{{ __common__.host-url }}/www/bootstrap/js/bootstrap-4.3.1.min.js'></script>
+    <script src='{{ __common__.host-url }}/www/scripts/util.js'></script>
+    <link rel="stylesheet" type="text/css" href="{{ __common__.host-url }}/www/datatables-1.10.18.min.css"/>
+    <script type="text/javascript" src="{{ __common__.host-url }}/www/datatables-1.10.18.min.js"></script>
+    <link href='{{ __common__.host-url }}/www/bootstrap/css/bootstrap-4.3.1.min.css' rel='stylesheet' media='screen'>
+    <link rel='icon' href='{{ __common__.host-url }}/www/favicon.ico'>
     <style>
+      @media (min-width: 1300px) {
+        #nav-options {
+            width: 1280px;
+        }
+      }
+
+      body {
+        font-size: 14px;
+      }
+
+      pre {
+        padding: 10px;
+        font-size: 12px;
+        border: 1px solid #ccc;
+      }
+
+      /* Avoid unsightly padding around code element */
+      pre.code {
+        padding: 0;
+      }
     </style>
   </head>
   <body>
-    <header class="navbar navbar-default navbar-static-top" id="top" role="banner">
-      <div class="container">
+    <header class="navbar navbar-default navbar-expand bg-light navbar-static-top" id="top" role="banner">
+      <div id="nav-options" class="container">
         <div class="navbar-header">
-          <a class='navbar-brand' href='/'>{{ __common__.process-name }}</a>
+          <a class='navbar-brand' href='{{ __common__.host-url }}/' id='root-link'>{{ __common__.process-name }}</a>
         </div>
         <nav class="collapse navbar-collapse bs-navbar-collapse" role="navigation">
           <ul class="nav navbar-nav">
             {{#__common__.navbar}}
-            <li><a href="{{link}}">{{title}}</a></li>
+            <li class="navbar-item"><a class="nav-link" href="{{ __common__.host-url }}{{link}}">{{title}}</a></li>
             {{/__common__.navbar}}
           </ul>
         </nav>
       </div>
     </header>
-<div class='container' style='width:80%'>
+<div class='container-fluid' style='width:80%'>
 {{#error}}
 <div class="alert alert-danger">
   <strong>Error:</strong>
   {{.}}
 </div>
 {{/error}}
+<script>
+// For Apache Knox compatibility, all urls that are accessed by javascript should have
+// their path wrapped with this.
+function make_url(path) {
+  var root_link = document.getElementById('root-link');
+  var s  = root_link.href.split("?");
+  url = s[0] + path;
+  if (s.length > 1) {
+    if (path.includes("?")) {
+      url += "&"
+    } else {
+      url += "?";
+    }
+    url += s[1];
+  }
+  return url;
+}
+</script>

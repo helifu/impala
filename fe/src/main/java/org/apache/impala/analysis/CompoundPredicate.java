@@ -17,7 +17,6 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.catalog.Db;
@@ -102,12 +101,13 @@ public class CompoundPredicate extends Predicate {
   }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     if (children_.size() == 1) {
       Preconditions.checkState(op_ == Operator.NOT);
-      return "NOT " + getChild(0).toSql();
+      return "NOT " + getChild(0).toSql(options);
     } else {
-      return getChild(0).toSql() + " " + op_.toString() + " " + getChild(1).toSql();
+      return getChild(0).toSql(options) + " " + op_.toString() + " "
+          + getChild(1).toSql(options);
     }
   }
 
@@ -132,7 +132,7 @@ public class CompoundPredicate extends Predicate {
         CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     Preconditions.checkState(fn_ != null);
     Preconditions.checkState(fn_.getReturnType().isBoolean());
-    castForFunctionCall(false);
+    castForFunctionCall(false, analyzer.isDecimalV2());
 
     if (!getChild(0).hasSelectivity() ||
         (children_.size() == 2 && !getChild(1).hasSelectivity())) {

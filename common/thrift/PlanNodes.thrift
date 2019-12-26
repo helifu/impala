@@ -29,56 +29,64 @@ include "ExecStats.thrift"
 include "Exprs.thrift"
 include "Types.thrift"
 include "ExternalDataSource.thrift"
+include "ResourceProfile.thrift"
 
 enum TPlanNodeType {
-  HDFS_SCAN_NODE,
-  HBASE_SCAN_NODE,
-  HASH_JOIN_NODE,
-  AGGREGATION_NODE,
-  SORT_NODE,
-  EMPTY_SET_NODE,
-  EXCHANGE_NODE,
-  UNION_NODE,
-  SELECT_NODE,
-  NESTED_LOOP_JOIN_NODE,
-  DATA_SOURCE_NODE,
-  ANALYTIC_EVAL_NODE,
-  SINGULAR_ROW_SRC_NODE,
-  UNNEST_NODE,
-  SUBPLAN_NODE,
-  KUDU_SCAN_NODE
+  HDFS_SCAN_NODE = 0
+  HBASE_SCAN_NODE = 1
+  HASH_JOIN_NODE = 2
+  AGGREGATION_NODE = 3
+  SORT_NODE = 4
+  EMPTY_SET_NODE = 5
+  EXCHANGE_NODE = 6
+  UNION_NODE = 7
+  SELECT_NODE = 8
+  NESTED_LOOP_JOIN_NODE = 9
+  DATA_SOURCE_NODE = 10
+  ANALYTIC_EVAL_NODE = 11
+  SINGULAR_ROW_SRC_NODE = 12
+  UNNEST_NODE = 13
+  SUBPLAN_NODE = 14
+  KUDU_SCAN_NODE = 15
+  CARDINALITY_CHECK_NODE = 16
+  MULTI_AGGREGATION_NODE = 17
 }
 
 // phases of an execution node
 // must be kept in sync with tests/failure/test_failpoints.py
 enum TExecNodePhase {
-  PREPARE,
-  PREPARE_SCANNER,
-  OPEN,
-  GETNEXT,
-  GETNEXT_SCANNER,
-  CLOSE,
-  INVALID
+  PREPARE = 0
+  PREPARE_SCANNER = 1
+  OPEN = 2
+  GETNEXT = 3
+  GETNEXT_SCANNER = 4
+  CLOSE = 5
+  // After a scanner thread completes a range with an error but before it propagates the
+  // error.
+  SCANNER_ERROR = 6
+  INVALID = 7
 }
 
 // what to do when hitting a debug point (TImpalaQueryOptions.DEBUG_ACTION)
 enum TDebugAction {
-  WAIT,
-  FAIL,
-  INJECT_ERROR_LOG,
-  MEM_LIMIT_EXCEEDED,
+  WAIT = 0
+  FAIL = 1
+  INJECT_ERROR_LOG = 2
+  MEM_LIMIT_EXCEEDED = 3
   // A floating point number in range [0.0, 1.0] that gives the probability of denying
   // each reservation increase request after the initial reservation.
-  SET_DENY_RESERVATION_PROBABILITY,
+  SET_DENY_RESERVATION_PROBABILITY = 4
+  // Delay for a short amount of time: 100ms
+  DELAY = 5
 }
 
 // Preference for replica selection
 enum TReplicaPreference {
-  CACHE_LOCAL,
-  CACHE_RACK,
-  DISK_LOCAL,
-  DISK_RACK,
-  REMOTE
+  CACHE_LOCAL = 0
+  CACHE_RACK = 1
+  DISK_LOCAL = 2
+  DISK_RACK = 3
+  REMOTE = 4
 }
 
 // Specification of a runtime filter target.
@@ -106,8 +114,8 @@ struct TRuntimeFilterTargetDesc {
 }
 
 enum TRuntimeFilterType {
-  BLOOM,
-  MIN_MAX
+  BLOOM = 0
+  MIN_MAX = 1
 }
 
 // Specification of a runtime filter.
@@ -145,6 +153,10 @@ struct TRuntimeFilterDesc {
 
   // The type of runtime filter to build.
   10: required TRuntimeFilterType type
+
+  // The size of the filter based on the ndv estimate and the min/max limit specified in
+  // the query options. Should be greater than zero for bloom filters, zero otherwise.
+  11: optional i64 filter_size_bytes
 }
 
 // The information contained in subclasses of ScanNode captured in two separate
@@ -156,9 +168,9 @@ struct TRuntimeFilterDesc {
 
 // Specification of subsection of a single hdfs file.
 struct THdfsFileSplit {
-  // File name (not the full path).  The path is assumed to be the
+  // File name (not the full path).  The path is assumed to be relative to the
   // 'location' of the THdfsPartition referenced by partition_id.
-  1: required string file_name
+  1: required string relative_path
 
   // starting offset
   2: required i64 offset
@@ -177,6 +189,15 @@ struct THdfsFileSplit {
 
   // last modified time of the file
   7: required i64 mtime
+
+  // whether this file is erasure-coded
+  8: required bool is_erasure_coded
+
+  // Hash of the partition's path. This must be hashed with a hash algorithm that is
+  // consistent across different processes and machines. This is currently using
+  // Java's String.hashCode(), which is consistent. For testing purposes, this can use
+  // any consistent hash.
+  9: required i32 partition_path_hash
 }
 
 // key range for single THBaseScanNode
@@ -190,8 +211,32 @@ struct THBaseKeyRange {
   2: optional string stopKey
 }
 
+// Specifies how THdfsFileSplits can be generated from HDFS files.
+// Currently used for files that do not have block locations,
+// such as S3, ADLS, and Local. The Frontend creates these and the
+// coordinator's scheduler expands them into THdfsFileSplits.
+// The plan is to use TFileSplitGeneratorSpec as well for HDFS
+// files with block information. Doing so will permit the FlatBuffer
+// representation used to represent block information to pass from the
+// FrontEnd to the Coordinator without transforming to a heavier
+// weight Thrift representation. See IMPALA-6458.
+struct TFileSplitGeneratorSpec {
+  1: required CatalogObjects.THdfsFileDesc file_desc
+
+  // Maximum length of a file split to generate.
+  2: required i64 max_block_size
+
+  3: required bool is_splittable
+
+  // ID of partition within the THdfsTable associated with this scan node.
+  4: required i64 partition_id
+
+  // Hash of the partition path
+  5: required i32 partition_path_hash
+}
+
 // Specification of an individual data range which is held in its entirety
-// by a storage server
+// by a storage server.
 struct TScanRange {
   // one of these must be set for every TScanRange
   1: optional THdfsFileSplit hdfs_file_split
@@ -252,7 +297,8 @@ struct TDataSourceScanNode {
 
 struct THBaseFilter {
   1: required string family
-  2: required string qualifier
+  // The qualifier for HBase Key column can be null, thus the field is optional here.
+  2: optional string qualifier
   // Ordinal number into enum HBase CompareFilter.CompareOp.
   // We don't use TExprOperator because the op is interpreted by an HBase Filter, and
   // not the c++ expr eval.
@@ -278,6 +324,9 @@ struct TKuduScanNode {
   // Indicates whether the MT scan node implementation should be used.
   // If this is true, then the MT_DOP query option must be > 0.
   2: optional bool use_mt_scan_node
+
+  // The byte offset of the slot for Kudu metadata if count star optimization is enabled.
+  3: optional i32 count_star_slot_offset
 }
 
 struct TEqJoinCondition {
@@ -290,22 +339,22 @@ struct TEqJoinCondition {
 }
 
 enum TJoinOp {
-  INNER_JOIN,
-  LEFT_OUTER_JOIN,
-  LEFT_SEMI_JOIN,
-  LEFT_ANTI_JOIN,
+  INNER_JOIN = 0
+  LEFT_OUTER_JOIN = 1
+  LEFT_SEMI_JOIN = 2
+  LEFT_ANTI_JOIN = 3
 
   // Similar to LEFT_ANTI_JOIN with special handling for NULLs for the join conjuncts
   // on the build side. Those NULLs are considered candidate matches, and therefore could
   // be rejected (ANTI-join), based on the other join conjuncts. This is in contrast
   // to LEFT_ANTI_JOIN where NULLs are not matches and therefore always returned.
-  NULL_AWARE_LEFT_ANTI_JOIN,
+  NULL_AWARE_LEFT_ANTI_JOIN = 4
 
-  RIGHT_OUTER_JOIN,
-  RIGHT_SEMI_JOIN,
-  RIGHT_ANTI_JOIN,
-  FULL_OUTER_JOIN,
-  CROSS_JOIN
+  RIGHT_OUTER_JOIN = 5
+  RIGHT_SEMI_JOIN = 6
+  RIGHT_ANTI_JOIN = 7
+  FULL_OUTER_JOIN = 8
+  CROSS_JOIN = 9
 }
 
 struct THashJoinNode {
@@ -326,7 +375,7 @@ struct TNestedLoopJoinNode {
   2: optional list<Exprs.TExpr> join_conjuncts
 }
 
-struct TAggregationNode {
+struct TAggregator {
   1: optional list<Exprs.TExpr> grouping_exprs
   // aggregate exprs. The root of each expr is the aggregate function. The
   // other exprs are the inputs to the aggregate function.
@@ -340,14 +389,25 @@ struct TAggregationNode {
   // aggregate functions.
   4: required Types.TTupleId output_tuple_id
 
-  // Set to true if this aggregation node needs to run the finalization step.
+  // Set to true if this aggregator needs to run the finalization step.
   5: required bool need_finalize
 
   // Set to true to use the streaming preagg algorithm. Node must be a preaggregation.
   6: required bool use_streaming_preaggregation
 
-  // Estimate of number of input rows from the planner.
-  7: required i64 estimated_input_cardinality
+  7: required ResourceProfile.TBackendResourceProfile resource_profile
+}
+
+struct TAggregationNode {
+  // Aggregators for this node, each with a unique set of grouping exprs.
+  1: required list<TAggregator> aggregators
+
+  // Used in streaming aggregations to determine how much memory to use.
+  2: required i64 estimated_input_cardinality
+
+  // If true, this is the first AggregationNode in a aggregation plan with multiple
+  // Aggregators and the entire input to this node should be passed to each Aggregator.
+  3: required bool replicate_input
 }
 
 struct TSortInfo {
@@ -359,17 +419,19 @@ struct TSortInfo {
   // Expressions evaluated over the input row that materialize the tuple to be sorted.
   // Contains one expr per slot in the materialized tuple.
   4: optional list<Exprs.TExpr> sort_tuple_slot_exprs
+  // The sorting order used in SORT BY clauses.
+  5: required Types.TSortingOrder sorting_order
 }
 
 enum TSortType {
   // Sort the entire input.
-  TOTAL,
+  TOTAL = 0
 
   // Return the first N sorted elements.
-  TOPN,
+  TOPN = 1
 
   // Divide the input into batches, each of which is sorted individually.
-  PARTIAL
+  PARTIAL = 2
 }
 
 struct TSortNode {
@@ -382,21 +444,21 @@ struct TSortNode {
 
 enum TAnalyticWindowType {
   // Specifies the window as a logical offset
-  RANGE,
+  RANGE = 0
 
   // Specifies the window in physical units
-  ROWS
+  ROWS = 1
 }
 
 enum TAnalyticWindowBoundaryType {
   // The window starts/ends at the current row.
-  CURRENT_ROW,
+  CURRENT_ROW = 0
 
   // The window starts/ends at an offset preceding current row.
-  PRECEDING,
+  PRECEDING = 1
 
   // The window starts/ends at an offset following current row.
-  FOLLOWING
+  FOLLOWING = 2
 }
 
 struct TAnalyticWindowBoundary {
@@ -496,23 +558,16 @@ struct TUnnestNode {
   1: required Exprs.TExpr collection_expr
 }
 
-// This contains all of the information computed by the plan as part of the resource
-// profile that is needed by the backend to execute.
-struct TBackendResourceProfile {
-  // The minimum reservation for this plan node in bytes.
-  1: required i64 min_reservation
+struct TCardinalityCheckNode {
+  // Associated statement of child
+  1: required string display_statement
+}
 
-  // The maximum reservation for this plan node in bytes. MAX_INT64 means effectively
-  // unlimited.
-  2: required i64 max_reservation
-
-  // The spillable buffer size in bytes to use for this node, chosen by the planner.
-  // Set iff the node uses spillable buffers.
-  3: optional i64 spillable_buffer_size
-
-  // The buffer size in bytes that is large enough to fit the largest row to be processed.
-  // Set if the node allocates buffers for rows from the buffer pool.
-  4: optional i64 max_row_buffer_size
+// See PipelineMembership in the frontend for details.
+struct TPipelineMembership {
+  1: required Types.TPlanNodeId pipe_id
+  2: required i32 height
+  3: required TExecNodePhase phase
 }
 
 // This is essentially a union of all messages corresponding to subclasses
@@ -533,6 +588,8 @@ struct TPlanNode {
   // Set to true if codegen should be disabled for this plan node. Otherwise the plan
   // node is codegen'd if the backend supports it.
   8: required bool disable_codegen
+
+  27: required list<TPipelineMembership> pipelines
 
   // one field per PlanNode subclass
   9: optional THdfsScanNode hdfs_scan_node
@@ -562,7 +619,9 @@ struct TPlanNode {
   24: optional list<TRuntimeFilterDesc> runtime_filters
 
   // Resource profile for this plan node.
-  25: required TBackendResourceProfile resource_profile
+  25: required ResourceProfile.TBackendResourceProfile resource_profile
+
+  26: optional TCardinalityCheckNode cardinality_check_node
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

@@ -17,6 +17,7 @@
 
 package org.apache.impala.catalog;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -29,12 +30,12 @@ import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Maps;
 
 /**
 * Class that manages scheduling the loading of table metadata from the Hive Metastore and
@@ -114,13 +115,13 @@ public class TableLoadingMgr {
   // attempts to load the same table by a different thread become no-ops.
   // This map is different from loadingTables_ because the latter tracks all in-flight
   // loads - even those being processed by threads other than table loading threads.
-  private final ConcurrentHashMap<TTableName, AtomicBoolean> tableLoadingBarrier_ =
-      new ConcurrentHashMap<TTableName, AtomicBoolean>();
+  private final Map<TTableName, AtomicBoolean> tableLoadingBarrier_ =
+      new ConcurrentHashMap<>();
 
   // Map of table name to a FutureTask associated with the table load. Used to
   // prevent duplicate loads of the same table.
-  private final ConcurrentHashMap<TTableName, FutureTask<Table>> loadingTables_ =
-      new ConcurrentHashMap<TTableName, FutureTask<Table>>();
+  private final Map<TTableName, FutureTask<Table>> loadingTables_ =
+      new ConcurrentHashMap<>();
 
   // Map of table name to the cache directives that are being waited on for that table.
   // Once all directives have completed, the table's metadata will be refreshed and
@@ -128,7 +129,7 @@ public class TableLoadingMgr {
   // A caching operation may take a long time to complete, so to maximize query
   // throughput it is preferable to allow the user to continue to run queries against
   // the table while a cache request completes in the background.
-  private final Map<TTableName, List<Long>> pendingTableCacheDirs_ = Maps.newHashMap();
+  private final Map<TTableName, List<Long>> pendingTableCacheDirs_ = new HashMap<>();
 
   // The number of parallel threads to use to load table metadata. Should be set to a
   // value that provides good throughput while not putting too much stress on the
@@ -151,8 +152,8 @@ public class TableLoadingMgr {
 
   // Tables for the async refresh thread to process. Synchronization must be handled
   // externally.
-  private final LinkedBlockingQueue<TTableName> refreshThreadWork_ =
-      new LinkedBlockingQueue<TTableName>();
+  private final LinkedBlockingQueue<Pair<TTableName, String>> refreshThreadWork_ =
+      new LinkedBlockingQueue<>();
 
   private final CatalogServiceCatalog catalog_;
   private final TableLoader tblLoader_;
@@ -163,8 +164,8 @@ public class TableLoadingMgr {
     numLoadingThreads_ = numLoadingThreads;
     tblLoadingPool_ = Executors.newFixedThreadPool(numLoadingThreads_);
 
-    // Start the background table loading threads.
-    startTableLoadingThreads();
+    // Start the background table loading submitter threads.
+    startTableLoadingSubmitterThreads();
 
     // Start the asyncRefreshThread_. Currently used to wait for cache directives to
     // complete in the background.
@@ -172,7 +173,8 @@ public class TableLoadingMgr {
       @Override
       public Void call() throws Exception {
         while(true) {
-          execAsyncRefreshWork(refreshThreadWork_.take());
+          Pair<TTableName, String> work = refreshThreadWork_.take();
+          execAsyncRefreshWork(work.first, /* reason=*/work.second);
         }
       }});
   }
@@ -206,7 +208,8 @@ public class TableLoadingMgr {
    * asyncRefreshThread_ will refresh the table metadata. After processing the
    * request the watch will be deleted.
    */
-  public void watchCacheDirs(List<Long> cacheDirIds, final TTableName tblName) {
+  public void watchCacheDirs(List<Long> cacheDirIds, final TTableName tblName,
+      final String reason) {
     synchronized (pendingTableCacheDirs_) {
       // A single table may have multiple pending cache requests since one request
       // gets submitted per-partition.
@@ -214,7 +217,7 @@ public class TableLoadingMgr {
       if (existingCacheReqIds == null) {
         existingCacheReqIds = cacheDirIds;
         pendingTableCacheDirs_.put(tblName, cacheDirIds);
-        refreshThreadWork_.add(tblName);
+        refreshThreadWork_.add(Pair.create(tblName, reason));
       } else {
         existingCacheReqIds.addAll(cacheDirIds);
       }
@@ -227,7 +230,7 @@ public class TableLoadingMgr {
    * the same underlying loading task (Future) will be used, helping to prevent duplicate
    * loads of the same table.
    */
-  public LoadRequest loadAsync(final TTableName tblName)
+  public LoadRequest loadAsync(final TTableName tblName, final String reason)
       throws DatabaseNotFoundException {
     final Db parentDb = catalog_.getDb(tblName.getDb_name());
     if (parentDb == null) {
@@ -238,7 +241,7 @@ public class TableLoadingMgr {
     FutureTask<Table> tableLoadTask = new FutureTask<Table>(new Callable<Table>() {
         @Override
         public Table call() throws Exception {
-          return tblLoader_.load(parentDb, tblName.table_name);
+          return tblLoader_.load(parentDb, tblName.table_name, reason);
         }});
 
     FutureTask<Table> existingValue = loadingTables_.putIfAbsent(tblName, tableLoadTask);
@@ -252,15 +255,19 @@ public class TableLoadingMgr {
   }
 
   /**
-   * Starts table loading threads in a fixed sized thread pool with a size
+   * Starts table loading submitter threads in a fixed sized thread pool with a size
    * defined by NUM_TBL_LOADING_THREADS. Each thread polls the tableLoadingDeque_
-   * for new tables to load.
+   * for new tables to load. Note these threads are just for submitting the
+   * load request, the real table loading threads are in tblLoadingPool_.
+   * There is a discussion here: https://issues.apache.org/jira/browse/IMPALA-9140
+   * which well explained the table loading mechanism.
    */
-  private void startTableLoadingThreads() {
-    ExecutorService loadingPool = Executors.newFixedThreadPool(numLoadingThreads_);
+  private void startTableLoadingSubmitterThreads() {
+    ExecutorService submitterLoadingPool =
+        Executors.newFixedThreadPool(numLoadingThreads_);
     try {
       for (int i = 0; i < numLoadingThreads_; ++i) {
-        loadingPool.execute(new Runnable() {
+        submitterLoadingPool.execute(new Runnable() {
           @Override
           public void run() {
             while (true) {
@@ -275,7 +282,7 @@ public class TableLoadingMgr {
         });
       }
     } finally {
-      loadingPool.shutdown();
+      submitterLoadingPool.shutdown();
     }
   }
 
@@ -297,7 +304,8 @@ public class TableLoadingMgr {
     try {
       // TODO: Instead of calling "getOrLoad" here we could call "loadAsync". We would
       // just need to add a mechanism for moving loaded tables into the Catalog.
-      catalog_.getOrLoadTable(tblName.getDb_name(), tblName.getTable_name());
+      catalog_.getOrLoadTable(tblName.getDb_name(), tblName.getTable_name(),
+          "background load");
     } catch (CatalogException e) {
       // Ignore.
     } finally {
@@ -312,12 +320,12 @@ public class TableLoadingMgr {
    * anyway, and if the table failed to load, then we do not want to hide errors by
    * reloading it 'silently' in response to the completion of an HDFS caching request.
    */
-  private void execAsyncRefreshWork(TTableName tblName) {
+  private void execAsyncRefreshWork(TTableName tblName, String reason) {
     if (!waitForCacheDirs(tblName)) return;
     try {
       Table tbl = catalog_.getTable(tblName.getDb_name(), tblName.getTable_name());
       if (tbl == null || tbl instanceof IncompleteTable || !tbl.isLoaded()) return;
-      catalog_.reloadTable(tbl);
+      catalog_.reloadTable(tbl, reason);
     } catch (CatalogException e) {
       LOG.error("Error reloading cached table: ", e);
     }

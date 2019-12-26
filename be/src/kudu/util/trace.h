@@ -32,6 +32,10 @@
 #include "kudu/util/locks.h"
 #include "kudu/util/trace_metrics.h"
 
+namespace kudu {
+class Trace;
+}
+
 // Adopt a Trace on the current thread for the duration of the current
 // scope. The old current Trace is restored when the scope is exited.
 //
@@ -135,25 +139,25 @@ class Trace : public RefCountedThreadSafe<Trace> {
   void SubstituteAndTrace(const char* filepath, int line_number,
                           StringPiece format,
                           const strings::internal::SubstituteArg& arg0 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg1 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg2 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg3 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg4 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg5 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg6 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg7 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg8 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg9 =
-                            strings::internal::SubstituteArg::NoArg);
+                            strings::internal::SubstituteArg::kNoArg);
 
   // Dump the trace buffer to the given output stream.
   //
@@ -252,30 +256,10 @@ class ScopedAdoptTrace {
   }
 
   ~ScopedAdoptTrace() {
-    auto t = Trace::threadlocal_trace_;
-    Trace::threadlocal_trace_ = old_trace_;
-
-    // It's critical that we Release() the reference count on 't' only
-    // after we've unset the thread-local variable. Otherwise, we can hit
-    // a nasty interaction with tcmalloc contention profiling. Consider
-    // the following sequence:
-    //
-    //   1. threadlocal_trace_ has refcount = 1
-    //   2. we call threadlocal_trace_->Release() which decrements refcount to 0
-    //   3. this calls 'delete' on the Trace object
-    //   3a. this calls tcmalloc free() on the Trace and various sub-objects
-    //   3b. the free() calls may end up experiencing contention in tcmalloc
-    //   3c. we try to account the contention in threadlocal_trace_'s TraceMetrics,
-    //       but it has already been freed.
-    //
-    // In the best case, we just scribble into some free tcmalloc memory. In the
-    // worst case, tcmalloc would have already re-used this memory for a new
-    // allocation on another thread, and we end up overwriting someone else's memory.
-    //
-    // Waiting to Release() only after 'unpublishing' the trace solves this.
-    if (t) {
-      t->Release();
+    if (Trace::threadlocal_trace_) {
+      Trace::threadlocal_trace_->Release();
     }
+    Trace::threadlocal_trace_ = old_trace_;
     DFAKE_SCOPED_LOCK_THREAD_LOCKED(ctor_dtor_);
   }
 

@@ -33,7 +33,7 @@ form. Note that commits are the full 20-byte git hashes.
     "source": "master",
     "target": "2.x",
     "commits": [
-      { "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "comment": "...",
+      { "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "comment": "..."},
       { "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "comment": "..."}
     ]
   }
@@ -64,7 +64,7 @@ import json
 import logging
 import os
 import re
-import sh
+import subprocess
 import sys
 
 from collections import defaultdict
@@ -90,6 +90,8 @@ def create_parser():
   parser.add_argument('--cherry_pick', action='store_true', default=False,
       help='Cherry-pick mismatched commits to current branch. This ' +
         'must match (in the hash sense) the target branch.')
+  parser.add_argument('--partial_ok', action='store_true', default=False,
+      help='Exit with success if at least one cherrypick succeeded.')
   parser.add_argument('--source_branch', default='master')
   parser.add_argument('--target_branch', default='2.x')
   parser.add_argument('--source_remote_name', default='asf-gerrit',
@@ -103,8 +105,9 @@ def create_parser():
       os.path.dirname(os.path.abspath(__file__)), 'ignored_commits.json')
   parser.add_argument('--ignored_commits_file', default=default_ignored_commits_path,
       help='JSON File that contains ignored commits as specified in the help')
-  parser.add_argument('--skip_commits_matching', default="Cherry-picks: not for {branch}",
-      help='String in commit messages that causes the commit to be ignored. ' +
+  parser.add_argument('--skip_commits_matching',
+      default="Cherry-pick.?:.?not (for|to) {branch}",
+      help='Regex searched for in commit messages that causes the commit to be ignored.' +
            ' {branch} is replaced with target branch; the search is case-insensitive')
   parser.add_argument('--verbose', '-v', action='store_true', default=False,
       help='Turn on DEBUG and INFO logging')
@@ -136,8 +139,8 @@ def build_commit_map(branch, merge_base):
   fields = ['%H', '%s', '%an', '%cd', '%b']
   pretty_format = '\x1f'.join(fields) + '\x1e'
   result = OrderedDict()
-  for line in sh.git.log(
-      branch, "^" + merge_base, pretty=pretty_format, color='never').split('\x1e'):
+  for line in subprocess.check_output(["git", "log", branch, "^" + merge_base,
+    "--pretty=" + pretty_format, "--color=never"]).split('\x1e'):
     if line == "":
       # if no changes are identified by the git log, we get an empty string
       continue
@@ -158,13 +161,16 @@ def build_commit_map(branch, merge_base):
   logging.debug("Commit map for branch %s has size %d.", branch, len(result))
   return result
 
-def cherrypick(cherry_pick_hashes, full_target_branch_name):
+def cherrypick(cherry_pick_hashes, full_target_branch_name, partial_ok):
   """Cherrypicks the given commits.
 
   Also, asserts that full_target_branch_name matches the current HEAD.
 
   cherry_pick_hashes is a list of git hashes, in the order to
   be cherry-picked.
+
+  If partial_ok is true, return gracefully if at least one cherrypick
+  has succeeded.
 
   Note that this function does not push to the remote.
   """
@@ -174,17 +180,25 @@ def cherrypick(cherry_pick_hashes, full_target_branch_name):
     return
 
   # Cherrypicking only makes sense if we're on the equivalent of the target branch.
-  head_sha = sh.git('rev-parse', 'HEAD').strip()
-  target_branch_sha = sh.git('rev-parse', full_target_branch_name).strip()
+  head_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
+  target_branch_sha = subprocess.check_output(
+      ['git', 'rev-parse', full_target_branch_name]).strip()
   if head_sha != target_branch_sha:
     print "Cannot cherrypick because %s (%s) and HEAD (%s) are divergent." % (
         full_target_branch_name, target_branch_sha, head_sha)
     sys.exit(1)
 
   cherry_pick_hashes.reverse()
-  for cherry_pick_hash in cherry_pick_hashes:
-    sh.git('cherry-pick', '--keep-redundant-commits', cherry_pick_hash)
-
+  for i, cherry_pick_hash in enumerate(cherry_pick_hashes):
+    ret = subprocess.call(
+        ['git', 'cherry-pick', '--keep-redundant-commits', cherry_pick_hash])
+    if ret != 0:
+      if partial_ok and i > 0:
+        subprocess.check_call(['git', 'cherry-pick', '--abort'])
+        print "Failed to cherry-pick %s; stopping picks." % (cherry_pick_hash,)
+        return
+      else:
+        raise Exception("Failed to cherry-pick: %s" % (cherry_pick_hash,))
 
 def main():
   parser = create_parser()
@@ -202,19 +216,19 @@ def main():
   # Ensure all branches are up to date, unless remotes are disabled
   # by specifying them with an empty string.
   if options.source_remote_name != "":
-    sh.git.fetch(options.source_remote_name)
+    subprocess.check_call(['git', 'fetch', options.source_remote_name])
     full_source_branch_name = options.source_remote_name + '/' + options.source_branch
   else:
     full_source_branch_name = options.source_branch
   if options.target_remote_name != "":
     if options.source_remote_name != options.target_remote_name:
-      sh.git.fetch(options.target_remote_name)
+      subprocess.check_call(['git', 'fetch', options.target_remote_name])
     full_target_branch_name = options.target_remote_name + '/' + options.target_branch
   else:
     full_target_branch_name = options.target_branch
 
-  merge_base = sh.git("merge-base",
-      full_source_branch_name, full_target_branch_name).strip()
+  merge_base = subprocess.check_output(["git", "merge-base",
+      full_source_branch_name, full_target_branch_name]).strip()
   source_commits = build_commit_map(full_source_branch_name, merge_base)
   target_commits = build_commit_map(full_target_branch_name, merge_base)
 
@@ -230,14 +244,14 @@ def main():
   print '-' * 80
   jira_keys = []
   jira_key_pat = re.compile(r'(IMPALA-\d+)')
-  skip_commits_matching = options.skip_commits_matching.replace(
-      "{branch}", options.target_branch)
+  skip_commits_matching = options.skip_commits_matching.format(
+      branch=options.target_branch)
   for change_id, (commit_hash, msg, author, date, body) in source_commits.iteritems():
     change_in_target = change_id in target_commits
     ignore_by_config = commit_hash in ignored_commits[
         (options.source_branch, options.target_branch)]
-    ignore_by_commit_message = skip_commits_matching.lower() in msg.lower() \
-        or skip_commits_matching.lower() in body.lower()
+    ignore_by_commit_message = re.search(skip_commits_matching, "\n".join([msg, body]),
+        re.IGNORECASE)
     # This conditional block just for debug logging of ignored commits
     if ignore_by_config or ignore_by_commit_message:
       if change_in_target:
@@ -267,7 +281,7 @@ def main():
                .format(pformat(commits_ignored)))
 
   if options.cherry_pick:
-    cherrypick(cherry_pick_hashes, full_target_branch_name)
+    cherrypick(cherry_pick_hashes, full_target_branch_name, options.partial_ok)
 
 if __name__ == '__main__':
   main()

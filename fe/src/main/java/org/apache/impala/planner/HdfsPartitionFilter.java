@@ -20,6 +20,9 @@ package org.apache.impala.planner;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
@@ -28,8 +31,8 @@ import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.service.FeSupport;
@@ -39,8 +42,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 /**
  * An HdfsPartitionFilter represents a predicate on the partition columns (or a subset)
@@ -52,17 +53,17 @@ public class HdfsPartitionFilter {
   private final Expr predicate_;
 
   // lhs exprs of smap used in isMatch()
-  private final ArrayList<SlotRef> lhsSlotRefs_ = Lists.newArrayList();
+  private final List<SlotRef> lhsSlotRefs_ = new ArrayList<>();
   // indices into Table.getColumnNames()
-  private final ArrayList<Integer> refdKeys_ = Lists.newArrayList();
+  private final List<Integer> refdKeys_ = new ArrayList<>();
 
-  public HdfsPartitionFilter(Expr predicate, HdfsTable tbl, Analyzer analyzer) {
+  public HdfsPartitionFilter(Expr predicate, FeFsTable tbl, Analyzer analyzer) {
     predicate_ = predicate;
 
     // populate lhsSlotRefs_ and refdKeys_
-    ArrayList<SlotId> refdSlots = Lists.newArrayList();
+    List<SlotId> refdSlots = new ArrayList<>();
     predicate.getIds(null, refdSlots);
-    HashMap<Column, SlotDescriptor> slotDescsByCol = Maps.newHashMap();
+    Map<Column, SlotDescriptor> slotDescsByCol = new HashMap<>();
     for (SlotId refdSlot: refdSlots) {
       SlotDescriptor slotDesc = analyzer.getDescTbl().getSlotDesc(refdSlot);
       slotDescsByCol.put(slotDesc.getColumn(), slotDesc);
@@ -83,14 +84,14 @@ public class HdfsPartitionFilter {
    * Evaluate a filter against a batch of partitions and return the partition ids
    * that pass the filter.
    */
-  public HashSet<Long> getMatchingPartitionIds(ArrayList<HdfsPartition> partitions,
+  public Set<Long> getMatchingPartitionIds(List<PrunablePartition> partitions,
       Analyzer analyzer) throws ImpalaException {
-    HashSet<Long> result = new HashSet<Long>();
+    Set<Long> result = new HashSet<>();
     // List of predicates to evaluate
-    ArrayList<Expr> predicates = new ArrayList<Expr>(partitions.size());
+    List<Expr> predicates = new ArrayList<>(partitions.size());
     long[] partitionIds = new long[partitions.size()];
     int indx = 0;
-    for (HdfsPartition p: partitions) {
+    for (PrunablePartition p: partitions) {
       predicates.add(buildPartitionPredicate(p, analyzer));
       partitionIds[indx++] = p.getId();
     }
@@ -110,13 +111,13 @@ public class HdfsPartitionFilter {
    * Construct a predicate for a given partition by substituting the SlotRefs
    * for the partition cols with the respective partition-key values.
    */
-  private Expr buildPartitionPredicate(HdfsPartition partition, Analyzer analyzer)
+  private Expr buildPartitionPredicate(PrunablePartition p, Analyzer analyzer)
       throws ImpalaException {
     // construct smap
     ExprSubstitutionMap sMap = new ExprSubstitutionMap();
     for (int i = 0; i < refdKeys_.size(); ++i) {
       sMap.put(
-          lhsSlotRefs_.get(i), partition.getPartitionValues().get(refdKeys_.get(i)));
+          lhsSlotRefs_.get(i), p.getPartitionValues().get(refdKeys_.get(i)));
     }
 
     Expr literalPredicate = predicate_.substitute(sMap, analyzer, false);

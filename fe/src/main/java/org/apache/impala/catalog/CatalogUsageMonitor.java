@@ -25,9 +25,10 @@ import com.google.common.base.Function;
 
 /**
  * Singleton class that monitors catalog usage. Currently, it tracks the most
- * frequently accessed tables (in terms of number of metadata operations) as well as
- * the tables with the highest (estimated) memory requirements. This class is
- * thread-safe.
+ * frequently accessed tables (in terms of number of metadata operations),
+ * the tables with the highest (estimated) memory requirements, and
+ * the table with most number of files.
+ * This class is thread-safe.
  */
 public final class CatalogUsageMonitor {
 
@@ -37,9 +38,16 @@ public final class CatalogUsageMonitor {
 
   private final TopNCache<Table, Long> largestTables_;
 
+  private final TopNCache<Table, Long> highFileCountTables_;
+
+  private final TopNCache<Table, Long> longMetadataLoadingTables_;
+
   private CatalogUsageMonitor() {
     final int num_tables_tracked = Integer.getInteger(
         "org.apache.impala.catalog.CatalogUsageMonitor.NUM_TABLES_TRACKED", 25);
+    final int num_loading_time_tables_tracked = Integer.getInteger(
+        "org.apache.impala.catalog.CatalogUsageMonitor.NUM_LOADING_TIME_TABLES_TRACKED",
+        100);
     frequentlyAccessedTables_ = new TopNCache<Table, Long>(
         new Function<Table, Long>() {
           @Override
@@ -51,6 +59,19 @@ public final class CatalogUsageMonitor {
           @Override
           public Long apply(Table tbl) { return tbl.getEstimatedMetadataSize(); }
         }, num_tables_tracked, false);
+
+    highFileCountTables_ = new TopNCache<Table, Long>(
+        new Function<Table, Long>() {
+          @Override
+          public Long apply(Table tbl) { return tbl.getNumFiles(); }
+        }, num_tables_tracked, false);
+
+    // sort by maximum loading time by default
+    longMetadataLoadingTables_ = new TopNCache<Table, Long>(
+        new Function<Table, Long>() {
+          @Override
+          public Long apply(Table tbl) { return tbl.getMaxTableLoadingTime(); }
+        }, num_loading_time_tables_tracked, false);
   }
 
   public void updateFrequentlyAccessedTables(Table tbl) {
@@ -59,9 +80,19 @@ public final class CatalogUsageMonitor {
 
   public void updateLargestTables(Table tbl) { largestTables_.putOrUpdate(tbl); }
 
+  public void updateHighFileCountTables(Table tbl) {
+    highFileCountTables_.putOrUpdate(tbl);
+  }
+
+  public void updateLongMetadataLoadingTables(Table tbl) {
+    longMetadataLoadingTables_.putOrUpdate(tbl);
+  }
+
   public void removeTable(Table tbl) {
     frequentlyAccessedTables_.remove(tbl);
     largestTables_.remove(tbl);
+    highFileCountTables_.remove(tbl);
+    longMetadataLoadingTables_.remove(tbl);
   }
 
   public List<Table> getFrequentlyAccessedTables() {
@@ -69,4 +100,12 @@ public final class CatalogUsageMonitor {
   }
 
   public List<Table> getLargestTables() { return largestTables_.listEntries(); }
+
+  public List<Table> getHighFileCountTables() {
+    return highFileCountTables_.listEntries();
+  }
+
+  public List<Table> getLongMetadataLoadingTables() {
+    return longMetadataLoadingTables_.listEntries();
+  }
 }

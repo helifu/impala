@@ -15,14 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 import pprint
 import pytest
 import shlex
 from subprocess import call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
+from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.util.test_file_parser import QueryTestSectionReader
 
@@ -46,6 +48,7 @@ from tests.util.test_file_parser import QueryTestSectionReader
 # Missing Coverage: Views created by Hive and Impala being visible and queryble by each
 # other on non hdfs storage.
 @SkipIfS3.hive
+@SkipIfABFS.hive
 @SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
@@ -73,6 +76,12 @@ class TestViewCompatibility(ImpalaTestSuite):
   def test_view_compatibility(self, vector, unique_database):
     self._run_view_compat_test_case('QueryTest/views-compatibility', vector,
       unique_database)
+    if HIVE_MAJOR_VERSION == 2:
+      self._run_view_compat_test_case('QueryTest/views-compatibility-hive2-only', vector,
+          unique_database)
+    if HIVE_MAJOR_VERSION >= 3:
+      self._run_view_compat_test_case('QueryTest/views-compatibility-hive3-only', vector,
+          unique_database)
 
   def _run_view_compat_test_case(self, test_file_name, vector, test_db_name):
     """
@@ -102,7 +111,7 @@ class TestViewCompatibility(ImpalaTestSuite):
       # The table may or may not have been created in Hive. And so, "invalidate metadata"
       # may throw an exception.
       try:
-        self.client.invalidate_table(test_case.hive_view_name)
+        self.client.execute("invalidate metadata {0}".format(test_case.hive_view_name))
       except ImpalaBeeswaxException as e:
         assert "TableNotFoundException" in str(e)
 
@@ -134,7 +143,7 @@ class TestViewCompatibility(ImpalaTestSuite):
       self._exec_in_hive(test_case.get_drop_view_sql('HIVE'),\
                           test_case.get_create_view_sql('HIVE'), None)
       try:
-        self.client.invalidate_table(test_case.hive_view_name)
+        self.client.execute("invalidate metadata {0}".format(test_case.hive_view_name))
       except ImpalaBeeswaxException as e:
         assert "TableNotFoundException" in str(e)
 
@@ -142,8 +151,12 @@ class TestViewCompatibility(ImpalaTestSuite):
                             test_case.get_create_view_sql('IMPALA'), None)
 
   def _exec_in_hive(self, sql_str, create_view_sql, exp_res):
-    hive_ret = call(['hive', '-e', sql_str])
-    self._cmp_expected(sql_str, create_view_sql, exp_res, "HIVE", hive_ret == 0)
+    try:
+      self.run_stmt_in_hive(sql_str)
+      success = True
+    except: # consider any exception a failure
+      success = False
+    self._cmp_expected(sql_str, create_view_sql, exp_res, "HIVE", success)
 
   def _exec_in_impala(self, sql_str, create_view_sql, exp_res):
     success = True
@@ -249,10 +262,13 @@ class ViewCompatTestCase(object):
     exp_res = dict()
     for line in lines:
       components = line.partition("=")
-      if (components[2].lower() == 'SUCCESS'.lower()):
+      component_value = components[2].upper()
+      if component_value == 'SUCCESS':
         exp_res[components[0]] = True
-      else:
+      elif component_value == 'FAILURE':
         exp_res[components[0]] = False
+      else:
+        raise Exception("Unexpected result declared: " + line)
 
     # check that the results section contains at least one entry
     if not (lambda a, b: any(i in b for i in a)):

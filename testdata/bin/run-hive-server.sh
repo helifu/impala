@@ -18,9 +18,8 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
-
-. ${IMPALA_HOME}/bin/set-pythonpath.sh
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 HIVE_SERVER_PORT=10000
 export HIVE_SERVER2_THRIFT_PORT=11050
@@ -62,17 +61,67 @@ done
 # Kill for a clean start.
 ${CLUSTER_BIN}/kill-hive-server.sh &> /dev/null
 
+export HIVE_METASTORE_HADOOP_OPTS="-Xdebug -Xrunjdwp:transport=dt_socket,server=y,\
+suspend=n,address=30010"
+
+# If this is CDP Hive we need to manually add the sentry jars in the classpath since
+# CDH Hive metastore scripts do not do so. This is currently to make sure that we can run
+# all the tests including sentry tests
+# TODO: This can be removed when we move to Ranger completely
+if [[ "$USE_CDP_HIVE" = "true" && -n "$SENTRY_HOME" ]]; then
+  for f in ${SENTRY_HOME}/lib/sentry-binding-hive*.jar; do
+    FILE_NAME=$(basename $f)
+    # exclude all the hive jars from being included in the classpath since Sentry
+    # depends on Hive 2.1.1
+    if [[ ! $FILE_NAME == hive* ]]; then
+      export HADOOP_CLASSPATH=${HADOOP_CLASSPATH}:${f}
+    fi
+  done
+fi
+
+# For Hive 3, we use Tez for execution. We have to add it to the classpath.
+# NOTE: it would seem like this would only be necessary on the HS2 classpath,
+# but compactions are initiated from the HMS in Hive 3. This may change at
+# some point in the future, in which case we can add this to only the
+# HS2 classpath.
+if ${USE_CDP_HIVE} ; then
+  export HADOOP_CLASSPATH=${HADOOP_CLASSPATH}:${TEZ_HOME}/*
+  # This is a little hacky, but Tez bundles a bunch of junk into lib/, such
+  # as extra copies of the hadoop libraries, etc, and we want to avoid conflicts.
+  # So, we'll be a bit choosy about what we add to the classpath here.
+  for jar in $TEZ_HOME/lib/* ; do
+    case $(basename $jar) in
+      commons-*|RoaringBitmap*)
+        export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:$jar
+        ;;
+    esac
+  done
+fi
+
+# Add kudu-hive.jar to the Hive Metastore classpath, so that Kudu's HMS
+# plugin can be loaded.
+for file in ${IMPALA_KUDU_JAVA_HOME}/*kudu-hive*jar; do
+  export HADOOP_CLASSPATH=${HADOOP_CLASSPATH}:${file}
+done
+# Default to skip validation on Kudu tables if KUDU_SKIP_HMS_PLUGIN_VALIDATION
+# is unset.
+export KUDU_SKIP_HMS_PLUGIN_VALIDATION=${KUDU_SKIP_HMS_PLUGIN_VALIDATION:-1}
+
 # Starts a Hive Metastore Server on the specified port.
-HADOOP_CLIENT_OPTS=-Xmx2024m hive --service metastore -p $HIVE_METASTORE_PORT \
-    > ${LOGDIR}/hive-metastore.out 2>&1 &
+# To debug log4j2 loading issues, add to HADOOP_CLIENT_OPTS:
+#   -Dorg.apache.logging.log4j.simplelog.StatusLogger.level=TRACE
+HADOOP_CLIENT_OPTS="-Xmx2024m -Dhive.log.file=hive-metastore.log" hive \
+  --service metastore -p $HIVE_METASTORE_PORT > ${LOGDIR}/hive-metastore.out 2>&1 &
 
 # Wait for the Metastore to come up because HiveServer2 relies on it being live.
 ${CLUSTER_BIN}/wait-for-metastore.py --transport=${METASTORE_TRANSPORT}
 
 if [ ${ONLY_METASTORE} -eq 0 ]; then
   # Starts a HiveServer2 instance on the port specified by the HIVE_SERVER2_THRIFT_PORT
-  # environment variable.
-  HADOOP_HEAPSIZE="512" hive --service hiveserver2 > ${LOGDIR}/hive-server2.out 2>&1 &
+  # environment variable. HADOOP_HEAPSIZE should be set to at least 2048 to avoid OOM
+  # when loading ORC tables like widerow.
+  HADOOP_CLIENT_OPTS="-Xmx2048m -Dhive.log.file=hive-server2.log" hive \
+      --service hiveserver2 > ${LOGDIR}/hive-server2.out 2>&1 &
 
   # Wait for the HiveServer2 service to come up because callers of this script
   # may rely on it being available.

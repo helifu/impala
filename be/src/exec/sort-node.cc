@@ -16,6 +16,8 @@
 // under the License.
 
 #include "exec/sort-node.h"
+
+#include "exec/exec-node-util.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/sorted-run-merger.h"
@@ -25,40 +27,50 @@
 
 namespace impala {
 
-SortNode::SortNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
-  : ExecNode(pool, tnode, descs),
-    offset_(tnode.sort_node.__isset.offset ? tnode.sort_node.offset : 0),
+Status SortPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+  RETURN_IF_ERROR(PlanNode::Init(tnode, state));
+  const TSortInfo& tsort_info = tnode.sort_node.sort_info;
+  RETURN_IF_ERROR(ScalarExpr::Create(
+      tsort_info.ordering_exprs, *row_descriptor_, state, &ordering_exprs_));
+  DCHECK(tsort_info.__isset.sort_tuple_slot_exprs);
+  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.sort_tuple_slot_exprs,
+      *children_[0]->row_descriptor_, state, &sort_tuple_slot_exprs_));
+  is_asc_order_ = tnode.sort_node.sort_info.is_asc_order;
+  nulls_first_ = tnode.sort_node.sort_info.nulls_first;
+  return Status::OK();
+}
+
+Status SortPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
+  ObjectPool* pool = state->obj_pool();
+  *node = pool->Add(new SortNode(pool, *this, state->desc_tbl()));
+  return Status::OK();
+}
+
+SortNode::SortNode(
+    ObjectPool* pool, const SortPlanNode& pnode, const DescriptorTbl& descs)
+  : ExecNode(pool, pnode, descs),
+    offset_(pnode.tnode_->sort_node.__isset.offset ? pnode.tnode_->sort_node.offset : 0),
     sorter_(NULL),
     num_rows_skipped_(0) {
+  ordering_exprs_ = pnode.ordering_exprs_;
+  sort_tuple_exprs_ = pnode.sort_tuple_slot_exprs_;
+  is_asc_order_ = pnode.is_asc_order_;
+  nulls_first_ = pnode.nulls_first_;
+  runtime_profile()->AddInfoString("SortType", "Total");
 }
 
 SortNode::~SortNode() {
 }
 
-Status SortNode::Init(const TPlanNode& tnode, RuntimeState* state) {
-  const TSortInfo& tsort_info = tnode.sort_node.sort_info;
-  RETURN_IF_ERROR(ExecNode::Init(tnode, state));
-  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.ordering_exprs, row_descriptor_,
-      state, &ordering_exprs_));
-  DCHECK(tsort_info.__isset.sort_tuple_slot_exprs);
-  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.sort_tuple_slot_exprs,
-      *child(0)->row_desc(), state, &sort_tuple_exprs_));
-  is_asc_order_ = tnode.sort_node.sort_info.is_asc_order;
-  nulls_first_ = tnode.sort_node.sort_info.nulls_first;
-  runtime_profile()->AddInfoString("SortType", "Total");
-  return Status::OK();
-}
-
 Status SortNode::Prepare(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Prepare(state));
-  sorter_.reset(
-      new Sorter(ordering_exprs_, is_asc_order_, nulls_first_, sort_tuple_exprs_,
-          &row_descriptor_, mem_tracker(), &buffer_pool_client_,
-          resource_profile_.spillable_buffer_size, runtime_profile(), state, id(), true));
+  sorter_.reset(new Sorter(ordering_exprs_, is_asc_order_, nulls_first_,
+      sort_tuple_exprs_, &row_descriptor_, mem_tracker(), buffer_pool_client(),
+      resource_profile_.spillable_buffer_size, runtime_profile(), state, label(), true));
   RETURN_IF_ERROR(sorter_->Prepare(pool_));
   DCHECK_GE(resource_profile_.min_reservation, sorter_->ComputeMinReservation());
-  AddCodegenDisabledMessage(state);
+  state->CheckAndAddCodegenDisabledMessage(runtime_profile());
   return Status::OK();
 }
 
@@ -72,11 +84,12 @@ void SortNode::Codegen(RuntimeState* state) {
 
 Status SortNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(child(0)->Open(state));
   // Claim reservation after the child has been opened to reduce the peak reservation
   // requirement.
-  if (!buffer_pool_client_.is_registered()) {
+  if (!buffer_pool_client()->is_registered()) {
     RETURN_IF_ERROR(ClaimBufferReservation(state));
   }
   RETURN_IF_ERROR(sorter_->Open());
@@ -91,6 +104,7 @@ Status SortNode::Open(RuntimeState* state) {
 
 Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -108,7 +122,7 @@ Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     // for the next subplan iteration or merging spilled runs.
     returned_buffer_ = false;
     if (!IsInSubplan() && !sorter_->HasSpilledRuns()) {
-      DCHECK(!buffer_pool_client_.has_unpinned_pages());
+      DCHECK(!buffer_pool_client()->has_unpinned_pages());
       Status status = ReleaseUnusedReservation();
       DCHECK(status.ok()) << "Should not fail - no runs were spilled so no pages are "
                           << "unpinned. " << status.GetDetail();
@@ -132,21 +146,17 @@ Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   }
 
   returned_buffer_ = row_batch->num_buffers() > 0;
-  num_rows_returned_ += row_batch->num_rows();
-  if (ReachedLimit()) {
-    row_batch->set_num_rows(row_batch->num_rows() - (num_rows_returned_ - limit_));
-    *eos = true;
-  }
+  CheckLimitAndTruncateRowBatchIfNeeded(row_batch, eos);
 
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
 
   return Status::OK();
 }
 
-Status SortNode::Reset(RuntimeState* state) {
+Status SortNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   num_rows_skipped_ = 0;
   if (sorter_.get() != NULL) sorter_->Reset();
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void SortNode::Close(RuntimeState* state) {

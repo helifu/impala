@@ -17,17 +17,21 @@
 
 #include "kudu/util/monotime.h"
 
-#include <glog/logging.h>
-#include <limits>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/time.h>
-#include <time.h>
 
+#include <ctime>
+#include <limits>
+
+#include <glog/logging.h>
+
+#include "kudu/gutil/integral_types.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/sysinfo.h"
-#include "kudu/gutil/walltime.h"
 #include "kudu/util/thread_restrictions.h"
+#if defined(__APPLE__)
+#include "kudu/gutil/walltime.h"
+#endif
 
 namespace kudu {
 
@@ -217,6 +221,11 @@ bool MonoTime::ComesBefore(const MonoTime &rhs) const {
 
 std::string MonoTime::ToString() const {
   return StringPrintf("%.3fs", ToSeconds());
+}
+
+void MonoTime::ToTimeSpec(struct timespec* ts) const {
+  DCHECK(Initialized());
+  MonoDelta::NanosToTimeSpec(nanos_, ts);
 }
 
 bool MonoTime::Equals(const MonoTime& other) const {

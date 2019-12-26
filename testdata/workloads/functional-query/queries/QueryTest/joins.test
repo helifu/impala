@@ -731,6 +731,15 @@ t1.timestamp_col = cast(t2.d4 as TIMESTAMP);
 BIGINT
 ====
 ---- QUERY
+# Exercise HashTableCtx::AssignNullValue() for DateValue.
+select count(*) from functional.date_tbl t1 right outer join functional.alltypestiny t2 on
+t1.date_col >= DATE '1400-01-01' and t1.date_col = t2.timestamp_col;
+---- RESULTS
+8
+---- TYPES
+BIGINT
+====
+---- QUERY
 # IMPALA-5850: Tests that the sender partition exprs of a series of partitioned hash
 # joins are cast to compatible types even when the containing fragment is RANDOM
 # partitioned due a union. This test borrows ideas from existing tests for IMPALA-1123.
@@ -794,4 +803,42 @@ where sqrt(-a.id) = b.float_col / b.double_col
 ---- RESULTS
 ---- TYPES
 INT
+====
+---- QUERY
+# Test than 'nan' != 'nan' when joining.
+with t1 as (select cast(sqrt(0.5-x) as FLOAT) c1, y c2 from
+     (VALUES((1.6 x, 0 y), (3.2, 1), (5.4,2), (0.5, 3), (0.5, 4), (-0.5, 5))) XX),
+     t2 as (select * from t1)
+select t1.c1,t2.c1 from t1 right outer join t2 on t1.c1 = t2.c1;
+---- RESULTS
+0,0
+0,0
+0,0
+0,0
+1,1
+NULL,NaN
+NULL,NaN
+NULL,NaN
+---- TYPES
+FLOAT,FLOAT
+====
+---- QUERY
+# Test that NaN <=> NaN in joins
+select t1.float_col as v
+    from functional.alltypessmall t1, functional.alltypessmall t2
+    where sqrt(0.5-t1.float_col) <=> sqrt(0.5-t2.float_col) and t1.float_col > 0.5
+---- RESULTS
+---- TYPES
+FLOAT
+====
+---- QUERY
+# IMPALA-6660: Test that +0 equals -0 when joining
+select * from
+  (select cast("-0" as float) c1) v1,
+  (select cast("+0" as float) c2) v2
+where v1.c1 = v2.c2;
+---- RESULTS
+-0, 0
+---- TYPES
+FLOAT,FLOAT
 ====

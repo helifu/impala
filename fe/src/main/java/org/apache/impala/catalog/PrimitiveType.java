@@ -17,10 +17,10 @@
 
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.thrift.TPrimitiveType;
-import com.google.common.collect.Lists;
 
 public enum PrimitiveType {
   INVALID_TYPE("INVALID_TYPE", -1, TPrimitiveType.INVALID_TYPE),
@@ -34,14 +34,13 @@ public enum PrimitiveType {
   BIGINT("BIGINT", 8, TPrimitiveType.BIGINT),
   FLOAT("FLOAT", 4, TPrimitiveType.FLOAT),
   DOUBLE("DOUBLE", 8, TPrimitiveType.DOUBLE),
-  DATE("DATE", 4, TPrimitiveType.DATE),
   DATETIME("DATETIME", 8, TPrimitiveType.DATETIME),
   // The timestamp structure is 12 bytes, Aligning to 8 bytes makes it 16.
   TIMESTAMP("TIMESTAMP", 16, TPrimitiveType.TIMESTAMP),
+  DATE("DATE", 4, TPrimitiveType.DATE),
   // 8-byte pointer and 4-byte length indicator (12 bytes total).
-  // Aligning to 8 bytes so 16 total.
-  STRING("STRING", 16, TPrimitiveType.STRING),
-  VARCHAR("VARCHAR", 16, TPrimitiveType.VARCHAR),
+  STRING("STRING", 12, TPrimitiveType.STRING),
+  VARCHAR("VARCHAR", 12, TPrimitiveType.VARCHAR),
 
   // Unsupported scalar type.
   BINARY("BINARY", -1, TPrimitiveType.BINARY),
@@ -100,7 +99,7 @@ public enum PrimitiveType {
   public TPrimitiveType toThrift() { return thriftType_; }
 
   public static List<TPrimitiveType> toThrift(PrimitiveType[] types) {
-    List<TPrimitiveType> result = Lists.newArrayList();
+    List<TPrimitiveType> result = new ArrayList<>();
     for (PrimitiveType t: types) {
       result.add(t.toThrift());
     }

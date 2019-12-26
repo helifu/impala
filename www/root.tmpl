@@ -18,13 +18,25 @@ under the License.
 -->
 {{! Template for / }}
 {{>www/common-header.tmpl}}
+  {{?is_quiescing}}
+  <div class="alert alert-info" role="alert">
+  <h4>Shutdown in Progress</h4>
+  <p>
+  {{shutdown_status}}
+  </div>
+  {{/is_quiescing}}
+
   {{?impala_server_mode}}
-  <h2>Impala Server Mode: {{?is_coordinator}}Coordinator{{/is_coordinator}} 
+  <h2>Impala Server Mode: {{?is_coordinator}}Coordinator{{?use_local_catalog}}
+    (Local Catalog Mode){{/use_local_catalog}}{{/is_coordinator}}
     {{?is_executor}}Executor{{/is_executor}}</h2>
   {{/impala_server_mode}}
 
   <h2>Vers<span id="v">i</span>on</h2>
-  <pre id="version_pre">{{version}}</pre>
+  <pre id="version_pre">{{version}}
+Build Flags: {{#build_flags}}{{flag_name}}={{flag_value}}  {{/build_flags}}</pre>
+<!-- The space after {{flag_value}} is necessary to add a space between each flag when
+this page is rendered -->
 
   <h2>Process Start Time</h2>
   <pre>{{process_start_time}}</pre>
@@ -37,4 +49,8 @@ under the License.
 
   <h2>Process Info</h2>
   <pre>{{process_state_info}}</pre>
+
+  <h2>CGroup Info</h2>
+  <pre>{{cgroup_info}}</pre>
+
 {{>www/common-footer.tmpl}}

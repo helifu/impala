@@ -17,23 +17,25 @@
 
 #include "kudu/security/cert.h"
 
+#include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
-#include <boost/optional.hpp>
-
+#include "kudu/gutil/macros.h"
 #include "kudu/security/crypto.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/security/openssl_util_bio.h"
-#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 
 using std::string;
+using std::vector;
 
 namespace kudu {
 namespace security {
@@ -138,7 +140,7 @@ boost::optional<string> Cert::KuduKerberosPrincipal() const {
   X509_EXTENSION* ext = X509_get_ext(GetTopOfChainX509(), idx);
   ASN1_OCTET_STRING* octet_str = X509_EXTENSION_get_data(ext);
   const unsigned char* octet_str_data = octet_str->data;
-  long len; // NOLINT(runtime/int)
+  long len; // NOLINT
   int tag, xclass;
   if (ASN1_get_object(&octet_str_data, &len, &tag, &xclass, octet_str->length) != 0 ||
       tag != V_ASN1_UTF8STRING) {
@@ -269,11 +271,21 @@ Status CertSignRequest::FromFile(const std::string& fpath, DataFormat format) {
 }
 
 CertSignRequest CertSignRequest::Clone() const {
+  X509_REQ* cloned_req;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   CHECK_GT(CRYPTO_add(&data_->references, 1, CRYPTO_LOCK_X509_REQ), 1)
     << "X509_REQ use-after-free detected";
+  cloned_req = GetRawData();
+#else
+  // With OpenSSL 1.1, data structure internals are hidden, and there doesn't
+  // seem to be a public method that increments data_'s refcount.
+  cloned_req = X509_REQ_dup(GetRawData());
+  CHECK(cloned_req != nullptr)
+    << "X509 allocation failure detected: " << GetOpenSSLErrors();
+#endif
 
   CertSignRequest clone;
-  clone.AdoptRawData(GetRawData());
+  clone.AdoptRawData(cloned_req);
   return clone;
 }
 

@@ -25,26 +25,11 @@ struct tm;
 #include <kudu/client/client.h>
 #include <kudu/client/value.h>
 
-#include "common/status.h"
+#include "util/kudu-status-util.h"
 #include "runtime/string-value.h"
 #include "runtime/types.h"
 
 namespace impala {
-
-/// Takes a Kudu status and returns an impala one, if it's not OK.
-#define KUDU_RETURN_IF_ERROR(expr, prepend) \
-  do { \
-    kudu::Status _s = (expr); \
-    if (UNLIKELY(!_s.ok())) {                                      \
-      return Status(strings::Substitute("$0: $1", prepend, _s.ToString())); \
-    } \
-  } while (0)
-
-#define KUDU_ASSERT_OK(status)                                     \
-  do {                                                             \
-    const Status& _s = FromKuduStatus(status);                     \
-    ASSERT_TRUE(_s.ok()) << "Error: " << _s.GetDetail();           \
-  } while (0)
 
 class TimestampValue;
 
@@ -65,9 +50,6 @@ bool KuduIsAvailable();
 Status CreateKuduClient(const std::vector<std::string>& master_addrs,
     kudu::client::sp::shared_ptr<kudu::client::KuduClient>* client) WARN_UNUSED_RESULT;
 
-/// Returns a debug string for the KuduSchema.
-std::string KuduSchemaDebugString(const kudu::client::KuduSchema& schema);
-
 /// Initializes Kudu's logging by binding a callback that logs back to Impala's glog. This
 /// also sets Kudu's verbose logging to whatever level is set in Impala.
 void InitKuduLogging();
@@ -78,35 +60,28 @@ void InitKuduLogging();
 void LogKuduMessage(kudu::client::KuduLogSeverity severity, const char* filename,
     int line_number, const struct ::tm* time, const char* message, size_t message_len);
 
-/// Casts 'value' according to 'type' and writes it into 'row' at position 'col'.
-/// If 'type' is STRING or VARCHAR, 'copy_strings' determines if 'value' will be copied
-/// into memory owned by the row. If false, string data must remain valid while the row
-/// is being used.
-Status WriteKuduValue(int col, PrimitiveType type, const void* value,
+/// Casts 'value' according to the column type in 'col_type' and writes it into 'row'
+/// at position 'col'. If the column type's primitive type is STRING or VARCHAR,
+/// 'copy_strings' determines if 'value' will be copied into memory owned by the row.
+/// If false, string data must remain valid while the row is being used.
+Status WriteKuduValue(int col, const ColumnType& col_type, const void* value,
     bool copy_strings, kudu::KuduPartialRow* row) WARN_UNUSED_RESULT;
 
-/// Casts 'value' according to 'type' and create a new KuduValue containing 'value' which
-/// is returned in 'out'.
-Status CreateKuduValue(
-    PrimitiveType type, void* value, kudu::client::KuduValue** out) WARN_UNUSED_RESULT;
+/// Casts 'value' according to the column type in 'col_type' and create a
+/// new KuduValue containing 'value' which is returned in 'out'.
+Status CreateKuduValue(const ColumnType& col_type, void* value,
+    kudu::client::KuduValue** out) WARN_UNUSED_RESULT;
 
-/// Takes a Kudu client DataType and returns the corresponding Impala ColumnType.
-ColumnType KuduDataTypeToColumnType(kudu::client::KuduColumnSchema::DataType type);
+/// Takes a Kudu client DataType and KuduColumnTypeAttributes and
+/// returns the corresponding Impala ColumnType.
+ColumnType KuduDataTypeToColumnType(kudu::client::KuduColumnSchema::DataType type,
+    const kudu::client::KuduColumnTypeAttributes& type_attributes);
 
-/// Utility function for creating an Impala Status object based on a kudu::Status object.
-/// 'k_status' is the kudu::Status object.
-/// 'prepend' is a string to be prepended to details of 'k_status' when creating the
-/// Impala Status object.
-/// Note that we don't translate the kudu::Status error code to Impala error code
-/// so the returned status' type is always of TErrorCode::GENERAL.
-inline Status FromKuduStatus(
-    const kudu::Status& k_status, const std::string prepend = "") {
-  if (LIKELY(k_status.ok())) return Status::OK();
-  const string& err_msg = prepend.empty() ? k_status.ToString() :
-      strings::Substitute("$0: $1", prepend, k_status.ToString());
-  VLOG(1) << err_msg;
-  return Status::Expected(err_msg);
-}
+/// Converts 'mode' to its equivalent ReadMode, stored in 'out'. Possible values for
+/// 'mode' are 'READ_LATEST' and 'READ_AT_SNAPSHOT'. If 'mode' is invalid, an error is
+/// returned.
+Status StringToKuduReadMode(
+    const std::string& mode, kudu::client::KuduScanner::ReadMode* out) WARN_UNUSED_RESULT;
 
 } /// namespace impala
 #endif

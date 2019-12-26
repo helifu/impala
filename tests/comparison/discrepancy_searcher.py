@@ -57,7 +57,7 @@ from tests.comparison.query import (
     SelectItem)
 from tests.comparison.query_flattener import QueryFlattener
 from tests.comparison.statement_generator import get_generator
-from tests.comparison import db_connection
+from tests.comparison import db_connection, compat
 
 LOG = getLogger(__name__)
 
@@ -74,14 +74,16 @@ class QueryResultComparator(object):
   def __init__(self, query_profile, ref_conn,
       test_conn, query_timeout_seconds, flatten_dialect=None):
     '''test/ref_conn arguments should be an instance of DbConnection'''
-    ref_cursor = ref_conn.cursor()
-    test_cursor = test_conn.cursor()
-
     self.ref_conn = ref_conn
     self.ref_sql_writer = SqlWriter.create(
         dialect=ref_conn.db_type, nulls_order_asc=query_profile.nulls_order_asc())
     self.test_conn = test_conn
     self.test_sql_writer = SqlWriter.create(dialect=test_conn.db_type)
+
+    compat.setup_ref_database(self.ref_conn)
+
+    ref_cursor = ref_conn.cursor()
+    test_cursor = test_conn.cursor()
 
     self.query_executor = QueryExecutor(
         [ref_cursor, test_cursor],
@@ -316,7 +318,6 @@ class QueryExecutor(object):
         SET DISABLE_UNSAFE_SPILLS={disable_unsafe_spills};
         SET EXEC_SINGLE_NODE_ROWS_THRESHOLD={exec_single_node_rows_threshold};
         SET BUFFER_POOL_LIMIT={buffer_pool_limit};
-        SET MAX_IO_BUFFERS={max_io_buffers};
         SET MAX_SCAN_RANGE_LENGTH={max_scan_range_length};
         SET NUM_NODES={num_nodes};
         SET NUM_SCANNER_THREADS={num_scanner_threads};
@@ -334,7 +335,6 @@ class QueryExecutor(object):
             disable_unsafe_spills=choice((0, 1)),
             exec_single_node_rows_threshold=randint(1, 100000000),
             buffer_pool_limit=randint(1, 100000000),
-            max_io_buffers=randint(1, 100000000),
             max_scan_range_length=randint(1, 100000000),
             num_nodes=randint(3, 3),
             num_scanner_threads=randint(1, 100),

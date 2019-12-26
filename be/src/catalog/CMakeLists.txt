@@ -25,3 +25,10 @@ add_library(Catalog
   catalogd-main.cc
 )
 add_dependencies(Catalog gen-deps)
+
+add_library(CatalogTests STATIC
+  catalog-util-test.cc
+)
+add_dependencies(CatalogTests gen-deps)
+
+ADD_UNIFIED_BE_LSAN_TEST(catalog-util-test CatalogUtil.*)

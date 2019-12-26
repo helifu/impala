@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/thread.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
+#include <openssl/err.h>
 #include <thrift/concurrency/Thread.h>
 #include <thrift/concurrency/ThreadManager.h>
 #include <thrift/protocol/TBinaryProtocol.h>
@@ -31,11 +33,13 @@
 
 #include <sstream>
 #include "gen-cpp/Types_types.h"
+#include "kudu/security/openssl_util.h"
 #include "rpc/TAcceptQueueServer.h"
 #include "rpc/auth-provider.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-server.h"
 #include "rpc/thrift-thread.h"
+#include "transport/THttpServer.h"
 #include "util/condition-variable.h"
 #include "util/debug-util.h"
 #include "util/metrics.h"
@@ -58,23 +62,22 @@ using namespace apache::thrift::server;
 using namespace apache::thrift::transport;
 using namespace apache::thrift;
 
-DEFINE_int32_hidden(rpc_cnxn_attempts, 10, "Deprecated");
-DEFINE_int32_hidden(rpc_cnxn_retry_interval_ms, 2000, "Deprecated");
-
 DECLARE_string(principal);
 DECLARE_string(keytab_file);
-DECLARE_string(ssl_client_ca_certificate);
-DECLARE_string(ssl_server_certificate);
-DECLARE_string(ssl_cipher_list);
 
 namespace impala {
 
 // Specifies the allowed set of values for --ssl_minimum_version. To keep consistent with
 // Apache Kudu, specifying a single version enables all versions including and succeeding
-// that one (e.g. TLSv1.1 enables v1.1 and v1.2). Specifying TLSv1.1_only enables only
-// v1.1.
+// that one (e.g. TLSv1.1 enables v1.1 and v1.2).
 map<string, SSLProtocol> SSLProtoVersions::PROTO_MAP = {
-    {"tlsv1.2", TLSv1_2_plus}, {"tlsv1.1", TLSv1_1_plus}, {"tlsv1", TLSv1_0_plus}};
+    {"tlsv1.2", TLSv1_2},
+    {"tlsv1.1", TLSv1_1},
+    {"tlsv1", TLSv1_0}};
+
+// A generic wrapper for OpenSSL structures.
+template <typename T>
+using c_unique_ptr = std::unique_ptr<T, std::function<void(T*)>>;
 
 Status SSLProtoVersions::StringToProtocol(const string& in, SSLProtocol* protocol) {
   for (const auto& proto : SSLProtoVersions::PROTO_MAP) {
@@ -88,85 +91,20 @@ Status SSLProtoVersions::StringToProtocol(const string& in, SSLProtocol* protoco
 }
 
 bool SSLProtoVersions::IsSupported(const SSLProtocol& protocol) {
-  DCHECK_LE(protocol, TLSv1_2_plus);
+  DCHECK_LE(protocol, TLSv1_2);
   int max_supported_tls_version = MaxSupportedTlsVersion();
   DCHECK_GE(max_supported_tls_version, TLS1_VERSION);
 
   switch (max_supported_tls_version) {
     case TLS1_VERSION:
-      return protocol == TLSv1_0_plus || protocol == TLSv1_0;
+      return protocol == TLSv1_0;
     case TLS1_1_VERSION:
-      return protocol != TLSv1_2_plus && protocol != TLSv1_2;
+      return protocol == TLSv1_0 || protocol == TLSv1_1;
     default:
       DCHECK_GE(max_supported_tls_version, TLS1_2_VERSION);
       return true;
   }
 }
-
-bool EnableInternalSslConnections() {
-  // Enable SSL between servers only if both the client validation certificate and the
-  // server certificate are specified. 'Client' here means clients that are used by Impala
-  // services to contact other Impala services (as distinct from user clients of Impala
-  // like the shell), and 'servers' are the processes that serve those clients. The server
-  // needs a certificate to demonstrate it is who the client thinks it is; the client
-  // needs a certificate to validate that assertion from the server.
-  return !FLAGS_ssl_client_ca_certificate.empty() &&
-      !FLAGS_ssl_server_certificate.empty();
-}
-
-// Helper class that starts a server in a separate thread, and handles
-// the inter-thread communication to monitor whether it started
-// correctly.
-class ThriftServer::ThriftServerEventProcessor : public TServerEventHandler {
- public:
-  ThriftServerEventProcessor(ThriftServer* thrift_server)
-      : thrift_server_(thrift_server),
-        signal_fired_(false) { }
-
-  // Called by the Thrift server implementation when it has acquired its resources and is
-  // ready to serve, and signals to StartAndWaitForServer that start-up is finished. From
-  // TServerEventHandler.
-  virtual void preServe();
-
-  // Called when a client connects; we create per-client state and call any
-  // ConnectionHandlerIf handler.
-  virtual void* createContext(boost::shared_ptr<TProtocol> input,
-      boost::shared_ptr<TProtocol> output);
-
-  // Called when a client starts an RPC; we set the thread-local connection context.
-  virtual void processContext(void* context, boost::shared_ptr<TTransport> output);
-
-  // Called when a client disconnects; we call any ConnectionHandlerIf handler.
-  virtual void deleteContext(void* serverContext, boost::shared_ptr<TProtocol> input,
-      boost::shared_ptr<TProtocol> output);
-
-  // Waits for a timeout of TIMEOUT_MS for a server to signal that it has started
-  // correctly.
-  Status StartAndWaitForServer();
-
- private:
-  // Lock used to ensure that there are no missed notifications between starting the
-  // supervision thread and calling signal_cond_.WaitUntil. Also used to ensure
-  // thread-safe access to members of thrift_server_
-  boost::mutex signal_lock_;
-
-  // Condition variable that is notified by the supervision thread once either
-  // a) all is well or b) an error occurred.
-  ConditionVariable signal_cond_;
-
-  // The ThriftServer under management. This class is a friend of ThriftServer, and
-  // reaches in to change member variables at will.
-  ThriftServer* thrift_server_;
-
-  // Guards against spurious condition variable wakeups
-  bool signal_fired_;
-
-  // The time, in milliseconds, to wait for a server to come up
-  static const int TIMEOUT_MS = 2500;
-
-  // Called in a separate thread
-  void Supervise();
-};
 
 Status ThriftServer::ThriftServerEventProcessor::StartAndWaitForServer() {
   // Locking here protects against missed notifications if Supervise executes quickly
@@ -179,8 +117,8 @@ Status ThriftServer::ThriftServerEventProcessor::StartAndWaitForServer() {
       &ThriftServer::ThriftServerEventProcessor::Supervise, this,
       &thrift_server_->server_thread_));
 
-  system_time deadline = get_system_time() +
-      posix_time::milliseconds(ThriftServer::ThriftServerEventProcessor::TIMEOUT_MS);
+  timespec deadline;
+  TimeFromNowMillis(ThriftServer::ThriftServerEventProcessor::TIMEOUT_MS, &deadline);
 
   // Loop protects against spurious wakeup. Locks provide necessary fences to ensure
   // visibility.
@@ -249,6 +187,9 @@ void ThriftServer::ThriftServerEventProcessor::preServe() {
 // connection state such as the connection identifier and the username.
 __thread ThriftServer::ConnectionContext* __connection_context__;
 
+bool ThriftServer::HasThreadConnectionContext() {
+  return __connection_context__ != nullptr;
+}
 
 const TUniqueId& ThriftServer::GetThreadConnectionId() {
   return __connection_context__->connection_id;
@@ -260,27 +201,14 @@ const ThriftServer::ConnectionContext* ThriftServer::GetThreadConnectionContext(
 
 void* ThriftServer::ThriftServerEventProcessor::createContext(
     boost::shared_ptr<TProtocol> input, boost::shared_ptr<TProtocol> output) {
-  TSocket* socket = NULL;
-  TTransport* transport = input->getTransport().get();
   boost::shared_ptr<ConnectionContext> connection_ptr =
       boost::shared_ptr<ConnectionContext>(new ConnectionContext);
-  TTransport* underlying_transport =
-      (static_cast<TBufferedTransport*>(transport))->getUnderlyingTransport().get();
-  if (!thrift_server_->auth_provider_->is_sasl()) {
-    socket = static_cast<TSocket*>(underlying_transport);
-  } else {
-    TSaslServerTransport* sasl_transport = static_cast<TSaslServerTransport*>(
-        underlying_transport);
-
-    // Get the username from the transport.
-    connection_ptr->username = sasl_transport->getUsername();
-    socket = static_cast<TSocket*>(sasl_transport->getUnderlyingTransport().get());
-  }
+  thrift_server_->auth_provider_->SetupConnectionContext(connection_ptr,
+      thrift_server_->transport_type_, input->getTransport().get(),
+      output->getTransport().get());
 
   {
     connection_ptr->server_name = thrift_server_->name_;
-    connection_ptr->network_address =
-        MakeNetworkAddress(socket->getPeerAddress(), socket->getPeerPort());
 
     lock_guard<mutex> l(thrift_server_->connection_contexts_lock_);
     uuid connection_uuid = thrift_server_->uuid_generator_();
@@ -311,9 +239,17 @@ void ThriftServer::ThriftServerEventProcessor::processContext(void* context,
   __connection_context__ = reinterpret_cast<ConnectionContext*>(context);
 }
 
-void ThriftServer::ThriftServerEventProcessor::deleteContext(void* serverContext,
+bool ThriftServer::ThriftServerEventProcessor::IsIdleContext(void* context) {
+  __connection_context__ = reinterpret_cast<ConnectionContext*>(context);
+  if (thrift_server_->connection_handler_ != nullptr) {
+    return thrift_server_->connection_handler_->IsIdleConnection(*__connection_context__);
+  }
+  return false;
+}
+
+void ThriftServer::ThriftServerEventProcessor::deleteContext(void* context,
     boost::shared_ptr<TProtocol> input, boost::shared_ptr<TProtocol> output) {
-  __connection_context__ = (ConnectionContext*) serverContext;
+  __connection_context__ = reinterpret_cast<ConnectionContext*>(context);
 
   if (thrift_server_->connection_handler_ != NULL) {
     thrift_server_->connection_handler_->ConnectionEnd(*__connection_context__);
@@ -331,27 +267,32 @@ void ThriftServer::ThriftServerEventProcessor::deleteContext(void* serverContext
 
 ThriftServer::ThriftServer(const string& name,
     const boost::shared_ptr<TProcessor>& processor, int port, AuthProvider* auth_provider,
-    MetricGroup* metrics, int max_concurrent_connections)
+    MetricGroup* metrics, int max_concurrent_connections, int64_t queue_timeout_ms,
+    int64_t idle_poll_period_ms, TransportType transport_type)
   : started_(false),
     port_(port),
     ssl_enabled_(false),
     max_concurrent_connections_(max_concurrent_connections),
+    queue_timeout_ms_(queue_timeout_ms),
+    idle_poll_period_ms_(idle_poll_period_ms),
     name_(name),
+    metrics_name_(Substitute("impala.thrift-server.$0", name_)),
     server_(NULL),
     processor_(processor),
     connection_handler_(NULL),
     metrics_(NULL),
-    auth_provider_(auth_provider) {
+    auth_provider_(auth_provider),
+    transport_type_(transport_type) {
   if (auth_provider_ == NULL) {
     auth_provider_ = AuthManager::GetInstance()->GetInternalAuthProvider();
   }
   if (metrics != NULL) {
     metrics_enabled_ = true;
     stringstream count_ss;
-    count_ss << "impala.thrift-server." << name << ".connections-in-use";
+    count_ss << metrics_name_ << ".connections-in-use";
     num_current_connections_metric_ = metrics->AddGauge(count_ss.str(), 0);
     stringstream max_ss;
-    max_ss << "impala.thrift-server." << name << ".total-connections";
+    max_ss << metrics_name_ << ".total-connections";
     total_connections_metric_ = metrics->AddCounter(max_ss.str(), 0);
     metrics_ = metrics;
   } else {
@@ -368,8 +309,45 @@ class ImpalaSslSocketFactory : public TSSLSocketFactory {
   ImpalaSslSocketFactory(SSLProtocol version, const string& password)
     : TSSLSocketFactory(version), password_(password) {}
 
+  void ciphers(const string& enable) override {
+    SCOPED_OPENSSL_NO_PENDING_ERRORS;
+    TSSLSocketFactory::ciphers(enable);
+
+    // The following was taken from be/src/kudu/security/tls_context.cc, bugs fixed here
+    // may also need to be fixed there.
+    // Enable ECDH curves. For OpenSSL 1.1.0 and up, this is done automatically.
+#ifndef OPENSSL_NO_ECDH
+#if OPENSSL_VERSION_NUMBER < 0x10002000L
+    // OpenSSL 1.0.1 and below only support setting a single ECDH curve at once.
+    // We choose prime256v1 because it's the first curve listed in the "modern
+    // compatibility" section of the Mozilla Server Side TLS recommendations,
+    // accessed Feb. 2017.
+    c_unique_ptr<EC_KEY> ecdh{
+        EC_KEY_new_by_curve_name(NID_X9_62_prime256v1), &EC_KEY_free};
+    if (ecdh == nullptr) {
+      throw TSSLException(
+          "failed to create prime256v1 curve: " + kudu::security::GetOpenSSLErrors());
+    }
+
+    int rc = SSL_CTX_set_tmp_ecdh(ctx_->get(), ecdh.get());
+    if (rc <= 0) {
+      throw new TSSLException(
+          "failed to set ECDH curve: " + kudu::security::GetOpenSSLErrors());
+    }
+#elif OPENSSL_VERSION_NUMBER < 0x10100000L
+    // OpenSSL 1.0.2 provides the set_ecdh_auto API which internally figures out
+    // the best curve to use.
+    int rc = SSL_CTX_set_ecdh_auto(ctx_->get(), 1);
+    if (rc <= 0) {
+      throw TSSLException(
+          "failed to configure ECDH support: " + kudu::security::GetOpenSSLErrors());
+    }
+#endif
+#endif
+  }
+
  protected:
-  virtual void getPassword(string& output, int size) {
+  virtual void getPassword(string& output, int size) override {
     output = password_;
     if (output.size() > size) output.resize(size);
   }
@@ -379,7 +357,7 @@ class ImpalaSslSocketFactory : public TSSLSocketFactory {
   const string password_;
 };
 }
-Status ThriftServer::CreateSocket(boost::shared_ptr<TServerTransport>* socket) {
+Status ThriftServer::CreateSocket(boost::shared_ptr<TServerSocket>* socket) {
   if (ssl_enabled()) {
     if (!SSLProtoVersions::IsSupported(version_)) {
       return Status(TErrorCode::SSL_SOCKET_CREATION_FAILED,
@@ -430,7 +408,7 @@ Status ThriftServer::EnableSsl(SSLProtocol version, const string& certificate,
   version_ = version;
 
   if (!pem_password_cmd.empty()) {
-    if (!RunShellProcess(pem_password_cmd, &key_password_, true)) {
+    if (!RunShellProcess(pem_password_cmd, &key_password_, true, {"JAVA_TOOL_OPTIONS"})) {
       return Status(TErrorCode::SSL_PASSWORD_CMD_FAILED, pem_password_cmd, key_password_);
     } else {
       LOG(INFO) << "Command '" << pem_password_cmd << "' executed successfully, "
@@ -449,15 +427,18 @@ Status ThriftServer::Start() {
 
   // Note - if you change the transport types here, you must check that the
   // logic in createContext is still accurate.
-  boost::shared_ptr<TServerTransport> server_socket;
+  boost::shared_ptr<TServerSocket> server_socket;
   boost::shared_ptr<TTransportFactory> transport_factory;
   RETURN_IF_ERROR(CreateSocket(&server_socket));
-  RETURN_IF_ERROR(auth_provider_->GetServerTransportFactory(&transport_factory));
+  RETURN_IF_ERROR(auth_provider_->GetServerTransportFactory(
+      transport_type_, metrics_name_, metrics_, &transport_factory));
+
   server_.reset(new TAcceptQueueServer(processor_, server_socket, transport_factory,
-        protocol_factory, thread_factory, max_concurrent_connections_));
+      protocol_factory, thread_factory, name_, max_concurrent_connections_,
+      queue_timeout_ms_, idle_poll_period_ms_));
   if (metrics_ != NULL) {
-    (static_cast<TAcceptQueueServer*>(server_.get()))->InitMetrics(metrics_,
-        Substitute("impala.thrift-server.$0", name_));
+    (static_cast<TAcceptQueueServer*>(server_.get()))
+        ->InitMetrics(metrics_, metrics_name_);
   }
   boost::shared_ptr<ThriftServer::ThriftServerEventProcessor> event_processor(
       new ThriftServer::ThriftServerEventProcessor(this));
@@ -465,6 +446,8 @@ Status ThriftServer::Start() {
 
   RETURN_IF_ERROR(event_processor->StartAndWaitForServer());
 
+  // If port_ was 0, figure out which port the server is listening on after starting.
+  port_ = server_socket->getPort();
   LOG(INFO) << "ThriftServer '" << name_ << "' started on port: " << port_
             << (ssl_enabled() ? "s" : "");
   DCHECK(started_);

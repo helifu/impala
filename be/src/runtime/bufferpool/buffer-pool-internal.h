@@ -196,7 +196,7 @@ class BufferPool::Client {
  public:
   Client(BufferPool* pool, TmpFileMgr::FileGroup* file_group, const string& name,
       ReservationTracker* parent_reservation, MemTracker* mem_tracker,
-      int64_t reservation_limit, RuntimeProfile* profile);
+      MemLimit mem_limit_mode, int64_t reservation_limit, RuntimeProfile* profile);
 
   ~Client() {
     DCHECK_EQ(0, num_pages_);
@@ -238,14 +238,22 @@ class BufferPool::Client {
   /// page->pin_in_flight was set to true by StartMoveToPinned().
   Status FinishMoveEvictedToPinned(Page* page) WARN_UNUSED_RESULT;
 
-  /// Must be called once before allocating a buffer of 'len' via the AllocateBuffer()
-  /// API to deduct from the client's reservation and update internal accounting. Cleans
-  /// dirty pages if needed to satisfy the buffer pool's internal invariants. No page or
-  /// client locks should be held by the caller.
-  Status PrepareToAllocateBuffer(int64_t len) WARN_UNUSED_RESULT;
+  /// Must be called once before allocating a buffer of 'len' via the AllocateBuffer() or
+  /// AllocateUnreservedBuffer() APIs. Deducts from the client's reservation and updates
+  /// internal accounting. Cleans dirty pages if needed to satisfy the buffer pool's
+  /// internal invariants. No page or client locks should be held by the caller.
+  /// If 'reserved' is true, we assume that the memory is already reserved. If it is
+  /// false, tries to increase the reservation if needed.
+  ///
+  /// On success, returns OK and sets 'success' to true if non-NULL. If an error is
+  /// encountered, e.g. while cleaning pages, returns an error status. If the reservation
+  /// could not be increased for an unreserved allocation, returns OK and sets 'success'
+  /// to false (for unreserved allocations, 'success' must be non-NULL).
+  Status PrepareToAllocateBuffer(
+      int64_t len, bool reserved, bool* success) WARN_UNUSED_RESULT;
 
   /// Implementation of ClientHandle::DecreaseReservationTo().
-  Status DecreaseReservationTo(int64_t target_bytes) WARN_UNUSED_RESULT;
+  Status DecreaseReservationTo(int64_t max_decrease, int64_t target_bytes) WARN_UNUSED_RESULT;
 
   /// Called after a buffer of 'len' is freed via the FreeBuffer() API to update
   /// internal accounting and release the buffer to the client's reservation. No page or
@@ -281,22 +289,23 @@ class BufferPool::Client {
     return pinned_pages_.size() < num_pages_;
   }
 
+  /// Print debugging info about the state of the client. Caller must not hold 'lock_'.
   std::string DebugString();
 
  private:
   // Check consistency of client, DCHECK if inconsistent. 'lock_' must be held.
   void DCheckConsistency() {
-    DCHECK_GE(buffers_allocated_bytes_, 0);
+    DCHECK_GE(buffers_allocated_bytes_, 0) << DebugStringLocked();
     pinned_pages_.DCheckConsistency();
     dirty_unpinned_pages_.DCheckConsistency();
     in_flight_write_pages_.DCheckConsistency();
     DCHECK_LE(pinned_pages_.size() + dirty_unpinned_pages_.size()
             + in_flight_write_pages_.size(),
-        num_pages_);
+        num_pages_) << DebugStringLocked();
     // Check that we flushed enough pages to disk given our eviction policy.
     DCHECK_GE(reservation_.GetReservation(), buffers_allocated_bytes_
             + pinned_pages_.bytes() + dirty_unpinned_pages_.bytes()
-            + in_flight_write_pages_.bytes());
+            + in_flight_write_pages_.bytes()) << DebugStringLocked();
   }
 
   /// Must be called once before allocating or reclaiming a buffer of 'len'. Ensures that
@@ -321,6 +330,9 @@ class BufferPool::Client {
   /// 'client_lock' is released then reacquired.
   Status StartMoveEvictedToPinned(
       boost::unique_lock<boost::mutex>* client_lock, ClientHandle* client, Page* page);
+
+  /// Same as DebugString() except the caller must already hold 'lock_'.
+  std::string DebugStringLocked();
 
   /// The buffer pool that owns the client.
   BufferPool* const pool_;

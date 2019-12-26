@@ -17,22 +17,21 @@
 
 package org.apache.impala.catalog;
 
-import java.io.StringReader;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-
-import org.apache.impala.analysis.ParseNode;
+import org.apache.impala.analysis.Parser;
 import org.apache.impala.analysis.QueryStmt;
-import org.apache.impala.analysis.SqlParser;
-import org.apache.impala.analysis.SqlScanner;
+import org.apache.impala.analysis.StatementBase;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.thrift.TTableType;
+
 import com.google.common.collect.Lists;
 
 /**
@@ -43,25 +42,7 @@ import com.google.common.collect.Lists;
  * Refreshing or invalidating a view will reload the view's definition but will not
  * affect the metadata of the underlying tables (if any).
  */
-public class View extends Table {
-
-  // The original SQL-string given as view definition. Set during analysis.
-  // Corresponds to Hive's viewOriginalText.
-  private String originalViewDef_;
-
-  // Query statement (as SQL string) that defines the View for view substitution.
-  // It is a transformation of the original view definition, e.g., to enforce the
-  // explicit column definitions even if the original view definition has explicit
-  // column aliases.
-  // If column definitions were given, then this "expanded" view definition
-  // wraps the original view definition in a select stmt as follows.
-  //
-  // SELECT viewName.origCol1 AS colDesc1, viewName.origCol2 AS colDesc2, ...
-  // FROM (originalViewDef) AS viewName
-  //
-  // Corresponds to Hive's viewExpandedText, but is not identical to the SQL
-  // Hive would produce in view creation.
-  private String inlineViewDef_;
+public class View extends Table implements FeView {
 
   // View definition created by parsing inlineViewDef_ into a QueryStmt.
   private QueryStmt queryStmt_;
@@ -101,7 +82,8 @@ public class View extends Table {
 
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
+      throws TableLoadingException {
     try {
       clearColumns();
       msTable_ = msTbl;
@@ -117,7 +99,8 @@ public class View extends Table {
       numClusteringCols_ = 0;
       tableStats_ = new TTableStats(-1);
       tableStats_.setTotal_file_bytes(-1);
-      init();
+      queryStmt_ = parseViewDef(this);
+      refreshLastUsedTime();
     } catch (TableLoadingException e) {
       throw e;
     } catch (Exception e) {
@@ -128,44 +111,56 @@ public class View extends Table {
   @Override
   protected void loadFromThrift(TTable t) throws TableLoadingException {
     super.loadFromThrift(t);
-    init();
+    queryStmt_ = parseViewDef(this);
   }
 
   /**
-   * Initializes the originalViewDef_, inlineViewDef_, and queryStmt_ members
-   * by parsing the expanded view definition SQL-string.
+   * Parse the expanded view definition SQL-string.
    * Throws a TableLoadingException if there was any error parsing the
    * the SQL or if the view definition did not parse into a QueryStmt.
    */
-  private void init() throws TableLoadingException {
-    // Set view-definition SQL strings.
-    originalViewDef_ = getMetaStoreTable().getViewOriginalText();
-    inlineViewDef_ = getMetaStoreTable().getViewExpandedText();
+  public static QueryStmt parseViewDef(FeView view) throws TableLoadingException {
+    // Query statement (as SQL string) that defines the View for view substitution.
+    // It is a transformation of the original view definition, e.g., to enforce the
+    // explicit column definitions even if the original view definition has explicit
+    // column aliases.
+    // If column definitions were given, then this "expanded" view definition
+    // wraps the original view definition in a select stmt as follows.
+    //
+    // SELECT viewName.origCol1 AS colDesc1, viewName.origCol2 AS colDesc2, ...
+    // FROM (originalViewDef) AS viewName
+    //
+    // Corresponds to Hive's viewExpandedText, but is not identical to the SQL
+    // Hive would produce in view creation.
+    String inlineViewDef = view.getMetaStoreTable().getViewExpandedText();
+
     // Parse the expanded view definition SQL-string into a QueryStmt and
     // populate a view definition.
-    SqlScanner input = new SqlScanner(new StringReader(inlineViewDef_));
-    SqlParser parser = new SqlParser(input);
-    ParseNode node = null;
+    StatementBase node;
     try {
-      node = (ParseNode) parser.parse().value;
-    } catch (Exception e) {
+      node = Parser.parse(inlineViewDef);
+    } catch (AnalysisException e) {
       // Do not pass e as the exception cause because it might reveal the existence
       // of tables that the user triggering this load may not have privileges on.
       throw new TableLoadingException(
           String.format("Failed to parse view-definition statement of view: " +
-              "%s.%s", db_.getName(), name_));
+              "%s", view.getFullName()));
     }
     // Make sure the view definition parses to a query statement.
     if (!(node instanceof QueryStmt)) {
-      throw new TableLoadingException(String.format("View definition of %s.%s " +
-          "is not a query statement", db_.getName(), name_));
+      throw new TableLoadingException(String.format("View definition of %s " +
+          "is not a query statement", view.getFullName()));
     }
-    queryStmt_ = (QueryStmt) node;
+    return (QueryStmt) node;
   }
 
   @Override
   public TCatalogObjectType getCatalogObjectType() { return TCatalogObjectType.VIEW; }
+
+  @Override // FeView
   public QueryStmt getQueryStmt() { return queryStmt_; }
+
+  @Override // FeView
   public boolean isLocalView() { return isLocalView_; }
 
   /**
@@ -173,11 +168,7 @@ public class View extends Table {
    */
   public List<String> getOriginalColLabels() { return colLabels_; }
 
-  /**
-   * Returns the explicit column labels for this view, or null if they need to be derived
-   * entirely from the underlying query statement. The returned list has at least as many
-   * elements as the number of column labels in the query stmt.
-   */
+  @Override
   public List<String> getColLabels() {
     if (colLabels_ == null) return null;
     if (colLabels_.size() >= queryStmt_.getColLabels().size()) return colLabels_;
@@ -186,8 +177,6 @@ public class View extends Table {
         colLabels_.size(), queryStmt_.getColLabels().size()));
     return explicitColLabels;
   }
-
-  public boolean hasColLabels() { return colLabels_ != null; }
 
   @Override
   public TTableDescriptor toThriftDescriptor(int tableId, Set<Long> referencedPartitions) {

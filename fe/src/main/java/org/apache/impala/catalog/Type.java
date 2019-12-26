@@ -17,20 +17,21 @@
 
 package org.apache.impala.catalog;
 
-import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.analysis.CreateTableStmt;
-import org.apache.impala.analysis.SqlParser;
-import org.apache.impala.analysis.SqlScanner;
+import org.apache.impala.analysis.Parser;
+import org.apache.impala.analysis.StatementBase;
 import org.apache.impala.analysis.TypeDef;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TPrimitiveType;
 import org.apache.impala.thrift.TScalarType;
 import org.apache.impala.thrift.TStructField;
 import org.apache.impala.thrift.TTypeNode;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -71,19 +72,19 @@ public abstract class Type {
   public static final ScalarType FIXED_UDA_INTERMEDIATE =
       ScalarType.createFixedUdaIntermediateType(-1);
 
-  private static ArrayList<ScalarType> integerTypes;
-  private static ArrayList<ScalarType> numericTypes;
-  private static ArrayList<ScalarType> supportedTypes;
-  private static ArrayList<ScalarType> unsupportedTypes;
+  private static List<ScalarType> integerTypes;
+  private static List<ScalarType> numericTypes;
+  private static List<ScalarType> supportedTypes;
+  private static List<ScalarType> unsupportedTypes;
 
   static {
-    integerTypes = Lists.newArrayList();
+    integerTypes = new ArrayList<>();
     integerTypes.add(TINYINT);
     integerTypes.add(SMALLINT);
     integerTypes.add(INT);
     integerTypes.add(BIGINT);
 
-    numericTypes = Lists.newArrayList();
+    numericTypes = new ArrayList<>();
     numericTypes.add(TINYINT);
     numericTypes.add(SMALLINT);
     numericTypes.add(INT);
@@ -92,7 +93,7 @@ public abstract class Type {
     numericTypes.add(DOUBLE);
     numericTypes.add(DECIMAL);
 
-    supportedTypes = Lists.newArrayList();
+    supportedTypes = new ArrayList<>();
     supportedTypes.add(NULL);
     supportedTypes.add(BOOLEAN);
     supportedTypes.add(TINYINT);
@@ -106,24 +107,53 @@ public abstract class Type {
     supportedTypes.add(CHAR);
     supportedTypes.add(TIMESTAMP);
     supportedTypes.add(DECIMAL);
+    supportedTypes.add(DATE);
 
-    unsupportedTypes = Lists.newArrayList();
+    unsupportedTypes = new ArrayList<>();
     unsupportedTypes.add(BINARY);
-    unsupportedTypes.add(DATE);
     unsupportedTypes.add(DATETIME);
   }
 
-  public static ArrayList<ScalarType> getIntegerTypes() {
+  public static List<ScalarType> getIntegerTypes() {
     return integerTypes;
   }
-  public static ArrayList<ScalarType> getNumericTypes() {
+  public static List<ScalarType> getNumericTypes() {
     return numericTypes;
   }
-  public static ArrayList<ScalarType> getSupportedTypes() {
+  public static List<ScalarType> getSupportedTypes() {
     return supportedTypes;
   }
-  public static ArrayList<ScalarType> getUnsupportedTypes() {
+  public static List<ScalarType> getUnsupportedTypes() {
     return unsupportedTypes;
+  }
+
+  /**
+   * Returns the static ScalarType members. The ScalarTypes which require additional
+   * metadata (such as CHAR, DECIMAL, FIXED_UDA_INTERMEDIATE) must be created using
+   * proper create functions defined in ScalarType class.
+   */
+  public static ScalarType getDefaultScalarType(PrimitiveType ptype) {
+    switch (ptype) {
+      case INVALID_TYPE: return INVALID;
+      case NULL_TYPE: return NULL;
+      case BOOLEAN: return BOOLEAN;
+      case TINYINT: return TINYINT;
+      case SMALLINT: return SMALLINT;
+      case INT: return INT;
+      case BIGINT: return BIGINT;
+      case FLOAT: return FLOAT;
+      case DOUBLE: return DOUBLE;
+      case DATE: return DATE;
+      case DATETIME: return DATETIME;
+      case TIMESTAMP: return TIMESTAMP;
+      case STRING: return STRING;
+      case VARCHAR: return VARCHAR;
+      case BINARY: return BINARY;
+      case DECIMAL: return DECIMAL;
+      case CHAR: return CHAR;
+      case FIXED_UDA_INTERMEDIATE: return FIXED_UDA_INTERMEDIATE;
+      default: return INVALID;
+    }
   }
 
   /**
@@ -154,6 +184,7 @@ public abstract class Type {
   public boolean isNull() { return isScalarType(PrimitiveType.NULL_TYPE); }
   public boolean isBoolean() { return isScalarType(PrimitiveType.BOOLEAN); }
   public boolean isTimestamp() { return isScalarType(PrimitiveType.TIMESTAMP); }
+  public boolean isDate() { return isScalarType(PrimitiveType.DATE); }
   public boolean isDecimal() { return isScalarType(PrimitiveType.DECIMAL); }
   public boolean isFullySpecifiedDecimal() { return false; }
   public boolean isWildcardDecimal() { return false; }
@@ -192,7 +223,7 @@ public abstract class Type {
     return isFixedPointType() || isFloatingPointType() || isDecimal();
   }
 
-  public boolean isDateType() {
+  public boolean isDateOrTimeType() {
     return isScalarType(PrimitiveType.DATE) || isScalarType(PrimitiveType.DATETIME)
         || isScalarType(PrimitiveType.TIMESTAMP);
   }
@@ -223,15 +254,13 @@ public abstract class Type {
    */
   public int getSlotSize() {
     // 8-byte pointer and 4-byte length indicator (12 bytes total).
-    // Per struct alignment rules, there is an extra 4 bytes of padding to align to 8
-    // bytes so 16 bytes total.
-    if (isCollectionType()) return 16;
+    if (isCollectionType()) return 12;
     throw new IllegalStateException("getSlotSize() not implemented for type " + toSql());
   }
 
   public TColumnType toThrift() {
     TColumnType container = new TColumnType();
-    container.setTypes(new ArrayList<TTypeNode>());
+    container.setTypes(new ArrayList<>());
     toThrift(container);
     return container;
   }
@@ -262,11 +291,9 @@ public abstract class Type {
     // to get the ColumnType.
     // Pick a table name that can't be used.
     String stmt = String.format("CREATE TABLE $DUMMY ($DUMMY %s)", typeStr);
-    SqlScanner input = new SqlScanner(new StringReader(stmt));
-    SqlParser parser = new SqlParser(input);
     CreateTableStmt createTableStmt;
     try {
-      Object o = parser.parse().value;
+      StatementBase o = Parser.parse(stmt);
       if (!(o instanceof CreateTableStmt)) {
         // Should never get here.
         throw new IllegalStateException("Couldn't parse create table stmt.");
@@ -276,7 +303,7 @@ public abstract class Type {
         // Should never get here.
         throw new IllegalStateException("Invalid create table stmt.");
       }
-    } catch (Exception e) {
+    } catch (AnalysisException e) {
       return null;
     }
     TypeDef typeDef = createTableStmt.getColumnDefs().get(0).getTypeDef();
@@ -285,17 +312,23 @@ public abstract class Type {
 
   /**
    * Returns true if t1 can be implicitly cast to t2 according to Impala's casting rules.
-   * Implicit casts are always allowed when no loss of precision would result (i.e. every
-   * value of t1 can be represented exactly by a value of t2). Implicit casts are allowed
-   * in certain other cases such as casting numeric types to floating point types and
-   * converting strings to timestamps.
-   * If strict is true, only consider casts that result in no loss of precision.
+   * Implicit casts are always allowed when no loss of information would result (i.e.
+   * every value of t1 can be represented exactly by a value of t2). Implicit casts are
+   * allowed in certain other cases such as casting numeric types to floating point types
+   * and converting strings to timestamps.
+   *
+   * If strictDecimal is true, only consider casts that result in no loss of information
+   * when casting between decimal types.
+   * If strict is true, only consider casts that result in no loss of information when
+   * casting between any two types other than both decimals.
+   *
    * TODO: Support casting of non-scalar types.
    */
-  public static boolean isImplicitlyCastable(Type t1, Type t2, boolean strict) {
+  public static boolean isImplicitlyCastable(
+      Type t1, Type t2, boolean strict, boolean strictDecimal) {
     if (t1.isScalarType() && t2.isScalarType()) {
       return ScalarType.isImplicitlyCastable(
-          (ScalarType) t1, (ScalarType) t2, strict);
+          (ScalarType) t1, (ScalarType) t2, strict, strictDecimal);
     }
     return false;
   }
@@ -305,12 +338,20 @@ public abstract class Type {
    * explicit cast. If strict, does not consider conversions that would result in loss
    * of precision (e.g. converting decimal to float). Returns INVALID_TYPE if there is
    * no such type or if any of t1 and t2 is INVALID_TYPE.
+   *
+   * If strictDecimal is true, only consider casts that result in no loss of information
+   * when casting between decimal types.
+   * If strict is true, only consider casts that result in no loss of information when
+   * casting between any two types other than both decimals.
+   *
+   *
    * TODO: Support non-scalar types.
    */
-  public static Type getAssignmentCompatibleType(Type t1, Type t2, boolean strict) {
+  public static Type getAssignmentCompatibleType(
+      Type t1, Type t2, boolean strict, boolean strictDecimal) {
     if (t1.isScalarType() && t2.isScalarType()) {
       return ScalarType.getAssignmentCompatibleType(
-          (ScalarType) t1, (ScalarType) t2, strict);
+          (ScalarType) t1, (ScalarType) t2, strict, strictDecimal);
     }
     return ScalarType.INVALID;
   }
@@ -357,8 +398,8 @@ public abstract class Type {
     return toThrift(Lists.newArrayList(types));
   }
 
-  public static List<TColumnType> toThrift(ArrayList<Type> types) {
-    ArrayList<TColumnType> result = Lists.newArrayList();
+  public static List<TColumnType> toThrift(List<Type> types) {
+    List<TColumnType> result = new ArrayList<>();
     for (Type t: types) {
       result.add(t.toThrift());
     }
@@ -419,7 +460,7 @@ public abstract class Type {
       }
       case STRUCT: {
         Preconditions.checkState(nodeIdx + node.getStruct_fieldsSize() < col.getTypesSize());
-        ArrayList<StructField> structFields = Lists.newArrayList();
+        List<StructField> structFields = new ArrayList<>();
         ++nodeIdx;
         for (int i = 0; i < node.getStruct_fieldsSize(); ++i) {
           TStructField thriftField = node.getStruct_fields().get(i);
@@ -456,6 +497,8 @@ public abstract class Type {
         return Integer.MAX_VALUE;
       case TIMESTAMP:
         return 29;
+      case DATE:
+        return 10;
       case CHAR:
       case VARCHAR:
       case FIXED_UDA_INTERMEDIATE:
@@ -508,6 +551,7 @@ public abstract class Type {
       case SMALLINT:
       case INT:
       case BIGINT:
+      case DATE:
         return 0;
       case FLOAT:
         return 7;
@@ -574,6 +618,7 @@ public abstract class Type {
       case FLOAT: return java.sql.Types.FLOAT;
       case DOUBLE: return java.sql.Types.DOUBLE;
       case TIMESTAMP: return java.sql.Types.TIMESTAMP;
+      case DATE: return java.sql.Types.DATE;
       case STRING: return java.sql.Types.VARCHAR;
       case CHAR: return java.sql.Types.CHAR;
       case VARCHAR: return java.sql.Types.VARCHAR;
@@ -734,14 +779,16 @@ public abstract class Type {
     compatibilityMatrix[DOUBLE.ordinal()][VARCHAR.ordinal()] = PrimitiveType.INVALID_TYPE;
     compatibilityMatrix[DOUBLE.ordinal()][CHAR.ordinal()] = PrimitiveType.INVALID_TYPE;
 
-    compatibilityMatrix[DATE.ordinal()][DATETIME.ordinal()] = PrimitiveType.DATETIME;
-    compatibilityMatrix[DATE.ordinal()][TIMESTAMP.ordinal()] = PrimitiveType.TIMESTAMP;
-    compatibilityMatrix[DATE.ordinal()][STRING.ordinal()] = PrimitiveType.INVALID_TYPE;
+    // We can convert some but not all string values to date.
+    compatibilityMatrix[DATE.ordinal()][STRING.ordinal()] = PrimitiveType.DATE;
+    strictCompatibilityMatrix[DATE.ordinal()][STRING.ordinal()] =
+        PrimitiveType.INVALID_TYPE;
     compatibilityMatrix[DATE.ordinal()][VARCHAR.ordinal()] = PrimitiveType.INVALID_TYPE;
     compatibilityMatrix[DATE.ordinal()][CHAR.ordinal()] = PrimitiveType.INVALID_TYPE;
 
     compatibilityMatrix[DATETIME.ordinal()][TIMESTAMP.ordinal()] =
         PrimitiveType.TIMESTAMP;
+    compatibilityMatrix[DATETIME.ordinal()][DATE.ordinal()] = PrimitiveType.DATETIME;
     compatibilityMatrix[DATETIME.ordinal()][STRING.ordinal()] =
         PrimitiveType.INVALID_TYPE;
     compatibilityMatrix[DATETIME.ordinal()][VARCHAR.ordinal()] =
@@ -749,6 +796,10 @@ public abstract class Type {
     compatibilityMatrix[DATETIME.ordinal()][CHAR.ordinal()] =
         PrimitiveType.INVALID_TYPE;
 
+    // We can convert some but not all date values to timestamps.
+    compatibilityMatrix[TIMESTAMP.ordinal()][DATE.ordinal()] = PrimitiveType.TIMESTAMP;
+    strictCompatibilityMatrix[TIMESTAMP.ordinal()][DATE.ordinal()] =
+        PrimitiveType.INVALID_TYPE;
     // We can convert some but not all string values to timestamps.
     compatibilityMatrix[TIMESTAMP.ordinal()][STRING.ordinal()] =
         PrimitiveType.TIMESTAMP;

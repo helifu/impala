@@ -16,6 +16,7 @@
 // under the License.
 
 #include "common/status.h"
+#include "gen-cpp/common.pb.h"
 #include "gen-cpp/StatestoreService_types.h"
 #include "gen-cpp/Types_types.h"
 #include <vector>
@@ -58,27 +59,27 @@ TNetworkAddress MakeNetworkAddress(const std::string& hostname, int port);
 /// hostname and a port of 0.
 TNetworkAddress MakeNetworkAddress(const std::string& address);
 
-/// Utility method because Thrift does not supply useful constructors
-TBackendDescriptor MakeBackendDescriptor(const Hostname& hostname, const IpAddr& ip,
-    int port);
-
 /// Returns true if the ip address parameter is the wildcard interface (0.0.0.0)
 bool IsWildcardAddress(const std::string& ipaddress);
 
 /// Utility method to print address as address:port
 std::string TNetworkAddressToString(const TNetworkAddress& address);
 
+/// Utility method to print a NetworkAddressPB as address:port.
+std::string NetworkAddressPBToString(const NetworkAddressPB& address);
+
+/// Utility method to convert a NetworkAddressPB to a TNetworkAddress.
+TNetworkAddress FromNetworkAddressPB(const NetworkAddressPB& address);
+
 /// Utility method to convert TNetworkAddress to Kudu sock addr.
 /// Note that 'address' has to contain a resolved IP address.
 Status TNetworkAddressToSockaddr(const TNetworkAddress& address,
     kudu::Sockaddr* sockaddr);
 
-/// Prints a hostport as ipaddress:port
-std::ostream& operator<<(std::ostream& out, const TNetworkAddress& hostport);
-
 /// Returns a ephemeral port that is currently unused. Returns -1 on an error or if
-/// a free ephemeral port can't be found after 100 tries. If 'used_ports' is non-NULL,
-/// does not select those ports and adds the selected port to 'used_ports'.
-int FindUnusedEphemeralPort(std::vector<int>* used_ports);
+/// a free ephemeral port can't be found after 100 tries.
+int FindUnusedEphemeralPort();
+
+extern const std::string LOCALHOST_IP_STR;
 
 } // namespace impala

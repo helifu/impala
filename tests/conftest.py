@@ -27,19 +27,23 @@ import logging
 import os
 import pytest
 
+import tests.common
+from impala_py_lib.helpers import find_all_files, is_core_dump
+from tests.common.environ import build_flavor_timeout
 from common.test_result_verifier import QueryTestResult
 from tests.common.patterns import is_valid_impala_identifier
 from tests.comparison.db_connection import ImpalaConnection
 from tests.util.filesystem_utils import FILESYSTEM, ISILON_WEBHDFS_PORT
 
-logging.basicConfig(level=logging.INFO, format='%(threadName)s: %(message)s')
 LOG = logging.getLogger('test_configuration')
+LOG_FORMAT = "-- %(asctime)s %(levelname)-8s %(threadName)s: %(message)s"
 
 DEFAULT_CONN_TIMEOUT = 45
 DEFAULT_EXPLORATION_STRATEGY = 'core'
 DEFAULT_HDFS_XML_CONF = os.path.join(os.environ['HADOOP_CONF_DIR'], "hdfs-site.xml")
 DEFAULT_HIVE_SERVER2 = 'localhost:11050'
 DEFAULT_IMPALAD_HS2_PORT = '21050'
+DEFAULT_IMPALAD_HS2_HTTP_PORT = '28000'
 DEFAULT_IMPALADS = "localhost:21000,localhost:21001,localhost:21002"
 DEFAULT_KUDU_MASTER_HOSTS = os.getenv('KUDU_MASTER_HOSTS', '127.0.0.1')
 DEFAULT_KUDU_MASTER_PORT = os.getenv('KUDU_MASTER_PORT', '7051')
@@ -48,6 +52,22 @@ DEFAULT_NAMENODE_ADDR = None
 if FILESYSTEM == 'isilon':
   DEFAULT_NAMENODE_ADDR = "{node}:{port}".format(node=os.getenv("ISILON_NAMENODE"),
                                                  port=ISILON_WEBHDFS_PORT)
+
+# Timeout each individual test case after 2 hours, or 4 hours for slow builds
+PYTEST_TIMEOUT_S = \
+    build_flavor_timeout(2 * 60 * 60, slow_build_timeout=4 * 60 * 60)
+
+def pytest_configure(config):
+  """ Hook startup of pytest. Sets up log format and per-test timeout. """
+  configure_logging()
+  config.option.timeout = PYTEST_TIMEOUT_S
+
+
+def configure_logging():
+  # Use a "--" since most of our tests output SQL commands, and it's nice to
+  # be able to copy-paste directly from the test output back into a shell to
+  # try to reproduce a failure.
+  logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 
 def pytest_addoption(parser):
@@ -61,12 +81,15 @@ def pytest_addoption(parser):
                    "format: workload:exploration_strategy. Ex: tpch:core,tpcds:pairwise.")
 
   parser.addoption("--impalad", default=DEFAULT_IMPALADS,
-                   help="A comma-separated list of impalad host:ports to target. Note: "
-                   "Not all tests make use of all impalad, some tests target just the "
-                   "first item in the list (it is considered the 'default'")
+                   help="A comma-separated list of impalad Beeswax host:ports to target. "
+                   "Note: Not all tests make use of all impalad, some tests target just "
+                   "the first item in the list (it is considered the 'default'")
 
   parser.addoption("--impalad_hs2_port", default=DEFAULT_IMPALAD_HS2_PORT,
                    help="The impalad HiveServer2 port.")
+
+  parser.addoption("--impalad_hs2_http_port", default=DEFAULT_IMPALAD_HS2_HTTP_PORT,
+                   help="The impalad HiveServer2 HTTP port.")
 
   parser.addoption("--metastore_server", default=DEFAULT_METASTORE_SERVER,
                    help="The Hive Metastore server host:port to connect to.")
@@ -105,6 +128,10 @@ def pytest_addoption(parser):
   parser.addoption("--use_kerberos", action="store_true", default=False,
                    help="use kerberos transport for running tests")
 
+  parser.addoption("--use_local_catalog", dest="use_local_catalog", action="store_true",
+                   default=False, help="Run all tests against Impala configured with "
+                   "LocalCatalog.")
+
   parser.addoption("--sanity", action="store_true", default=False,
                    help="Runs a single test vector from each test to provide a quick "
                    "sanity check at the cost of lower test coverage.")
@@ -115,6 +142,10 @@ def pytest_addoption(parser):
   parser.addoption("--testing_remote_cluster", action="store_true", default=False,
                    help=("Indicates that tests are being run against a remote cluster. "
                          "Some tests may be marked to skip or xfail on remote clusters."))
+
+  parser.addoption("--shard_tests", default=None,
+                   help="If set to N/M (e.g., 3/5), will split the tests into "
+                   "M partitions and run the Nth partition. 1-indexed.")
 
 
 def pytest_assertrepr_compare(op, left, right):
@@ -144,7 +175,9 @@ def pytest_assertrepr_compare(op, left, right):
   if isinstance(left, set) and isinstance(right, set) and op == '<=':
     # If expected is not a subset of actual, print out the set difference.
     result = ['Items in expected results not found in actual results:']
-    result.append(('').join(list(left - right)))
+    result.extend(list(left - right))
+    result.append('Items in actual results:')
+    result.extend(list(right))
     LOG.error('\n'.join(result))
     return result
 
@@ -166,8 +199,10 @@ def pytest_generate_tests(metafunc):
     metafunc.cls.add_test_dimensions()
     vectors = metafunc.cls.ImpalaTestMatrix.generate_test_vectors(
         metafunc.config.option.exploration_strategy)
+
     if len(vectors) == 0:
-      LOG.warning('No test vectors generated. Check constraints and input vectors')
+      LOG.warning("No test vectors generated for test '%s'. Check constraints and "
+          "input vectors" % metafunc.function.func_name)
 
     vector_names = map(str, vectors)
     # In the case this is a test result update or sanity run, select a single test vector
@@ -177,6 +212,27 @@ def pytest_generate_tests(metafunc):
       vectors = vectors[0:1]
       vector_names = vector_names[0:1]
     metafunc.parametrize('vector', vectors, ids=vector_names)
+
+
+@pytest.yield_fixture
+def cleanup_generated_core_dumps(request):
+  """
+  A fixture to cleanup core dumps intentionally generated by tests (for negative testing).
+
+  Only core dumps generated by the decorated test function will be removed. Pre-existing
+  cores that need to be triaged from prior test failures are retained.
+  """
+  possible_cores = find_all_files('*core*')
+  pre_test_cores = set([f for f in possible_cores if is_core_dump(f)])
+
+  yield  # Wait for test to execute
+
+  possible_cores = find_all_files('*core*')
+  post_test_cores = set([f for f in possible_cores if is_core_dump(f)])
+
+  for f in (post_test_cores - pre_test_cores):
+    LOG.info("Cleaned up {core} created by {test}".format(core=f, test=request.node.name))
+    os.remove(f)
 
 
 @pytest.fixture
@@ -300,6 +356,29 @@ def unique_database(request, testid_checksum):
   return first_db_name
 
 
+@pytest.fixture
+def unique_role(request, testid_checksum):
+  """Returns a unique role to any test using the fixture. The fixture does not create
+  a role."""
+  role_name_prefix = request.function.__name__
+  fixture_params = getattr(request, 'param', None)
+  if fixture_params is not None:
+    if 'name_prefix' in fixture_params:
+      role_name_prefix = fixture_params['name_prefix']
+  return '{0}_{1}_role'.format(role_name_prefix, testid_checksum)
+
+
+@pytest.fixture
+def unique_name(request, testid_checksum):
+  """Returns a unique name to any test using the fixture."""
+  name_prefix = request.function.__name__
+  fixture_params = getattr(request, 'param', None)
+  if fixture_params is not None:
+    if 'name_prefix' in fixture_params:
+      name_prefix = fixture_params['name_prefix']
+  return '{0}_{1}'.format(name_prefix, testid_checksum)
+
+
 @pytest.yield_fixture
 def kudu_client():
   """Provides a new Kudu client as a pytest fixture. The client only exists for the
@@ -336,7 +415,8 @@ def conn(request):
        - get_conn_timeout(): The timeout, in seconds, to use for this connection.
      The returned connection will have a 'db_name' property.
 
-     See the 'unique_database' fixture above if you want to use Impala's custom python
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
      API instead of DB-API.
   """
   db_name = __call_cls_method_if_exists(request.cls, "get_db_name")
@@ -347,7 +427,7 @@ def conn(request):
     with __unique_conn(db_name=db_name, timeout=timeout) as conn:
       yield conn
   else:
-    with __auto_closed_conn(db_name=db_name) as conn:
+    with __auto_closed_conn(db_name=db_name, timeout=timeout) as conn:
       yield conn
 
 
@@ -372,10 +452,14 @@ def __unique_conn(db_name=None, timeout=DEFAULT_CONN_TIMEOUT):
      # The database no longer exists and the conn is closed.
 
      The returned connection will have a 'db_name' property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   if not db_name:
     db_name = choice(ascii_lowercase) + "".join(sample(ascii_lowercase + digits, 5))
-  with __auto_closed_conn() as conn:
+  with __auto_closed_conn(timeout=timeout) as conn:
     with __auto_closed_cursor(conn) as cur:
       cur.execute("CREATE DATABASE %s" % db_name)
   with __auto_closed_conn(db_name=db_name, timeout=timeout) as conn:
@@ -399,6 +483,10 @@ def __auto_closed_conn(db_name=None, timeout=DEFAULT_CONN_TIMEOUT):
      The connection will be closed upon exiting the block.
 
      The returned connection will have a 'db_name' property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   default_impalad = pytest.config.option.impalad.split(',')[0]
   impalad_host = default_impalad.split(':')[0]
@@ -423,6 +511,10 @@ def cursor(conn):
 
      The returned cursor will have a 'conn' property. The 'conn' will have a 'db_name'
      property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   with __auto_closed_cursor(conn) as cur:
     yield cur
@@ -435,6 +527,10 @@ def cls_cursor(conn):
 
      The returned cursor will have a 'conn' property. The 'conn' will have a 'db_name'
      property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   with __auto_closed_cursor(conn) as cur:
     yield cur
@@ -448,6 +544,10 @@ def unique_cursor():
 
      The returned cursor will have a 'conn' property. The 'conn' will have a 'db_name'
      property.
+
+     DEPRECATED:
+     See the 'unique_database' fixture above to use Impala's custom python
+     API instead of DB-API.
   """
   with __unique_conn() as conn:
     with __auto_closed_cursor(conn) as cur:
@@ -497,3 +597,54 @@ def validate_pytest_config():
     if any(pytest.config.option.impalad.startswith(loc) for loc in local_prefixes):
       logging.error("--testing_remote_cluster can not be used with a local impalad")
       pytest.exit("Invalid pytest config option: --testing_remote_cluster")
+
+
+@pytest.yield_fixture(autouse=True, scope='session')
+def cluster_properties():
+  """Set up test cluster properties for the test session"""
+  # Don't import at top level to avoid circular dependency between conftest and
+  # tests.common.environ, which uses command-line flags set up by conftest.
+  from tests.common.environ import ImpalaTestClusterProperties
+  cluster_properties = ImpalaTestClusterProperties.get_instance()
+  yield cluster_properties
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(items, config, session):
+  """Hook to handle --shard_tests command line option.
+
+  If set, this "deselects" a subset of tests, by hashing
+  their id into buckets.
+  """
+  if not config.option.shard_tests:
+    return
+
+  num_items = len(items)
+  this_shard, num_shards = map(int, config.option.shard_tests.split("/"))
+  assert 0 <= this_shard <= num_shards
+  if this_shard == num_shards:
+    this_shard = 0
+
+  items_selected, items_deselected = [], []
+  for i in items:
+    if hash(i.nodeid) % num_shards == this_shard:
+      items_selected.append(i)
+    else:
+      items_deselected.append(i)
+  config.hook.pytest_deselected(items=items_deselected)
+
+  # We must modify the items list in place for it to take effect.
+  items[:] = items_selected
+
+  logging.info("pytest shard selection enabled %s. Of %d items, selected %d items by hash.",
+      config.option.shard_tests, num_items, len(items))
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_logstart(nodeid, location):
+  # Beeswax doesn't support commas or equals in configuration, so they are replaced.
+  # Spaces are removed to make the string a little bit shorter.
+  # The string is shortened so that it is entirely spit out by ThriftDebugString, rather
+  # than being elided.
+  tests.common.current_node = \
+      nodeid.replace(",", ";").replace(" ", "").replace("=", "-")[0:255]

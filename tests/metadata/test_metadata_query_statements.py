@@ -22,7 +22,8 @@ import re
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfIsilon, SkipIfS3, SkipIfADLS, SkipIfLocal
+from tests.common.skip import (SkipIfIsilon, SkipIfS3, SkipIfABFS, SkipIfADLS,
+                               SkipIfLocal, SkipIfCatalogV2)
 from tests.common.test_dimensions import ALL_NODES_ONLY
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_dimensions import create_uncompressed_text_dimension
@@ -75,6 +76,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
   # data doesn't reside in hdfs.
   @SkipIfIsilon.hive
   @SkipIfS3.hive
+  @SkipIfABFS.hive
   @SkipIfADLS.hive
   @SkipIfLocal.hive
   def test_describe_formatted(self, vector, unique_database):
@@ -132,6 +134,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
         compare=compare_describe_formatted)
 
   @pytest.mark.execute_serially # due to data src setup/teardown
+  @SkipIfCatalogV2.data_sources_unsupported()
   def test_show_data_sources(self, vector):
     try:
       self.__create_data_sources()
@@ -149,11 +152,12 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
       self.client.execute(self.CREATE_DATA_SRC_STMT % (name,))
 
   @SkipIfS3.hive
+  @SkipIfABFS.hive
   @SkipIfADLS.hive
   @SkipIfIsilon.hive
   @SkipIfLocal.hive
-  @pytest.mark.execute_serially # because of invalidate metadata
-  def test_describe_db(self, vector):
+  @pytest.mark.execute_serially  # because of use of hardcoded database
+  def test_describe_db(self, vector, cluster_properties):
     self.__test_describe_db_cleanup()
     try:
       self.client.execute("create database impala_test_desc_db1")
@@ -165,9 +169,15 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
                           "location \"" + get_fs_path("/test2.db") + "\"")
       self.run_stmt_in_hive("create database hive_test_desc_db comment 'test comment' "
                            "with dbproperties('pi' = '3.14', 'e' = '2.82')")
-      self.run_stmt_in_hive("alter database hive_test_desc_db set owner user test")
-      self.client.execute("invalidate metadata")
+      if cluster_properties.is_event_polling_enabled():
+        # Using HMS event processor - wait until the database shows up.
+        self.wait_for_db_to_appear("hive_test_desc_db", timeout_s=30)
+      else:
+        # Invalidate metadata to pick up hive-created db.
+        self.client.execute("invalidate metadata")
       self.run_test_case('QueryTest/describe-db', vector)
+      if not cluster_properties.is_catalog_v2_cluster():
+        self.run_test_case('QueryTest/describe-hive-db', vector)
     finally:
       self.__test_describe_db_cleanup()
 

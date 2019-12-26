@@ -15,7 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <cstring>
+#include <ostream>
+#include <string>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/stopwatch.h"
@@ -46,7 +55,7 @@ class CrcTest : public KuduTest {
 
 // Basic functionality test.
 TEST_F(CrcTest, TestCRC32C) {
-  const string test_data("abcdefgh");
+  const std::string test_data("abcdefgh");
   const uint64_t kExpectedCrc = 0xa9421b7; // Known value from crcutil usage test program.
 
   Crc* crc32c = GetCrc32cInstance();

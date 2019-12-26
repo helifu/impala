@@ -17,9 +17,11 @@
 
 package org.apache.impala.analysis;
 
+import java.util.List;
+
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TShowFilesParams;
 import org.apache.impala.thrift.TTableName;
@@ -40,19 +42,24 @@ public class ShowFilesStmt extends StatementBase {
   private final PartitionSet partitionSet_;
 
   // Set during analysis.
-  protected Table table_;
+  protected FeTable table_;
 
   public ShowFilesStmt(TableName tableName, PartitionSet partitionSet) {
-    this.tableName_ = tableName;
-    this.partitionSet_ = partitionSet;
+    tableName_ = Preconditions.checkNotNull(tableName);
+    partitionSet_ = partitionSet;
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder strBuilder = new StringBuilder();
     strBuilder.append("SHOW FILES IN " + tableName_.toString());
-    if (partitionSet_ != null) strBuilder.append(" " + partitionSet_.toSql());
+    if (partitionSet_ != null) strBuilder.append(" " + partitionSet_.toSql(options));
     return strBuilder.toString();
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
   }
 
   @Override
@@ -68,7 +75,7 @@ public class ShowFilesStmt extends StatementBase {
     }
     table_ = tableRef.getTable();
     Preconditions.checkNotNull(table_);
-    if (!(table_ instanceof HdfsTable)) {
+    if (!(table_ instanceof FeFsTable)) {
       throw new AnalysisException(String.format(
           "SHOW FILES not applicable to a non hdfs table: %s", tableName_));
     }

@@ -17,9 +17,11 @@
 
 package org.apache.impala.analysis;
 
+import java.util.List;
+
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.DataSourceTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeDataSourceTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TTableName;
@@ -30,10 +32,10 @@ import com.google.common.base.Preconditions;
  * Base class for all ALTER TABLE statements.
  */
 public abstract class AlterTableStmt extends StatementBase {
-  protected final TableName tableName_;
+  protected TableName tableName_;
 
   // Set during analysis.
-  protected Table table_;
+  protected FeTable table_;
 
   protected AlterTableStmt(TableName tableName) {
     Preconditions.checkState(tableName != null && !tableName.isEmpty());
@@ -55,7 +57,7 @@ public abstract class AlterTableStmt extends StatementBase {
    * Can only be called after analysis, returns the Table object of the target of this
    * ALTER TABLE statement.
    */
-  protected Table getTargetTable() {
+  protected FeTable getTargetTable() {
     Preconditions.checkNotNull(table_);
     return table_;
   }
@@ -64,6 +66,11 @@ public abstract class AlterTableStmt extends StatementBase {
     TAlterTableParams params = new TAlterTableParams();
     params.setTable_name(new TTableName(getDb(), getTbl()));
     return params;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
   }
 
   @Override
@@ -83,7 +90,9 @@ public abstract class AlterTableStmt extends StatementBase {
     }
     Preconditions.checkState(tableRef instanceof BaseTableRef);
     table_ = tableRef.getTable();
-    if (table_ instanceof DataSourceTable
+    analyzer.checkTableCapability(table_, Analyzer.OperationType.WRITE);
+    analyzer.ensureTableNotTransactional(table_, "ALTER TABLE");
+    if (table_ instanceof FeDataSourceTable
         && !(this instanceof AlterTableSetColumnStats)) {
       throw new AnalysisException(String.format(
           "ALTER TABLE not allowed on a table produced by a data source: %s",

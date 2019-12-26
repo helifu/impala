@@ -18,7 +18,10 @@
 
 #include <string>
 
-#include <boost/optional/optional_fwd.hpp>
+namespace boost {
+template <class T>
+class optional;
+}
 
 namespace kudu {
 
@@ -31,6 +34,12 @@ namespace security {
 // Have the daemons use an in-memory ticket cache, so they don't accidentally
 // pick up credentials from test cases or any other daemon.
 static const std::string kKrb5CCName = "MEMORY:kudu";
+
+// Parses the given Kerberos principal into service name, hostname, and realm.
+Status Krb5ParseName(const std::string& principal,
+                     std::string* service_name,
+                     std::string* hostname,
+                     std::string* realm);
 
 // Initializes Kerberos for a server. In particular, this processes
 // the '--keytab_file' command line flag.

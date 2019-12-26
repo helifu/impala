@@ -31,13 +31,14 @@ class KuduScanner;
 /// in the thread calling GetNext().
 class KuduScanNodeMt : public KuduScanNodeBase {
  public:
-  KuduScanNodeMt(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  KuduScanNodeMt(ObjectPool* pool, const ScanPlanNode& pnode, const DescriptorTbl& descs);
 
   ~KuduScanNodeMt();
 
-  virtual Status Open(RuntimeState* state);
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
-  virtual void Close(RuntimeState* state);
+  virtual Status Open(RuntimeState* state) override;
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) override;
+  virtual void Close(RuntimeState* state) override;
+  virtual ExecutionModel getExecutionModel() const override { return TASK_BASED; }
 
  private:
   /// Current scan token and corresponding scanner.

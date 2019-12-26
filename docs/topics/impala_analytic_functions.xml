@@ -43,16 +43,13 @@ under the License.
 
   <conbody>
 
-    <p rev="2.0.0">
-      <indexterm audience="hidden">analytic functions</indexterm>
-
-      <indexterm audience="hidden">window functions</indexterm>
-      Analytic functions (also known as window functions) are a special category of built-in functions. Like
-      aggregate functions, they examine the contents of multiple input rows to compute each output value. However,
-      rather than being limited to one result value per <codeph>GROUP BY</codeph> group, they operate on
-      <term>windows</term> where the input rows are ordered and grouped using flexible conditions expressed through
-      an <codeph>OVER()</codeph> clause.
-    </p>
+    <p rev="2.0.0"> Analytic functions (also known as window functions) are a
+      special category of built-in functions. Like aggregate functions, they
+      examine the contents of multiple input rows to compute each output value.
+      However, rather than being limited to one result value per <codeph>GROUP
+        BY</codeph> group, they operate on <term>windows</term> where the input
+      rows are ordered and grouped using flexible conditions expressed through
+      an <codeph>OVER()</codeph> clause. </p>
 
     <p conref="../shared/impala_common.xml#common/added_in_20"/>
 
@@ -781,7 +778,7 @@ order by kind, ordering desc, name;
 
       <p>
         Partitioning by the <codeph>X</codeph> column groups all the duplicate numbers together and returns the
-        place each each value within the group; because each value occurs only 1 or 2 times,
+        place each value within the group; because each value occurs only 1 or 2 times,
         <codeph>DENSE_RANK()</codeph> designates each <codeph>X</codeph> value as either first or second within its
         group.
       </p>
@@ -1569,7 +1566,7 @@ insert into animals values ('Fire-breathing dragon', 'Mythical', NULL);
 
       <p>
         Partitioning by the <codeph>X</codeph> column groups all the duplicate numbers together and returns the
-        place each each value within the group; because each value occurs only 1 or 2 times,
+        place each value within the group; because each value occurs only 1 or 2 times,
         <codeph>RANK()</codeph> designates each <codeph>X</codeph> value as either first or second within its
         group.
       </p>

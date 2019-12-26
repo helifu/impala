@@ -18,8 +18,10 @@
 package org.apache.impala.planner;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -27,17 +29,20 @@ import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprId;
 import org.apache.impala.analysis.ExprSubstitutionMap;
+import org.apache.impala.analysis.ToSqlOptions;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.planner.RuntimeFilterGenerator.RuntimeFilter;
+import org.apache.impala.thrift.TExecNodePhase;
 import org.apache.impala.thrift.TExecStats;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlan;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.util.BitUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,6 +71,15 @@ import com.google.common.math.LongMath;
 abstract public class PlanNode extends TreeNode<PlanNode> {
   private final static Logger LOG = LoggerFactory.getLogger(PlanNode.class);
 
+  // The default row batch size used if the BATCH_SIZE query option is not set
+  // or is less than 1. Must be in sync with QueryState::DEFAULT_BATCH_SIZE.
+  protected final static int DEFAULT_ROWBATCH_SIZE = 1024;
+
+  // Max memory that a row batch can accumulate before it is considered at capacity.
+  // This is a soft capacity: row batches may exceed the capacity, preferably only by a
+  // row's worth of data. Must be in sync with RowBatch::AT_CAPACITY_MEM_USAGE.
+  protected final static int ROWBATCH_MAX_MEM_USAGE = 8 * 1024 * 1024;
+
   // String used for this node in getExplainString().
   protected String displayName_;
 
@@ -75,19 +89,19 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   protected long limit_; // max. # of rows to be returned; 0: no limit_
 
   // ids materialized by the tree rooted at this node
-  protected ArrayList<TupleId> tupleIds_;
+  protected List<TupleId> tupleIds_;
 
   // ids of the TblRefs "materialized" by this node; identical with tupleIds_
   // if the tree rooted at this node only materializes BaseTblRefs;
   // useful during plan generation
-  protected ArrayList<TupleId> tblRefIds_;
+  protected List<TupleId> tblRefIds_;
 
   // A set of nullable TupleId produced by this node. It is a subset of tupleIds_.
   // A tuple is nullable within a particular plan tree if it's the "nullable" side of
   // an outer join, which has nothing to do with the schema.
-  protected Set<TupleId> nullableTupleIds_ = Sets.newHashSet();
+  protected Set<TupleId> nullableTupleIds_ = new HashSet<>();
 
-  protected List<Expr> conjuncts_ = Lists.newArrayList();
+  protected List<Expr> conjuncts_ = new ArrayList<>();
 
   // Fragment that this PlanNode is executed in. Valid only after this PlanNode has been
   // assigned to a fragment. Set and maintained by enclosing PlanFragment.
@@ -117,6 +131,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   // computeResourceProfile().
   protected ResourceProfile nodeResourceProfile_ = ResourceProfile.invalid();
 
+  // List of query execution pipelines that this node executes as a part of.
+  protected List<PipelineMembership> pipelines_;
+
   // sum of tupleIds_' avgSerializedSizes; set in computeStats()
   protected float avgRowSize_;
 
@@ -124,7 +141,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   protected boolean disableCodegen_;
 
   // Runtime filters assigned to this node.
-  protected List<RuntimeFilter> runtimeFilters_ = Lists.newArrayList();
+  protected List<RuntimeFilter> runtimeFilters_ = new ArrayList<>();
 
   protected PlanNode(PlanNodeId id, List<TupleId> tupleIds, String displayName) {
     this(id, displayName);
@@ -142,8 +159,8 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   protected PlanNode(PlanNodeId id, String displayName) {
     id_ = id;
     limit_ = -1;
-    tupleIds_ = Lists.newArrayList();
-    tblRefIds_ = Lists.newArrayList();
+    tupleIds_ = new ArrayList<>();
+    tblRefIds_ = new ArrayList<>();
     cardinality_ = -1;
     numNodes_ = -1;
     displayName_ = displayName;
@@ -184,6 +201,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   }
 
   public PlanNodeId getId() { return id_; }
+  public List<PipelineMembership> getPipelines() { return pipelines_; }
   public void setId(PlanNodeId id) {
     Preconditions.checkState(id_ == null);
     id_ = id;
@@ -214,13 +232,13 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
   public void unsetLimit() { limit_ = -1; }
 
-  public ArrayList<TupleId> getTupleIds() {
+  public List<TupleId> getTupleIds() {
     Preconditions.checkState(tupleIds_ != null);
     return tupleIds_;
   }
 
-  public ArrayList<TupleId> getTblRefIds() { return tblRefIds_; }
-  public void setTblRefIds(ArrayList<TupleId> ids) { tblRefIds_ = ids; }
+  public List<TupleId> getTblRefIds() { return tblRefIds_; }
+  public void setTblRefIds(List<TupleId> ids) { tblRefIds_ = ids; }
 
   public Set<TupleId> getNullableTupleIds() {
     Preconditions.checkState(nullableTupleIds_ != null);
@@ -303,6 +321,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
     // Output cardinality, cost estimates and tuple Ids only when explain plan level
     // is extended or above.
+    boolean displayCardinality = displayCardinality(detailLevel);
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
       // Print resource profile.
       expBuilder.append(detailPrefix);
@@ -317,9 +336,34 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         expBuilder.append(tupleId.asInt() + nullIndicator);
         if (i + 1 != tupleIds_.size()) expBuilder.append(",");
       }
-      expBuilder.append(" row-size=" + PrintUtils.printBytes(Math.round(avgRowSize_)));
-      expBuilder.append(PrintUtils.printCardinality(" ", cardinality_));
-      expBuilder.append("\n");
+      expBuilder.append(displayCardinality ? " " : "\n");
+    }
+    // Output cardinality: in standard and above levels.
+    // In standard, on a line by itself (if wanted). In extended, on
+    // a line with tuple ids.
+    if (displayCardinality) {
+      if (detailLevel == TExplainLevel.STANDARD) expBuilder.append(detailPrefix);
+      expBuilder.append("row-size=")
+        .append(PrintUtils.printBytes(Math.round(avgRowSize_)))
+        .append(" cardinality=")
+        .append(PrintUtils.printEstCardinality(cardinality_))
+        .append("\n");
+    }
+
+    if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+      expBuilder.append(detailPrefix);
+      expBuilder.append("in pipelines: ");
+      if (pipelines_ != null) {
+        List<String> pipelines = new ArrayList<>();
+        for (PipelineMembership pipe: pipelines_) {
+          pipelines.add(pipe.getExplainString());
+        }
+        if (pipelines.isEmpty()) expBuilder.append("<none>");
+        else expBuilder.append(Joiner.on(", ").join(pipelines));
+        expBuilder.append("\n");
+      } else {
+        expBuilder.append("<not computed>");
+      }
     }
 
     // Print the children. Do not traverse into the children of an Exchange node to
@@ -351,6 +395,17 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
           children_.get(0).getExplainString(prefix, prefix, queryOptions, detailLevel));
     }
     return expBuilder.toString();
+  }
+
+  /**
+   * Per-node setting whether to include cardinality in the node overview.
+   * Some nodes omit cardinality because either a) it is not needed
+   * (Empty set, Exchange), or b) it is printed by the node itself (HDFS scan.)
+   * @return true if cardinality should be included in the generic
+   * node details, false if it should be omitted.
+   */
+  protected boolean displayCardinality(TExplainLevel detailLevel) {
+    return detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal();
   }
 
   /**
@@ -410,6 +465,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     msg.setDisable_codegen(disableCodegen_);
     Preconditions.checkState(nodeResourceProfile_.isValid());
     msg.resource_profile = nodeResourceProfile_.toThrift();
+    msg.pipelines = new ArrayList<>();
+    for (PipelineMembership pipe : pipelines_) {
+      msg.pipelines.add(pipe.toThrift());
+    }
     toThrift(msg);
     container.addToNodes(msg);
     // For the purpose of the BE consider ExchangeNodes to have no children.
@@ -491,15 +550,15 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     if (!children_.isEmpty()) numNodes_ = getChild(0).numNodes_;
   }
 
-  protected long capAtLimit(long cardinality) {
+  protected long capCardinalityAtLimit(long cardinality) {
     if (hasLimit()) {
-      if (cardinality == -1) {
-        return limit_;
-      } else {
-        return Math.min(cardinality, limit_);
-      }
+      return capCardinalityAtLimit(cardinality, limit_);
     }
     return cardinality;
+  }
+
+  static long capCardinalityAtLimit(long cardinality, long limit) {
+    return cardinality == -1 ? limit : Math.min(cardinality, limit);
   }
 
   /**
@@ -525,7 +584,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    */
   static protected double computeCombinedSelectivity(List<Expr> conjuncts) {
     // Collect all estimated selectivities.
-    List<Double> selectivities = Lists.newArrayList();
+    List<Double> selectivities = new ArrayList<>();
     for (Expr e: conjuncts) {
       if (e.hasSelectivity()) selectivities.add(e.getSelectivity());
     }
@@ -551,6 +610,20 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     return computeCombinedSelectivity(conjuncts_);
   }
 
+  // Compute the cardinality after applying conjuncts_ based on 'preConjunctCardinality'.
+  protected long applyConjunctsSelectivity(long preConjunctCardinality) {
+    return applySelectivity(preConjunctCardinality, computeSelectivity());
+  }
+
+  // Compute the cardinality after applying conjuncts with 'selectivity', based on
+  // 'preConjunctCardinality'.
+  protected long applySelectivity(long preConjunctCardinality, double selectivity) {
+    long cardinality = (long) Math.round(preConjunctCardinality * selectivity);
+    // IMPALA-8647: don't round cardinality down to zero for safety.
+    if (cardinality == 0 && preConjunctCardinality > 0) return 1;
+    return cardinality;
+  }
+
   // Convert this plan node into msg (excluding children), which requires setting
   // the node type and the node-specific field.
   protected abstract void toThrift(TPlanNode msg);
@@ -564,13 +637,47 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     return output.toString();
   }
 
-  protected String getExplainString(List<? extends Expr> exprs) {
+  protected String getExplainString(
+      List<? extends Expr> exprs, TExplainLevel detailLevel) {
     if (exprs == null) return "";
+    ToSqlOptions toSqlOptions =
+        detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal() ?
+        ToSqlOptions.SHOW_IMPLICIT_CASTS :
+        ToSqlOptions.DEFAULT;
     StringBuilder output = new StringBuilder();
     for (int i = 0; i < exprs.size(); ++i) {
       if (i > 0) output.append(", ");
-      output.append(exprs.get(i).toSql());
+      output.append(exprs.get(i).toSql(toSqlOptions));
     }
+    return output.toString();
+  }
+
+  protected String getSortingOrderExplainString(List<? extends Expr> exprs,
+      List<Boolean> isAscOrder, List<Boolean> nullsFirstParams,
+      TSortingOrder sortingOrder) {
+    StringBuilder output = new StringBuilder();
+    switch (sortingOrder) {
+    case LEXICAL:
+      for (int i = 0; i < exprs.size(); ++i) {
+        if (i > 0) output.append(", ");
+        output.append(exprs.get(i).toSql() + " ");
+        output.append(isAscOrder.get(i) ? "ASC" : "DESC");
+
+        Boolean nullsFirstParam = nullsFirstParams.get(i);
+        if (nullsFirstParam != null) {
+          output.append(nullsFirstParam ? " NULLS FIRST" : " NULLS LAST");
+        }
+      }
+      break;
+    case ZORDER:
+      output.append("ZORDER: ");
+      for (int i = 0; i < exprs.size(); ++i) {
+        if (i > 0) output.append(", ");
+        output.append(exprs.get(i).toSql());
+      }
+      break;
+    }
+    output.append("\n");
     return output.toString();
   }
 
@@ -614,6 +721,58 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    * into pipelined units for resource estimation.
    */
   public boolean isBlockingNode() { return false; }
+
+  /**
+   * Fills in 'pipelines_' with the pipelines that this PlanNode is a member of.
+   *
+   * This is called only for nodes that are not part of the right branch of a
+   * subplan. All nodes in the right branch of a subplan belong to the same
+   * pipeline as the GETNEXT phase of the subplan.
+   */
+  public void computePipelineMembership() {
+    Preconditions.checkState(
+        children_.size() <= 1, "Plan nodes with > 1 child must override");
+    if (children_.size() == 0) {
+      // Leaf node, e.g. SCAN.
+      pipelines_ = Arrays.asList(
+          new PipelineMembership(id_, 0, TExecNodePhase.GETNEXT));
+      return;
+    }
+    children_.get(0).computePipelineMembership();
+    // Default behaviour for simple blocking or streaming nodes.
+    if (isBlockingNode()) {
+      // Executes as root of pipelines that child belongs to and leaf of another
+      // pipeline.
+      pipelines_ = Lists.newArrayList(
+          new PipelineMembership(id_, 0, TExecNodePhase.GETNEXT));
+      for (PipelineMembership childPipeline : children_.get(0).getPipelines()) {
+        if (childPipeline.getPhase() == TExecNodePhase.GETNEXT) {
+          pipelines_.add(new PipelineMembership(
+              childPipeline.getId(), childPipeline.getHeight() + 1, TExecNodePhase.OPEN));
+        }
+      }
+    } else {
+      // Streaming with child, e.g. SELECT. Executes as part of all pipelines the child
+      // belongs to.
+      pipelines_ = new ArrayList<>();
+      for (PipelineMembership childPipeline : children_.get(0).getPipelines()) {
+        if (childPipeline.getPhase() == TExecNodePhase.GETNEXT) {
+           pipelines_.add(new PipelineMembership(
+               childPipeline.getId(), childPipeline.getHeight() + 1, TExecNodePhase.GETNEXT));
+        }
+      }
+    }
+  }
+
+  /**
+   * Called from SubplanNode to set the pipeline to 'pipelines'.
+   */
+  protected void setPipelinesRecursive(List<PipelineMembership> pipelines) {
+    pipelines_ = pipelines;
+    for (PlanNode child: children_) {
+      child.setPipelinesRecursive(pipelines);
+    }
+  }
 
   /**
    * Compute peak resources consumed when executing this PlanNode, initializing
@@ -708,7 +867,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   protected String getRuntimeFilterExplainString(
       boolean isBuildNode, TExplainLevel detailLevel) {
     if (runtimeFilters_.isEmpty()) return "";
-    List<String> filtersStr = Lists.newArrayList();
+    List<String> filtersStr = new ArrayList<>();
     for (RuntimeFilter filter: runtimeFilters_) {
       StringBuilder filterStr = new StringBuilder();
       filterStr.append(filter.getFilterId());
@@ -749,7 +908,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     int numWithoutSel = 0;
     List<T> remaining = Lists.newArrayListWithCapacity(conjuncts.size());
     for (T e : conjuncts) {
-      Preconditions.checkState(e.hasCost(), e.toSql());
+      if (!e.hasCost()) {
+        // Avoid toSql() calls for each call
+        Preconditions.checkState(false, e.toSql());
+      }
       totalCost += e.getCost();
       remaining.add(e);
       if (!e.hasSelectivity()) {

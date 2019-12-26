@@ -2,21 +2,35 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <cassert>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include <glog/logging.h>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <gtest/gtest.h>
-#include <memory>
 
-#include <vector>
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/coding.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 #if defined(__linux__)
 DECLARE_string(nvm_cache_path);
 #endif // defined(__linux__)
+
+DECLARE_double(cache_memtracker_approximation_ratio);
 
 namespace kudu {
 
@@ -51,12 +65,16 @@ class CacheTest : public KuduTest,
 
   virtual void SetUp() OVERRIDE {
 
-#if defined(__linux__)
+#if defined(HAVE_LIB_VMEM)
     if (google::GetCommandLineFlagInfoOrDie("nvm_cache_path").is_default) {
       FLAGS_nvm_cache_path = GetTestPath("nvm-cache");
       ASSERT_OK(Env::Default()->CreateDir(FLAGS_nvm_cache_path));
     }
-#endif // defined(__linux__)
+#endif // defined(HAVE_LIB_VMEM)
+
+    // Disable approximate tracking of cache memory since we make specific
+    // assertions on the MemTracker in this test.
+    FLAGS_cache_memtracker_approximation_ratio = 0;
 
     cache_.reset(NewLRUCache(GetParam(), kCacheSize, "cache_test"));
 
@@ -82,8 +100,8 @@ class CacheTest : public KuduTest,
   }
 
   void Insert(int key, int value, int charge = 1) {
-    string key_str = EncodeInt(key);
-    string val_str = EncodeInt(value);
+    std::string key_str = EncodeInt(key);
+    std::string val_str = EncodeInt(value);
     Cache::PendingHandle* handle = CHECK_NOTNULL(cache_->Allocate(key_str, val_str.size(), charge));
     memcpy(cache_->MutableValue(handle), val_str.data(), val_str.size());
 
@@ -223,12 +241,6 @@ TEST_P(CacheTest, HeavyEntries) {
     }
   }
   ASSERT_LE(cached_weight, kCacheSize + kCacheSize/10);
-}
-
-TEST_P(CacheTest, NewId) {
-  uint64_t a = cache_->NewId();
-  uint64_t b = cache_->NewId();
-  ASSERT_NE(a, b);
 }
 
 }  // namespace kudu

@@ -18,7 +18,8 @@
 # under the License.
 #
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 : ${REMOTE_LOAD:=}
 
@@ -63,12 +64,25 @@ if [[ -n "${REMOTE_LOAD:-}" ]]; then
   fi
 fi
 
-if hdfs cacheadmin -listPools testPool | grep testPool &>/dev/null; then
-  hdfs cacheadmin -removePool testPool
-fi
-hdfs cacheadmin -addPool testPool ${CACHEADMIN_ARGS}
+function create-pool {
+  local pool_name=$1
+  local pool_args=${2:-}
+  if hdfs cacheadmin -listPools ${pool_name} | grep ${pool_name} &>/dev/null; then
+    hdfs cacheadmin -removePool ${pool_name}
+  fi
+  hdfs cacheadmin -addPool ${pool_name} ${pool_args} ${CACHEADMIN_ARGS}
+}
+
+create-pool testPool
+create-pool testPoolWithTtl "-maxTtl 7d"
 
 # Back to ourselves:
 if [ "${PREVIOUS_PRINCIPAL}" != "" ]; then
   kinit -k -t ${KRB5_KTNAME} ${PREVIOUS_PRINCIPAL}
+fi
+
+if [[ -n "${HDFS_ERASURECODE_POLICY:-}" ]]; then
+  hdfs ec -enablePolicy -policy "${HDFS_ERASURECODE_POLICY}"
+  hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" \
+    -path "${HDFS_ERASURECODE_PATH:=/test-warehouse}"
 fi

@@ -17,17 +17,21 @@
 
 package org.apache.impala.planner;
 
+import java.util.List;
+
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.SortInfo;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TExchangeNode;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TSortInfo;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -49,6 +53,9 @@ public class ExchangeNode extends PlanNode {
   // update this constant as well.
   private static final double PER_TUPLE_SERIALIZATION_OVERHEAD = 4.0;
 
+  // Empirically derived minimum estimate (in bytes) for the exchange node.
+  private static final int MIN_ESTIMATE_BYTES = 16 * 1024;
+
   // The parameters based on which sorted input streams are merged by this
   // exchange node. Null if this exchange does not merge sorted streams
   private SortInfo mergeInfo_;
@@ -56,6 +63,21 @@ public class ExchangeNode extends PlanNode {
   // Offset after which the exchange begins returning rows. Currently valid
   // only if mergeInfo_ is non-null, i.e. this is a merging exchange node.
   private long offset_;
+
+  private boolean isMergingExchange() {
+    return mergeInfo_ != null;
+  }
+
+  private boolean isBroadcastExchange() {
+    // If the output of the sink is not partitioned but the target fragment is
+    // partitioned, then the data exchange is broadcast.
+    Preconditions.checkState(!children_.isEmpty());
+    DataSink sink = getChild(0).getFragment().getSink();
+    if (sink == null) return false;
+    Preconditions.checkState(sink instanceof DataStreamSink);
+    DataStreamSink streamSink = (DataStreamSink) sink;
+    return !streamSink.getOutputPartition().isPartitioned() && fragment_.isPartitioned();
+  }
 
   public ExchangeNode(PlanNodeId id, PlanNode input) {
     super(id, "EXCHANGE");
@@ -82,37 +104,11 @@ public class ExchangeNode extends PlanNode {
 
   @Override
   public void computeStats(Analyzer analyzer) {
-    Preconditions.checkState(!children_.isEmpty(),
-        "ExchangeNode must have at least one child");
-    cardinality_ = 0;
-    for (PlanNode child: children_) {
-      if (child.getCardinality() == -1) {
-        cardinality_ = -1;
-        break;
-      }
-      cardinality_ = checkedAdd(cardinality_, child.getCardinality());
-    }
-
-    if (hasLimit()) {
-      if (cardinality_ == -1) {
-        cardinality_ = limit_;
-      } else {
-        cardinality_ = Math.min(limit_, cardinality_);
-      }
-    }
-
+    super.computeStats(analyzer);
+    Preconditions.checkState(children_.size() == 1);
+    cardinality_ = capCardinalityAtLimit(children_.get(0).getCardinality());
     // Apply the offset correction if there's a valid cardinality
-    if (cardinality_ > -1) {
-      cardinality_ = Math.max(0, cardinality_ - offset_);
-    }
-
-    // Pick the max numNodes_ and avgRowSize_ of all children.
-    numNodes_ = Integer.MIN_VALUE;
-    avgRowSize_ = Integer.MIN_VALUE;
-    for (PlanNode child: children_) {
-      numNodes_ = Math.max(child.numNodes_, numNodes_);
-      avgRowSize_ = Math.max(child.avgRowSize_, avgRowSize_);
-    }
+    if (cardinality_ > -1) cardinality_ = Math.max(0, cardinality_ - offset_);
   }
 
   /**
@@ -136,21 +132,24 @@ public class ExchangeNode extends PlanNode {
       output.append(detailPrefix + "offset: ").append(offset_).append("\n");
     }
 
-    if (mergeInfo_ != null && detailLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
+    if (isMergingExchange() && detailLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
       output.append(detailPrefix + "order by: ");
-      for (int i = 0; i < mergeInfo_.getOrderingExprs().size(); ++i) {
-        if (i > 0) output.append(", ");
-        output.append(mergeInfo_.getOrderingExprs().get(i).toSql() + " ");
-        output.append(mergeInfo_.getIsAscOrder().get(i) ? "ASC" : "DESC");
-
-        Boolean nullsFirstParam = mergeInfo_.getNullsFirstParams().get(i);
-        if (nullsFirstParam != null) {
-          output.append(nullsFirstParam ? " NULLS FIRST" : " NULLS LAST");
-        }
-      }
-      output.append("\n");
+      output.append(getSortingOrderExplainString(mergeInfo_.getSortExprs(),
+          mergeInfo_.getIsAscOrder(), mergeInfo_.getNullsFirstParams(),
+          mergeInfo_.getSortingOrder()));
     }
     return output.toString();
+  }
+
+  /**
+   * An Exchange simply moves rows over the network: its row width
+   * and cardinality are identical to its input. So, for standard
+   * level, there is no need to repeat these values. Retained in
+   * higher levels for backward compatibility.
+   */
+  @Override
+  protected boolean displayCardinality(TExplainLevel detailLevel) {
+    return detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal();
   }
 
   @Override
@@ -160,14 +159,11 @@ public class ExchangeNode extends PlanNode {
     Preconditions.checkState(!children_.isEmpty());
     DataSink sink = getChild(0).getFragment().getSink();
     if (sink == null) return "";
-    Preconditions.checkState(sink instanceof DataStreamSink);
-    DataStreamSink streamSink = (DataStreamSink) sink;
-    if (!streamSink.getOutputPartition().isPartitioned() &&
-        fragment_.isPartitioned()) {
-      // If the output of the sink is not partitioned but the target fragment is
-      // partitioned, then the data exchange is broadcast.
+    if (isBroadcastExchange()) {
       return "BROADCAST";
     } else {
+      Preconditions.checkState(sink instanceof DataStreamSink);
+      DataStreamSink streamSink = (DataStreamSink) sink;
       return streamSink.getOutputPartition().getExplainString();
     }
   }
@@ -183,8 +179,66 @@ public class ExchangeNode extends PlanNode {
 
   @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    // TODO: add an estimate
-    nodeResourceProfile_ =  ResourceProfile.noReservation(0);
+    // For non-merging exchanges, one row batch queue is maintained for row
+    // batches from all sender fragment instances. For merging exchange, one
+    // queue is created for the batches from each distinct sender. There is a
+    // soft limit on every row batch queue of FLAGS_exchg_node_buffer_size_bytes
+    // (default 10MB). There is also a deferred rpc queue which queues at max
+    // one rpc payload (containing the rowbatch) per sender in-case the row
+    // batch queue hits the previously mentioned soft limit. Actual memory used
+    // depends on the row size (that can vary a lot due to presence of var len
+    // strings) and on the rate at which rows are received and consumed from the
+    // exchange node which in turn depends on the complexity of the query and
+    // the system load. This makes it difficult to accurately estimate the
+    // memory usage at runtime. The following estimates assume that memory usage will
+    // lean towards the soft limits.
+    Preconditions.checkState(!children_.isEmpty());
+    Preconditions.checkNotNull(children_.get(0).getFragment());
+    int numSenders = children_.get(0).getFragment().getNumInstances(queryOptions.mt_dop);
+    long estimatedTotalQueueByteSize = estimateTotalQueueByteSize(numSenders);
+    long estimatedDeferredRPCQueueSize = estimateDeferredRPCQueueSize(queryOptions,
+        numSenders);
+    long estimatedMem = Math.max(
+        checkedAdd(estimatedTotalQueueByteSize, estimatedDeferredRPCQueueSize),
+        MIN_ESTIMATE_BYTES);
+    nodeResourceProfile_ = ResourceProfile.noReservation(estimatedMem);
+  }
+
+  // Returns the estimated size of the deferred batch queue (in bytes) by
+  // assuming that at least one row batch rpc payload per sender is queued.
+  private long estimateDeferredRPCQueueSize(TQueryOptions queryOptions,
+      int numSenders) {
+    long rowBatchSize = queryOptions.isSetBatch_size() && queryOptions.batch_size > 0
+        ? queryOptions.batch_size : DEFAULT_ROWBATCH_SIZE;
+    // Set an upper limit based on estimated cardinality.
+    if (getCardinality() > 0) rowBatchSize = Math.min(rowBatchSize, getCardinality());
+    long avgRowBatchByteSize = Math.min(
+        (long) Math.ceil(rowBatchSize * getAvgSerializedRowSize(this)),
+        ROWBATCH_MAX_MEM_USAGE);
+    long deferredBatchQueueSize = avgRowBatchByteSize * numSenders;
+    return deferredBatchQueueSize;
+  }
+
+  // Returns the total estimated size (in bytes) of the row batch queues by
+  // assuming enough batches can be queued such that it hits the row batch
+  // queue's soft mem limit.
+  private long estimateTotalQueueByteSize(int numSenders) {
+    int numQueues = isMergingExchange() ? numSenders : 1;
+    long maxQueueByteSize = BackendConfig.INSTANCE.getBackendCfg().
+        exchg_node_buffer_size_bytes;
+    // TODO: Should we set a better default size here? This might be alot for
+    // queries without stats.
+    long estimatedTotalQueueByteSize = numQueues * maxQueueByteSize;
+    // Set an upper limit based on estimated cardinality.
+    if (hasValidStats()) {
+      long totalBytesToReceive = (long) Math.ceil(getAvgRowSize() * getCardinality());
+      // Assuming no skew in distribution during data shuffling.
+      long bytesToReceivePerExchNode = isBroadcastExchange() ? totalBytesToReceive
+          : totalBytesToReceive / getNumNodes();
+      estimatedTotalQueueByteSize = Math.min(bytesToReceivePerExchNode,
+          estimatedTotalQueueByteSize);
+    }
+    return estimatedTotalQueueByteSize;
   }
 
   @Override
@@ -202,10 +256,10 @@ public class ExchangeNode extends PlanNode {
       msg.exchange_node.addToInput_row_tuples(tid.asInt());
     }
 
-    if (mergeInfo_ != null) {
+    if (isMergingExchange()) {
       TSortInfo sortInfo = new TSortInfo(
-          Expr.treesToThrift(mergeInfo_.getOrderingExprs()), mergeInfo_.getIsAscOrder(),
-          mergeInfo_.getNullsFirst());
+          Expr.treesToThrift(mergeInfo_.getSortExprs()), mergeInfo_.getIsAscOrder(),
+          mergeInfo_.getNullsFirst(), mergeInfo_.getSortingOrder());
       msg.exchange_node.setSort_info(sortInfo);
       msg.exchange_node.setOffset(offset_);
     }

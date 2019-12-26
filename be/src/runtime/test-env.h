@@ -41,9 +41,18 @@ class TestEnv {
   void SetTmpFileMgrArgs(
       const std::vector<std::string>& tmp_dirs, bool one_dir_per_device);
 
+  /// Disables creation of a BufferPool instance as part of this TestEnv in Init().
+  void DisableBufferPool() { enable_buffer_pool_ = false; }
+
   /// Set configuration for BufferPool. Only has effect if called before Init().
   /// If not called, a buffer pool with no capacity is created.
   void SetBufferPoolArgs(int64_t min_buffer_len, int64_t capacity);
+
+  /// Set configuration for the process memory tracker. Only has effect if called before
+  /// Init(). If 'use_metrics' is true, the usual process memory tracker that uses
+  /// memory consumption metrics is created, otherwise no metrics are used.
+  /// If not called, a process memory tracker with no limit is created.
+  void SetProcessMemTrackerArgs(int64_t bytes_limit, bool use_metrics);
 
   /// Initialize the TestEnv with the specified arguments.
   Status Init();
@@ -79,9 +88,16 @@ class TestEnv {
   std::vector<std::string> tmp_dirs_;
   bool one_tmp_dir_per_device_;
 
+  /// Whether a buffer pool should be created in Init().
+  bool enable_buffer_pool_ = true;
+
   /// Arguments for BufferPool, used in Init().
   int64_t buffer_pool_min_buffer_len_;
   int64_t buffer_pool_capacity_;
+
+  /// Arguments for process memory tracker, used in Init().
+  int64_t process_mem_limit_ = -1;
+  bool process_mem_tracker_use_metrics_ = false;
 
   /// Global state for test environment.
   static boost::scoped_ptr<MetricGroup> static_metrics_;

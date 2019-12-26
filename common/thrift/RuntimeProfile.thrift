@@ -18,7 +18,34 @@
 namespace cpp impala
 namespace java org.apache.impala.thrift
 
+include "ExecStats.thrift"
 include "Metrics.thrift"
+include "Types.thrift"
+
+// NOTE: This file and the includes above define the format of Impala query profiles. As
+// newer versions of Impala should be able to read profiles written by older versions,
+// some best practices must be followed when making changes to the structures below:
+//
+// - Only append new values at the end of enums.
+// - Only add new fields at the end of structures, and always make them optional.
+// - Don't remove fields.
+// - Don't change the numbering of fields.
+
+// Represents the different formats a runtime profile can be represented in.
+enum TRuntimeProfileFormat {
+  // Pretty printed.
+  STRING = 0
+
+  // The thrift profile, serialized, compressed, and encoded. Used for the query log.
+  // See RuntimeProfile::SerializeToArchiveString.
+  BASE64 = 1
+
+  // TRuntimeProfileTree.
+  THRIFT = 2
+
+  // JSON profile
+  JSON = 3
+}
 
 // Counter data
 struct TCounter {
@@ -50,6 +77,12 @@ struct TTimeSeriesCounter {
 
   // The sampled values.
   4: required list<i64> values
+
+  // The index of the first value in this series (this is equal to the total number of
+  // values contained in previous updates for this counter). Values > 0 mean that this
+  // series contains an interval of a larger series. For values > 0, period_ms should be
+  // ignored, as chunked counters don't resample their values.
+  5: optional i64 start_index
 }
 
 // Thrift version of RuntimeProfile::SummaryStatsCounter.
@@ -62,13 +95,23 @@ struct TSummaryStatsCounter {
   6: required i64 max_value
 }
 
+// Metadata to help identify what entity the profile node corresponds to.
+union TRuntimeProfileNodeMetadata {
+  // Set if this node corresponds to a plan node.
+  1: Types.TPlanNodeId plan_node_id
+
+  // Set if this node corresponds to a data sink.
+  2: Types.TDataSinkId data_sink_id
+}
+
 // A single runtime profile
 struct TRuntimeProfileNode {
   1: required string name
   2: required i32 num_children
   3: required list<TCounter> counters
-  // TODO: should we make metadata a serializable struct?  We only use it to
-  // store the node id right now so this is sufficient.
+
+  // Legacy field. May contain the node ID for plan nodes.
+  // Replaced by node_metadata, which contains richer metadata.
   4: required i64 metadata
 
   // indicates whether the child will be printed with extra indentation;
@@ -93,10 +136,20 @@ struct TRuntimeProfileNode {
 
   // List of summary stats counters
   11: optional list<TSummaryStatsCounter> summary_stats_counters
+
+  // Metadata about the entity that this node refers to.
+  12: optional TRuntimeProfileNodeMetadata node_metadata
 }
 
 // A flattened tree of runtime profiles, obtained by an
 // pre-order traversal
 struct TRuntimeProfileTree {
   1: required list<TRuntimeProfileNode> nodes
+  2: optional ExecStats.TExecSummary exec_summary
+}
+
+// A list of TRuntimeProfileTree structures.
+struct TRuntimeProfileForest {
+  1: required list<TRuntimeProfileTree> profile_trees
+  2: optional TRuntimeProfileTree host_profile
 }

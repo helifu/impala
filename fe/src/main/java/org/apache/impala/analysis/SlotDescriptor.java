@@ -17,11 +17,14 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.thrift.TSlotDescriptor;
@@ -48,7 +51,7 @@ public class SlotDescriptor {
 
   // Expr(s) materialized into this slot; multiple exprs for unions. Should be empty if
   // path_ is set.
-  private List<Expr> sourceExprs_ = Lists.newArrayList();
+  private List<Expr> sourceExprs_ = new ArrayList<>();
 
   // if false, this slot doesn't need to be materialized in parent tuple
   // (and physical layout parameters are invalid)
@@ -163,6 +166,34 @@ public class SlotDescriptor {
   }
 
   /**
+   * Checks if this descriptor describes  an array "pos" pseudo-column.
+   *
+   * Note: checking whether the column is null distinguishes between top-level columns
+   * and nested types. This check more specifically looks just for a reference to the
+   * "pos" field of an array type.
+   */
+  public boolean isArrayPosRef() {
+    if (parent_ == null) return false;
+    Type parentType = parent_.getType();
+    if (parentType instanceof CollectionStructType) {
+      if (((CollectionStructType)parentType).isArrayStruct() &&
+          label_.equals(Path.ARRAY_POS_FIELD_NAME)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Returns true if this slot is of STRING type in a kudu table.
+   */
+  public boolean isKuduStringSlot() {
+    if (getParent() == null) return false;
+    if (!(getParent().getTable() instanceof FeKuduTable)) return false;
+    return getType().isStringType();
+  }
+
+  /**
    * Assembles the absolute materialized path to this slot starting from the schema
    * root. The materialized path points to the first non-struct schema element along the
    * path starting from the parent's tuple path to this slot's path.
@@ -260,12 +291,22 @@ public class SlotDescriptor {
     return result;
   }
 
+  public static String debugString(Collection<SlotDescriptor> slots) {
+    if (slots == null || slots.isEmpty()) return "";
+    List<String> strings = new ArrayList<>();
+    for (SlotDescriptor slot: slots) {
+      strings.add(slot.debugString());
+    }
+    return Joiner.on("\n").join(strings);
+  }
+
   public String debugString() {
     String pathStr = (path_ == null) ? "null" : path_.toString();
     String typeStr = (type_ == null ? "null" : type_.toString());
     return Objects.toStringHelper(this)
         .add("id", id_.asInt())
         .add("path", pathStr)
+        .add("label", label_)
         .add("type", typeStr)
         .add("materialized", isMaterialized_)
         .add("byteSize", byteSize_)
@@ -277,4 +318,7 @@ public class SlotDescriptor {
         .add("stats", stats_)
         .toString();
   }
+
+  @Override
+  public String toString() { return debugString(); }
 }

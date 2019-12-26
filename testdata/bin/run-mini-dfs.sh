@@ -18,7 +18,8 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 if [[ $# -eq 1 && "$1" == -format ]]; then
   SHOULD_FORMAT=true
@@ -37,4 +38,20 @@ if $SHOULD_FORMAT; then
   $IMPALA_HOME/testdata/cluster/admin delete_data
 fi
 
+set +e
 $IMPALA_HOME/testdata/cluster/admin start_cluster
+if [[ $? != 0 ]]; then
+  # Only issue Java version warning when running Java 7.
+  $JAVA -version 2>&1 | grep -q 'java version "1.7' || exit 1
+
+  cat << EOF
+
+Start of the minicluster failed. If the error looks similar to
+"Unsupported major.minor version 52.0", make sure you are running at least Java 8.
+Your JAVA binary currently points to $JAVA and reports the following version:
+
+EOF
+  $JAVA -version
+  echo
+  exit 1
+fi

@@ -28,6 +28,7 @@ set_source_files_properties(${RPC_TEST_PROTO_SRCS} PROPERTIES GENERATED TRUE)
 add_library(Rpc
   authentication.cc
   ${COMMON_PROTO_SRCS}
+  cookie-util.cc
   impala-service-pool.cc
   rpc-mgr.cc
   rpc-trace.cc
@@ -39,19 +40,37 @@ add_library(Rpc
 )
 add_dependencies(Rpc gen-deps)
 
-ADD_BE_TEST(thrift-util-test)
-ADD_BE_TEST(thrift-server-test)
-# The thrift-server-test uses some utilites from the Kudu security test code.
+add_library(RpcTests STATIC
+  thrift-util-test.cc
+)
+add_dependencies(RpcTests gen-deps)
+
+ADD_UNIFIED_BE_LSAN_TEST(thrift-util-test ThriftUtil.*)
+
+# Exception to unified be tests: The following tests have extra link libraries and some
+# have custom main() functions.
+
+ADD_BE_TEST(thrift-server-test) # TODO: this test leaks servers
+# The thrift-server-test uses some utilities from the Kudu security test code.
 target_link_libraries(thrift-server-test security-test-for-impala)
 
-ADD_BE_TEST(authentication-test)
+ADD_BE_TEST(kerberos-test)
+target_link_libraries(kerberos-test security-test-for-impala)
 
-ADD_BE_TEST(rpc-mgr-test)
-add_dependencies(rpc-mgr-test rpc_test_proto)
-target_link_libraries(rpc-mgr-test rpc_test_proto)
+ADD_BE_LSAN_TEST(authentication-test)
+
+ADD_BE_TEST(rpc-mgr-test) # TODO: this test leaks various KRPC things
+add_dependencies(rpc-mgr-test rpc_test_proto_tgt)
+target_link_libraries(rpc-mgr-test rpc_test_proto_tgt)
 target_link_libraries(rpc-mgr-test security-test-for-impala)
 target_link_libraries(rpc-mgr-test ${KRB5_REALM_OVERRIDE})
 
-add_library(rpc_test_proto ${RPC_TEST_PROTO_SRCS})
-add_dependencies(rpc_test_proto rpc_test_proto_tgt krpc)
-target_link_libraries(rpc_test_proto krpc)
+ADD_BE_TEST(rpc-mgr-kerberized-test) # TODO: this test leaks various KRPC things
+add_dependencies(rpc-mgr-kerberized-test rpc_test_proto_tgt)
+target_link_libraries(rpc-mgr-kerberized-test rpc_test_proto_tgt)
+target_link_libraries(rpc-mgr-kerberized-test security-test-for-impala)
+target_link_libraries(rpc-mgr-kerberized-test ${KRB5_REALM_OVERRIDE})
+
+add_library(rpc_test_proto_tgt ${RPC_TEST_PROTO_SRCS})
+add_dependencies(rpc_test_proto_tgt rpc_test_proto krpc)
+target_link_libraries(rpc_test_proto_tgt krpc)

@@ -28,11 +28,16 @@ class PrettyOutputFormatter(object):
     self.prettytable = prettytable
 
   def format(self, rows):
+    """Returns string containing UTF-8-encoded representation of the table data."""
     # Clear rows that already exist in the table.
     self.prettytable.clear_rows()
     try:
       map(self.prettytable.add_row, rows)
-      return self.prettytable.get_string()
+      # PrettyTable.get_string() converts UTF-8-encoded strs added via add_row() into
+      # Python unicode strings. We need to convert it back to a UTF-8-encoded str for
+      # output, since Python won't do the encoding automatically when outputting to a
+      # non-terminal (see IMPALA-2717).
+      return self.prettytable.get_string().encode('utf-8')
     except Exception, e:
       # beeswax returns each row as a tab separated string. If a string column
       # value in a row has tabs, it will break the row split. Default to displaying
@@ -47,12 +52,11 @@ class DelimitedOutputFormatter(object):
   def __init__(self, field_delim="\t"):
     if field_delim:
       self.field_delim = field_delim.decode('string-escape')
-      if len(self.field_delim) != 1:
-        error_msg = ("Illegal delimiter %s, the delimiter "
-                     "must be a 1-character string." % self.field_delim)
-        raise ValueError, error_msg
+      # IMPALA-8652, the delimiter should be a 1-character string and verified already
+      assert len(self.field_delim) == 1
 
   def format(self, rows):
+    """Returns string containing UTF-8-encoded representation of the table data."""
     # csv.writer expects a file handle to the input.
     # cStringIO is used as the temporary buffer.
     temp_buffer = StringIO()

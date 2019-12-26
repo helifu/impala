@@ -19,8 +19,6 @@ cmake_minimum_required(VERSION 3.2.3)
 
 # This is a Kudu-specific flag that disables Kudu targets that are test-only.
 set(NO_TESTS 1)
-# Kudu-specific, disable NVM support so that libvmem is not a dependency.
-set(NO_NVM_SUPPORT 1)
 
 # Explicitly define project() to allow modifying the compiler before the project is
 # initialized.
@@ -31,6 +29,9 @@ include(cmake_modules/kudu_cmake_fns.txt)
 if (NOT DEFINED BUILD_SHARED_LIBS)
   set(BUILD_SHARED_LIBS OFF)
 endif()
+
+# Store BUILD_SHARED_LIBS in a variable so it can be read in config.h.in
+set(IMPALA_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
 
 # Build compile commands database
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -49,8 +50,14 @@ endif(NOT CMAKE_BUILD_TYPE)
 STRING (TOUPPER ${CMAKE_BUILD_TYPE} CMAKE_BUILD_TYPE)
 
 message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
-# Write the build type to a file so that tests can determine the current build type.
-file(WRITE "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${CMAKE_BUILD_TYPE})
+
+# Write build flags to a file so that they can be read by tests
+file(WRITE "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${CMAKE_BUILD_TYPE}\n)
+file(APPEND "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${BUILD_SHARED_LIBS}\n)
+
+# Store CMAKE_BUILD_TYPE in a variable so it can be read in config.h.in
+string(REPLACE "_" "-" ESCAPED_CMAKE_BUILD_TYPE ${CMAKE_BUILD_TYPE})
+set(IMPALA_CMAKE_BUILD_TYPE ${ESCAPED_CMAKE_BUILD_TYPE})
 
 set(ENABLE_CODE_COVERAGE false)
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "CODE_COVERAGE_DEBUG")
@@ -62,6 +69,13 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "CODE_COVERAGE_RELEASE")
 endif()
 
 message(STATUS "ENABLE_CODE_COVERAGE: ${ENABLE_CODE_COVERAGE}")
+
+if (ENABLE_CODE_COVERAGE
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN")
+  set (SLOW_BUILD true)
+endif()
 
 # Helper function that given a package name constructs the package_ROOT variable based on
 # the version number extracted from the environment
@@ -76,6 +90,7 @@ endfunction()
 # set_dep_root(PACKAGE) ->
 #   PACKAGE_ROOT set to $ENV{IMPALA_TOOLCHAIN}/PACKAGE-$ENV{IMPALA_PACKAGE_VERSION}
 set_dep_root(AVRO)
+set_dep_root(ORC)
 set_dep_root(BOOST)
 set_dep_root(BREAKPAD)
 set_dep_root(BZIP2)
@@ -87,16 +102,20 @@ set_dep_root(GLOG)
 set_dep_root(GPERFTOOLS)
 set_dep_root(GTEST)
 set_dep_root(LIBEV)
+set_dep_root(LIBUNWIND)
 set_dep_root(LLVM)
 set(LLVM_DEBUG_ROOT $ENV{IMPALA_TOOLCHAIN}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION})
 set_dep_root(LZ4)
+set_dep_root(ZSTD)
 set_dep_root(OPENLDAP)
 set_dep_root(PROTOBUF)
 set_dep_root(RE2)
 set_dep_root(RAPIDJSON)
 set_dep_root(SNAPPY)
 set_dep_root(THRIFT)
+set(THRIFT11_ROOT $ENV{IMPALA_TOOLCHAIN}/thrift-$ENV{IMPALA_THRIFT11_VERSION})
 set_dep_root(ZLIB)
+set_dep_root(CCTZ)
 
 # The boost-cmake project hasn't been maintained for years. Let's make sure we
 # don't accidentally use it if it can be found.
@@ -145,7 +164,7 @@ function(IMPALA_ADD_THIRDPARTY_LIB NAME HEADER STATIC_LIB SHARED_LIB)
 endfunction()
 
 
-find_package(Boost REQUIRED COMPONENTS thread regex filesystem system date_time)
+find_package(Boost REQUIRED COMPONENTS thread regex filesystem system date_time random)
 # Mark Boost as a system header to avoid compile warnings.
 include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIRS})
@@ -155,7 +174,7 @@ message(STATUS "Boost libraries: " ${Boost_LIBRARIES})
 # platform that this build might ultimately be deployed on. If no suitable OpenSSL is
 # found, use the toolchain version - but beware that Impala will then fail to start if
 # deployed on a system with a lower version.
-find_package(OpenSSL 1.0.0 QUIET)
+find_package(OpenSSL 1.0.1 QUIET)
 if (NOT ${OPENSSL_FOUND})
   set_dep_root(OPENSSL)
   set(OPENSSL_FOUND ON)
@@ -212,6 +231,7 @@ if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
   # Use the LLVM libaries with assertions for debug builds.
   set(LLVM_ROOT ${LLVM_DEBUG_ROOT})
@@ -245,6 +265,12 @@ message(STATUS "Thrift version: ${THRIFT_VERSION}")
 message(STATUS "Thrift contrib dir: ${THRIFT_CONTRIB_DIR}")
 message(STATUS "Thrift compiler: ${THRIFT_COMPILER}")
 
+if (NOT EXISTS ${THRIFT11_ROOT}/bin/thrift)
+  message(FATAL_ERROR "Unable to find Thrift 11 compiler")
+endif(NOT EXISTS ${THRIFT11_ROOT}/bin/thrift)
+
+set(THRIFT11_COMPILER ${THRIFT11_ROOT}/bin/thrift)
+
 # find flatbuffers headers, lib and compiler
 find_package(FlatBuffers REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(flatbuffers ${FLATBUFFERS_INCLUDE_DIR}
@@ -259,6 +285,10 @@ IMPALA_ADD_THIRDPARTY_LIB(snappy ${SNAPPY_INCLUDE_DIR} ${SNAPPY_STATIC_LIB} "")
 find_package(Lz4 REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(lz4 ${LZ4_INCLUDE_DIR} ${LZ4_STATIC_LIB} "")
 
+# find zstd lib
+find_package(Zstd REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(zstd ${ZSTD_INCLUDE_DIR} ${ZSTD_STATIC_LIB} "")
+
 # find re2 headers and libs
 find_package(Re2 REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(re2 ${RE2_INCLUDE_DIR} ${RE2_STATIC_LIB} "")
@@ -271,6 +301,14 @@ message(STATUS "RapidJson include dir: " ${RAPIDJSON_INCLUDE_DIR})
 # find Avro headers and libs
 find_package(Avro REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(avro ${AVRO_INCLUDE_DIR} ${AVRO_STATIC_LIB} "")
+
+# find ORC headers and libs
+find_package(Orc REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(orc ${ORC_INCLUDE_DIR} ${ORC_STATIC_LIB} "")
+
+# find CCTZ headers and libs
+find_package(Cctz REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(cctz ${CCTZ_INCLUDE_DIR} ${CCTZ_STATIC_LIB} "")
 
 # find protobuf headers, libs and compiler
 find_package(Protobuf REQUIRED)
@@ -333,6 +371,14 @@ endif()
 
 ###################################################################
 
+## libunwind
+if (NOT APPLE)
+  find_package(LibUnwind REQUIRED)
+  include_directories(SYSTEM ${LIBUNWIND_INCLUDE_DIR})
+  IMPALA_ADD_THIRDPARTY_LIB(libunwind ${LIBUNWIND_INCLUDE_DIR} ${LIBUNWIND_STATIC_LIB}
+    ${LIBUNWIND_SHARED_LIB})
+endif()
+
 # Required for KRPC_GENERATE, which converts protobuf to stubs.
 find_package(KRPC REQUIRED)
 
@@ -341,11 +387,10 @@ add_definitions(-DKUDU_HEADERS_USE_GLOG)
 if(NOT $ENV{KUDU_CLIENT_DIR} EQUAL "")
   set(kuduClient_DIR "$ENV{KUDU_CLIENT_DIR}/usr/local/share/kuduClient/cmake")
 else()
-  set(kuduClient_DIR "$ENV{IMPALA_TOOLCHAIN}/kudu-$ENV{IMPALA_KUDU_VERSION}")
   if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
-    set(kuduClient_DIR "${kuduClient_DIR}/debug/share/kuduClient/cmake")
+    set(kuduClient_DIR "$ENV{IMPALA_KUDU_HOME}/debug/share/kuduClient/cmake")
   else()
-    set(kuduClient_DIR "${kuduClient_DIR}/release/share/kuduClient/cmake")
+    set(kuduClient_DIR "$ENV{IMPALA_KUDU_HOME}/release/share/kuduClient/cmake")
   endif()
 endif()
 # When KUDU_IS_SUPPORTED is false, the Kudu client is expected to be a non-functional
@@ -360,17 +405,24 @@ add_subdirectory(common/fbs)
 add_subdirectory(common/yarn-extras)
 add_subdirectory(common/protobuf)
 add_subdirectory(be)
+add_subdirectory(docker)
+add_subdirectory(shaded-deps)
 add_subdirectory(fe)
 add_subdirectory(impala-parent)
 add_subdirectory(ext-data-source)
+add_subdirectory(query-event-hook-api)
 
 # Build target for all generated files which most backend code depends on
-add_custom_target(gen-deps ALL DEPENDS thrift-deps proto-deps)
+add_custom_target(gen-deps ALL DEPENDS thrift-deps proto-deps fb-deps)
 
 add_custom_target(tarballs ALL DEPENDS shell_tarball)
 
 add_custom_target(shell_tarball DEPENDS gen-deps
   COMMAND "${CMAKE_SOURCE_DIR}/shell/make_shell_tarball.sh"
+)
+
+add_custom_target(shell_pypi_package DEPENDS shell_tarball
+  COMMAND "DIST_DIR=${CMAKE_SOURCE_DIR}/shell/dist CLEAN_DIST=true ${CMAKE_SOURCE_DIR}/shell/packaging/make_python_package.sh"
 )
 
 add_custom_target(cscope ALL DEPENDS gen-deps

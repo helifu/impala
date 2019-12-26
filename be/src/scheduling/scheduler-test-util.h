@@ -26,11 +26,14 @@
 
 #include "common/status.h"
 #include "gen-cpp/ImpalaInternalService.h" // for TQueryOptions
+#include "scheduling/cluster-membership-mgr.h"
+#include "scheduling/scheduler.h"
 #include "scheduling/query-schedule.h"
 #include "util/metrics.h"
 
 namespace impala {
 
+class ClusterMembershipMgr;
 class Scheduler;
 class TTopicDelta;
 
@@ -84,6 +87,24 @@ enum class ReplicaPlacement {
   REMOTE_ONLY,
 };
 
+/// Blocks and FileSplitGeneratorSpecs mimic real files, and for some parts of scheduling
+/// (e.g. consistent remote scheduling) the actual file names and partition paths matter.
+/// When defining a table, you can specify a block naming policy to control this.
+///  - UNPARTITIONED means that the partition paths and partition ids are constant, but
+///    the file names are unique.
+///  - PARTITIONED_SINGLE_FILENAME means that the partition paths and partition ids are
+///    unique, but the file name inside the partition is a single constant.
+///  - PARTITIONED_UNIQUE_FILENAMES means that the partition paths, partition ids, and
+///    the file names inside the partition.
+/// These policies are mostly irrelevent for single block tables or tables with local
+/// scheduling, so the default policy is UNPARTITIONED.
+enum class BlockNamingPolicy {
+  UNPARTITIONED,
+  PARTITIONED_SINGLE_FILENAME,
+  PARTITIONED_UNIQUE_FILENAMES,
+};
+std::ostream& operator<<(std::ostream& os, const BlockNamingPolicy& naming_policy);
+
 /// Host model. Each host can have either a backend, a datanode, or both. To specify that
 /// a host should not act as a backend or datanode specify '-1' as the respective port.
 /// A host with a backend is always a coordinator but it may not be an executor.
@@ -113,14 +134,18 @@ class Cluster {
   void AddHosts(int num_hosts, bool has_backend, bool has_datanode,
       bool is_executor = true);
 
-  /// Convert a host index to a hostname.
-  static Hostname HostIdxToHostname(int host_idx);
-
   /// Return the backend address (ip, port) for the host with index 'host_idx'.
   void GetBackendAddress(int host_idx, TNetworkAddress* addr) const;
 
   const std::vector<Host>& hosts() const { return hosts_; }
   int NumHosts() const { return hosts_.size(); }
+
+  /// Helper function to create a cluster with Impala nodes separate from the datanodes.
+  /// This is primarily used for consistent remote scheduling tests. This places
+  /// the impalad nodes first, then the data nodes. Impalad nodes will have indices
+  /// in the range [0, num_impala_nodes-1] and data nodes will have indices in the
+  /// range [num_impala_nodes, num_impala_nodes+num_data_nodes-1].
+  static Cluster CreateRemoteCluster(int num_impala_nodes, int num_data_nodes);
 
   /// These methods return lists of host indexes, grouped by their type, which can be used
   /// to draw samples of random sets of hosts.
@@ -160,10 +185,6 @@ class Cluster {
 
   /// Map from IP addresses to host indexes.
   std::unordered_map<IpAddr, int> ip_to_idx_;
-
-  /// Convert a host index to an IP address. The host index must be smaller than 2^24 and
-  /// will specify the lower 24 bits of the IPv4 address (the lower 3 octets).
-  static IpAddr HostIdxToIpAddr(int host_idx);
 };
 
 struct Block {
@@ -180,13 +201,42 @@ struct Block {
   static const int64_t DEFAULT_BLOCK_SIZE;
 };
 
+struct FileSplitGeneratorSpec {
+  FileSplitGeneratorSpec() {}
+  FileSplitGeneratorSpec(int64_t length, int64_t block, bool splittable)
+    : length(length), block_size(block), is_splittable(splittable) {}
+
+  /// Length of file for which to generate file splits.
+  int64_t length = DEFAULT_FILE_SIZE;
+
+  /// Size of each split.
+  int64_t block_size = DEFAULT_BLOCK_SIZE;
+
+  bool is_splittable = true;
+
+  static const int64_t DEFAULT_FILE_SIZE;
+  static const int64_t DEFAULT_BLOCK_SIZE;
+};
+
+/// A table models multiple files. Each file can be represented explicitly with a Block
+/// or with a FileSplitGeneratorSpecs. A table can consist of files with both
+/// representations. The table can specify a BlockNamingPolicy, which tailors the
+/// file name and path for scan ranges to simulate partitioned vs unpartitioned tables.
+/// Consistent remote scheduling depends on the file paths, but the file names do not
+/// impact other aspects of scheduling.
 struct Table {
+  BlockNamingPolicy naming_policy = BlockNamingPolicy::UNPARTITIONED;
   std::vector<Block> blocks;
+  std::vector<FileSplitGeneratorSpec> specs;
 };
 
 class Schema {
  public:
   Schema(const Cluster& cluster) : cluster_(cluster) {}
+
+  /// Add a table with no blocks. This is useful for tables with a custom naming
+  /// policy that later add FileSplitGeneratorSpecs.
+  void AddEmptyTable(const TableName& table_name, BlockNamingPolicy naming_policy);
 
   /// Add a table consisting of a single block to the schema with explicitly specified
   /// replica indexes for non-cached replicas and without any cached replicas. Replica
@@ -209,9 +259,21 @@ class Schema {
 
   /// Add a table to the schema, selecting replica hosts according to the given replica
   /// placement preference. After replica selection has been done, 'num_cached_replicas'
-  /// of them are marked as cached.
+  /// of them are marked as cached. The table uses the specified 'naming_policy' for
+  /// its blocks.
   void AddMultiBlockTable(const TableName& table_name, int num_blocks,
-      ReplicaPlacement replica_placement, int num_replicas, int num_cached_replicas);
+      ReplicaPlacement replica_placement, int num_replicas, int num_cached_replicas,
+      BlockNamingPolicy naming_policy);
+
+  /// Adds FileSplitGeneratorSpecs to table named 'table_name'. If the table does not
+  /// exist, creates a new table. Otherwise, adds the 'specs' to an existing table.
+  void AddFileSplitGeneratorSpecs(
+      const TableName& table_name, const std::vector<FileSplitGeneratorSpec>& specs);
+
+  /// Adds 'num' default FileSplitGeneratorSpecs to table named 'table_name'. If the table
+  /// does not exist, creates a new table. Otherwise, adds the 'specs' to an existing
+  /// table.
+  void AddFileSplitGeneratorDefaultSpecs(const TableName& table_name, int num);
 
   const Table& GetTable(const TableName& table_name) const;
 
@@ -236,16 +298,16 @@ class Plan {
   void SetReplicaPreference(TReplicaPreference::type p);
 
   void SetRandomReplica(bool b) { query_options_.schedule_random_replica = b; }
-  void SetDisableCachedReads(bool b) { query_options_.disable_cached_reads = b; }
+  void SetNumRemoteExecutorCandidates(int32_t num);
   const Cluster& cluster() const { return schema_.cluster(); }
 
   const std::vector<TNetworkAddress>& referenced_datanodes() const;
 
-  const std::vector<TScanRangeLocationList>& scan_range_locations() const;
+  const TScanRangeSpec& scan_range_specs() const;
 
   /// Add a scan of table 'table_name' to the plan. This method will populate the internal
-  /// list of TScanRangeLocationList and can be called multiple times for the same table
-  /// to schedule additional scans.
+  /// TScanRangeSpecs and can be called multiple times for the same table to schedule
+  /// additional scans.
   void AddTableScan(const TableName& table_name);
 
  private:
@@ -261,15 +323,29 @@ class Plan {
   /// Map from plan host index to an index in 'referenced_datanodes_'.
   std::unordered_map<int, int> host_idx_to_datanode_idx_;
 
-  /// List of all scan range locations, which can be passed to the Scheduler.
-  std::vector<TScanRangeLocationList> scan_range_locations_;
+  /// Scan range specs that are scheduled by the Scheduler.
+  TScanRangeSpec scan_range_specs_;
 
   /// Initialize a TScanRangeLocationList object in place.
   void BuildTScanRangeLocationList(const TableName& table_name, const Block& block,
-      int block_idx, TScanRangeLocationList* scan_range_locations);
+      int block_idx, BlockNamingPolicy naming_policy,
+      TScanRangeLocationList* scan_range_locations);
 
-  void BuildScanRange(const TableName& table_name, const Block& block, int block_idx,
-      TScanRange* scan_range);
+  /// Builds appropriate paths for a Block given the table name and block naming
+  /// policy.
+  void GetBlockPaths(const TableName& table_name, bool is_spec, int index,
+      BlockNamingPolicy naming_policy, string* relative_path, int64_t* partition_id,
+      string* partition_path);
+
+  /// Initializes a scan range for a Block.
+  void BuildScanRange(
+      const TableName& table_name, const Block& block, int block_idx,
+      BlockNamingPolicy naming_policy, TScanRange* range);
+
+  /// Initializes a scan range for a FileSplitGeneratorSpec.
+  void BuildScanRangeSpec(const TableName& table_name, const FileSplitGeneratorSpec& spec,
+      int spec_idx, BlockNamingPolicy naming_policy,
+      TFileSplitGeneratorSpec* thrift_spec);
 
   /// Look up the plan-local host index of 'cluster_datanode_idx'. If the host has not
   /// been added to the plan before, it will add it to 'referenced_datanodes_' and return
@@ -456,6 +532,7 @@ class SchedulerWrapper {
 
  private:
   const Plan& plan_;
+  boost::scoped_ptr<ClusterMembershipMgr> cluster_membership_mgr_;
   boost::scoped_ptr<Scheduler> scheduler_;
   MetricGroup metrics_;
 

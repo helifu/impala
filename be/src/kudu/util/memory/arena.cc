@@ -20,17 +20,10 @@
 #include "kudu/util/memory/arena.h"
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 
-#include "kudu/util/debug-util.h"
-#include "kudu/util/flag_tags.h"
-
-using std::copy;
-using std::max;
 using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 using std::unique_ptr;
 
 namespace kudu {
@@ -38,23 +31,36 @@ namespace kudu {
 template <bool THREADSAFE>
 const size_t ArenaBase<THREADSAFE>::kMinimumChunkSize = 16;
 
+// The max size of our allocations is set to this magic number
+// corresponding to 127 tcmalloc pages (each being 8KB). tcmalloc
+// internally keeps a free-list of spans up to this size. Larger
+// allocations have to go through a linear search through free
+// space, which can get quite slow in a fragmented heap.
+//
+// See the definition of kMaxPages in tcmalloc/src/common.h
+// as well as https://github.com/gperftools/gperftools/issues/535
+// for a description of the performance issue.
+constexpr int kMaxTcmallocFastAllocation = 8192 * 127;
+
 template <bool THREADSAFE>
-ArenaBase<THREADSAFE>::ArenaBase(
-  BufferAllocator* const buffer_allocator,
-  size_t initial_buffer_size,
-  size_t max_buffer_size)
+ArenaBase<THREADSAFE>::ArenaBase(BufferAllocator* buffer_allocator,
+                                 size_t initial_buffer_size)
     : buffer_allocator_(buffer_allocator),
-      max_buffer_size_(max_buffer_size),
+      max_buffer_size_(kMaxTcmallocFastAllocation),
       arena_footprint_(0) {
   AddComponent(CHECK_NOTNULL(NewComponent(initial_buffer_size, 0)));
 }
 
 template <bool THREADSAFE>
-ArenaBase<THREADSAFE>::ArenaBase(size_t initial_buffer_size, size_t max_buffer_size)
-    : buffer_allocator_(HeapBufferAllocator::Get()),
-      max_buffer_size_(max_buffer_size),
-      arena_footprint_(0) {
-  AddComponent(CHECK_NOTNULL(NewComponent(initial_buffer_size, 0)));
+ArenaBase<THREADSAFE>::ArenaBase(size_t initial_buffer_size)
+    : ArenaBase<THREADSAFE>(HeapBufferAllocator::Get(),
+                            initial_buffer_size) {
+}
+
+template <bool THREADSAFE>
+void ArenaBase<THREADSAFE>::SetMaxBufferSize(size_t size) {
+  DCHECK_LE(size, kMaxTcmallocFastAllocation);
+  max_buffer_size_ = size;
 }
 
 template <bool THREADSAFE>

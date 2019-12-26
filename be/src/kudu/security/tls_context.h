@@ -17,23 +17,26 @@
 
 #pragma once
 
-#include <functional>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "kudu/security/cert.h"
+#include "kudu/gutil/port.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_handshake.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
+// IWYU pragma: no_include "kudu/security/cert.h"
 
 namespace kudu {
 namespace security {
 
-class Cert;
+class Cert;           // IWYU pragma: keep
+class CertSignRequest;// IWYU pragma: keep
 class PrivateKey;
 
 // TlsContext wraps data required by the OpenSSL library for creating and

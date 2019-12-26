@@ -17,45 +17,34 @@
 
 package org.apache.impala.catalog;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import javax.xml.bind.DatatypeConverter;
-
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.KuduPartitionParam;
 import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.service.BackendConfig;
-import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.TCatalogObjectType;
-import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TKuduPartitionByHashParam;
 import org.apache.impala.thrift.TKuduPartitionByRangeParam;
 import org.apache.impala.thrift.TKuduPartitionParam;
 import org.apache.impala.thrift.TKuduTable;
-import org.apache.impala.thrift.TResultSet;
-import org.apache.impala.thrift.TResultSetMetadata;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
 import org.apache.impala.util.KuduUtil;
-import org.apache.impala.util.TResultRowBuilder;
 import org.apache.kudu.ColumnSchema;
-import org.apache.kudu.Schema;
+import org.apache.kudu.client.HiveMetastoreConfig;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduException;
-import org.apache.kudu.client.LocatedTablet;
-import org.apache.kudu.client.PartitionSchema;
-import org.apache.kudu.client.PartitionSchema.HashBucketSchema;
-import org.apache.kudu.client.PartitionSchema.RangeSchema;
-import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
 import com.codahale.metrics.Timer;
@@ -67,7 +56,7 @@ import com.google.common.collect.Lists;
 /**
  * Representation of a Kudu table in the catalog cache.
  */
-public class KuduTable extends Table {
+public class KuduTable extends Table implements FeKuduTable {
 
   // Alias to the string key that identifies the storage handler for Kudu tables.
   public static final String KEY_STORAGE_HANDLER =
@@ -75,6 +64,9 @@ public class KuduTable extends Table {
 
   // Key to access the table name from the table properties.
   public static final String KEY_TABLE_NAME = "kudu.table_name";
+
+  // Key to access the table ID from the table properties.
+  public static final String KEY_TABLE_ID = "kudu.table_id";
 
   // Key to access the columns used to build the (composite) key of the table.
   // Deprecated - Used only for error checking.
@@ -86,11 +78,15 @@ public class KuduTable extends Table {
   // with older versions.
   public static final String KEY_MASTER_HOSTS = "kudu.master_addresses";
 
+  // Kudu specific value for the legacy storage handler table property keyed by
+  // KEY_STORAGE_HANDLER. This is expected to be deprecated eventually.
+  public static final String KUDU_LEGACY_STORAGE_HANDLER =
+      "com.cloudera.kudu.hive.KuduStorageHandler";
+
   // Kudu specific value for the storage handler table property keyed by
   // KEY_STORAGE_HANDLER.
-  // TODO: Fix the storage handler name (see IMPALA-4271).
   public static final String KUDU_STORAGE_HANDLER =
-      "com.cloudera.kudu.hive.KuduStorageHandler";
+      "org.apache.hadoop.hive.kudu.KuduStorageHandler";
 
   // Key to specify the number of tablet replicas.
   public static final String KEY_TABLET_REPLICAS = "kudu.num_tablet_replicas";
@@ -107,12 +103,12 @@ public class KuduTable extends Table {
   // Comma separated list of Kudu master hosts with optional ports.
   private String kuduMasters_;
 
-  // Primary key column names.
-  private final List<String> primaryKeyColumnNames_ = Lists.newArrayList();
+  // Primary key column names, the column names are all in lower case.
+  private final List<String> primaryKeyColumnNames_ = new ArrayList<>();
 
   // Partitioning schemes of this Kudu table. Both range and hash-based partitioning are
   // supported.
-  private final List<KuduPartitionParam> partitionBy_ = Lists.newArrayList();
+  private List<KuduPartitionParam> partitionBy_;
 
   // Schema of the underlying Kudu table.
   private org.apache.kudu.Schema kuduSchema_;
@@ -122,6 +118,40 @@ public class KuduTable extends Table {
     super(msTable, db, name, owner);
     kuduTableName_ = msTable.getParameters().get(KuduTable.KEY_TABLE_NAME);
     kuduMasters_ = msTable.getParameters().get(KuduTable.KEY_MASTER_HOSTS);
+  }
+
+  /**
+   * A synchronized Kudu table is a table where operations like (drop, rename)
+   * on the table are pushed down to Kudu along with HMS. This method returns
+   * true if given metastore table is a synchronized Kudu table. For older HMS
+   * versions (HMS 2 and below) this is just checking if the table is managed or not.
+   * However, since HIVE-22158 this also checks if the external table has
+   * <code>external.table.purge</code> property set to true. After HIVE-22158 HMS
+   * transforms a managed table into external table if it is not transactional and sets
+   * <code>external.table.purge</code> to true to indicate that table data will be
+   * dropped when it is dropped. From the perspective of
+   * Impala, if a Kudu table has <code>external.table.purge</code> set to true and it
+   * is an external HMS table, it should treat it like a managed table so the user facing
+   * behavior is not changed when compared to previous versions of HMS.
+   *
+   * A table is synchronized table if its Managed table or if its a external table with
+   * <code>external.table.purge</code> property set to true.
+   */
+  public static boolean isSynchronizedTable(
+      org.apache.hadoop.hive.metastore.api.Table msTbl) {
+    Preconditions.checkState(isKuduTable(msTbl));
+    // HIVE-22158: A translated table can have external purge property set to true
+    // in such case we sync operations in Impala and Kudu
+    // it is possible that in older versions of HMS a managed Kudu table is present
+    return isManagedTable(msTbl) || isExternalPurgeTable(msTbl);
+  }
+
+  /**
+   * Returns if this metastore table has managed table type
+   */
+  private static boolean isManagedTable(
+      org.apache.hadoop.hive.metastore.api.Table msTbl) {
+    return msTbl.getTableType().equalsIgnoreCase(TableType.MANAGED_TABLE.toString());
   }
 
   @Override
@@ -134,52 +164,112 @@ public class KuduTable extends Table {
    * Returns the columns in the order they have been created
    */
   @Override
-  public ArrayList<Column> getColumnsInHiveOrder() { return getColumns(); }
+  public List<Column> getColumnsInHiveOrder() { return getColumns(); }
 
-  public static boolean isKuduTable(org.apache.hadoop.hive.metastore.api.Table msTbl) {
-    return KUDU_STORAGE_HANDLER.equals(msTbl.getParameters().get(KEY_STORAGE_HANDLER));
+  public static boolean isKuduStorageHandler(String handler) {
+    return handler != null && (handler.equals(KUDU_LEGACY_STORAGE_HANDLER) ||
+                               handler.equals(KUDU_STORAGE_HANDLER));
   }
 
+  public static boolean isKuduTable(org.apache.hadoop.hive.metastore.api.Table msTbl) {
+    return isKuduStorageHandler(msTbl.getParameters().get(KEY_STORAGE_HANDLER));
+  }
+
+  @Override
   public String getKuduTableName() { return kuduTableName_; }
+  @Override
   public String getKuduMasterHosts() { return kuduMasters_; }
+
   public org.apache.kudu.Schema getKuduSchema() { return kuduSchema_; }
 
+  @Override
   public List<String> getPrimaryKeyColumnNames() {
     return ImmutableList.copyOf(primaryKeyColumnNames_);
   }
 
+  @Override
   public List<KuduPartitionParam> getPartitionBy() {
+    Preconditions.checkState(partitionBy_ != null);
     return ImmutableList.copyOf(partitionBy_);
   }
 
-  public Set<String> getPartitionColumnNames() {
-    Set<String> ret = new HashSet<String>();
-    for (KuduPartitionParam partitionParam : partitionBy_) {
-      ret.addAll(partitionParam.getColumnNames());
+  /**
+   * Get the Hive Metastore configuration from Kudu masters.
+   */
+  private static HiveMetastoreConfig getHiveMetastoreConfig(String kuduMasters)
+      throws ImpalaRuntimeException {
+    Preconditions.checkNotNull(kuduMasters);
+    Preconditions.checkArgument(!kuduMasters.isEmpty());
+    KuduClient kuduClient = KuduUtil.getKuduClient(kuduMasters);
+    HiveMetastoreConfig hmsConfig;
+    try {
+      hmsConfig = kuduClient.getHiveMetastoreConfig();
+    } catch (KuduException e) {
+      throw new ImpalaRuntimeException(
+          String.format("Error determining if Kudu's integration with " +
+              "the Hive Metastore is enabled: %s", e.getMessage()));
     }
-    return ret;
+    return hmsConfig;
   }
 
   /**
-   * Returns the range-based partitioning of this table if it exists, null otherwise.
+   * Check with Kudu master to see if Kudu's integration with the Hive Metastore
+   * is enabled.
    */
-  private KuduPartitionParam getRangePartitioning() {
-    for (KuduPartitionParam partitionParam: partitionBy_) {
-      if (partitionParam.getType() == KuduPartitionParam.Type.RANGE) {
-        return partitionParam;
-      }
-    }
-    return null;
+  public static boolean isHMSIntegrationEnabled(String kuduMasters)
+      throws ImpalaRuntimeException {
+    return getHiveMetastoreConfig(kuduMasters) != null;
   }
 
   /**
-   * Returns the column names of the table's range-based partitioning or an empty
-   * list if the table doesn't have a range-based partitioning.
+   * Check with the Kudu master to see if its Kudu-HMS integration is enabled;
+   * if so, validate that it is integrated with the same Hive Metastore that
+   * Impala is configured to use.
    */
-  public List<String> getRangePartitioningColNames() {
-    KuduPartitionParam rangePartitioning = getRangePartitioning();
-    if (rangePartitioning == null) return Collections.<String>emptyList();
-    return rangePartitioning.getColumnNames();
+  public static boolean isHMSIntegrationEnabledAndValidate(String kuduMasters,
+      String hmsUris) throws ImpalaRuntimeException {
+    Preconditions.checkNotNull(hmsUris);
+    Preconditions.checkArgument(!hmsUris.isEmpty());
+    HiveMetastoreConfig hmsConfig = getHiveMetastoreConfig(kuduMasters);
+    if (hmsConfig == null) {
+      return false;
+    }
+    // Validate Kudu is configured to use the same HMS as Impala. We consider
+    // it is the case as long as Kudu and Impala are configured to talk to
+    // the HMS with the same host address(es).
+    final String kuduHmsUris = hmsConfig.getHiveMetastoreUris();
+    Set<String> hmsHosts;
+    Set<String> kuduHmsHosts;
+    try {
+      hmsHosts = parseHosts(hmsUris);
+      kuduHmsHosts = parseHosts(kuduHmsUris);
+    } catch (URISyntaxException e) {
+      throw new ImpalaRuntimeException(
+          String.format("Error parsing URI: %s", e.getMessage()));
+    }
+    if (hmsHosts != null && kuduHmsHosts != null && hmsHosts.equals(kuduHmsHosts)) {
+      return true;
+    }
+    throw new ImpalaRuntimeException(
+       String.format("Kudu is integrated with a different Hive Metastore " +
+           "than that used by Impala, Kudu is configured to use the HMS: " +
+           "%s, while Impala is configured to use the HMS: %s",
+           kuduHmsUris, hmsUris));
+  }
+
+  /**
+   * Parse the given URIs and return a set of hosts in the URIs.
+   */
+  private static Set<String> parseHosts(String uris) throws URISyntaxException {
+    String[] urisString = uris.split(",");
+    Set<String> parsedHosts = new HashSet<>();
+
+    for (String s : urisString) {
+      s.trim();
+      URI tmpUri = new URI(s);
+      parsedHosts.add(tmpUri.getHost());
+    }
+    return parsedHosts;
   }
 
   /**
@@ -203,7 +293,8 @@ public class KuduTable extends Table {
     Preconditions.checkNotNull(kuduTable);
 
     loadSchema(kuduTable);
-    loadPartitionByParams(kuduTable);
+    Preconditions.checkState(!colsByPos_.isEmpty());
+    partitionBy_ = Utils.loadPartitionByParams(kuduTable);
   }
 
   /**
@@ -215,29 +306,43 @@ public class KuduTable extends Table {
    */
   @Override
   public void load(boolean dummy /* not used */, IMetaStoreClient msClient,
-      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
+      throws TableLoadingException {
     final Timer.Context context =
         getMetrics().getTimer(Table.LOAD_DURATION_METRIC).time();
     try {
-      msTable_ = msTbl;
+      // Copy the table to check later if anything has changed.
+      msTable_ = msTbl.deepCopy();
       kuduTableName_ = msTable_.getParameters().get(KuduTable.KEY_TABLE_NAME);
-      Preconditions.checkNotNull(kuduTableName_);
       kuduMasters_ = msTable_.getParameters().get(KuduTable.KEY_MASTER_HOSTS);
-      Preconditions.checkNotNull(kuduMasters_);
+      if (kuduMasters_ == null || kuduMasters_.isEmpty()) {
+        throw new TableLoadingException("No " + KuduTable.KEY_MASTER_HOSTS +
+            " property found for Kudu table " + kuduTableName_);
+      }
       setTableStats(msTable_);
-      // Load metadata from Kudu and HMS
+      // Load metadata from Kudu
+      final Timer.Context ctxStorageLdTime =
+          getMetrics().getTimer(Table.LOAD_DURATION_STORAGE_METADATA).time();
       try {
         loadSchemaFromKudu();
-        loadAllColumnStats(msClient);
       } catch (ImpalaRuntimeException e) {
         throw new TableLoadingException("Error loading metadata for Kudu table " +
             kuduTableName_, e);
+      } finally {
+        storageMetadataLoadTime_ = ctxStorageLdTime.stop();
       }
+      // Load from HMS
+      loadAllColumnStats(msClient);
+      refreshLastUsedTime();
+      // Avoid updating HMS if the schema didn't change.
+      if (msTable_.equals(msTbl)) return;
 
       // Update the table schema in HMS.
       try {
-        long lastDdlTime = CatalogOpExecutor.calculateDdlTime(msTable_);
-        msTable_.putToParameters("transient_lastDdlTime", Long.toString(lastDdlTime));
+        // HMS would fill this table property if it was not set, but as metadata written
+        // with alter_table is not read back in case of Kudu tables, it has to be set here
+        // to ensure that HMS and catalogd have the same timestamp.
+        updateTimestampProperty(msTable_, TBL_PROP_LAST_DDL_TIME);
         msTable_.putToParameters(StatsSetupConst.DO_NOT_UPDATE_STATS,
             StatsSetupConst.TRUE);
         msClient.alter_table(msTable_.getDbName(), msTable_.getTableName(), msTable_);
@@ -260,56 +365,29 @@ public class KuduTable extends Table {
     Preconditions.checkNotNull(kuduTable);
     clearColumns();
     primaryKeyColumnNames_.clear();
+    boolean isHMSIntegrationEnabled = KuduTable.isHMSIntegrationEnabled(kuduMasters_);
     List<FieldSchema> cols = msTable_.getSd().getCols();
-    cols.clear();
+    if (!isHMSIntegrationEnabled) {
+      cols.clear();
+    }
+
     int pos = 0;
     kuduSchema_ = kuduTable.getSchema();
     for (ColumnSchema colSchema: kuduSchema_.getColumns()) {
       KuduColumn kuduCol = KuduColumn.fromColumnSchema(colSchema, pos);
       Preconditions.checkNotNull(kuduCol);
-      // Add the HMS column
-      cols.add(new FieldSchema(kuduCol.getName(), kuduCol.getType().toSql().toLowerCase(),
-          null));
+      // Only update the HMS column definition when Kudu/HMS integration
+      // is disabled.
+      if (!isHMSIntegrationEnabled) {
+        cols.add(new FieldSchema(kuduCol.getName(),
+            kuduCol.getType().toSql().toLowerCase(), null));
+      }
       if (kuduCol.isKey()) primaryKeyColumnNames_.add(kuduCol.getName());
       addColumn(kuduCol);
       ++pos;
     }
   }
 
-  private void loadPartitionByParams(org.apache.kudu.client.KuduTable kuduTable) {
-    Preconditions.checkNotNull(kuduTable);
-    Schema tableSchema = kuduTable.getSchema();
-    PartitionSchema partitionSchema = kuduTable.getPartitionSchema();
-    Preconditions.checkState(!colsByPos_.isEmpty());
-    partitionBy_.clear();
-    for (HashBucketSchema hashBucketSchema: partitionSchema.getHashBucketSchemas()) {
-      List<String> columnNames = Lists.newArrayList();
-      for (int colId: hashBucketSchema.getColumnIds()) {
-        columnNames.add(getColumnNameById(tableSchema, colId));
-      }
-      partitionBy_.add(KuduPartitionParam.createHashParam(columnNames,
-          hashBucketSchema.getNumBuckets()));
-    }
-    RangeSchema rangeSchema = partitionSchema.getRangeSchema();
-    List<Integer> columnIds = rangeSchema.getColumns();
-    if (columnIds.isEmpty()) return;
-    List<String> columnNames = Lists.newArrayList();
-    for (int colId: columnIds) columnNames.add(getColumnNameById(tableSchema, colId));
-    // We don't populate the split values because Kudu's API doesn't currently support
-    // retrieving the split values for range partitions.
-    // TODO: File a Kudu JIRA.
-    partitionBy_.add(KuduPartitionParam.createRangeParam(columnNames, null));
-  }
-
-  /**
-   * Returns the name of a Kudu column with id 'colId'.
-   */
-  private String getColumnNameById(Schema tableSchema, int colId) {
-    Preconditions.checkNotNull(tableSchema);
-    ColumnSchema col = tableSchema.getColumnByIndex(tableSchema.getColumnIndex(colId));
-    Preconditions.checkNotNull(col);
-    return col.getName();
-  }
 
   /**
    * Creates a temporary KuduTable object populated with the specified properties but has
@@ -318,14 +396,16 @@ public class KuduTable extends Table {
    */
   public static KuduTable createCtasTarget(Db db,
       org.apache.hadoop.hive.metastore.api.Table msTbl, List<ColumnDef> columnDefs,
-      List<String> primaryKeyColumnNames, List<KuduPartitionParam> partitionParams) {
+      List<ColumnDef> primaryKeyColumnDefs, List<KuduPartitionParam> partitionParams) {
     KuduTable tmpTable = new KuduTable(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     int pos = 0;
     for (ColumnDef colDef: columnDefs) {
       tmpTable.addColumn(new Column(colDef.getColName(), colDef.getType(), pos++));
     }
-    tmpTable.primaryKeyColumnNames_.addAll(primaryKeyColumnNames);
-    tmpTable.partitionBy_.addAll(partitionParams);
+    for (ColumnDef pkColDef: primaryKeyColumnDefs) {
+      tmpTable.primaryKeyColumnNames_.add(pkColDef.getColName());
+    }
+    tmpTable.partitionBy_ = ImmutableList.copyOf(partitionParams);
     return tmpTable;
   }
 
@@ -345,30 +425,32 @@ public class KuduTable extends Table {
     kuduMasters_ = Joiner.on(',').join(tkudu.getMaster_addresses());
     primaryKeyColumnNames_.clear();
     primaryKeyColumnNames_.addAll(tkudu.getKey_columns());
-    loadPartitionByParamsFromThrift(tkudu.getPartition_by());
+    partitionBy_ = loadPartitionByParamsFromThrift(tkudu.getPartition_by());
   }
 
-  private void loadPartitionByParamsFromThrift(List<TKuduPartitionParam> params) {
-    partitionBy_.clear();
+  private static List<KuduPartitionParam> loadPartitionByParamsFromThrift(
+      List<TKuduPartitionParam> params) {
+    List<KuduPartitionParam> ret= new ArrayList<>();
     for (TKuduPartitionParam param: params) {
       if (param.isSetBy_hash_param()) {
         TKuduPartitionByHashParam hashParam = param.getBy_hash_param();
-        partitionBy_.add(KuduPartitionParam.createHashParam(
+        ret.add(KuduPartitionParam.createHashParam(
             hashParam.getColumns(), hashParam.getNum_partitions()));
       } else {
         Preconditions.checkState(param.isSetBy_range_param());
         TKuduPartitionByRangeParam rangeParam = param.getBy_range_param();
-        partitionBy_.add(KuduPartitionParam.createRangeParam(rangeParam.getColumns(),
+        ret.add(KuduPartitionParam.createRangeParam(rangeParam.getColumns(),
             null));
       }
     }
+    return ret;
   }
 
   @Override
   public TTableDescriptor toThriftDescriptor(int tableId,
       Set<Long> referencedPartitions) {
     TTableDescriptor desc = new TTableDescriptor(tableId, TTableType.KUDU_TABLE,
-        getTColumnDescriptors(), numClusteringCols_, kuduTableName_, db_.getName());
+        getTColumnDescriptors(), numClusteringCols_, name_, db_.getName());
     desc.setKuduTable(getTKuduTable());
     return desc;
   }
@@ -381,91 +463,10 @@ public class KuduTable extends Table {
     Preconditions.checkNotNull(partitionBy_);
     // IMPALA-5154: partitionBy_ may be empty if Kudu table created outside Impala,
     // partition_by must be explicitly created because the field is required.
-    tbl.partition_by = Lists.newArrayList();
+    tbl.partition_by = new ArrayList<>();
     for (KuduPartitionParam partitionParam: partitionBy_) {
       tbl.addToPartition_by(partitionParam.toThrift());
     }
     return tbl;
-  }
-
-  public boolean isPrimaryKeyColumn(String name) {
-    return primaryKeyColumnNames_.contains(name);
-  }
-
-  public TResultSet getTableStats() throws ImpalaRuntimeException {
-    TResultSet result = new TResultSet();
-    TResultSetMetadata resultSchema = new TResultSetMetadata();
-    result.setSchema(resultSchema);
-
-    resultSchema.addToColumns(new TColumn("# Rows", Type.INT.toThrift()));
-    resultSchema.addToColumns(new TColumn("Start Key", Type.STRING.toThrift()));
-    resultSchema.addToColumns(new TColumn("Stop Key", Type.STRING.toThrift()));
-    resultSchema.addToColumns(new TColumn("Leader Replica", Type.STRING.toThrift()));
-    resultSchema.addToColumns(new TColumn("# Replicas", Type.INT.toThrift()));
-
-    KuduClient client = KuduUtil.getKuduClient(getKuduMasterHosts());
-    try {
-      org.apache.kudu.client.KuduTable kuduTable = client.openTable(kuduTableName_);
-      List<LocatedTablet> tablets =
-          kuduTable.getTabletsLocations(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
-      if (tablets.isEmpty()) {
-        TResultRowBuilder builder = new TResultRowBuilder();
-        result.addToRows(
-            builder.add("-1").add("N/A").add("N/A").add("N/A").add("-1").get());
-        return result;
-      }
-      for (LocatedTablet tab: tablets) {
-        TResultRowBuilder builder = new TResultRowBuilder();
-        builder.add("-1");   // The Kudu client API doesn't expose tablet row counts.
-        builder.add(DatatypeConverter.printHexBinary(
-            tab.getPartition().getPartitionKeyStart()));
-        builder.add(DatatypeConverter.printHexBinary(
-            tab.getPartition().getPartitionKeyEnd()));
-        LocatedTablet.Replica leader = tab.getLeaderReplica();
-        if (leader == null) {
-          // Leader might be null, if it is not yet available (e.g. during
-          // leader election in Kudu)
-          builder.add("Leader n/a");
-        } else {
-          builder.add(leader.getRpcHost() + ":" + leader.getRpcPort().toString());
-        }
-        builder.add(tab.getReplicas().size());
-        result.addToRows(builder.get());
-      }
-
-    } catch (Exception e) {
-      throw new ImpalaRuntimeException("Error accessing Kudu for table stats.", e);
-    }
-    return result;
-  }
-
-  public TResultSet getRangePartitions() throws ImpalaRuntimeException {
-    TResultSet result = new TResultSet();
-    TResultSetMetadata resultSchema = new TResultSetMetadata();
-    result.setSchema(resultSchema);
-
-    // Build column header
-    String header = "RANGE (" + Joiner.on(',').join(getRangePartitioningColNames()) + ")";
-    resultSchema.addToColumns(new TColumn(header, Type.STRING.toThrift()));
-    KuduClient client = KuduUtil.getKuduClient(getKuduMasterHosts());
-    try {
-      org.apache.kudu.client.KuduTable kuduTable = client.openTable(kuduTableName_);
-      // The Kudu table API will return the partitions in sorted order by value.
-      List<String> partitions = kuduTable.getFormattedRangePartitions(
-          BackendConfig.INSTANCE.getKuduClientTimeoutMs());
-      if (partitions.isEmpty()) {
-        TResultRowBuilder builder = new TResultRowBuilder();
-        result.addToRows(builder.add("").get());
-        return result;
-      }
-      for (String partition: partitions) {
-        TResultRowBuilder builder = new TResultRowBuilder();
-        builder.add(partition);
-        result.addToRows(builder.get());
-      }
-    } catch (Exception e) {
-      throw new ImpalaRuntimeException("Error accessing Kudu for table partitions.", e);
-    }
-    return result;
   }
 }

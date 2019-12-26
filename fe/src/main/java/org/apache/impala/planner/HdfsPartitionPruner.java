@@ -39,17 +39,21 @@ import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TupleDescriptor;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.FeFsPartition;
+import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -77,7 +81,7 @@ public class HdfsPartitionPruner {
   // Partition batch size used during partition pruning.
   private final static int PARTITION_PRUNING_BATCH_SIZE = 1024;
 
-  private final HdfsTable tbl_;
+  private final FeFsTable tbl_;
   private final List<SlotId> partitionSlots_;
 
   // For converting BetweenPredicates to CompoundPredicates so they can be
@@ -86,24 +90,28 @@ public class HdfsPartitionPruner {
       new ExprRewriter(BetweenToCompoundRule.INSTANCE);
 
   public HdfsPartitionPruner(TupleDescriptor tupleDesc) {
-    Preconditions.checkState(tupleDesc.getTable() instanceof HdfsTable);
-    tbl_ = (HdfsTable)tupleDesc.getTable();
+    Preconditions.checkState(tupleDesc.getTable() instanceof FeFsTable);
+    tbl_ = (FeFsTable)tupleDesc.getTable();
     partitionSlots_ = tupleDesc.getPartitionSlots();
 
   }
 
   /**
-   * Return a list of partitions left after applying the conjuncts. Please note
-   * that conjuncts used for filtering will be removed from the list 'conjuncts'.
+   * Return a list of partitions left after applying the conjuncts.
+   * Conjuncts used for filtering will be removed from the list 'conjuncts' and
+   * returned as the second item in the returned Pair. These expressions can be
+   * shown in the EXPLAIN output.
+   *
    * If 'allowEmpty' is False, empty partitions are not returned.
    */
-  public List<HdfsPartition> prunePartitions(
+  public Pair<List<? extends FeFsPartition>, List<Expr>> prunePartitions(
       Analyzer analyzer, List<Expr> conjuncts, boolean allowEmpty)
       throws ImpalaException {
     // Start with creating a collection of partition filters for the applicable conjuncts.
-    List<HdfsPartitionFilter> partitionFilters = Lists.newArrayList();
+    List<HdfsPartitionFilter> partitionFilters = new ArrayList<>();
     // Conjuncts that can be evaluated from the partition key values.
-    List<Expr> simpleFilterConjuncts = Lists.newArrayList();
+    List<Expr> simpleFilterConjuncts = new ArrayList<>();
+    List<Expr> partitionConjuncts = new ArrayList<>();
 
     // Simple predicates (e.g. binary predicates of the form
     // <SlotRef> <op> <LiteralExpr>) can be used to derive lists
@@ -125,18 +133,19 @@ public class HdfsPartitionPruner {
         } else {
           partitionFilters.add(new HdfsPartitionFilter(clonedConjunct, tbl_, analyzer));
         }
+        partitionConjuncts.add(conjunct);
         it.remove();
       }
     }
 
     // Set of matching partition ids, i.e. partitions that pass all filters
-    HashSet<Long> matchingPartitionIds = null;
+    Set<Long> matchingPartitionIds = null;
 
     // Evaluate the partition filters from the partition key values.
     // The result is the intersection of the associated partition id sets.
     for (Expr filter: simpleFilterConjuncts) {
       // Evaluate the filter
-      HashSet<Long> matchingIds = evalSlotBindingFilter(filter);
+      Set<Long> matchingIds = evalSlotBindingFilter(filter);
       if (matchingPartitionIds == null) {
         matchingPartitionIds = matchingIds;
       } else {
@@ -154,14 +163,18 @@ public class HdfsPartitionPruner {
     evalPartitionFiltersInBe(partitionFilters, matchingPartitionIds, analyzer);
 
     // Populate the list of valid, non-empty partitions to process
-    List<HdfsPartition> results = Lists.newArrayList();
-    Map<Long, HdfsPartition> partitionMap = tbl_.getPartitionMap();
-    for (Long id: matchingPartitionIds) {
-      HdfsPartition partition = partitionMap.get(id);
-      Preconditions.checkNotNull(partition);
-      if (partition.hasFileDescriptors() || allowEmpty) results.add(partition);
+    List<? extends FeFsPartition> results = tbl_.loadPartitions(
+        matchingPartitionIds);
+    if (!allowEmpty) {
+      results = Lists.newArrayList(Iterables.filter(results,
+          new Predicate<FeFsPartition>() {
+            @Override
+            public boolean apply(FeFsPartition partition) {
+              return partition.hasFileDescriptors();
+            }
+          }));
     }
-    return results;
+    return new Pair<>(results, partitionConjuncts);
   }
 
   /**
@@ -176,7 +189,11 @@ public class HdfsPartitionPruner {
     if (expr instanceof BinaryPredicate) {
       // Evaluate any constant expression in the BE
       try {
-        analyzer.getConstantFolder().rewrite(expr, analyzer);
+        // TODO: Analyzer should already have done constant folding
+        // and rewrite -- unless this is a copy of an expression taken
+        // before analysis, which would introduce its own issues.
+        expr = analyzer.getConstantFolder().rewrite(expr, analyzer);
+        Preconditions.checkState(expr instanceof BinaryPredicate);
       } catch (AnalysisException e) {
         LOG.error("Error evaluating constant expressions in the BE: " + e.getMessage());
         return false;
@@ -186,7 +203,7 @@ public class HdfsPartitionPruner {
       SlotRef slot = bp.getBoundSlot();
       if (slot == null) return false;
       Expr bindingExpr = bp.getSlotBinding(slot.getSlotId());
-      if (bindingExpr == null || !bindingExpr.isLiteral()) return false;
+      if (bindingExpr == null || !Expr.IS_LITERAL.apply(bindingExpr)) return false;
       return true;
     } else if (expr instanceof CompoundPredicate) {
       boolean res = canEvalUsingPartitionMd(expr.getChild(0), analyzer);
@@ -210,7 +227,7 @@ public class HdfsPartitionPruner {
       SlotRef slot = ((InPredicate)expr).getBoundSlot();
       if (slot == null) return false;
       for (int i = 1; i < expr.getChildren().size(); ++i) {
-        if (!(expr.getChild(i).isLiteral())) return false;
+        if (!Expr.IS_LITERAL.apply(expr.getChild(i))) return false;
       }
       return true;
     }
@@ -222,11 +239,13 @@ public class HdfsPartitionPruner {
    * ids of the matching partitions. An empty set is returned if there
    * are no matching partitions.
    */
-  private HashSet<Long> evalBinaryPredicate(Expr expr) {
+  private Set<Long> evalBinaryPredicate(Expr expr) {
     Preconditions.checkNotNull(expr);
     Preconditions.checkState(expr instanceof BinaryPredicate);
+    // TODO: Note that rewrite rules should have ensured that the slot
+    // is on the left.
     boolean isSlotOnLeft = true;
-    if (expr.getChild(0).isLiteral()) isSlotOnLeft = false;
+    if (Expr.IS_LITERAL.apply(expr.getChild(0))) isSlotOnLeft = false;
 
     // Get the operands
     BinaryPredicate bp = (BinaryPredicate)expr;
@@ -234,26 +253,26 @@ public class HdfsPartitionPruner {
     Preconditions.checkNotNull(slot);
     Expr bindingExpr = bp.getSlotBinding(slot.getSlotId());
     Preconditions.checkNotNull(bindingExpr);
-    Preconditions.checkState(bindingExpr.isLiteral());
+    Preconditions.checkState(Expr.IS_LITERAL.apply(bindingExpr));
     LiteralExpr literal = (LiteralExpr)bindingExpr;
     Operator op = bp.getOp();
-    if ((literal instanceof NullLiteral) && (op != Operator.NOT_DISTINCT)
+    if (Expr.IS_NULL_LITERAL.apply(literal) && (op != Operator.NOT_DISTINCT)
         && (op != Operator.DISTINCT_FROM)) {
-      return Sets.newHashSet();
+      return new HashSet<>();
     }
 
     // Get the partition column position and retrieve the associated partition
     // value metadata.
     int partitionPos = slot.getDesc().getColumn().getPosition();
-    TreeMap<LiteralExpr, HashSet<Long>> partitionValueMap =
+    TreeMap<LiteralExpr, Set<Long>> partitionValueMap =
         tbl_.getPartitionValueMap(partitionPos);
-    if (partitionValueMap.isEmpty()) return Sets.newHashSet();
+    if (partitionValueMap.isEmpty()) return new HashSet<>();
 
-    HashSet<Long> matchingIds = Sets.newHashSet();
+    Set<Long> matchingIds = new HashSet<>();
     // Compute the matching partition ids
     if (op == Operator.NOT_DISTINCT) {
       // Case: SlotRef <=> Literal
-      if (literal instanceof NullLiteral) {
+      if (Expr.IS_NULL_LITERAL.apply(literal)) {
         Set<Long> ids = tbl_.getNullPartitionIds(partitionPos);
         if (ids != null) matchingIds.addAll(ids);
         return matchingIds;
@@ -263,36 +282,34 @@ public class HdfsPartitionPruner {
     }
     if (op == Operator.EQ) {
       // Case: SlotRef = Literal
-      HashSet<Long> ids = partitionValueMap.get(literal);
+      Set<Long> ids = partitionValueMap.get(literal);
       if (ids != null) matchingIds.addAll(ids);
       return matchingIds;
     }
     if (op == Operator.DISTINCT_FROM) {
       // Case: SlotRef IS DISTINCT FROM Literal
-      if (literal instanceof NullLiteral) {
-        matchingIds.addAll(tbl_.getPartitionIds());
+      matchingIds.addAll(tbl_.getPartitionIds());
+      if (Expr.IS_NULL_LITERAL.apply(literal)) {
         Set<Long> nullIds = tbl_.getNullPartitionIds(partitionPos);
         matchingIds.removeAll(nullIds);
-        return matchingIds;
       } else {
-        matchingIds.addAll(tbl_.getPartitionIds());
-        HashSet<Long> ids = partitionValueMap.get(literal);
+        Set<Long> ids = partitionValueMap.get(literal);
         if (ids != null) matchingIds.removeAll(ids);
-        return matchingIds;
       }
+      return matchingIds;
     }
     if (op == Operator.NE) {
       // Case: SlotRef != Literal
       matchingIds.addAll(tbl_.getPartitionIds());
       Set<Long> nullIds = tbl_.getNullPartitionIds(partitionPos);
       matchingIds.removeAll(nullIds);
-      HashSet<Long> ids = partitionValueMap.get(literal);
+      Set<Long> ids = partitionValueMap.get(literal);
       if (ids != null) matchingIds.removeAll(ids);
       return matchingIds;
     }
 
     // Determine the partition key value range of this predicate.
-    NavigableMap<LiteralExpr, HashSet<Long>> rangeValueMap = null;
+    NavigableMap<LiteralExpr, Set<Long>> rangeValueMap = null;
     LiteralExpr firstKey = partitionValueMap.firstKey();
     LiteralExpr lastKey = partitionValueMap.lastKey();
     boolean upperInclusive = false;
@@ -303,7 +320,7 @@ public class HdfsPartitionPruner {
     if (((op == Operator.LE || op == Operator.LT) && isSlotOnLeft) ||
         ((op == Operator.GE || op == Operator.GT) && !isSlotOnLeft)) {
       // Case: SlotRef <[=] Literal
-      if (literal.compareTo(firstKey) < 0) return Sets.newHashSet();
+      if (literal.compareTo(firstKey) < 0) return new HashSet<>();
       if (op == Operator.LE || op == Operator.GE) upperInclusive = true;
 
       if (literal.compareTo(lastKey) <= 0) {
@@ -316,7 +333,7 @@ public class HdfsPartitionPruner {
       lowerInclusive = true;
     } else {
       // Cases: SlotRef >[=] Literal
-      if (literal.compareTo(lastKey) > 0) return Sets.newHashSet();
+      if (literal.compareTo(lastKey) > 0) return new HashSet<>();
       if (op == Operator.GE || op == Operator.LE) lowerInclusive = true;
 
       if (literal.compareTo(firstKey) >= 0) {
@@ -334,7 +351,7 @@ public class HdfsPartitionPruner {
     rangeValueMap = partitionValueMap.subMap(lowerBoundKey, lowerInclusive,
         upperBoundKey, upperInclusive);
     // Compute the matching partition ids
-    for (HashSet<Long> idSet: rangeValueMap.values()) {
+    for (Set<Long> idSet: rangeValueMap.values()) {
       if (idSet != null) matchingIds.addAll(idSet);
     }
     return matchingIds;
@@ -344,21 +361,21 @@ public class HdfsPartitionPruner {
    * Evaluate an InPredicate filter on a partition column and return the ids of
    * the matching partitions.
    */
-  private HashSet<Long> evalInPredicate(Expr expr) {
+  private Set<Long> evalInPredicate(Expr expr) {
     Preconditions.checkNotNull(expr);
     Preconditions.checkState(expr instanceof InPredicate);
     InPredicate inPredicate = (InPredicate)expr;
-    HashSet<Long> matchingIds = Sets.newHashSet();
+    Set<Long> matchingIds = new HashSet<>();
     SlotRef slot = inPredicate.getBoundSlot();
     Preconditions.checkNotNull(slot);
     int partitionPos = slot.getDesc().getColumn().getPosition();
-    TreeMap<LiteralExpr, HashSet<Long>> partitionValueMap =
+    TreeMap<LiteralExpr, Set<Long>> partitionValueMap =
         tbl_.getPartitionValueMap(partitionPos);
 
     if (inPredicate.isNotIn()) {
       // Case: SlotRef NOT IN (Literal, ..., Literal)
       // If there is a NullLiteral, return an empty set.
-      List<Expr> nullLiterals = Lists.newArrayList();
+      List<Expr> nullLiterals = new ArrayList<>();
       inPredicate.collectAll(Predicates.instanceOf(NullLiteral.class), nullLiterals);
       if (!nullLiterals.isEmpty()) return matchingIds;
       matchingIds.addAll(tbl_.getPartitionIds());
@@ -369,7 +386,7 @@ public class HdfsPartitionPruner {
     // Compute the matching partition ids
     for (int i = 1; i < inPredicate.getChildren().size(); ++i) {
       LiteralExpr literal = (LiteralExpr)inPredicate.getChild(i);
-      HashSet<Long> idSet = partitionValueMap.get(literal);
+      Set<Long> idSet = partitionValueMap.get(literal);
       if (idSet != null) {
         if (inPredicate.isNotIn()) {
           matchingIds.removeAll(idSet);
@@ -385,10 +402,10 @@ public class HdfsPartitionPruner {
    * Evaluate an IsNullPredicate on a partition column and return the ids of the
    * matching partitions.
    */
-  private HashSet<Long> evalIsNullPredicate(Expr expr) {
+  private Set<Long> evalIsNullPredicate(Expr expr) {
     Preconditions.checkNotNull(expr);
     Preconditions.checkState(expr instanceof IsNullPredicate);
-    HashSet<Long> matchingIds = Sets.newHashSet();
+    Set<Long> matchingIds = new HashSet<>();
     IsNullPredicate nullPredicate = (IsNullPredicate)expr;
     SlotRef slot = nullPredicate.getBoundSlot();
     Preconditions.checkNotNull(slot);
@@ -411,21 +428,21 @@ public class HdfsPartitionPruner {
    * types of predicates: BinaryPredicate, CompoundPredicate, IsNullPredicate,
    * InPredicate.
    */
-  private HashSet<Long> evalSlotBindingFilter(Expr expr) {
+  private Set<Long> evalSlotBindingFilter(Expr expr) {
     Preconditions.checkNotNull(expr);
     Preconditions.checkState(!(expr instanceof BetweenPredicate));
     if (expr instanceof BinaryPredicate) {
       return evalBinaryPredicate(expr);
     } else if (expr instanceof CompoundPredicate) {
-      HashSet<Long> leftChildIds = evalSlotBindingFilter(expr.getChild(0));
+      Set<Long> leftChildIds = evalSlotBindingFilter(expr.getChild(0));
       CompoundPredicate cp = (CompoundPredicate)expr;
       // NOT operators have been eliminated
       Preconditions.checkState(cp.getOp() != CompoundPredicate.Operator.NOT);
       if (cp.getOp() == CompoundPredicate.Operator.AND) {
-        HashSet<Long> rightChildIds = evalSlotBindingFilter(expr.getChild(1));
+        Set<Long> rightChildIds = evalSlotBindingFilter(expr.getChild(1));
         leftChildIds.retainAll(rightChildIds);
       } else if (cp.getOp() == CompoundPredicate.Operator.OR) {
-        HashSet<Long> rightChildIds = evalSlotBindingFilter(expr.getChild(1));
+        Set<Long> rightChildIds = evalSlotBindingFilter(expr.getChild(1));
         leftChildIds.addAll(rightChildIds);
       }
       return leftChildIds;
@@ -442,17 +459,17 @@ public class HdfsPartitionPruner {
    * filters that could not be evaluated from the partition key values.
    */
   private void evalPartitionFiltersInBe(List<HdfsPartitionFilter> filters,
-      HashSet<Long> matchingPartitionIds, Analyzer analyzer) throws ImpalaException {
-    Map<Long, HdfsPartition> partitionMap = tbl_.getPartitionMap();
+      Set<Long> matchingPartitionIds, Analyzer analyzer) throws ImpalaException {
+    Map<Long, ? extends PrunablePartition> partitionMap = tbl_.getPartitionMap();
     // Set of partition ids that pass a filter
-    HashSet<Long> matchingIds = Sets.newHashSet();
+    Set<Long> matchingIds = new HashSet<>();
     // Batch of partitions
-    ArrayList<HdfsPartition> partitionBatch = Lists.newArrayList();
+    List<PrunablePartition> partitionBatch = new ArrayList<>();
     // Identify the partitions that pass all filters.
     for (HdfsPartitionFilter filter: filters) {
       // Iterate through the currently valid partitions
       for (Long id: matchingPartitionIds) {
-        HdfsPartition p = partitionMap.get(id);
+        PrunablePartition p = partitionMap.get(id);
         Preconditions.checkState(
             p.getPartitionValues().size() == tbl_.getNumClusteringCols());
         // Add the partition to the current batch

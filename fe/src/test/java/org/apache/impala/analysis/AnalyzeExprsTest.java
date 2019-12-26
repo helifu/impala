@@ -18,6 +18,8 @@
 package org.apache.impala.analysis;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -27,9 +29,9 @@ import java.util.Arrays;
 import java.util.List;
 
 import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
-import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.AggregateFunction;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
@@ -42,6 +44,7 @@ import org.apache.impala.catalog.TestSchemaUtils;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExpr;
+import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.junit.Assert;
@@ -100,9 +103,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testNumericLiteral("-" + Double.toString(Double.MAX_VALUE), Type.DOUBLE);
 
     AnalysisError(String.format("select %s1", Double.toString(Double.MAX_VALUE)),
-      "Numeric literal '1.7976931348623157E+3081' exceeds maximum range of doubles.");
+      "Numeric literal '1.7976931348623157E+3081' exceeds maximum range of DOUBLE.");
     AnalysisError(String.format("select %s1", Double.toString(Double.MIN_VALUE)),
-      "Numeric literal '4.9E-3241' underflows minimum resolution of doubles.");
+      "Numeric literal '4.9E-3241' underflows minimum resolution of DOUBLE.");
 
     // Test edge cases near the upper limits of decimal precision - 38 digits.
     // Integer literal.
@@ -180,6 +183,15 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalyzesOk("select cast (0 as timestamp)");
     AnalyzesOk("select cast (0.1 as timestamp)");
     AnalyzesOk("select cast ('1970-10-10 10:00:00.123' as timestamp)");
+    AnalyzesOk("select cast (cast ('1970-10-10' as date) as timestamp)");
+    AnalyzesOk("select cast (date '1970-10-10' as timestamp)");
+  }
+
+  @Test
+  public void testDateValueExprs() throws AnalysisException {
+    AnalyzesOk("select DATE '1970-10-10'");
+    AnalyzesOk("select cast ('1970-10-10' as date)");
+    AnalyzesOk("select cast (cast ('1970-10-10 10:00:00.123' as timestamp) as date)");
   }
 
   @Test
@@ -214,7 +226,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "IS NOT DISTINCT FROM", "<", ">", ">=", "<=", "!=", "=", "<>"}) {
       // Operator can compare numeric values (literals, casts, and columns), even ones of
       // different types.
-      ArrayList<String> numericValues =
+      List<String> numericValues =
           new ArrayList<String>(Arrays.asList("0", "1", "1.1", "-7", "-7.7", "1.2e99",
               "false", "1234567890123456789012345678901234567890", "tinyint_col",
               "smallint_col", "int_col", "bigint_col", "float_col", "double_col"));
@@ -241,6 +253,23 @@ public class AnalyzeExprsTest extends AnalyzerTest {
             "select * from functional.alltypes where NULL " + operator + " " + operand);
       }
 
+      // Operator can compare date columns
+      AnalyzesOk("select * from functional.date_tbl where date_col " + operator
+          + " date_col");
+      AnalyzesOk("select * from functional.date_tbl where date_col " + operator
+          + " NULL");
+      AnalyzesOk("select * from functional.date_tbl where NULL " + operator
+          + " date_col");
+      // Operator can compare date column and timestamp column
+      AnalyzesOk("select * from functional.date_tbl, functional.alltypes where date_col "
+          + operator + " timestamp_col");
+      AnalyzesOk("select * from functional.date_tbl, functional.alltypes where "
+          + "timestamp_col " + operator + " date_col");
+      // Operator can compare date column and string literals. This works beacuse the
+      // string literal is implicitly converted to date.
+      AnalyzesOk("select * from functional.date_tbl where date_col " + operator
+          + " '1993-01-21'");
+
       // Operator can compare string column and literals
       AnalyzesOk(
           "select * from functional.alltypes where string_col " + operator + " 'hi'");
@@ -260,6 +289,15 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         }
       }
 
+      // IMPALA-7260: Check that when a numerical type gets implicitly cast to decimal,
+      // we do not get an error when the type of the decimal operand is not able to fit
+      // all of the digits of the non-deicmal operand.
+      AnalyzesOk("select cast(1 as decimal(38,37)) " + operator + " cast(2 as bigint)");
+      AnalyzesOk("select cast(1 as bigint) " + operator + " cast(2 as decimal(38,37))");
+      AnalyzesOk("select cast(1 as decimal(38,1)) " + operator + " cast(2 as bigint)");
+      AnalyzesOk("select cast(1 as decimal(38,37)) " + operator + " cast(2 as tinyint)");
+      AnalyzesOk("select cast(1 as decimal(38,37)) " + operator + " cast(2 as double)");
+
       // Chars of different length are comparable
       for (int i = 1; i < 16; ++i) {
         AnalyzesOk("select cast('hi' as char(" + i + ")) " + operator +
@@ -275,7 +313,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
       // Binary operators do not operate on expression with incompatible types
       for (String numeric_type: new String[]{"BOOLEAN", "TINYINT", "SMALLINT", "INT",
           "BIGINT", "FLOAT", "DOUBLE", "DECIMAL(9,0)"}) {
-        for (String string_type: new String[]{"STRING", "TIMESTAMP"}) {
+        for (String string_type: new String[]{"STRING", "TIMESTAMP", "DATE"}) {
           AnalysisError("select cast(NULL as " + numeric_type + ") "
               + operator + " cast(NULL as " + string_type + ")",
               "operands of type " + numeric_type + " and " + string_type +
@@ -308,9 +346,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "where int_map_col = int_map_col",
         "operands of type MAP<STRING,INT> and MAP<STRING,INT> are not comparable: " +
         "int_map_col = int_map_col");
-    // TODO: Enable once date and datetime are implemented.
-    // AnalysisError("select * from functional.alltypes where date_col = 15",
-    // "operands are not comparable: date_col = 15");
+    AnalysisError("select * from functional.date_tbl where date_col = 15",
+        "operands of type DATE and TINYINT are not comparable: date_col = 15");
+    // TODO: Enable once datetime is implemented.
     // AnalysisError("select * from functional.alltypes where datetime_col = 1.0",
     // "operands are not comparable: datetime_col = 1.0");
   }
@@ -321,13 +359,17 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalyzesOk("select cast(1.1 as boolean)");
     AnalyzesOk("select cast(1.1 as timestamp)");
 
+    AnalysisError("select cast(1.1 as date)",
+        "Invalid type cast of 1.1 from DECIMAL(2,1) to DATE");
     AnalysisError("select cast(true as decimal)",
         "Invalid type cast of TRUE from BOOLEAN to DECIMAL(9,0)");
     AnalysisError("select cast(cast(1 as timestamp) as decimal)",
         "Invalid type cast of CAST(1 AS TIMESTAMP) from TIMESTAMP to DECIMAL(9,0)");
+    AnalysisError("select cast(date '1970-01-01' as decimal)",
+        "Invalid type cast of DATE '1970-01-01' from DATE to DECIMAL(9,0)");
 
     for (Type type: Type.getSupportedTypes()) {
-      if (type.isNull() || type.isDecimal() || type.isBoolean() || type.isDateType()
+      if (type.isNull() || type.isDecimal() || type.isBoolean() || type.isDateOrTimeType()
           || type.getPrimitiveType() == PrimitiveType.VARCHAR
           || type.getPrimitiveType() == PrimitiveType.CHAR) {
         continue;
@@ -354,7 +396,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("insert into functional.alltypesinsert (tinyint_col, year, month) " +
         "values(CAST(999 AS DECIMAL(3,0)), 1, 1)",
         "Possible loss of precision for target table 'functional.alltypesinsert'.\n" +
-        "Expression 'cast(999 as decimal(3,0))' (type: DECIMAL(3,0)) would need to be " +
+        "Expression 'CAST(999 AS DECIMAL(3,0))' (type: DECIMAL(3,0)) would need to be " +
         "cast to TINYINT for column 'tinyint_col'");
   }
 
@@ -446,6 +488,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("select now() = cast('hi' as CHAR(3))",
         "operands of type TIMESTAMP and CHAR(3) are not comparable: " +
         "now() = CAST('hi' AS CHAR(3))");
+    AnalysisError("select cast(now() as DATE) = cast('hi' as CHAR(3))",
+        "operands of type DATE and CHAR(3) are not comparable: " +
+        "CAST(now() AS DATE) = CAST('hi' AS CHAR(3))");
     testExprCast("cast('Hello' as VARCHAR(5))", ScalarType.createVarcharType(7));
     testExprCast("cast('Hello' as VARCHAR(5))", ScalarType.createVarcharType(3));
 
@@ -693,9 +738,13 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     // Lower and upper bounds require implicit casts.
     AnalyzesOk("select * from functional.alltypes " +
         "where double_col between smallint_col and int_col");
+    AnalyzesOk("select * from functional.alltypes, functional.date_tbl " +
+        "where timestamp_col between date_part and date_col");
     // Comparison expr requires implicit cast.
     AnalyzesOk("select * from functional.alltypes " +
         "where smallint_col between float_col and double_col");
+    AnalyzesOk("select * from functional.date_tbl, functional.alltypes " +
+        "where date_col between timestamp_col and timestamp_col + interval 1 day");
     // Test NULLs.
     AnalyzesOk("select * from functional.alltypes " +
         "where NULL between float_col and double_col");
@@ -714,10 +763,33 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "where timestamp_col between int_col and double_col",
         "Incompatible return types 'TIMESTAMP' and 'INT' " +
         "of exprs 'timestamp_col' and 'int_col'.");
+    AnalysisError("select * from functional.date_tbl, functional.alltypes " +
+        "where date_col between int_col and double_col",
+        "Incompatible return types 'DATE' and 'INT' " +
+        "of exprs 'date_col' and 'int_col'.");
     AnalysisError("select 1 from functional.allcomplextypes " +
         "where int_struct_col between 10 and 20",
         "Incompatible return types 'STRUCT<f1:INT,f2:INT>' and 'TINYINT' " +
         "of exprs 'int_struct_col' and '10'.");
+    // IMPALA-7211: Do not cast decimal types to other decimal types
+    AnalyzesOk("select cast(1 as decimal(38,2)) between " +
+        "0.9 * cast(1 as decimal(38,3)) and 3");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as decimal(38,15))");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as double) and cast(3 as decimal(38,1))");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as double)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as bigint)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as bigint) and cast(3 as bigint)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as bigint) and cast(3 as decimal(38,1))");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as decimal(38,1)) and cast(3 as int)");
+    AnalyzesOk("select cast(2 as decimal(38,37)) between " +
+        "cast(1 as int) and cast(3 as decimal(38,1))");
   }
 
   @Test
@@ -736,9 +808,13 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     // In list requires implicit casts.
     AnalyzesOk("select * from functional.alltypes where " +
         "double_col in (int_col, bigint_col)");
+    AnalyzesOk("select * from functional.alltypes, functional.date_tbl where " +
+        "timestamp_col in (date_col, date_part)");
     // Comparison expr requires implicit cast.
     AnalyzesOk("select * from functional.alltypes where " +
         "int_col in (double_col, bigint_col)");
+    AnalyzesOk("select * from functional.alltypes, functional.date_tbl where " +
+        "date_col in (timestamp_col, timestamp_col + interval 1 day)");
     // Test predicates.
     AnalyzesOk("select * from functional.alltypes where " +
         "!true in (false or true, true and false)");
@@ -764,6 +840,14 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "timestamp_col in (NULL, int_col)",
         "Incompatible return types 'TIMESTAMP' and 'INT' " +
         "of exprs 'timestamp_col' and 'int_col'.");
+    AnalysisError("select * from functional.date_tbl, functional.alltypes where " +
+        "date_col in (int_col, double_col)",
+        "Incompatible return types 'DATE' and 'INT' " +
+        "of exprs 'date_col' and 'int_col'.");
+    AnalysisError("select * from functional.date_tbl, functional.alltypes where " +
+        "date_col in (NULL, int_col)",
+        "Incompatible return types 'DATE' and 'INT' " +
+        "of exprs 'date_col' and 'int_col'.");
     AnalysisError("select 1 from functional.allcomplextypes where " +
         "int_array_col in (id, NULL)",
         "Incompatible return types 'ARRAY<INT>' and 'INT' " +
@@ -951,11 +1035,6 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "select id, tinyint_col, sum(distinct tinyint_col) over(order by id) "
           + "from functional.alltypes",
         "DISTINCT not allowed in analytic function");
-    // select list alias needs to be ignored
-    AnalysisError(
-        "select min(id) over (order by tinyint_col) as X from functional.alltypes "
-          + "group by id, tinyint_col order by rank() over (order by X)",
-        "Nesting of analytic expressions is not allowed");
     // IGNORE NULLS may only be used with first_value/last_value
     AnalysisError(
         "select sum(id ignore nulls) over (order by id) from functional.alltypes",
@@ -979,16 +1058,11 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "(first_value(cast(int_col AS DECIMAL)) " +
         " over (order by int_col rows between 2 preceding and 1 preceding)) " +
         "from functional.alltypestiny");
-    // IMPALA-1354: Constant expressions in order by and partition by exprs
-    AnalysisError(
-        "select rank() over (order by 1) from functional.alltypestiny",
-        "Expressions in the ORDER BY clause must not be constant: 1");
-    AnalysisError(
-        "select rank() over (partition by 2 order by id) from functional.alltypestiny",
-        "Expressions in the PARTITION BY clause must not be constant: 2");
-    AnalysisError(
-        "select rank() over (partition by 2 order by 1) from functional.alltypestiny",
-        "Expressions in the PARTITION BY clause must not be constant: 2");
+    // IMPALA-6323: Allow constant expressions in analytic window exprs.
+    AnalyzesOk("select rank() over (order by 1) from functional.alltypestiny");
+    AnalyzesOk("select count() over (partition by 2) from functional.alltypestiny");
+    AnalyzesOk(
+        "select rank() over (partition by 2 order by 1) from functional.alltypestiny");
 
     // nested analytic exprs
     AnalysisError(
@@ -1005,7 +1079,6 @@ public class AnalyzeExprsTest extends AnalyzerTest {
           + "order by rank() over (order by tinyint_col), int_col) "
           + "from functional.alltypes",
         "Nesting of analytic expressions is not allowed");
-
     // lead/lag variants
     AnalyzesOk(
         "select lag(int_col, 10, 5 + 1) over (partition by id, bool_col "
@@ -1217,7 +1290,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         Type.BIGINT, Type.FLOAT, Type.DOUBLE , Type.NULL };
     for (Type type1: numericTypes) {
       for (Type type2: numericTypes) {
-        Type t = Type.getAssignmentCompatibleType(type1, type2, false);
+        Type t = Type.getAssignmentCompatibleType(type1, type2, false, false);
         assertTrue(t.isScalarType());
         ScalarType compatibleType = (ScalarType) t;
         Type promotedType = compatibleType.getNextResolutionType();
@@ -1299,9 +1372,11 @@ public class AnalyzeExprsTest extends AnalyzerTest {
       for (Type type1: types) {
         for (Type type2: types) {
           // Prefer strict matching.
-          Type compatibleType = Type.getAssignmentCompatibleType(type1, type2, true);
+          Type compatibleType = Type.getAssignmentCompatibleType(
+              type1, type2, true, true);
           if (compatibleType.isInvalid()) {
-            compatibleType = Type.getAssignmentCompatibleType(type1, type2, false);
+            compatibleType = Type.getAssignmentCompatibleType(
+                type1, type2, false, false);
           }
           typeCastTest(type1, type2, false, null, cmpOp, compatibleType);
           typeCastTest(type1, type2, true, null, cmpOp, compatibleType);
@@ -1369,8 +1444,8 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   /**
    * Get the result type of a select statement with a single select list element.
    */
-  Type getReturnType(String stmt, Analyzer analyzer) {
-    SelectStmt select = (SelectStmt) AnalyzesOk(stmt, analyzer, null);
+  Type getReturnType(String stmt, AnalysisContext ctx) {
+    SelectStmt select = (SelectStmt) AnalyzesOk(stmt, ctx);
     List<Expr> selectListExprs = select.getResultExprs();
     assertNotNull(selectListExprs);
     assertEquals(selectListExprs.size(), 1);
@@ -1379,13 +1454,13 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     return expr.getType();
   }
 
-  private void checkReturnType(String stmt, Type resultType, Analyzer analyzer) {
-    Type exprType = getReturnType(stmt, analyzer);
+  private void checkReturnType(String stmt, Type resultType, AnalysisContext ctx) {
+    Type exprType = getReturnType(stmt, ctx);
     assertEquals("Expected: " + resultType + " != " + exprType, resultType, exprType);
   }
 
   private void checkReturnType(String stmt, Type resultType) {
-    checkReturnType(stmt, resultType, createAnalyzer(Catalog.DEFAULT_DB));
+    checkReturnType(stmt, resultType, createAnalysisCtx(Catalog.DEFAULT_DB));
   }
 
   /**
@@ -1394,12 +1469,12 @@ public class AnalyzeExprsTest extends AnalyzerTest {
    */
   private void checkDecimalReturnType(String stmt, Type decimalV1ResultType,
       Type decimalV2ResultType) {
-    Analyzer analyzer = createAnalyzer(Catalog.DEFAULT_DB);
-    analyzer.getQueryOptions().setDecimal_v2(false);
-    checkReturnType(stmt, decimalV1ResultType, analyzer);
-    analyzer = createAnalyzer(Catalog.DEFAULT_DB);
-    analyzer.getQueryOptions().setDecimal_v2(true);
-    checkReturnType(stmt, decimalV2ResultType, analyzer);
+    AnalysisContext ctx = createAnalysisCtx(Catalog.DEFAULT_DB);
+    ctx.getQueryOptions().setDecimal_v2(false);
+    checkReturnType(stmt, decimalV1ResultType, ctx);
+    ctx = createAnalysisCtx(Catalog.DEFAULT_DB);
+    ctx.getQueryOptions().setDecimal_v2(true);
+    checkReturnType(stmt, decimalV2ResultType, ctx);
   }
 
   /**
@@ -1608,7 +1683,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   }
 
   /**
-   * We have three variants of timestamp arithmetic exprs, as in MySQL:
+   * We have three variants of timestamp/date arithmetic exprs, as in MySQL:
    * http://dev.mysql.com/doc/refman/5.5/en/date-and-time-functions.html
    * (section #function_date-add)
    * 1. Non-function-call like version, e.g., 'a + interval b timeunit'
@@ -1648,77 +1723,79 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     // First operand does not return a timestamp. Non-function-call like version.
     AnalysisError("select float_col + interval 10 years from functional.alltypes",
-        "Operand 'float_col' of timestamp arithmetic expression " +
+        "Operand 'float_col' of timestamp/date arithmetic expression " +
         "'float_col + INTERVAL 10 years' returns type 'FLOAT'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
     AnalysisError("select string_col + interval 10 years from functional.alltypes",
-        "Operand 'string_col' of timestamp arithmetic expression " +
+        "Operand 'string_col' of timestamp/date arithmetic expression " +
         "'string_col + INTERVAL 10 years' returns type 'STRING'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
     AnalysisError(
         "select int_struct_col + interval 10 years from functional.allcomplextypes",
-        "Operand 'int_struct_col' of timestamp arithmetic expression " +
+        "Operand 'int_struct_col' of timestamp/date arithmetic expression " +
         "'int_struct_col + INTERVAL 10 years' returns type 'STRUCT<f1:INT,f2:INT>'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
     // Reversed interval and timestamp using addition.
     AnalysisError("select interval 10 years + float_col from functional.alltypes",
-        "Operand 'float_col' of timestamp arithmetic expression " +
+        "Operand 'float_col' of timestamp/date arithmetic expression " +
         "'INTERVAL 10 years + float_col' returns type 'FLOAT'. " +
-        "Expected type 'TIMESTAMP'");
+        "Expected type 'TIMESTAMP' or 'DATE'");
     AnalysisError("select interval 10 years + string_col from functional.alltypes",
-        "Operand 'string_col' of timestamp arithmetic expression " +
+        "Operand 'string_col' of timestamp/date arithmetic expression " +
         "'INTERVAL 10 years + string_col' returns type 'STRING'. " +
-        "Expected type 'TIMESTAMP'");
+        "Expected type 'TIMESTAMP' or 'DATE'");
     AnalysisError(
         "select interval 10 years + int_array_col from functional.allcomplextypes",
-        "Operand 'int_array_col' of timestamp arithmetic expression " +
+        "Operand 'int_array_col' of timestamp/date arithmetic expression " +
         "'INTERVAL 10 years + int_array_col' returns type 'ARRAY<INT>'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
     // First operand does not return a timestamp. Function-call like version.
     AnalysisError("select date_add(float_col, interval 10 years) " +
         "from functional.alltypes",
-        "Operand 'float_col' of timestamp arithmetic expression " +
+        "Operand 'float_col' of timestamp/date arithmetic expression " +
         "'DATE_ADD(float_col, INTERVAL 10 years)' returns type 'FLOAT'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
     AnalysisError("select date_add(string_col, interval 10 years) " +
         "from functional.alltypes",
-        "Operand 'string_col' of timestamp arithmetic expression " +
+        "Operand 'string_col' of timestamp/date arithmetic expression " +
         "'DATE_ADD(string_col, INTERVAL 10 years)' returns type 'STRING'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
     AnalysisError("select date_add(int_map_col, interval 10 years) " +
         "from functional.allcomplextypes",
-        "Operand 'int_map_col' of timestamp arithmetic expression " +
+        "Operand 'int_map_col' of timestamp/date arithmetic expression " +
         "'DATE_ADD(int_map_col, INTERVAL 10 years)' returns type 'MAP<STRING,INT>'. " +
-        "Expected type 'TIMESTAMP'.");
+        "Expected type 'TIMESTAMP' or 'DATE'.");
 
     // Second operand is not compatible with a fixed-point type.
     // Non-function-call like version.
     AnalysisError("select timestamp_col + interval 5.2 years from functional.alltypes",
-        "Operand '5.2' of timestamp arithmetic expression " +
+        "Operand '5.2' of timestamp/date arithmetic expression " +
         "'timestamp_col + INTERVAL 5.2 years' returns type 'DECIMAL(2,1)'. " +
         "Expected an integer type.");
     AnalysisError("select cast(0 as timestamp) + interval int_array_col years " +
         "from functional.allcomplextypes",
-        "Operand 'int_array_col' of timestamp arithmetic expression " +
+        "Operand 'int_array_col' of timestamp/date arithmetic expression " +
         "'CAST(0 AS TIMESTAMP) + INTERVAL int_array_col years' " +
         "returns type 'ARRAY<INT>'. Expected an integer type.");
 
     // No implicit cast from STRING to integer types.
     AnalysisError("select timestamp_col + interval '10' years from functional.alltypes",
-                  "Operand ''10'' of timestamp arithmetic expression 'timestamp_col + " +
-                  "INTERVAL '10' years' returns type 'STRING'. " +
+                  "Operand ''10'' of timestamp/date arithmetic expression " +
+                  "'timestamp_col + INTERVAL '10' years' returns type 'STRING'. " +
                   "Expected an integer type.");
     AnalysisError("select date_add(timestamp_col, interval '10' years) " +
-                  "from functional.alltypes", "Operand ''10'' of timestamp arithmetic " +
-                  "expression 'DATE_ADD(timestamp_col, INTERVAL '10' years)' returns " +
-                  "type 'STRING'. Expected an integer type.");
+                  "from functional.alltypes",
+                  "Operand ''10'' of timestamp/date " +
+                  "arithmetic expression " +
+                  "'DATE_ADD(timestamp_col, INTERVAL '10' years)' returns type " +
+                  "'STRING'. Expected an integer type.");
 
     // Cast from STRING to INT.
     AnalyzesOk("select timestamp_col + interval cast('10' as int) years " +
         "from functional.alltypes");
     // Reversed interval and timestamp using addition.
     AnalysisError("select interval 5.2 years + timestamp_col from functional.alltypes",
-        "Operand '5.2' of timestamp arithmetic expression " +
+        "Operand '5.2' of timestamp/date arithmetic expression " +
         "'INTERVAL 5.2 years + timestamp_col' returns type 'DECIMAL(2,1)'. " +
         "Expected an integer type.");
     // Cast from STRING to INT.
@@ -1727,7 +1804,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     // Second operand is not compatible with type INT. Function-call like version.
     AnalysisError("select date_add(timestamp_col, interval 5.2 years) " +
         "from functional.alltypes",
-        "Operand '5.2' of timestamp arithmetic expression " +
+        "Operand '5.2' of timestamp/date arithmetic expression " +
         "'DATE_ADD(timestamp_col, INTERVAL 5.2 years)' returns type 'DECIMAL(2,1)'. " +
         "Expected an integer type.");
     // Cast from STRING to INT.
@@ -1736,23 +1813,23 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     // Invalid time unit. Non-function-call like version.
     AnalysisError("select timestamp_col + interval 10 error from functional.alltypes",
-        "Invalid time unit 'error' in timestamp arithmetic expression " +
+        "Invalid time unit 'error' in timestamp/date arithmetic expression " +
          "'timestamp_col + INTERVAL 10 error'.");
     AnalysisError("select timestamp_col - interval 10 error from functional.alltypes",
-        "Invalid time unit 'error' in timestamp arithmetic expression " +
+        "Invalid time unit 'error' in timestamp/date arithmetic expression " +
          "'timestamp_col - INTERVAL 10 error'.");
     // Reversed interval and timestamp using addition.
     AnalysisError("select interval 10 error + timestamp_col from functional.alltypes",
-        "Invalid time unit 'error' in timestamp arithmetic expression " +
+        "Invalid time unit 'error' in timestamp/date arithmetic expression " +
         "'INTERVAL 10 error + timestamp_col'.");
     // Invalid time unit. Function-call like version.
     AnalysisError("select date_add(timestamp_col, interval 10 error) " +
         "from functional.alltypes",
-        "Invalid time unit 'error' in timestamp arithmetic expression " +
+        "Invalid time unit 'error' in timestamp/date arithmetic expression " +
         "'DATE_ADD(timestamp_col, INTERVAL 10 error)'.");
     AnalysisError("select date_sub(timestamp_col, interval 10 error) " +
         "from functional.alltypes",
-        "Invalid time unit 'error' in timestamp arithmetic expression " +
+        "Invalid time unit 'error' in timestamp/date arithmetic expression " +
         "'DATE_SUB(timestamp_col, INTERVAL 10 error)'.");
   }
 
@@ -1791,12 +1868,21 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     // Special cases for FROM in function call
     AnalyzesOk("select extract(year from now())");
+    AnalyzesOk("select extract(year from cast(now() as date))");
+    AnalyzesOk("select extract(year from date_col) from functional.date_tbl");
+    AnalyzesOk("select extract(hour from now())");
+    AnalysisError("select extract(hour from cast(now() as date))",
+        "Time unit 'hour' in expression 'EXTRACT(hour FROM CAST(now() AS DATE))' is " +
+        "invalid. Expected one of YEAR, QUARTER, MONTH, DAY.");
     AnalysisError("select extract(foo from now())",
         "Time unit 'foo' in expression 'EXTRACT(foo FROM now())' is invalid. Expected " +
-        "one of YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MILLISECOND, EPOCH.");
+        "one of YEAR, QUARTER, MONTH, DAY, HOUR, MINUTE, SECOND, MILLISECOND, EPOCH.");
+    AnalysisError("select extract(foo from date_col) from functional.date_tbl",
+        "Time unit 'foo' in expression 'EXTRACT(foo FROM date_col)' is " +
+        "invalid. Expected one of YEAR, QUARTER, MONTH, DAY.");
     AnalysisError("select extract(year from 0)",
         "Expression '0' in 'EXTRACT(year FROM 0)' has a return type of TINYINT but a " +
-        "TIMESTAMP is required.");
+        "TIMESTAMP or DATE is required.");
     AnalysisError("select functional.extract(year from now())",
         "Function functional.extract conflicts with the EXTRACT builtin");
     AnalysisError("select date_part(year from now())",
@@ -1904,6 +1990,8 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     // Requires casting then exprs.
     AnalyzesOk("select case when 20 > 10 then 20 when 1 > 2 then 1.0 " +
         "when 4 < 5 then 2 else 15 end");
+    AnalyzesOk("select case when 20 > 10 then date '2001-01-01' else " +
+        "cast('2001-01-01' as timestamp) end");
     // First when expr doesn't return boolean.
     AnalysisError("select case when 20 then 20 when 1 > 2 then timestamp_col " +
         "when 4 < 5 then 2 else 15 end from functional.alltypes",
@@ -1917,6 +2005,10 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "when 4 < 5 then 2 else 15 end from functional.alltypes",
         "Incompatible return types 'TINYINT' and 'TIMESTAMP' " +
          "of exprs '20' and 'timestamp_col'.");
+    AnalysisError("select case when 20 > 10 then 20 when 1 > 2 then date_col " +
+        "when 4 < 5 then 2 else 15 end from functional.date_tbl",
+        "Incompatible return types 'TINYINT' and 'DATE' " +
+         "of exprs '20' and 'date_col'.");
     AnalysisError("select case when 20 > 10 then 20 when 1 > 2 then int_map_col " +
         "else 15 end from functional.allcomplextypes",
         "Incompatible return types 'TINYINT' and 'MAP<STRING,INT>' of exprs " +
@@ -1931,9 +2023,13 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     // Requires casting case expr.
     AnalyzesOk("select case int_col when bigint_col then 30 else 15 end " +
         "from functional.alltypes");
+    AnalyzesOk("select case date_col when timestamp_col then 30 else " +
+        "15 end from functional.date_tbl, functional.alltypes");
     // Requires casting when expr.
     AnalyzesOk("select case bigint_col when int_col then 30 else 15 end " +
         "from functional.alltypes");
+    AnalyzesOk("select case timestamp_col when date_col then 30 else 15 end " +
+        "from functional.alltypes, functional.date_tbl");
     // Requires multiple casts.
     AnalyzesOk("select case bigint_col when int_col then 30 " +
         "when double_col then 1.0 else 15 end from functional.alltypes");
@@ -1942,11 +2038,21 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "when double_col then 1.0 else 15 end from functional.alltypes",
         "Incompatible return types 'BIGINT' and 'TIMESTAMP' " +
         "of exprs 'bigint_col' and 'timestamp_col'.");
+    AnalysisError("select case bigint_col when date_col then 30 " +
+        "when double_col then 1.0 else 15 end from functional.alltypes, " +
+        "functional.date_tbl",
+        "Incompatible return types 'BIGINT' and 'DATE' " +
+        "of exprs 'bigint_col' and 'date_col'.");
     // Then exprs return incompatible types.
     AnalysisError("select case bigint_col when int_col then 30 " +
         "when double_col then timestamp_col else 15 end from functional.alltypes",
         "Incompatible return types 'TINYINT' and 'TIMESTAMP' " +
          "of exprs '30' and 'timestamp_col'.");
+    AnalysisError("select case bigint_col when int_col then 30 " +
+        "when double_col then date_col else 15 end from functional.alltypes, " +
+        "functional.date_tbl",
+        "Incompatible return types 'TINYINT' and 'DATE' " +
+         "of exprs '30' and 'date_col'.");
 
     // Test different type classes (all types are tested in BE tests).
     AnalyzesOk("select case when true then 1 end");
@@ -1954,6 +2060,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalyzesOk("select case when true then 'abc' end");
     AnalyzesOk("select case when true then cast('2011-01-01 09:01:01' " +
         "as timestamp) end");
+    AnalyzesOk("select case when true then date '2011-01-01' end");
     // Test NULLs.
     AnalyzesOk("select case NULL when 1 then 2 else 3 end");
     AnalyzesOk("select case 1 when NULL then 2 else 3 end");
@@ -2036,8 +2143,8 @@ public class AnalyzeExprsTest extends AnalyzerTest {
    * as materialized and computes their mem layout.
    */
   private void makeExprExecutable(Expr e, Analyzer analyzer) {
-    List<TupleId> tids = Lists.newArrayList();
-    List<SlotId> sids = Lists.newArrayList();
+    List<TupleId> tids = new ArrayList<>();
+    List<SlotId> sids = new ArrayList<>();
     e.getIds(tids, sids);
     for (SlotId sid: sids) {
       SlotDescriptor slotDesc = analyzer.getDescTbl().getSlotDesc(sid);
@@ -2078,8 +2185,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "No matching function with signature: if(BOOLEAN).");
 
     // Test IsNull() conditional function.
-    for (PrimitiveType t: PrimitiveType.values()) {
-      String literal = typeToLiteralValue_.get(t);
+    for (String literal : typeToLiteralValue_.values()) {
       AnalyzesOk(String.format("select isnull(%s, %s)", literal, literal));
       AnalyzesOk(String.format("select isnull(%s, NULL)", literal));
       AnalyzesOk(String.format("select isnull(NULL, %s)", literal));
@@ -2156,6 +2262,83 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     catalog_.removeFunction(udf);
   }
 
+  // Serializes to thrift and checks the mtime setting.
+  private void checkSerializedMTime(Expr expr, boolean expectMTime) {
+    Preconditions.checkNotNull(expr.getFn());
+    TExpr thriftExpr = expr.treeToThrift();
+    Preconditions.checkState(thriftExpr.getNodesSize() > 0);
+    Preconditions.checkState(thriftExpr.getNodes().get(0).isSetFn());
+    TFunction thriftFn = thriftExpr.getNodes().get(0).getFn();
+    if (expectMTime) {
+      assertTrue(thriftFn.getLast_modified_time() >= 0);
+    } else {
+      assertEquals(thriftFn.getLast_modified_time(), -1);
+    }
+  }
+
+  // Checks that 'expr', when serialized to thrift, has mtime
+  // set as expected. 'expr' must be a single function call.
+  private void testMTime(String expr, boolean expectMTime) {
+    SelectStmt stmt =
+        (SelectStmt) AnalyzesOk("select " + expr + " from functional.alltypes");
+    Preconditions.checkState(stmt.getSelectList().getItems().size() == 1);
+    TupleDescriptor tblRefDesc = stmt.fromClause_.get(0).getDesc();
+    tblRefDesc.materializeSlots();
+    tblRefDesc.computeMemLayout();
+    if (stmt.hasMultiAggInfo()) {
+      Preconditions.checkState(stmt.getMultiAggInfo().getAggClasses().size() == 1);
+      AggregateInfo aggInfo = stmt.getMultiAggInfo().getAggClass(0);
+      TupleDescriptor intDesc = aggInfo.intermediateTupleDesc_;
+      intDesc.materializeSlots();
+      intDesc.computeMemLayout();
+      checkSerializedMTime(aggInfo.getAggregateExprs().get(0), expectMTime);
+      checkSerializedMTime(
+          aggInfo.getMergeAggInfo().getAggregateExprs().get(0), expectMTime);
+    } else {
+      checkSerializedMTime(stmt.getSelectList().getItems().get(0).getExpr(), expectMTime);
+    }
+  }
+
+  @Test
+  public void TestFunctionMTime() {
+    // Expect unset mtime for builtin.
+    testMTime("sleep(1)", false);
+    testMTime("concat('a', 'b')", false);
+    testMTime("3 is null", false);
+    testMTime("1 < 3", false);
+    testMTime("1 + 1", false);
+    testMTime("avg(int_col)", false);
+
+    final String nativeSymbol =
+        "'_Z8IdentityPN10impala_udf15FunctionContextERKNS_10BooleanValE'";
+    final String nativeUdfPath = "/test-warehouse/libTestUdfs.so";
+    final String javaSymbol = "SYMBOL='org.apache.impala.TestUdf";
+    final String javaPath = "/test-warehouse/impala-hive-udfs.jar";
+    final String nativeUdaPath = "hdfs://localhost:20500/test-warehouse/libTestUdas.so";
+
+    // Spec for a bogus builtin that specifies a bogus path.
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf_builtin_bug",
+        new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null, null,
+        TFunctionBinaryType.BUILTIN));
+    // Valid specs for native and java udf/uda's.
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf_jar",
+        Lists.<Type>newArrayList(Type.INT), Type.INT, javaPath, javaSymbol, null, null,
+        TFunctionBinaryType.JAVA));
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf_native",
+        new ArrayList<Type>(), Type.INT, nativeUdfPath, nativeSymbol, null, null,
+        TFunctionBinaryType.NATIVE));
+    catalog_.addFunction(AggregateFunction.createForTesting(
+        new FunctionName("default", "uda"), Lists.<Type>newArrayList(Type.INT), Type.INT,
+        Type.INT, new HdfsUri(nativeUdaPath), "init_fn_symbol", "update_fn_symbol", null,
+        null, null, null, null, TFunctionBinaryType.NATIVE));
+
+    // Expect these to have mtime set.
+    testMTime("udf_builtin_bug()", false);
+    testMTime("udf_jar(3)", true);
+    testMTime("udf_native()", true);
+    testMTime("uda(int_col)", true);
+  }
+
   @Test
   public void TestExprChildLimit() {
     // Test IN predicate.
@@ -2167,7 +2350,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalyzesOk(inPredStr.toString() + ")");
     inPredStr.append(", " + 1234);
     AnalysisError(inPredStr.toString() + ")",
-        String.format("Exceeded the maximum number of child expressions (%s).\n" +
+        String.format("Exceeded the maximum number of child expressions (%d).\n" +
         "Expression has %s children",  Expr.EXPR_CHILDREN_LIMIT,
         Expr.EXPR_CHILDREN_LIMIT + 1));
 
@@ -2179,7 +2362,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalyzesOk(caseExprStr.toString() + " end");
     caseExprStr.append(" when true then 1");
     AnalysisError(caseExprStr.toString() + " end",
-        String.format("Exceeded the maximum number of child expressions (%s).\n" +
+        String.format("Exceeded the maximum number of child expressions (%d).\n" +
         "Expression has %s children", Expr.EXPR_CHILDREN_LIMIT,
         Expr.EXPR_CHILDREN_LIMIT + 2));
   }
@@ -2216,15 +2399,220 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testFuncExprDepthLimit("cast(", "1", " as int)");
   }
 
-  // Verifies the resulting expr decimal type is exptectedType
-  private void testDecimalExpr(String expr, Type expectedType) {
-    SelectStmt selectStmt = (SelectStmt) AnalyzesOk("select " + expr);
+  /** Generates a specific number of expressions by repeating a column reference.
+   * It generates a string containing 'num_copies' expressions. If 'use_alias' is true,
+   * each column reference has a distinct alias. This allows the repeated columns to be
+   * used in places that require distinct names (e.g. the definition of a view).
+   */
+  String getRepeatedColumnReference(String col_name, int num_copies, boolean use_alias) {
+    StringBuilder repColRef = new StringBuilder();
+
+    for (int i = 0; i < num_copies; ++i) {
+      if (i != 0) repColRef.append(", ");
+      repColRef.append(col_name);
+      if (use_alias) repColRef.append(String.format(" alias%d", i));
+    }
+    return repColRef.toString();
+  }
+
+  /** Get the error message for a statement with 'actual_num_expressions' that exceeds
+   * the statment_expression_limit 'limit'.
+   */
+  String getExpressionLimitErrorStr(int actual_num_expressions, int limit) {
+    return String.format("Exceeded the statement expression limit (%d)\n" +
+        "Statement has %d expressions", limit, actual_num_expressions);
+  }
+
+  @Test
+  public void TestStatementExprLimit() {
+    // To keep it simple and fast, we use a low value for statement_expression_limit.
+    // Since the statement_expression_limit is evaluated before rewrites, turn off
+    // expression rewrites.
+    TQueryOptions queryOpts = new TQueryOptions();
+    queryOpts.setStatement_expression_limit(20);
+    queryOpts.setEnable_expr_rewrites(false);
+    AnalysisContext ctx = createAnalysisCtx(queryOpts);
+
+    // Known SQL patterns (repeated reference to column) that generate 20 and 21
+    // expressions, respectively.
+    String repCols20 = getRepeatedColumnReference("int_col", 20, true);
+    String repCols21 = getRepeatedColumnReference("int_col", 21, true);
+
+    // Select from table
+    AnalyzesOk(String.format("select %s from functional.alltypes", repCols20), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    AnalysisError(String.format("select %s from functional.alltypes", repCols21),
+        ctx, getExpressionLimitErrorStr(21, 20));
+
+    // WHERE clause
+    // This statement has 20 expressions without the WHERE clause, as tested above.
+    // So, this will only be an error if the bool_col in the WHERE clause counts.
+    AnalysisError(String.format("select %s from functional.alltypes where bool_col",
+        repCols20), ctx, getExpressionLimitErrorStr(21, 20));
+
+    // Create table as select
+    AnalyzesOk(String.format("create table exprlimit1 as " +
+        "select %s from functional.alltypes", repCols20), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    AnalysisError(String.format("create table exprlimit1 as " +
+        "select %s from functional.alltypes", repCols21), ctx,
+        getExpressionLimitErrorStr(21, 20));
+
+    // Create view
+    AnalyzesOk(String.format("create view exprlimit1 as " +
+        "select %s from functional.alltypes", repCols20), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    AnalysisError(String.format("create view exprlimit1 as " +
+        "select %s from functional.alltypes", repCols21), ctx,
+        getExpressionLimitErrorStr(21, 20));
+
+    // Subquery
+    AnalyzesOk(String.format("select * from (select %s from functional.alltypes) x",
+        repCols20), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    AnalysisError(String.format("select * from (select %s from functional.alltypes) x",
+        repCols21), ctx, getExpressionLimitErrorStr(21, 20));
+
+    // WITH clause
+    AnalyzesOk(String.format("with v as (select %s from functional.alltypes) " +
+        "select * from v", repCols20), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    AnalysisError(String.format("with v as (select %s from functional.alltypes) " +
+        "select * from v", repCols21), ctx, getExpressionLimitErrorStr(21, 20));
+
+    // View is counted (functional.alltypes_parens has a few expressions)
+    AnalysisError(String.format("select %s from functional.alltypes_parens", repCols20),
+        ctx, getExpressionLimitErrorStr(32, 20));
+
+    // If a view is referenced multiple times, it counts multiple times.
+    AnalysisError(String.format("with v as (select %s from functional.alltypes) " +
+        "select * from v v1,v v2", repCols20), ctx, getExpressionLimitErrorStr(40, 20));
+
+    // If a view is not referenced, it doesn't count.
+    AnalyzesOk(String.format("with v as (select %s from functional.alltypes) select 1",
+        repCols21), ctx);
+    // This is zero because literals do not count.
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 0);
+
+    // EXPLAIN is not exempted from the limit
+    AnalysisError(String.format("explain select %s from functional.alltypes", repCols21),
+        ctx, getExpressionLimitErrorStr(21, 20));
+
+    // Wide table doesn't impact *
+    AnalyzesOk("select * from functional.widetable_1000_cols", ctx);
+
+    // Literal expressions don't count towards the limit, so build a list of literals
+    // to use to test various cases.
+    StringBuilder literalList = new StringBuilder();
+    for (int i = 0; i < 200; ++i) {
+      if (i != 0) literalList.append(", ");
+      literalList.append(i);
+    }
+
+    // Literals in the select list do not count
+    AnalyzesOk(String.format("select %s", literalList.toString()), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 0);
+
+    // Literals in an IN list do not count
+    AnalyzesOk(String.format("select int_col IN (%s) from functional.alltypes",
+        literalList.toString()), ctx);
+
+    // Literals in a VALUES clause do not count
+    StringBuilder valuesList = new StringBuilder();
+    for (int i = 0; i < 200; ++i) {
+      if (i != 0) valuesList.append(", ");
+      valuesList.append("(" + i + ")");
+    }
+    AnalyzesOk("insert into functional.insert_overwrite_nopart (col1) VALUES " +
+        valuesList.toString(), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 0);
+
+    // Expressions that are operators applied to constants still count
+    StringBuilder constantExpr = new StringBuilder();
+    for (int i = 0; i < 21; ++i) {
+      if (i != 0) constantExpr.append(" * ");
+      constantExpr.append(i);
+    }
+    // 21 literals with 20 multiplications requires 20 ArithmeticExprs
+    AnalyzesOk(String.format("select %s", constantExpr.toString()), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    constantExpr.append(" * 100");
+    // 22 literals with 21 multiplications requires 21 ArithmeticExprs
+    AnalysisError(String.format("select %s", constantExpr.toString()),
+        ctx, getExpressionLimitErrorStr(21, 20));
+
+    // Put a non-literal in an IN list to verify it still counts appropriately.
+    StringBuilder inListExpr = new StringBuilder();
+    for (int i = 0; i < 19; i++) {
+      if (i != 0) inListExpr.append(" * ");
+      inListExpr.append(i);
+    }
+    // 19 literals with 18 multiplications = 18 expressions. int_col and IN are another
+    // two expressions. This has 20 expressions total.
+    AnalyzesOk(String.format("select int_col IN (%s) from functional.alltypes",
+        inListExpr.toString()), ctx);
+    assertEquals(ctx.getAnalyzer().getNumStmtExprs(), 20);
+    // Adding one more expression pushes us over the limit.
+    inListExpr.append(" * 100");
+    AnalysisError(String.format("select int_col IN (%s) from functional.alltypes",
+        inListExpr.toString()), ctx, getExpressionLimitErrorStr(21, 20));
+  }
+
+  // Verifies the resulting expr decimal type is expectedType under decimal v1 or
+  // decimal v2.
+  private void testDecimalExpr(String expr, Type decimalExpectedType, boolean isV2) {
+    TQueryOptions queryOpts = new TQueryOptions();
+
+    queryOpts.setDecimal_v2(isV2);
+    SelectStmt selectStmt =
+        (SelectStmt) AnalyzesOk("select " + expr, createAnalysisCtx(queryOpts));
     Expr root = selectStmt.resultExprs_.get(0);
     Type actualType = root.getType();
     Assert.assertTrue(
-        "Expr: " + expr + " Expected: " + expectedType + " Actual: " + actualType,
-        expectedType.equals(actualType));
+        "Expr: " + expr + " Decimal Version: " + (isV2? "2" : "1") +
+        " Expected: " + decimalExpectedType + " Actual: " + actualType,
+        decimalExpectedType.equals(actualType));
   }
+
+  // Verifies the resulting expr decimal type is expectedType under decimal v1.
+  private void testDecimalExprV1(String expr, Type decimalExpectedType) {
+    testDecimalExpr(expr, decimalExpectedType, false);
+  }
+
+  // Verifies the resulting expr decimal type is expectedType under decimal v2.
+  private void testDecimalExprV2(String expr, Type decimalExpectedType) {
+    testDecimalExpr(expr, decimalExpectedType, true);
+  }
+
+  // Verifies the resulting expr decimal type is expectedType under decimal v1 and
+  // decimal v2.
+  private void testDecimalExpr(String expr,
+      Type decimalV1ExpectedType, Type decimalV2ExpectedType) {
+    testDecimalExprV1(expr, decimalV1ExpectedType);
+    testDecimalExprV2(expr, decimalV2ExpectedType);
+  }
+
+  // Verifies the resulting expr decimal type is exptectedType
+  private void testDecimalExpr(String expr, Type expectedType) {
+    testDecimalExpr(expr, expectedType, expectedType);
+  }
+
+  // Verify that mod and % returns the same type when it's DECIMAL V2 mode.
+  // See IMPALA-6202.
+  @Test
+  public void TestModReturnType() {
+    testDecimalExprV2("mod(9.8, 3)", ScalarType.createDecimalType(2,1));
+    testDecimalExprV2("9.7 % 3", ScalarType.createDecimalType(2,1));
+
+    testDecimalExprV2("mod(109.8, 3)", ScalarType.createDecimalType(4,1));
+    testDecimalExprV2("109.7 % 3", ScalarType.createDecimalType(4,1));
+
+    testDecimalExprV2("mod(109.8, 3.45)", ScalarType.createDecimalType(3,2));
+    testDecimalExprV2("109.7 % 3.45", ScalarType.createDecimalType(3,2));
+
+    testDecimalExprV1("mod(9.6, 3)", ScalarType.createDecimalType(4,1));
+    testDecimalExprV1("9.5 % 3", Type.DOUBLE);
+ }
 
   @Test
   public void TestDecimalArithmetic() {
@@ -2242,7 +2630,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testDecimalExpr(decimal_10_0 + " - " + decimal_10_0,
         ScalarType.createDecimalType(11, 0));
     testDecimalExpr(decimal_10_0 + " * " + decimal_10_0,
-        ScalarType.createDecimalType(20, 0));
+        ScalarType.createDecimalType(20, 0), ScalarType.createDecimalType(21, 0));
     testDecimalExpr(decimal_10_0 + " / " + decimal_10_0,
         ScalarType.createDecimalType(21, 11));
     testDecimalExpr(decimal_10_0 + " % " + decimal_10_0,
@@ -2253,7 +2641,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testDecimalExpr(decimal_10_0 + " - " + decimal_5_5,
         ScalarType.createDecimalType(16, 5));
     testDecimalExpr(decimal_10_0 + " * " + decimal_5_5,
-        ScalarType.createDecimalType(15, 5));
+        ScalarType.createDecimalType(15, 5), ScalarType.createDecimalType(16, 5));
     testDecimalExpr(decimal_10_0 + " / " + decimal_5_5,
         ScalarType.createDecimalType(21, 6));
     testDecimalExpr(decimal_10_0 + " % " + decimal_5_5,
@@ -2264,7 +2652,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testDecimalExpr(decimal_5_5 + " - " + decimal_10_0,
         ScalarType.createDecimalType(16, 5));
     testDecimalExpr(decimal_5_5 + " * " + decimal_10_0,
-        ScalarType.createDecimalType(15, 5));
+        ScalarType.createDecimalType(15, 5), ScalarType.createDecimalType(16, 5));
     testDecimalExpr(decimal_5_5 + " / " + decimal_10_0,
         ScalarType.createDecimalType(16, 16));
     testDecimalExpr(decimal_5_5 + " % " + decimal_10_0,
@@ -2272,31 +2660,31 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     // Test some overflow cases.
     testDecimalExpr(decimal_10_0 + " + " + decimal_38_34,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 27));
     testDecimalExpr(decimal_10_0 + " - " + decimal_38_34,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 27));
     testDecimalExpr(decimal_10_0 + " * " + decimal_38_34,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 23));
     testDecimalExpr(decimal_10_0 + " / " + decimal_38_34,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 6));
     testDecimalExpr(decimal_10_0 + " % " + decimal_38_34,
         ScalarType.createDecimalType(38, 34));
 
     testDecimalExpr(decimal_38_34 + " + " + decimal_5_5,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 33));
     testDecimalExpr(decimal_38_34 + " - " + decimal_5_5,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 33));
     testDecimalExpr(decimal_38_34 + " * " + decimal_5_5,
-        ScalarType.createDecimalType(38, 38));
+        ScalarType.createDecimalType(38, 38), ScalarType.createDecimalType(38, 33));
     testDecimalExpr(decimal_38_34 + " / " + decimal_5_5,
-        ScalarType.createDecimalType(38, 34));
+        ScalarType.createDecimalType(38, 34), ScalarType.createDecimalType(38, 29));
     testDecimalExpr(decimal_38_34 + " % " + decimal_5_5,
         ScalarType.createDecimalType(34, 34));
 
     testDecimalExpr(decimal_10_0 + " + " + decimal_10_0 + " + " + decimal_10_0,
         ScalarType.createDecimalType(12, 0));
     testDecimalExpr(decimal_10_0 + " - " + decimal_10_0 + " * " + decimal_10_0,
-        ScalarType.createDecimalType(21, 0));
+        ScalarType.createDecimalType(21, 0), ScalarType.createDecimalType(22, 0));
     testDecimalExpr(decimal_10_0 + " / " + decimal_10_0 + " / " + decimal_10_0,
         ScalarType.createDecimalType(32, 22));
     testDecimalExpr(decimal_10_0 + " % " + decimal_10_0 + " + " + decimal_10_0,
@@ -2313,22 +2701,22 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testDecimalExpr(decimal_10_0 + " + cast(1 as bigint)",
         ScalarType.createDecimalType(20, 0));
     testDecimalExpr(decimal_10_0 + " + cast(1 as float)",
-        ScalarType.createDecimalType(38, 9));
+        ScalarType.createDecimalType(38, 9), ScalarType.createDecimalType(38, 8));
     testDecimalExpr(decimal_10_0 + " + cast(1 as double)",
-        ScalarType.createDecimalType(38, 17));
+        ScalarType.createDecimalType(38, 17), ScalarType.createDecimalType(38, 16));
 
     testDecimalExpr(decimal_5_5 + " + cast(1 as tinyint)",
         ScalarType.createDecimalType(9, 5));
     testDecimalExpr(decimal_5_5 + " - cast(1 as smallint)",
         ScalarType.createDecimalType(11, 5));
     testDecimalExpr(decimal_5_5 + " * cast(1 as int)",
-        ScalarType.createDecimalType(15, 5));
+        ScalarType.createDecimalType(15, 5), ScalarType.createDecimalType(16, 5));
     testDecimalExpr(decimal_5_5 + " % cast(1 as bigint)",
         ScalarType.createDecimalType(5, 5));
     testDecimalExpr(decimal_5_5 + " / cast(1 as float)",
-        ScalarType.createDecimalType(38, 9));
+        ScalarType.createDecimalType(38, 9), ScalarType.createDecimalType(38, 29));
     testDecimalExpr(decimal_5_5 + " + cast(1 as double)",
-        ScalarType.createDecimalType(38, 17));
+        ScalarType.createDecimalType(38, 17), ScalarType.createDecimalType(38, 16));
 
     AnalyzesOk("select " + decimal_5_5 + " = cast(1 as tinyint)");
     AnalyzesOk("select " + decimal_5_5 + " != cast(1 as smallint)");
@@ -2343,6 +2731,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("select " + decimal_5_5 + " + 'cast(1 as timestamp)'",
         "Arithmetic operation requires numeric operands: "
         + "CAST(1 AS DECIMAL(5,5)) + 'cast(1 as timestamp)'");
+    AnalysisError("select " + decimal_5_5 + " + \"DATE '1970-01-01'\"",
+        "Arithmetic operation requires numeric operands: "
+        + "CAST(1 AS DECIMAL(5,5)) + 'DATE \\\'1970-01-01\\\''");
 
     AnalysisError("select " + decimal_5_5 + " = 'abcd'",
         "operands of type DECIMAL(5,5) and STRING are not comparable: " +
@@ -2350,6 +2741,36 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("select " + decimal_5_5 + " > 'cast(1 as timestamp)'",
         "operands of type DECIMAL(5,5) and STRING are not comparable: "
         + "CAST(1 AS DECIMAL(5,5)) > 'cast(1 as timestamp)'");
+    AnalysisError("select " + decimal_5_5 + " > date '1899-12-23'",
+        "operands of type DECIMAL(5,5) and DATE are not comparable: "
+        + "CAST(1 AS DECIMAL(5,5)) > DATE '1899-12-23'");
+
+    // IMPALA-7254: Inconsistent decimal behavior when finding a compatible type.
+    // for casting.
+    // In predicate that does not result in a new precision.
+    AnalyzesOk("select cast(2 as double) in " +
+        "(cast(2 as decimal(38, 37)), cast(3 as decimal(38, 37)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as double), cast(3 as decimal(38, 37)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as decimal(38, 37)), cast(3 as double))");
+    // In predicate that results in a precision.
+    AnalyzesOk("select cast(2 as double) in " +
+        "(cast(2 as decimal(5, 3)), cast(3 as decimal(10, 5)))");
+    AnalyzesOk("select cast(2 as decimal(5, 3)) in " +
+        "(cast(2 as double), cast(3 as decimal(10, 5)))");
+    AnalyzesOk("select cast(2 as decimal(5, 3)) in " +
+        "(cast(2 as decimal(10, 5)), cast(3 as double))");
+    // In predicate that results in a loss of precision.
+    AnalysisError("select cast(2 as decimal(38, 37)) in (cast(2 as decimal(38, 1)))",
+        "Incompatible return types 'DECIMAL(38,37)' and 'DECIMAL(38,1)' of exprs " +
+        "'CAST(2 AS DECIMAL(38,37))' and 'CAST(2 AS DECIMAL(38,1))'");
+    AnalyzesOk("select cast(2 as double) in " +
+        "(cast(2 as decimal(38, 37)), cast(3 as decimal(38, 1)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as double), cast(3 as decimal(38, 1)))");
+    AnalyzesOk("select cast(2 as decimal(38, 37)) in " +
+        "(cast(2 as decimal(38, 1)), cast(3 as double))");
   }
 
   @Test
@@ -2419,14 +2840,13 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     AnalysisError("select round(cast(1.123 as decimal(10,3)), 5.1)",
         "No matching function with signature: round(DECIMAL(10,3), DECIMAL(2,1))");
-    AnalysisError("select round(cast(1.123 as decimal(30,20)), 40)",
-        "Cannot round/truncate to scales greater than 38.");
+    AnalyzesOk("select round(cast(1.123 as decimal(30,20)), 40)");
     for (final String alias : aliasesOfTruncate) {
-        AnalysisError(String.format("select truncate(cast(1.123 as decimal(10,3)), 40)",
-            alias), "Cannot round/truncate to scales greater than 38.");
+        AnalyzesOk(String.format("select %s(cast(1.123 as decimal(10,3)), 40)", alias));
         AnalyzesOk(String.format("select %s(NULL)", alias));
         AnalysisError(String.format("select %s(NULL, 1)", alias),
-            "Cannot resolve DECIMAL precision and scale from NULL type.");
+            String.format("Cannot resolve DECIMAL precision and scale from NULL type " +
+                "in %s function.", alias));
     }
     AnalysisError("select round(cast(1.123 as decimal(10,3)), NULL)",
         "round() cannot be called with a NULL second argument.");
@@ -2439,18 +2859,22 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "No matching function with signature: precision(FLOAT)");
 
     AnalysisError("select precision(NULL)",
-        "Cannot resolve DECIMAL precision and scale from NULL type.");
+        "Cannot resolve DECIMAL precision and scale from NULL type in " +
+            "precision function");
     AnalysisError("select scale(NULL)",
-        "Cannot resolve DECIMAL precision and scale from NULL type.");
+        "Cannot resolve DECIMAL precision and scale from NULL type in " +
+            "scale function.");
 
     testDecimalExpr("round(1.23)", ScalarType.createDecimalType(2, 0));
     testDecimalExpr("round(1.23, 1)", ScalarType.createDecimalType(3, 1));
     testDecimalExpr("round(1.23, 0)", ScalarType.createDecimalType(2, 0));
-    testDecimalExpr("round(1.23, 3)", ScalarType.createDecimalType(4, 3));
+    testDecimalExpr("round(1.23, 3)", ScalarType.createDecimalType(3, 2));
     testDecimalExpr("round(1.23, -1)", ScalarType.createDecimalType(2, 0));
     testDecimalExpr("round(1.23, -2)", ScalarType.createDecimalType(2, 0));
     testDecimalExpr("round(cast(1.23 as decimal(3,2)), -2)",
         ScalarType.createDecimalType(2, 0));
+    testDecimalExpr("round(cast(1.23 as decimal(30, 20)), 40)",
+        ScalarType.createDecimalType(30, 20));
 
     testDecimalExpr("ceil(123.45)", ScalarType.createDecimalType(4, 0));
     testDecimalExpr("floor(12.345)", ScalarType.createDecimalType(3, 0));
@@ -2463,12 +2887,56 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         testDecimalExpr(String.format("%s(1.23, 0)", alias),
             ScalarType.createDecimalType(1, 0));
         testDecimalExpr(String.format("%s(1.23, 3)", alias),
-            ScalarType.createDecimalType(4, 3));
+            ScalarType.createDecimalType(3, 2));
         testDecimalExpr(String.format("%s(1.23, -1)", alias),
             ScalarType.createDecimalType(1, 0));
         testDecimalExpr(String.format("%s(1.23, -2)", alias),
             ScalarType.createDecimalType(1, 0));
+        testDecimalExpr(String.format("%s(cast(1.23 as decimal(30, 20)), 40)", alias),
+            ScalarType.createDecimalType(30, 20));
     }
+
+    AnalysisContext decimalV1Ctx = createAnalysisCtx();
+    decimalV1Ctx.getQueryOptions().setDecimal_v2(false);
+    AnalysisContext decimalV2Ctx = createAnalysisCtx();
+    decimalV2Ctx.getQueryOptions().setDecimal_v2(true);
+
+    testDecimalExpr("coalesce(cast(0.789 as decimal(19, 19)), " +
+        "cast(123 as decimal(19, 0)))", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select coalesce(cast(0.789 as decimal(20, 20)), " +
+            "cast(123 as decimal(19, 0)))", decimalV1Ctx);
+    AnalysisError("select coalesce(cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV2Ctx,
+        "Cannot resolve DECIMAL types of the coalesce(DECIMAL(20,20), " +
+        "DECIMAL(19,0)) function arguments. You need to wrap the arguments in a CAST.");
+
+    testDecimalExpr("if(true, cast(0.789 as decimal(19, 19)), " +
+        "cast(123 as decimal(19, 0)))", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select if(true, cast(0.789 as decimal(20, 20)), " +
+            "cast(123 as decimal(19, 0)))", decimalV1Ctx);
+    AnalysisError("select if(true, cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV2Ctx,
+        "Cannot resolve DECIMAL types of the if(BOOLEAN, " +
+        "DECIMAL(20,20), DECIMAL(19,0)) function arguments. " +
+        "You need to wrap the arguments in a CAST.");
+
+    testDecimalExpr("isnull(cast(0.789 as decimal(19, 19)), " +
+        "cast(123 as decimal(19, 0)))", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select isnull(cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV1Ctx);
+    AnalysisError("select isnull(cast(0.789 as decimal(20, 20)), " +
+        "cast(123 as decimal(19, 0)))", decimalV2Ctx,
+        "Cannot resolve DECIMAL types of the isnull(DECIMAL(20,20), " +
+        "DECIMAL(19,0)) function arguments. You need to wrap the arguments in a CAST.");
+
+    testDecimalExpr("case 1 when 0 then cast(0.789 as decimal(19, 19)) " +
+        "else cast(123 as decimal(19, 0)) end", ScalarType.createDecimalType(38, 19));
+    AnalyzesOk("select case 1 when 0 then cast(0.789 as decimal(19, 19)) " +
+            "else cast(123 as decimal(20, 0)) end", decimalV1Ctx);
+    AnalysisError("select case 1 when 0 then cast(0.789 as decimal(19, 19)) " +
+        "else cast(123 as decimal(20, 0)) end", decimalV2Ctx,
+        "Incompatible return types 'DECIMAL(19,19)' and 'DECIMAL(20,0)' " +
+        "of exprs 'CAST(0.789 AS DECIMAL(19,19))' and 'CAST(123 AS DECIMAL(20,0))'.");
   }
 
   /**
@@ -2481,6 +2949,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
       exprStr.append(repeatSuffix);
     }
     AnalyzesOk(exprStr.toString());
+    exprStr.append(repeatSuffix);
     exprStr.append(repeatSuffix);
     AnalysisError(exprStr.toString(),
         String.format("Exceeded the maximum depth of an expression tree (%s).",
@@ -2504,7 +2973,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalyzesOk("select " + getNestedFuncExpr(openFunc, baseArg, closeFunc,
         Expr.EXPR_DEPTH_LIMIT - 1));
     AnalysisError("select " + getNestedFuncExpr(openFunc, baseArg, closeFunc,
-        Expr.EXPR_DEPTH_LIMIT),
+        Expr.EXPR_DEPTH_LIMIT + 1),
         String.format("Exceeded the maximum depth of an expression tree (%s).",
         Expr.EXPR_DEPTH_LIMIT));
     // Test 10x the safe depth.
@@ -2532,74 +3001,147 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   }
 
   @Test
-  public void TestAppxCountDistinctOption() throws AnalysisException, CatalogException {
+  public void TestAppxCountDistinctOption() throws AnalysisException {
     TQueryOptions queryOptions = new TQueryOptions();
     queryOptions.setAppx_count_distinct(true);
 
     // Accumulates count(distinct) for all columns of alltypesTbl or decimalTbl.
-    List<String> countDistinctFns = Lists.newArrayList();
+    List<String> countDistinctFns = new ArrayList<>();
     // Accumulates count(distinct) for all columns of both alltypesTbl and decimalTbl.
-    List<String> allCountDistinctFns = Lists.newArrayList();
+    List<String> allCountDistinctFns = new ArrayList<>();
 
-    Table alltypesTbl = catalog_.getTable("functional", "alltypes");
+    Table alltypesTbl = catalog_.getOrLoadTable("functional", "alltypes");
     for (Column col: alltypesTbl.getColumns()) {
       String colName = col.getName();
       // Test a single count(distinct) with some other aggs.
-      AnalyzesOk(String.format(
-          "select count(distinct %s), sum(distinct smallint_col), " +
+      String countDistinctFn = String.format("count(distinct %s)", colName);
+      SelectStmt stmt = (SelectStmt) AnalyzesOk(String.format(
+          "select %s, sum(distinct smallint_col), " +
           "avg(float_col), min(%s) " +
           "from functional.alltypes",
-          colName, colName), createAnalyzer(queryOptions));
-      countDistinctFns.add(String.format("count(distinct %s)", colName));
+          countDistinctFn, colName), createAnalysisCtx(queryOptions));
+      validateSingleColAppxCountDistinctRewrite(stmt, colName, 4, 1, 1);
+      countDistinctFns.add(countDistinctFn);
     }
     // Test a single query with a count(distinct) on all columns of alltypesTbl.
-    AnalyzesOk(String.format("select %s from functional.alltypes",
-        Joiner.on(",").join(countDistinctFns)), createAnalyzer(queryOptions));
+    SelectStmt alltypesStmt = (SelectStmt) AnalyzesOk(String.format(
+        "select %s from functional.alltypes",
+        Joiner.on(",").join(countDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(alltypesStmt, alltypesTbl.getColumns().size());
 
     allCountDistinctFns.addAll(countDistinctFns);
     countDistinctFns.clear();
-    Table decimalTbl = catalog_.getTable("functional", "decimal_tbl");
+    Table decimalTbl = catalog_.getOrLoadTable("functional", "decimal_tbl");
     for (Column col: decimalTbl.getColumns()) {
       String colName = col.getName();
       // Test a single count(distinct) with some other aggs.
-      AnalyzesOk(String.format(
+      SelectStmt stmt = (SelectStmt) AnalyzesOk(String.format(
           "select count(distinct %s), sum(distinct d1), " +
           "avg(d2), min(%s) " +
           "from functional.decimal_tbl",
-          colName, colName), createAnalyzer(queryOptions));
+          colName, colName), createAnalysisCtx(queryOptions));
       countDistinctFns.add(String.format("count(distinct %s)", colName));
+      validateSingleColAppxCountDistinctRewrite(stmt, colName, 4, 1, 1);
     }
     // Test a single query with a count(distinct) on all columns of decimalTbl.
-    AnalyzesOk(String.format("select %s from functional.decimal_tbl",
-        Joiner.on(",").join(countDistinctFns)), createAnalyzer(queryOptions));
+    SelectStmt decimalTblStmt = (SelectStmt) AnalyzesOk(String.format(
+        "select %s from functional.decimal_tbl",
+        Joiner.on(",").join(countDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(decimalTblStmt, decimalTbl.getColumns().size());
+
+    allCountDistinctFns.addAll(countDistinctFns);
+    countDistinctFns.clear();
+    Table dateTbl = catalog_.getOrLoadTable("functional", "date_tbl");
+    for (Column col: dateTbl.getColumns()) {
+      String colName = col.getName();
+      // Test a single count(distinct) with some other aggs.
+      String countDistinctFn = String.format("count(distinct %s)", colName);
+      SelectStmt stmt = (SelectStmt) AnalyzesOk(String.format(
+          "select %s, avg(%s), min(%s) from functional.date_tbl",
+          countDistinctFn, colName, colName), createAnalysisCtx(queryOptions));
+      validateSingleColAppxCountDistinctRewrite(stmt, colName, 3, 0, 1);
+      countDistinctFns.add(countDistinctFn);
+    }
+    // Test a single query with a count(distinct) on all columns of dateTbl.
+    SelectStmt dateStmt = (SelectStmt) AnalyzesOk(String.format(
+        "select %s from functional.date_tbl",
+        Joiner.on(",").join(countDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(dateStmt, dateTbl.getColumns().size());
 
     allCountDistinctFns.addAll(countDistinctFns);
 
-    // Test a single query with a count(distinct) on all columns of both
-    // alltypes/decimalTbl.
-    AnalyzesOk(String.format(
-        "select %s from functional.alltypes cross join functional.decimal_tbl",
-        Joiner.on(",").join(countDistinctFns)), createAnalyzer(queryOptions));
+    // Test a single query with a count(distinct) on all columns of alltypes, decimalTbl
+    // and dateTbl.
+    SelectStmt comboStmt = (SelectStmt) AnalyzesOk(String.format(
+        "select %s from functional.alltypes cross join functional.decimal_tbl " +
+        "cross join functional.date_tbl",
+        Joiner.on(",").join(allCountDistinctFns)), createAnalysisCtx(queryOptions));
+    assertAllNdvAggExprs(comboStmt, alltypesTbl.getColumns().size() +
+        decimalTbl.getColumns().size() + dateTbl.getColumns().size());
 
     // The rewrite does not work for multiple count() arguments.
-    AnalysisError("select count(distinct int_col, bigint_col), " +
-        "count(distinct string_col, float_col) from functional.alltypes",
-        createAnalyzer(queryOptions),
-        "all DISTINCT aggregate functions need to have the same set of parameters as " +
-        "count(DISTINCT int_col, bigint_col); deviating function: " +
-        "count(DISTINCT string_col, float_col)");
+    SelectStmt noRewriteStmt = (SelectStmt) AnalyzesOk(
+        "select count(distinct int_col, bigint_col), " +
+        "count(distinct string_col, float_col) from functional.alltypes");
+    assertNoNdvAggExprs(noRewriteStmt, 2);
+
     // The rewrite only applies to the count() function.
-    AnalysisError(
+    noRewriteStmt = (SelectStmt) AnalyzesOk(
         "select avg(distinct int_col), sum(distinct float_col) from functional.alltypes",
-        createAnalyzer(queryOptions),
-        "all DISTINCT aggregate functions need to have the same set of parameters as " +
-        "avg(DISTINCT int_col); deviating function: sum(DISTINCT");
+        createAnalysisCtx(queryOptions));
+    assertNoNdvAggExprs(noRewriteStmt, 2);
+  }
+
+  // Checks that 'stmt' has two aggregate exprs - DISTINCT 'sum' and non-DISTINCT 'ndv'.
+  private void validateSingleColAppxCountDistinctRewrite(
+      SelectStmt stmt, String rewrittenColName, int expNumAggExprs,
+      int expNumDistinctExprs, int expNumNdvExprs) {
+    MultiAggregateInfo multiAggInfo = stmt.getMultiAggInfo();
+    List<FunctionCallExpr> aggExprs = multiAggInfo.getAggExprs();
+    assertEquals(expNumAggExprs, aggExprs.size());
+    int numDistinctExprs = 0;
+    int numNdvExprs = 0;
+    for (FunctionCallExpr aggExpr : aggExprs) {
+      if (aggExpr.isDistinct()) {
+        assertEquals("sum", aggExpr.getFnName().toString());
+        ++numDistinctExprs;
+      }
+      if (aggExpr.getFnName().toString().equals("ndv")) {
+        assertEquals(ToSqlUtils.getIdentSql(rewrittenColName),
+            aggExpr.getChild(0).toSql());
+        ++numNdvExprs;
+      }
+    }
+    assertEquals(expNumDistinctExprs, numDistinctExprs);
+    assertEquals(expNumNdvExprs, numNdvExprs);
+  }
+
+  // Checks that all aggregate exprs in 'stmt' are non-DISTINCT 'ndv'.
+  private void assertAllNdvAggExprs(SelectStmt stmt, int expectedNumAggExprs) {
+    MultiAggregateInfo multiAggInfo = stmt.getMultiAggInfo();
+    List<FunctionCallExpr> aggExprs = multiAggInfo.getAggExprs();
+    assertEquals(expectedNumAggExprs, aggExprs.size());
+    for (FunctionCallExpr aggExpr : aggExprs) {
+      assertFalse(aggExpr.isDistinct());
+      assertEquals("ndv", aggExpr.getFnName().toString());
+    }
+  }
+
+  // Checks that all aggregate exprs in 'stmt' are DISTINCT and not 'ndv'.
+  private void assertNoNdvAggExprs(SelectStmt stmt, int expectedNumAggExprs) {
+    MultiAggregateInfo multiAggInfo = stmt.getMultiAggInfo();
+    List<FunctionCallExpr> aggExprs = multiAggInfo.getAggExprs();
+    assertEquals(expectedNumAggExprs, aggExprs.size());
+    for (FunctionCallExpr aggExpr : aggExprs) {
+      assertTrue(aggExpr.isDistinct());
+      assertNotEquals("ndv", aggExpr.getFnName().toString());
+    }
   }
 
   @Test
   // IMPALA-2233: Regression test for loss of precision through implicit casts.
   public void TestImplicitArgumentCasts() throws AnalysisException {
-    FunctionName fnName = new FunctionName(Catalog.BUILTINS_DB, "greatest");
+    FunctionName fnName = new FunctionName(BuiltinsDb.NAME, "greatest");
     Function tinyIntFn = new Function(fnName, new Type[] {ScalarType.DOUBLE},
         Type.DOUBLE, true);
     Function decimalFn = new Function(fnName,
@@ -2609,8 +3151,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     Assert.assertTrue(tinyIntFn.compare(decimalFn,
         CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
     // Check that this resolves to the decimal version of the function.
-    Analyzer analyzer = createAnalyzer(Catalog.BUILTINS_DB);
-    Db db = analyzer.getDb(Catalog.BUILTINS_DB, Privilege.VIEW_METADATA, true);
+    Db db = catalog_.getDb(BuiltinsDb.NAME);
     Function foundFn = db.getFunction(decimalFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     assertNotNull(foundFn);
     Assert.assertTrue(foundFn.getArgs()[0].isDecimal());
@@ -2643,12 +3184,144 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     Assert.assertNotNull(foundFn);
     Assert.assertEquals(Type.DOUBLE, foundFn.getArgs()[0]);
 
-    FunctionName lagFnName = new FunctionName(Catalog.BUILTINS_DB, "lag");
-    // Timestamp should not be converted to string if string overload available.
+    FunctionName lagFnName = new FunctionName(BuiltinsDb.NAME, "lag");
+    // String should not be converted to timestamp or date if string overload available.
     Function lagStringFn = new Function(lagFnName,
         new Type[] {ScalarType.STRING, Type.TINYINT}, Type.INVALID, false);
     foundFn = db.getFunction(lagStringFn, CompareMode.IS_SUPERTYPE_OF);
     Assert.assertNotNull(foundFn);
     Assert.assertEquals(Type.STRING, foundFn.getArgs()[0]);
+
+    // Date should not be converted to timestamp if date overload is available.
+    Function lagDateFn = new Function(lagFnName,
+        new Type[] {ScalarType.DATE, Type.TINYINT}, Type.INVALID, false);
+    foundFn = db.getFunction(lagDateFn, CompareMode.IS_INDISTINGUISHABLE);
+    Assert.assertNull(foundFn);
+    foundFn = db.getFunction(lagDateFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNotNull(foundFn);
+    Assert.assertEquals(Type.DATE, foundFn.getArgs()[0]);
+
+    // String is matched non-strictly to date, instead of converting both string and date
+    // arguments to timestamp.
+    FunctionName ifFnName = new FunctionName(BuiltinsDb.NAME, "if");
+    Function ifStringDateFn = new Function(ifFnName,
+        new Type[] {ScalarType.BOOLEAN, ScalarType.STRING, ScalarType.DATE}, Type.INVALID,
+            false);
+    foundFn = db.getFunction(ifStringDateFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNull(foundFn);
+    foundFn = db.getFunction(ifStringDateFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertNotNull(foundFn);
+    Assert.assertEquals(Type.DATE, foundFn.getArgs()[1]);
+    Assert.assertEquals(Type.DATE, foundFn.getArgs()[2]);
+
+    // Date is matched non-strictly to timestamp
+    ifStringDateFn = new Function(ifFnName,
+        new Type[] {ScalarType.BOOLEAN, ScalarType.TIMESTAMP, ScalarType.DATE},
+            Type.INVALID, false);
+    foundFn = db.getFunction(ifStringDateFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNull(foundFn);
+    foundFn = db.getFunction(ifStringDateFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertNotNull(foundFn);
+    Assert.assertEquals(Type.TIMESTAMP, foundFn.getArgs()[1]);
+    Assert.assertEquals(Type.TIMESTAMP, foundFn.getArgs()[2]);
+
+    // String is matched non-strictly to timestamp if there's no string overload but both
+    // timestamp and date overloads are available.
+    FunctionName yearFnName = new FunctionName(BuiltinsDb.NAME, "year");
+    Function yearStringFn = new Function(yearFnName,
+        new Type[] {ScalarType.STRING}, Type.INT, false);
+    foundFn = db.getFunction(yearStringFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNull(foundFn);
+    foundFn = db.getFunction(yearStringFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    Assert.assertNotNull(foundFn);
+    Assert.assertEquals(Type.TIMESTAMP, foundFn.getArgs()[0]);
   }
+
+  @Test
+  public void TestCastFormatClauseFromString() throws AnalysisException {
+    AnalysisError("select cast('05-01-2017' AS DATETIME FORMAT 'MM-dd-yyyy')",
+        "Unsupported data type: DATETIME");
+    AnalysisError("select cast('05-01-2017' AS INT FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from STRING to INT");
+    AnalysisError("select cast('05-01-2017' AS STRING FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from STRING to STRING");
+    AnalysisError("select cast('05-01-2017' AS BOOLEAN FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from STRING to BOOLEAN");
+    AnalysisError("select cast('05-01-2017' AS DOUBLE FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from STRING to DOUBLE");
+    AnalysisError("select cast('05-01-2017' AS TIMESTAMP FORMAT '')",
+        "FORMAT clause can't be empty");
+    AnalyzesOk("select cast('05-01-2017' AS TIMESTAMP FORMAT 'MM-dd-yyyy')");
+    AnalyzesOk("select cast('05-01-2017' AS DATE FORMAT 'MM-dd-yyyy')");
+  }
+
+  @Test
+  public void TestCastFormatClauseFromDatetime() throws AnalysisException {
+    RunCastFormatTestOnType("TIMESTAMP");
+    RunCastFormatTestOnType("DATE");
+  }
+
+  private void RunCastFormatTestOnType(String type) {
+    String to_timestamp_cast = "cast('05-01-2017' as " + type + ")";
+    AnalysisError(
+        "select cast(" + to_timestamp_cast + " as DATETIME FORMAT 'MM-dd-yyyy')",
+        "Unsupported data type: DATETIME");
+    if (!type.equals("TIMESTAMP")) {
+      AnalysisError(
+          "select cast(" + to_timestamp_cast + " as TIMESTAMP FORMAT 'MM-dd-yyyy')",
+          "FORMAT clause is not applicable from " + type + " to TIMESTAMP");
+    }
+    if (!type.equals("DATE")) {
+      AnalysisError("select cast(" + to_timestamp_cast + " as DATE FORMAT 'MM-dd-yyyy')",
+          "FORMAT clause is not applicable from " + type + " to DATE");
+    }
+    AnalysisError("select cast(" + to_timestamp_cast + " AS INT FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from " + type +" to INT");
+    AnalysisError("select cast(" + to_timestamp_cast + " AS BOOLEAN FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from " + type + " to BOOLEAN");
+    AnalysisError("select cast(" + to_timestamp_cast + " AS DOUBLE FORMAT 'MM-dd-yyyy')",
+        "FORMAT clause is not applicable from " + type + " to DOUBLE");
+    AnalysisError("select cast(" + to_timestamp_cast + " AS STRING FORMAT '')",
+        "FORMAT clause can't be empty");
+    AnalyzesOk("select cast(" + to_timestamp_cast + " AS STRING FORMAT 'MM-dd-yyyy')");
+    AnalyzesOk("select cast(" + to_timestamp_cast + " AS VARCHAR FORMAT 'MM-dd-yyyy')");
+    AnalyzesOk("select cast(" + to_timestamp_cast + " AS CHAR(10) FORMAT 'MM-dd-yyyy')");
+  }
+
+  @Test
+  public void TestToStringOnCastFormatClause() throws AnalysisException {
+    String cast_str = "CAST('05-01-2017' AS TIMESTAMP FORMAT 'MM-dd-yyyy')";
+    SelectStmt select = (SelectStmt) AnalyzesOk("select " + cast_str);
+    Assert.assertEquals(cast_str, select.getResultExprs().get(0).toSqlImpl());
+
+    cast_str = "CAST('05-01-2017' AS DATE FORMAT 'MM-dd-yyyy')";
+    select = (SelectStmt) AnalyzesOk("select " + cast_str);
+    Assert.assertEquals(cast_str, select.getResultExprs().get(0).toSqlImpl());
+
+    // Check that escaped single quotes in the format remain escaped in the printout.
+    cast_str = "CAST('2019-01-01te\\\'xt' AS DATE FORMAT " +
+        "'YYYY\\\'MM\\\'DD\"te\\\'xt\"')";
+    select = (SelectStmt) AnalyzesOk("select " + cast_str);
+    Assert.assertEquals(cast_str, select.getResultExprs().get(0).toSqlImpl());
+
+    // Check that non-escaped single quotes in the format are escaped in the printout.
+    // Also check that the surrounding double quotes around the format string are
+    // replaced with single quotes in the output.
+    cast_str = "select CAST(\"2019-01-02te'xt\" AS DATE FORMAT " +
+        "\"YYYY'MM'DD\\\"te'xt\\\"\")";
+    select = (SelectStmt) AnalyzesOk(cast_str);
+    String expected_str = "CAST('2019-01-02te\\\'xt' AS DATE FORMAT " +
+        "'YYYY\\\'MM\\\'DD\\\"te\\\'xt\\\"')";
+    Assert.assertEquals(expected_str, select.getResultExprs().get(0).toSqlImpl());
+
+    // Check that a single quote in a free text token is escaped in the output even if it
+    // is after an escaped backslash.
+    cast_str = "select CAST(\"2019-01-02te\\'xt\" AS DATE FORMAT " +
+        "\"YYYY-MM-DD\\\"te\\\\'xt\\\"\")";
+    select = (SelectStmt) AnalyzesOk(cast_str);
+    expected_str = "CAST('2019-01-02te\\\'xt' AS DATE FORMAT " +
+        "'YYYY-MM-DD\\\"te\\\\\\'xt\\\"')";
+    Assert.assertEquals(expected_str, select.getResultExprs().get(0).toSqlImpl());
+  }
+
 }

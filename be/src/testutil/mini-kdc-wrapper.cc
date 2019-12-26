@@ -30,17 +30,14 @@ using namespace impala;
 namespace filesystem = boost::filesystem;
 using filesystem::path;
 
-DECLARE_bool(use_kudu_kinit);
-
 DECLARE_string(keytab_file);
-DECLARE_string(principal);
-DECLARE_string(be_principal);
 DECLARE_string(krb5_conf);
+DECLARE_string(krb5_ccname);
 
 Status MiniKdcWrapper::StartKdc(string keytab_dir) {
   kudu::MiniKdcOptions options;
   options.realm = realm_;
-  options.data_root = keytab_dir;
+  options.data_root = move(keytab_dir);
   options.ticket_lifetime = ticket_lifetime_;
   options.renew_lifetime = renew_lifetime_;
   options.port = kdc_port_;
@@ -58,49 +55,54 @@ Status MiniKdcWrapper::StopKdc() {
   return Status::OK();
 }
 
+Status MiniKdcWrapper::Kinit(const string& username) {
+  KUDU_RETURN_IF_ERROR(kdc_->Kinit(username), "Failed to kinit.");
+  return Status::OK();
+}
+
+Status MiniKdcWrapper::CreateUserPrincipal(const string& username) {
+  KUDU_RETURN_IF_ERROR(kdc_->CreateUserPrincipal(username),
+      "Failed to create user principal.");
+  return Status::OK();
+}
+
 Status MiniKdcWrapper::CreateServiceKeytab(const string& spn, string* kt_path) {
   KUDU_RETURN_IF_ERROR(kdc_->CreateServiceKeytab(spn, kt_path),
       "Failed to create service keytab.");
   return Status::OK();
 }
 
-Status MiniKdcWrapper::SetupAndStartMiniKDC(KerberosSwitch k) {
-  if (k != KERBEROS_OFF) {
-    FLAGS_use_kudu_kinit = k == USE_KUDU_KERBEROS;
+Status MiniKdcWrapper::SetupAndStartMiniKDC(string realm,
+    string ticket_lifetime, string renew_lifetime,
+    int kdc_port, unique_ptr<MiniKdcWrapper>* kdc_ptr) {
+  unique_ptr<MiniKdcWrapper> kdc(new MiniKdcWrapper(
+      move(realm), move(ticket_lifetime), move(renew_lifetime), kdc_port));
+  DCHECK(kdc.get() != nullptr);
 
-    // Check if the unique directory already exists, and create it if it doesn't.
-    RETURN_IF_ERROR(FileSystemUtil::RemoveAndCreateDirectory(unique_test_dir_.string()));
-    string keytab_dir = unique_test_dir_.string() + "/krb5kdc";
+  // Enable the workaround for MIT krb5 1.10 bugs from krb5_realm_override.cc.
+  setenv("KUDU_ENABLE_KRB5_REALM_FIX", "true", 0);
 
-    RETURN_IF_ERROR(StartKdc(keytab_dir));
+  // Check if the unique directory already exists, and create it if it doesn't.
+  RETURN_IF_ERROR(
+      FileSystemUtil::RemoveAndCreateDirectory(kdc->unique_test_dir_.string()));
+  string keytab_dir = kdc->unique_test_dir_.string() + "/krb5kdc";
 
-    string kt_path;
-    RETURN_IF_ERROR(CreateServiceKeytab(spn_, &kt_path));
+  RETURN_IF_ERROR(kdc->StartKdc(keytab_dir));
 
-    // Set the appropriate flags based on how we've set up the kerberos environment.
-    FLAGS_krb5_conf = strings::Substitute("$0/$1", keytab_dir, "krb5.conf");
-    FLAGS_keytab_file = kt_path;
+  // Set the appropriate flags based on how we've set up the kerberos environment.
+  FLAGS_krb5_conf = strings::Substitute("$0/$1", keytab_dir, "krb5.conf");
 
-    // We explicitly set 'principal' and 'be_principal' even though 'principal' won't be
-    // used to test IMPALA-6256.
-    FLAGS_principal = "dummy-service/host@realm";
-    FLAGS_be_principal = strings::Substitute("$0@$1", spn_, realm_);
-  }
+  *kdc_ptr = std::move(kdc);
   return Status::OK();
 }
 
-Status MiniKdcWrapper::TearDownMiniKDC(KerberosSwitch k) {
-  if (k != KERBEROS_OFF) {
-    RETURN_IF_ERROR(StopKdc());
+Status MiniKdcWrapper::TearDownMiniKDC() {
+  RETURN_IF_ERROR(StopKdc());
 
-    // Clear the flags so we don't step on other tests that may run in the same process.
-    FLAGS_keytab_file.clear();
-    FLAGS_principal.clear();
-    FLAGS_be_principal.clear();
-    FLAGS_krb5_conf.clear();
+  // Clear the flags so we don't step on other tests that may run in the same process.
+  FLAGS_krb5_conf.clear();
 
-    // Remove test directory.
-    RETURN_IF_ERROR(FileSystemUtil::RemovePaths({unique_test_dir_.string()}));
-  }
+  // Remove test directory.
+  RETURN_IF_ERROR(FileSystemUtil::RemovePaths({unique_test_dir_.string()}));
   return Status::OK();
 }

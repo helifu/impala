@@ -22,12 +22,27 @@
 #include <boost/scoped_ptr.hpp>
 #include "exec/exec-node.h"
 
+#include "runtime/bufferpool/buffer-pool.h"
+
 namespace impala {
 
-class DataStreamRecvrBase;
+class KrpcDataStreamRecvr;
 class RowBatch;
 class ScalarExpr;
 class TupleRowComparator;
+
+class ExchangePlanNode : public PlanNode {
+ public:
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+
+  ~ExchangePlanNode(){}
+
+  /// Sort expressions and parameters passed to the merging receiver.
+  std::vector<ScalarExpr*> ordering_exprs_;
+  std::vector<bool> is_asc_order_;
+  std::vector<bool> nulls_first_;
+};
 
 /// Receiver node for data streams. The data stream receiver is created in Prepare()
 /// and closed in Close().
@@ -40,17 +55,18 @@ class TupleRowComparator;
 /// in its SortExecExprs member that are used to compare rows.
 /// If is_merging_ is false, the exchange node directly retrieves batches from the row
 /// batch queue of the DataStreamRecvrBase via calls to DataStreamRecvrBase::GetBatch().
+
 class ExchangeNode : public ExecNode {
  public:
-  ExchangeNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  ExchangeNode(
+      ObjectPool* pool, const ExchangePlanNode& pnode, const DescriptorTbl& descs);
 
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state);
   virtual void Codegen(RuntimeState* state);
   /// Blocks until the first batch is available for consumption via GetNext().
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
-  virtual Status Reset(RuntimeState* state);
+  virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
   virtual void Close(RuntimeState* state);
 
   /// the number of senders needs to be set after the c'tor, because it's not
@@ -69,12 +85,20 @@ class ExchangeNode : public ExecNode {
   /// Only used when is_merging_ is false.
   Status FillInputRowBatch(RuntimeState* state);
 
+  /// Releases resources of the receiver by transferring the resource ownership of
+  /// the most recently dequeued row batch to 'output_batch'. Also cancels the underlying
+  /// receiver so all senders will get unblocked. This function is called after the
+  /// exchange node hits end-of-stream due to reaching the node's row count limit.
+  /// Please note that no more rows will be returned from the receiver once this function
+  /// is called.
+  void ReleaseRecvrResources(RowBatch* output_batch);
+
   int num_senders_;  // needed for stream_recvr_ construction
 
   /// The underlying DataStreamRecvrBase instance. Ownership is shared between this
   /// exchange node instance and the DataStreamMgr used to create the receiver.
   /// stream_recvr_->Close() must be called before this instance is destroyed.
-  std::shared_ptr<DataStreamRecvrBase> stream_recvr_;
+  std::shared_ptr<KrpcDataStreamRecvr> stream_recvr_;
 
   /// our input rows are a prefix of the rows we produce
   RowDescriptor input_row_desc_;
@@ -88,6 +112,10 @@ class ExchangeNode : public ExecNode {
   /// is retrieved directly from the sender queue in the stream recvr, and rows from
   /// input_batch_ must be copied to the output batch in GetNext().
   int next_row_idx_;
+
+  /// The buffer pool client for allocating buffers for tuple pointers and
+  /// tuple data in row batches.
+  BufferPool::ClientHandle recvr_buffer_pool_client_;
 
   /// time spent reconstructing received rows
   RuntimeProfile::Counter* convert_row_batch_timer_;

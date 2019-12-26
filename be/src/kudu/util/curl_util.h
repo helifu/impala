@@ -18,8 +18,10 @@
 #define KUDU_UTIL_CURL_UTIL_H
 
 #include <string>
+#include <vector>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
 typedef void CURL;
@@ -39,8 +41,11 @@ class EasyCurl {
 
   // Fetch the given URL into the provided buffer.
   // Any existing data in the buffer is replaced.
+  // The optional param 'headers' holds additional headers.
+  // e.g. {"Accept-Encoding: gzip"}
   Status FetchURL(const std::string& url,
-                  faststring* dst);
+                  faststring* dst,
+                  const std::vector<std::string>& headers = {});
 
   // Issue an HTTP POST to the given URL with the given data.
   // Returns results in 'dst' as above.
@@ -58,12 +63,17 @@ class EasyCurl {
     return_headers_ = v;
   }
 
+  void set_timeout(MonoDelta t) {
+    timeout_ = t;
+  }
+
  private:
   // Do a request. If 'post_data' is non-NULL, does a POST.
   // Otherwise, does a GET.
   Status DoRequest(const std::string& url,
                    const std::string* post_data,
-                   faststring* dst);
+                   faststring* dst,
+                   const std::vector<std::string>& headers = {});
   CURL* curl_;
 
   // Whether to verify the server certificate.
@@ -71,6 +81,8 @@ class EasyCurl {
 
   // Whether to return the HTTP headers with the response.
   bool return_headers_ = false;
+
+  MonoDelta timeout_;
 
   DISALLOW_COPY_AND_ASSIGN(EasyCurl);
 };

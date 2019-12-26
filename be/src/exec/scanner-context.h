@@ -27,6 +27,7 @@
 #include "common/compiler-util.h"
 #include "common/status.h"
 #include "exec/filter-context.h"
+#include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/io/request-ranges.h"
 
 namespace impala {
@@ -84,12 +85,14 @@ class TupleRow;
 class ScannerContext {
  public:
   /// Create a scanner context with the parent scan_node (where materialized row batches
-  /// get pushed to) and the scan range to process.
-  /// This context starts with 1 stream.
-  ScannerContext(RuntimeState*, HdfsScanNodeBase*, HdfsPartitionDescriptor*,
-      io::ScanRange* scan_range, const std::vector<FilterContext>& filter_ctxs,
+  /// get pushed to) and the scan range to process. Buffers are allocated using
+  /// 'bp_client'. 'total_reservation' bytes of 'bp_client''s reservation has been
+  /// initally allotted for use by this scanner.
+  ScannerContext(RuntimeState* state, HdfsScanNodeBase* scan_node,
+      BufferPool::ClientHandle* bp_client, int64_t total_reservation,
+      HdfsPartitionDescriptor* partition_desc,
+      const std::vector<FilterContext>& filter_ctxs,
       MemPool* expr_results_pool);
-
   /// Destructor verifies that all stream objects have been released.
   ~ScannerContext();
 
@@ -105,9 +108,10 @@ class ScannerContext {
     ///  - If peek is true, the scan range position is not incremented (i.e. repeated calls
     ///    with peek = true will return the same data).
     ///  - *buffer on return is a pointer to the buffer.  The memory is owned by
-    ///    the ScannerContext and should not be modified.  If the buffer is entirely
-    ///    from one disk io buffer, a pointer inside that buffer is returned directly.
-    ///    If the requested buffer straddles io buffers, a copy is done here.
+    ///    the ScannerContext and should not be modified. The contents of the buffer are
+    ///    invalidated after subsequent calls to GetBytes()/ReadBytes(). If the buffer
+    ///    is entirely from one disk io buffer, a pointer inside that buffer is returned
+    ///    directly. If the requested buffer straddles io buffers, a copy is done here.
     ///  - *out_len is the number of bytes returned.
     ///  - *status is set if there is an error.
     /// Returns true if the call was successful (i.e. status->ok())
@@ -137,12 +141,14 @@ class ScannerContext {
     void set_read_past_size_cb(ReadPastSizeCallback cb) { read_past_size_cb_ = cb; }
 
     /// Return the number of bytes left in the range for this stream.
-    int64_t bytes_left() { return scan_range_->len() - total_bytes_returned_; }
+    int64_t bytes_left() { return scan_range_->bytes_to_read() - total_bytes_returned_; }
 
     /// If true, all bytes in this scan range have been returned from this ScannerContext
     /// to callers or we hit eof before reaching the end of the scan range. Callers can
     /// continue to call Read*()/Get*()/Skip*() methods on the stream until eof() is true.
-    bool eosr() const { return total_bytes_returned_ >= scan_range_->len() || eof(); }
+    bool eosr() const {
+      return total_bytes_returned_ >= scan_range_->bytes_to_read() || eof();
+    }
 
     /// If true, the stream has reached the end of the file. After this is true, any
     /// Read*()/Get*()/Skip*() methods will not succeed.
@@ -151,6 +157,7 @@ class ScannerContext {
     const char* filename() { return scan_range_->file(); }
     const io::ScanRange* scan_range() { return scan_range_; }
     const HdfsFileDesc* file_desc() { return file_desc_; }
+    int64_t reservation() const { return reservation_; }
 
     /// Returns the buffer's current offset in the file.
     int64_t file_offset() const { return scan_range_->offset() + total_bytes_returned_; }
@@ -187,8 +194,10 @@ class ScannerContext {
     bool SkipBytes(int64_t length, Status* status) WARN_UNUSED_RESULT;
 
     /// Read length bytes into the supplied buffer.  The returned buffer is owned
-    /// by this object. Returns true on success, otherwise returns false and sets 'status'
-    /// to indicate the error.
+    /// by this object The memory is owned by and should not be modified. The contents
+    /// of the buffer are invalidated after subsequent calls to GetBytes()/ReadBytes().
+    /// Returns true on success, otherwise returns false and sets 'status' to
+    /// indicate the error.
     bool ReadBytes(int64_t length, uint8_t** buf, Status* status, bool peek = false)
         WARN_UNUSED_RESULT;
 
@@ -212,9 +221,15 @@ class ScannerContext {
 
    private:
     friend class ScannerContext;
-    ScannerContext* parent_;
-    io::ScanRange* scan_range_;
-    const HdfsFileDesc* file_desc_;
+    ScannerContext* const parent_;
+    io::ScanRange* const scan_range_;
+    const HdfsFileDesc* const file_desc_;
+
+    /// Reservation given to this stream for allocating I/O buffers. The reservation is
+    /// shared with 'scan_range_', so the context must be careful not to use this until
+    /// all of 'scan_ranges_'s buffers have been freed. Must be >= the minimum IoMgr
+    /// buffer size to allow reading past the end of 'scan_range_'.
+    const int64_t reservation_;
 
     /// Total number of bytes returned from GetBytes()
     int64_t total_bytes_returned_ = 0;
@@ -273,7 +288,8 @@ class ScannerContext {
     /// output_buffer_bytes_left_ will be set to something else.
     static const int64_t OUTPUT_BUFFER_BYTES_LEFT_INIT = 0;
 
-    Stream(ScannerContext* parent, io::ScanRange* scan_range,
+    /// Private constructor. See AddStream() for public API.
+    Stream(ScannerContext* parent, io::ScanRange* scan_range, int64_t reservation,
         const HdfsFileDesc* file_desc);
 
     /// GetBytes helper to handle the slow path.
@@ -338,6 +354,15 @@ class ScannerContext {
     return streams_[idx].get();
   }
 
+  int NumStreams() const { return streams_.size(); }
+
+  /// Tries to increase 'total_reservation()' to 'ideal_reservation'. May get
+  /// none, part or all of the requested increase. total_reservation() can be
+  /// checked by the caller to find out the new total reservation. When this
+  /// ScannerContext is destroyed, the scan node takes back ownership of
+  /// total_reservation().
+  void TryIncreaseReservation(int64_t ideal_reservation);
+
   /// Release completed resources for all streams, e.g. the last buffer in each stream if
   /// the current read position is at the end of the buffer. If 'done' is true all
   /// resources are freed, even if the caller has not read that data yet. After calling
@@ -354,24 +379,44 @@ class ScannerContext {
   /// size to 0.
   void ClearStreams();
 
-  /// Add a stream to this ScannerContext for 'range'. Returns the added stream.
-  /// The stream is created in the runtime state's object pool
-  Stream* AddStream(io::ScanRange* range);
+  /// Add a stream to this ScannerContext for 'range'. 'range' must already have any
+  /// buffers that it needs allocated. 'reservation' is the amount of reservation that
+  /// is given to this stream for allocating I/O buffers. The reservation is shared with
+  /// 'range', so the context must be careful not to use this until all of 'range's
+  /// buffers have been freed. Must be >= the minimum IoMgr buffer size to allow reading
+  /// past the end of 'range'. 'reservation' must be <=
+  /// ScannerContext::total_reservation(), i.e. this reservation is included in the total.
+  ///
+  /// Returns the added stream. The returned stream is owned by this context.
+  Stream* AddStream(io::ScanRange* range, int64_t reservation);
 
-  /// Returns false if scan_node_ is multi-threaded and has been cancelled.
-  /// Always returns false if the scan_node_ is not multi-threaded.
+  /// Returns true if RuntimeState::is_cancelled() is true, or if scan node is not
+  /// multi-threaded and is done (finished, cancelled or reached it's limit).
+  /// In all other cases returns false.
   bool cancelled() const;
 
-  HdfsPartitionDescriptor* partition_descriptor() { return partition_desc_; }
+  BufferPool::ClientHandle* bp_client() const { return bp_client_; }
+  int64_t total_reservation() const { return total_reservation_; }
+  HdfsPartitionDescriptor* partition_descriptor() const { return partition_desc_; }
   const std::vector<FilterContext>& filter_ctxs() const { return filter_ctxs_; }
   MemPool* expr_results_pool() const { return expr_results_pool_; }
  private:
   friend class Stream;
 
-  RuntimeState* state_;
-  HdfsScanNodeBase* scan_node_;
+  RuntimeState* const state_;
+  HdfsScanNodeBase* const scan_node_;
 
-  HdfsPartitionDescriptor* partition_desc_;
+  /// Buffer pool client used to allocate I/O buffers. This is accessed by multiple
+  /// threads in the multi-threaded scan node, so those threads must take care to only
+  /// call thread-safe BufferPool methods with this client.
+  BufferPool::ClientHandle* const bp_client_;
+
+  /// Total reservation from 'bp_client_' that this scanner is allowed to use.
+  /// TODO: when we remove the multi-threaded scan node, we may be able to just use
+  /// bp_client_->Reservation()
+  int64_t total_reservation_;
+
+  HdfsPartitionDescriptor* const partition_desc_;
 
   /// Vector of streams. Non-columnar formats will always have one stream per context.
   std::vector<std::unique_ptr<Stream>> streams_;

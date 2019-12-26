@@ -19,12 +19,9 @@
 #ifndef IMPALA_UTIL_IMPALAD_METRICS_H
 #define IMPALA_UTIL_IMPALAD_METRICS_H
 
-#include "util/metrics.h"
-#include "util/collection-metrics.h"
+#include "util/metrics-fwd.h"
 
 namespace impala {
-
-class HistogramMetric;
 
 /// Contains the keys (strings) for impala metrics.
 class ImpaladMetricKeys {
@@ -46,6 +43,12 @@ class ImpaladMetricKeys {
   /// Number of fragments currently running on this server.
   static const char* IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT;
 
+  /// Number of queries that started executing on this backend.
+  static const char* BACKEND_NUM_QUERIES_EXECUTED;
+
+  /// Number of queries currently executing on this backend.
+  static const char* BACKEND_NUM_QUERIES_EXECUTING;
+
   /// Number of open HiveServer2 sessions
   static const char* IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS;
 
@@ -58,23 +61,8 @@ class ImpaladMetricKeys {
   /// Number of scan ranges with missing volume id metadata
   static const char* NUM_SCAN_RANGES_MISSING_VOLUME_ID;
 
-  /// Number of bytes currently in use across all mem pools
-  static const char* MEM_POOL_TOTAL_BYTES;
-
-  /// Number of bytes currently in use across all hash tables
-  static const char* HASH_TABLE_TOTAL_BYTES;
-
   /// Number of files currently opened by the io mgr
   static const char* IO_MGR_NUM_OPEN_FILES;
-
-  /// Number of IO buffers allocated by the io mgr
-  static const char* IO_MGR_NUM_BUFFERS;
-
-  /// Number of bytes used by IO buffers (used and unused).
-  static const char* IO_MGR_TOTAL_BYTES;
-
-  /// Number of IO buffers that are currently unused (and can be GC'ed)
-  static const char* IO_MGR_NUM_UNUSED_BUFFERS;
 
   /// Total number of bytes read by the io mgr
   static const char* IO_MGR_BYTES_READ;
@@ -87,6 +75,19 @@ class ImpaladMetricKeys {
 
   /// Total number of cached bytes read by the io mgr
   static const char* IO_MGR_CACHED_BYTES_READ;
+
+  /// Total number of bytes read from the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES;
+
+  /// Total number of bytes missing from the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES;
+
+  /// Current byte size of the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES;
+
+  /// Total number of bytes not inserted into the remote data cache due to
+  /// concurrency limit.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES;
 
   /// Total number of bytes written to disk by the io mgr (for spilling)
   static const char* IO_MGR_BYTES_WRITTEN;
@@ -106,8 +107,24 @@ class ImpaladMetricKeys {
   /// Number of cache misses for cached HDFS file handles
   static const char* IO_MGR_CACHED_FILE_HANDLES_MISS_COUNT;
 
+  /// Number of cached file handles that hit an error and were reopened
+  static const char* IO_MGR_CACHED_FILE_HANDLES_REOPENED;
+
   /// Number of DBs in the catalog
   static const char* CATALOG_NUM_DBS;
+
+  /// Current version of catalog with impalad.
+  static const char* CATALOG_VERSION;
+
+  /// Lower bound of catalog object version in local catalog cache. All catalog objects
+  /// have catalog version larger than this.
+  static const char* CATALOG_OBJECT_VERSION_LOWER_BOUND;
+
+  /// Catalog topic version  with impalad.
+  static const char* CATALOG_TOPIC_VERSION;
+
+  /// ServiceID of Catalog with impalad.
+  static const char* CATALOG_SERVICE_ID;
 
   /// Number of tables in the catalog
   static const char* CATALOG_NUM_TABLES;
@@ -117,6 +134,47 @@ class ImpaladMetricKeys {
   /// catalog state, such as detecting a catalog-update topic entry originating from
   /// a catalog server with an unexpected ID.
   static const char* CATALOG_READY;
+
+  /// Average time spent loading new values into the Impalad Catalog Cache.
+  static const char* CATALOG_CACHE_AVG_LOAD_TIME;
+
+  /// Total number of evictions from the Impalad Catalog Cache. Does not include manual
+  /// cache invalidate calls.
+  static const char* CATALOG_CACHE_EVICTION_COUNT;
+
+  /// Total number of Impalad Catalog cache hits.
+  static const char* CATALOG_CACHE_HIT_COUNT;
+
+  /// Ratio of Impalad Catalog cache requests that were hits. Accounts for all the
+  /// requests since the process boot time.
+  static const char* CATALOG_CACHE_HIT_RATE;
+
+  /// Total requests to Impalad Catalog cache requests that loaded new values.
+  static const char* CATALOG_CACHE_LOAD_COUNT;
+
+  /// Total requests to Impalad Catalog cache requests that threw exceptions loading
+  /// new values.
+  static const char* CATALOG_CACHE_LOAD_EXCEPTION_COUNT;
+
+  /// Ratio of Impalad Catalog cache requests that threw exceptions loading new values.
+  /// Accounts for all the requests since the process boot time.
+  static const char* CATALOG_CACHE_LOAD_EXCEPTION_RATE;
+
+  /// Number of Impalad Catalog cache requests that successfully loaded new values.
+  static const char* CATALOG_CACHE_LOAD_SUCCESS_COUNT;
+
+  /// Number of Impalad Catalog cache requests that returned uncached values.
+  static const char* CATALOG_CACHE_MISS_COUNT;
+
+  /// Ratio of Impalad Catalog cache requests that were misses. Accounts for all the
+  /// requests since the process boot time.
+  static const char* CATALOG_CACHE_MISS_RATE;
+
+  /// Total number of Impalad Catalog cache requests.
+  static const char* CATALOG_CACHE_REQUEST_COUNT;
+
+  /// Total time spent in Impalad Catalog cache loading new values.
+  static const char* CATALOG_CACHE_TOTAL_LOAD_TIME;
 
   /// Number of files open for insert
   static const char* NUM_FILES_OPEN_FOR_INSERT;
@@ -151,6 +209,10 @@ class ImpaladMetricKeys {
   /// (i.e. returned faster than original read).
   static const char* HEDGED_READ_OPS_WIN;
 
+  /// Total number of times the FAIL debug action is hit. The counter is only created if
+  /// --debug_actions is set.
+  static const char* DEBUG_ACTION_NUM_FAIL;
+
 };
 
 /// Global impalad-wide metrics.  This is useful for objects that want to update metrics
@@ -160,7 +222,12 @@ class ImpaladMetricKeys {
 class ImpaladMetrics {
  public:
   // Counters
-  static IntGauge* HASH_TABLE_TOTAL_BYTES;
+  static IntCounter* BACKEND_NUM_QUERIES_EXECUTED;
+  /// BACKEND_NUM_QUERIES_EXECUTING is used to determine when the backend has quiesced
+  /// and can be safely shut down without causing query failures. See IMPALA-7931 for
+  /// an example of a race that can occur if this is decremented before a query is
+  /// truly finished.
+  static IntGauge* BACKEND_NUM_QUERIES_EXECUTING;
   static IntCounter* IMPALA_SERVER_NUM_FRAGMENTS;
   static IntGauge* IMPALA_SERVER_NUM_FRAGMENTS_IN_FLIGHT;
   static IntCounter* IMPALA_SERVER_NUM_QUERIES;
@@ -172,16 +239,37 @@ class ImpaladMetrics {
   static IntCounter* IO_MGR_BYTES_READ;
   static IntCounter* IO_MGR_LOCAL_BYTES_READ;
   static IntCounter* IO_MGR_CACHED_BYTES_READ;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES;
   static IntCounter* IO_MGR_SHORT_CIRCUIT_BYTES_READ;
   static IntCounter* IO_MGR_BYTES_WRITTEN;
+  static IntCounter* IO_MGR_CACHED_FILE_HANDLES_REOPENED;
   static IntCounter* HEDGED_READ_OPS;
   static IntCounter* HEDGED_READ_OPS_WIN;
+  static IntCounter* CATALOG_CACHE_EVICTION_COUNT;
+  static IntCounter* CATALOG_CACHE_HIT_COUNT;
+  static IntCounter* CATALOG_CACHE_LOAD_COUNT;
+  static IntCounter* CATALOG_CACHE_LOAD_EXCEPTION_COUNT;
+  static IntCounter* CATALOG_CACHE_LOAD_SUCCESS_COUNT;
+  static IntCounter* CATALOG_CACHE_MISS_COUNT;
+  static IntCounter* CATALOG_CACHE_REQUEST_COUNT;
+  static IntCounter* CATALOG_CACHE_TOTAL_LOAD_TIME;
+  static IntCounter* DEBUG_ACTION_NUM_FAIL;
 
   // Gauges
   static IntGauge* CATALOG_NUM_DBS;
   static IntGauge* CATALOG_NUM_TABLES;
+  static IntGauge* CATALOG_VERSION;
+  static IntGauge* CATALOG_OBJECT_VERSION_LOWER_BOUND;
+  static IntGauge* CATALOG_TOPIC_VERSION;
+  static DoubleGauge* CATALOG_CACHE_AVG_LOAD_TIME;
+  static DoubleGauge* CATALOG_CACHE_HIT_RATE;
+  static DoubleGauge* CATALOG_CACHE_LOAD_EXCEPTION_RATE;
+  static DoubleGauge* CATALOG_CACHE_MISS_RATE;
   static IntGauge* IMPALA_SERVER_NUM_OPEN_BEESWAX_SESSIONS;
   static IntGauge* IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS;
+  static MetricGroup* IO_MGR_METRICS;
   static IntGauge* IO_MGR_NUM_BUFFERS;
   static IntGauge* IO_MGR_NUM_OPEN_FILES;
   static IntGauge* IO_MGR_NUM_UNUSED_BUFFERS;
@@ -189,16 +277,17 @@ class ImpaladMetrics {
   static IntGauge* IO_MGR_NUM_FILE_HANDLES_OUTSTANDING;
   static IntGauge* IO_MGR_CACHED_FILE_HANDLES_HIT_COUNT;
   static IntGauge* IO_MGR_CACHED_FILE_HANDLES_MISS_COUNT;
-  static IntGauge* IO_MGR_TOTAL_BYTES;
-  static IntGauge* MEM_POOL_TOTAL_BYTES;
+  static IntGauge* IO_MGR_REMOTE_DATA_CACHE_TOTAL_BYTES;
   static IntGauge* NUM_FILES_OPEN_FOR_INSERT;
   static IntGauge* NUM_QUERIES_REGISTERED;
   static IntGauge* RESULTSET_CACHE_TOTAL_NUM_ROWS;
   static IntGauge* RESULTSET_CACHE_TOTAL_BYTES;
+
   // Properties
   static BooleanProperty* CATALOG_READY;
   static BooleanProperty* IMPALA_SERVER_READY;
   static StringProperty* IMPALA_SERVER_VERSION;
+  static StringProperty* CATALOG_SERVICE_ID;
   // Histograms
   static HistogramMetric* QUERY_DURATIONS;
   static HistogramMetric* DDL_DURATIONS;
@@ -208,6 +297,10 @@ class ImpaladMetrics {
 
   // Creates and initializes all metrics above in 'm'.
   static void CreateMetrics(MetricGroup* m);
+
+ private:
+  // Initializes the metrics for this coordinator's metadata catalog.
+  static void InitCatalogMetrics(MetricGroup* m);
 };
 
 

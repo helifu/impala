@@ -308,7 +308,8 @@ Status HdfsAvroScanner::WriteDefaultValue(
       RawValue::Write(&v, avro_header_->template_tuple, slot_desc, nullptr);
       break;
     }
-    case AVRO_INT32: {
+    case AVRO_INT32:
+    case AVRO_DATE: {
       RETURN_IF_ERROR(VerifyTypesMatch(slot_desc, default_value));
       int32_t v;
       if (avro_int32_get(default_value, &v)) DCHECK(false);
@@ -431,8 +432,10 @@ bool HdfsAvroScanner::VerifyTypesMatch(
       return true;
     case TYPE_STRING: return reader_type.IsStringType();
     case TYPE_INT:
+    case TYPE_DATE:
       switch(reader_type.type) {
         case TYPE_INT:
+        case TYPE_DATE:
         // Type promotion
         case TYPE_BIGINT:
         case TYPE_FLOAT:
@@ -493,73 +496,93 @@ Status HdfsAvroScanner::InitNewRange() {
 }
 
 Status HdfsAvroScanner::ProcessRange(RowBatch* row_batch) {
-  if (record_pos_ == num_records_in_block_) {
-    // Read new data block
-    RETURN_IF_FALSE(stream_->ReadZLong(&num_records_in_block_, &parse_status_));
-    if (num_records_in_block_ < 0) {
-      return Status(TErrorCode::AVRO_INVALID_RECORD_COUNT, stream_->filename(),
-          num_records_in_block_, stream_->file_offset());
-    }
-    int64_t compressed_size;
-    RETURN_IF_FALSE(stream_->ReadZLong(&compressed_size, &parse_status_));
-    if (compressed_size < 0) {
-      return Status(TErrorCode::AVRO_INVALID_COMPRESSED_SIZE, stream_->filename(),
-          compressed_size, stream_->file_offset());
-    }
-    uint8_t* compressed_data;
-    RETURN_IF_FALSE(stream_->ReadBytes(
-        compressed_size, &compressed_data, &parse_status_));
-
-    if (header_->is_compressed) {
-      if (header_->compression_type == THdfsCompression::SNAPPY) {
-        // Snappy-compressed data block includes trailing 4-byte checksum,
-        // decompressor_ doesn't expect this
-        compressed_size -= SnappyDecompressor::TRAILING_CHECKSUM_LEN;
+  // Process blocks until we hit eos, the limit or the batch fills up. Check
+  // AtCapacity() at the end of the loop to guarantee that we process at least one row
+  // so that we make progress even if the batch starts off with AtCapacity() == true,
+  // which can happen if the tuple buffer is > 8MB.
+  DCHECK_GT(row_batch->capacity(), row_batch->num_rows());
+  while (!eos_ && !scan_node_->ReachedLimitShared()) {
+    if (record_pos_ == num_records_in_block_) {
+      // Read new data block
+      RETURN_IF_FALSE(stream_->ReadZLong(&num_records_in_block_, &parse_status_));
+      if (num_records_in_block_ < 0) {
+        return Status(TErrorCode::AVRO_INVALID_RECORD_COUNT, stream_->filename(),
+            num_records_in_block_, stream_->file_offset());
       }
-      SCOPED_TIMER(decompress_timer_);
-      RETURN_IF_ERROR(decompressor_->ProcessBlock(false, compressed_size,
-          compressed_data, &data_block_len_, &data_block_));
-    } else {
-      data_block_ = compressed_data;
-      data_block_len_ = compressed_size;
+      int64_t compressed_size;
+      RETURN_IF_FALSE(stream_->ReadZLong(&compressed_size, &parse_status_));
+      if (compressed_size < 0) {
+        return Status(TErrorCode::AVRO_INVALID_COMPRESSED_SIZE, stream_->filename(),
+            compressed_size, stream_->file_offset());
+      }
+      uint8_t* compressed_data;
+      RETURN_IF_FALSE(stream_->ReadBytes(
+          compressed_size, &compressed_data, &parse_status_));
+
+      if (header_->is_compressed) {
+        if (header_->compression_type == THdfsCompression::SNAPPY) {
+          // Snappy-compressed data block includes trailing 4-byte checksum,
+          // decompressor_ doesn't expect this
+          compressed_size -= SnappyDecompressor::TRAILING_CHECKSUM_LEN;
+        }
+        SCOPED_TIMER(decompress_timer_);
+        RETURN_IF_ERROR(decompressor_->ProcessBlock(false, compressed_size,
+            compressed_data, &data_block_len_, &data_block_));
+      } else {
+        data_block_ = compressed_data;
+        data_block_len_ = compressed_size;
+      }
+      data_block_end_ = data_block_ + data_block_len_;
+      record_pos_ = 0;
     }
-    data_block_end_ = data_block_ + data_block_len_;
-    record_pos_ = 0;
-  }
 
-  // Process block data
-  while (record_pos_ != num_records_in_block_) {
-    SCOPED_TIMER(scan_node_->materialize_tuple_timer());
+    int64_t prev_record_pos = record_pos_;
+    int block_start_row = row_batch->num_rows();
+    // Process the remaining data in the current block. Always process at least one row
+    // to ensure we make progress even if the batch starts off with AtCapacity() == true.
+    DCHECK_GT(row_batch->capacity(), row_batch->num_rows());
+    while (record_pos_ != num_records_in_block_) {
+      SCOPED_TIMER(scan_node_->materialize_tuple_timer());
 
-    Tuple* tuple = tuple_;
-    TupleRow* tuple_row = row_batch->GetRow(row_batch->AddRow());
-    int max_tuples = row_batch->capacity() - row_batch->num_rows();
-    max_tuples = min<int64_t>(max_tuples, num_records_in_block_ - record_pos_);
-    int num_to_commit;
-    if (scan_node_->materialized_slots().empty()) {
-      // No slots to materialize (e.g. count(*)), no need to decode data
-      num_to_commit = WriteTemplateTuples(tuple_row, max_tuples);
-    } else if (codegend_decode_avro_data_ != nullptr) {
-      num_to_commit = codegend_decode_avro_data_(this, max_tuples,
-          row_batch->tuple_data_pool(), &data_block_, data_block_end_, tuple, tuple_row);
-    } else {
-      num_to_commit = DecodeAvroData(max_tuples, row_batch->tuple_data_pool(),
-          &data_block_, data_block_end_, tuple, tuple_row);
+      Tuple* tuple = tuple_;
+      TupleRow* tuple_row = row_batch->GetRow(row_batch->AddRow());
+      int max_tuples = row_batch->capacity() - row_batch->num_rows();
+      max_tuples = min<int64_t>(max_tuples, num_records_in_block_ - record_pos_);
+      int num_to_commit;
+      if (scan_node_->materialized_slots().empty()) {
+        // No slots to materialize (e.g. count(*)), no need to decode data
+        num_to_commit = WriteTemplateTuples(tuple_row, max_tuples);
+      } else if (codegend_decode_avro_data_ != nullptr) {
+        num_to_commit = codegend_decode_avro_data_(this, max_tuples,
+            row_batch->tuple_data_pool(), &data_block_, data_block_end_, tuple, tuple_row);
+      } else {
+        num_to_commit = DecodeAvroData(max_tuples, row_batch->tuple_data_pool(),
+            &data_block_, data_block_end_, tuple, tuple_row);
+      }
+      RETURN_IF_ERROR(parse_status_);
+      RETURN_IF_ERROR(CommitRows(num_to_commit, row_batch));
+      record_pos_ += max_tuples;
+      COUNTER_ADD(scan_node_->rows_read_counter(), max_tuples);
+      if (row_batch->AtCapacity() || scan_node_->ReachedLimitShared()) break;
     }
-    RETURN_IF_ERROR(parse_status_);
-    RETURN_IF_ERROR(CommitRows(num_to_commit, row_batch));
-    record_pos_ += max_tuples;
-    COUNTER_ADD(scan_node_->rows_read_counter(), max_tuples);
-    if (row_batch->AtCapacity() || scan_node_->ReachedLimit()) break;
-  }
 
-  if (record_pos_ == num_records_in_block_) {
-    if (decompressor_.get() != nullptr && !decompressor_->reuse_output_buffer()) {
-      row_batch->tuple_data_pool()->AcquireData(data_buffer_pool_.get(), false);
+    if (record_pos_ == num_records_in_block_) {
+      if (decompressor_.get() != nullptr && !decompressor_->reuse_output_buffer()) {
+        if (prev_record_pos == 0 && row_batch->num_rows() == block_start_row) {
+          // Did not return any rows from current block in this or a previous
+          // ProcessRange() call - we can recycle the memory. This optimisation depends on
+          // passing keep_current_chunk = false to the AcquireData() call below, so that
+          // the current chunk only contains data for the current Avro block.
+          data_buffer_pool_->Clear();
+        } else {
+          // Returned rows may reference data buffers - need to attach to batch.
+          row_batch->tuple_data_pool()->AcquireData(data_buffer_pool_.get(), false);
+        }
+      }
+      RETURN_IF_ERROR(ReadSync());
     }
-    RETURN_IF_ERROR(ReadSync());
+    if (row_batch->AtCapacity()) break;
   }
-
   return Status::OK();
 }
 
@@ -597,8 +620,13 @@ bool HdfsAvroScanner::MaterializeTuple(const AvroSchemaElement& record_schema,
       case AVRO_BOOLEAN:
         success = ReadAvroBoolean(slot_type, data, data_end, write_slot, slot, pool);
         break;
+      case AVRO_DATE:
       case AVRO_INT32:
-        success = ReadAvroInt32(slot_type, data, data_end, write_slot, slot, pool);
+        if (slot_type == TYPE_DATE) {
+          success = ReadAvroDate(slot_type, data, data_end, write_slot, slot, pool);
+        } else {
+          success = ReadAvroInt32(slot_type, data, data_end, write_slot, slot, pool);
+        }
         break;
       case AVRO_INT64:
         success = ReadAvroInt64(slot_type, data, data_end, write_slot, slot, pool);
@@ -669,7 +697,8 @@ void HdfsAvroScanner::SetStatusValueOverflow(TErrorCode::type error_code, int64_
   if (TestInfo::is_test()) {
     parse_status_ = Status(error_code, "test file", len, limit, 123);
   } else {
-    parse_status_ = Status(error_code, stream_->filename(), len, limit, stream_->file_offset());
+    parse_status_ = Status(error_code, stream_->filename(), len, limit,
+        stream_->file_offset());
   }
 }
 
@@ -759,23 +788,18 @@ Status HdfsAvroScanner::CodegenMaterializeTuple(const HdfsScanNodeBase* node,
   llvm::LLVMContext& context = codegen->context();
   LlvmBuilder builder(context);
 
-  llvm::Type* this_type = codegen->GetType(HdfsAvroScanner::LLVM_CLASS_NAME);
-  DCHECK(this_type != nullptr);
-  llvm::PointerType* this_ptr_type = llvm::PointerType::get(this_type, 0);
+  llvm::PointerType* this_ptr_type = codegen->GetStructPtrType<HdfsAvroScanner>();
 
   TupleDescriptor* tuple_desc = const_cast<TupleDescriptor*>(node->tuple_desc());
   llvm::StructType* tuple_type = tuple_desc->GetLlvmStruct(codegen);
   if (tuple_type == nullptr) return Status("Could not generate tuple struct.");
   llvm::Type* tuple_ptr_type = llvm::PointerType::get(tuple_type, 0);
 
-  llvm::Type* tuple_opaque_type = codegen->GetType(Tuple::LLVM_CLASS_NAME);
-  llvm::PointerType* tuple_opaque_ptr_type = llvm::PointerType::get(tuple_opaque_type, 0);
+  llvm::PointerType* tuple_opaque_ptr_type = codegen->GetStructPtrType<Tuple>();
 
-  llvm::Type* data_ptr_type = llvm::PointerType::get(codegen->ptr_type(), 0); // char**
-  llvm::Type* mempool_type =
-      llvm::PointerType::get(codegen->GetType(MemPool::LLVM_CLASS_NAME), 0);
-  llvm::Type* schema_element_type =
-      codegen->GetPtrType(AvroSchemaElement::LLVM_CLASS_NAME);
+  llvm::Type* data_ptr_type = codegen->ptr_ptr_type(); // char**
+  llvm::Type* mempool_type = codegen->GetStructPtrType<MemPool>();
+  llvm::Type* schema_element_type = codegen->GetStructPtrType<AvroSchemaElement>();
 
   // Schema can be null if metadata is stale. See test in
   // queries/QueryTest/avro-schema-changes.test.
@@ -792,7 +816,7 @@ Status HdfsAvroScanner::CodegenMaterializeTuple(const HdfsScanNodeBase* node,
   std::vector<llvm::Function*> helper_functions;
 
   // prototype re-used several times by amending with SetName()
-  LlvmCodeGen::FnPrototype prototype(codegen, "", codegen->boolean_type());
+  LlvmCodeGen::FnPrototype prototype(codegen, "", codegen->bool_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_ptr_type));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("record_schema", schema_element_type));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("pool", mempool_type));
@@ -826,7 +850,6 @@ Status HdfsAvroScanner::CodegenMaterializeTuple(const HdfsScanNodeBase* node,
         bail_out_block, this_val, pool_val, tuple_val, data_val, data_end_val);
     if (!status.ok()) {
       VLOG_QUERY << status.GetDetail();
-      helper_fn->eraseFromParent();
       return status;
     }
 
@@ -933,9 +956,9 @@ Status HdfsAvroScanner::CodegenReadRecord(const SchemaPath& path,
       llvm::Function* read_union_fn =
           codegen->GetFunction(IRFunction::READ_UNION_TYPE, false);
       llvm::Value* null_union_pos_val =
-          codegen->GetIntConstant(TYPE_INT, field->null_union_position);
+          codegen->GetI32Constant(field->null_union_position);
       if (is_null_ptr == nullptr) {
-        is_null_ptr = codegen->CreateEntryBlockAlloca(*builder, codegen->boolean_type(),
+        is_null_ptr = codegen->CreateEntryBlockAlloca(*builder, codegen->bool_type(),
             "is_null_ptr");
       }
       llvm::Value* is_null_ptr_cast =
@@ -998,8 +1021,19 @@ Status HdfsAvroScanner::CodegenReadScalar(const AvroSchemaElement& element,
     case AVRO_BOOLEAN:
       read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_BOOLEAN, false);
       break;
+    case AVRO_DATE:
+      if (slot_desc != nullptr && slot_desc->type().type == TYPE_INT) {
+        read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_INT32, false);
+      } else {
+        read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_DATE, false);
+      }
+      break;
     case AVRO_INT32:
-      read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_INT32, false);
+      if (slot_desc != nullptr && slot_desc->type().type == TYPE_DATE) {
+        read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_DATE, false);
+      } else {
+        read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_INT32, false);
+      }
       break;
     case AVRO_INT64:
       read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_INT64, false);
@@ -1067,8 +1101,6 @@ Status HdfsAvroScanner::CodegenReadScalar(const AvroSchemaElement& element,
 Status HdfsAvroScanner::CodegenDecodeAvroData(const HdfsScanNodeBase* node,
     LlvmCodeGen* codegen, const vector<ScalarExpr*>& conjuncts,
     llvm::Function** decode_avro_data_fn) {
-  SCOPED_TIMER(codegen->codegen_timer());
-
   llvm::Function* materialize_tuple_fn;
   RETURN_IF_ERROR(CodegenMaterializeTuple(node, codegen, &materialize_tuple_fn));
   DCHECK(materialize_tuple_fn != nullptr);
@@ -1078,27 +1110,27 @@ Status HdfsAvroScanner::CodegenDecodeAvroData(const HdfsScanNodeBase* node,
   llvm::Function* init_tuple_fn;
   RETURN_IF_ERROR(CodegenInitTuple(node, codegen, &init_tuple_fn));
   int replaced = codegen->ReplaceCallSites(fn, init_tuple_fn, "InitTuple");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   replaced = codegen->ReplaceCallSites(fn, materialize_tuple_fn, "MaterializeTuple");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   llvm::Function* eval_conjuncts_fn;
   RETURN_IF_ERROR(ExecNode::CodegenEvalConjuncts(codegen, conjuncts, &eval_conjuncts_fn));
 
   replaced = codegen->ReplaceCallSites(fn, eval_conjuncts_fn, "EvalConjuncts");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   llvm::Function* copy_strings_fn;
   RETURN_IF_ERROR(Tuple::CodegenCopyStrings(
       codegen, *node->tuple_desc(), &copy_strings_fn));
   replaced = codegen->ReplaceCallSites(fn, copy_strings_fn, "CopyStrings");
-  DCHECK_EQ(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   int tuple_byte_size = node->tuple_desc()->byte_size();
   replaced = codegen->ReplaceCallSitesWithValue(fn,
-      codegen->GetIntConstant(TYPE_INT, tuple_byte_size), "tuple_byte_size");
-  DCHECK_EQ(replaced, 1);
+      codegen->GetI32Constant(tuple_byte_size), "tuple_byte_size");
+  DCHECK_REPLACE_COUNT(replaced, 1);
 
   fn->setName("DecodeAvroData");
   *decode_avro_data_fn = codegen->FinalizeFunction(fn);

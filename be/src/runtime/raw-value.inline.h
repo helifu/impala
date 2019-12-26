@@ -26,6 +26,7 @@
 #include <boost/functional/hash.hpp>
 
 #include "common/logging.h"
+#include "runtime/date-value.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
@@ -38,6 +39,58 @@ namespace impala {
 /// hash to different values.
 static const uint32_t HASH_VAL_NULL = 0x58081667;
 static const uint32_t HASH_VAL_EMPTY = 0x7dca7eee;
+
+inline bool RawValue::IsNaN(const void* val, const ColumnType& type) {
+  switch(type.type) {
+  case TYPE_FLOAT:
+    return std::isnan(*reinterpret_cast<const float*>(val));
+  case TYPE_DOUBLE:
+    return std::isnan(*reinterpret_cast<const double*>(val));
+  default:
+    return false;
+  }
+}
+
+inline bool RawValue::IsFloatingZero(const void* val, const ColumnType& type) {
+  switch(type.type) {
+  case TYPE_FLOAT:
+    return *reinterpret_cast<const float*>(val) == CANONICAL_FLOAT_ZERO;
+  case TYPE_DOUBLE:
+    return *reinterpret_cast<const double*>(val) == CANONICAL_DOUBLE_ZERO;
+  default:
+    return false;
+  }
+}
+
+inline const void* RawValue::CanonicalValue(const void* val, const ColumnType& type) {
+  if (RawValue::IsNaN(val, type)) return RawValue::CanonicalNaNValue(type);
+  if (RawValue::IsFloatingZero(val, type)) return RawValue::PositiveFloatingZero(type);
+  return val;
+}
+
+inline const void* RawValue::CanonicalNaNValue(const ColumnType& type) {
+  switch(type.type) {
+  case TYPE_FLOAT:
+    return &CANONICAL_FLOAT_NAN;
+  case TYPE_DOUBLE:
+    return &CANONICAL_DOUBLE_NAN;
+  default:
+    DCHECK(false);
+    return nullptr;
+  }
+}
+
+inline const void* RawValue::PositiveFloatingZero(const ColumnType& type) {
+  switch(type.type) {
+  case TYPE_FLOAT:
+    return &CANONICAL_FLOAT_ZERO;
+  case TYPE_DOUBLE:
+    return &CANONICAL_DOUBLE_ZERO;
+  default:
+    DCHECK(false);
+    return nullptr;
+  }
+}
 
 inline bool RawValue::Eq(const void* v1, const void* v2, const ColumnType& type) {
   const StringValue* string_value1;
@@ -55,6 +108,9 @@ inline bool RawValue::Eq(const void* v1, const void* v2, const ColumnType& type)
     case TYPE_INT:
       return *reinterpret_cast<const int32_t*>(v1)
           == *reinterpret_cast<const int32_t*>(v2);
+    case TYPE_DATE:
+      return *reinterpret_cast<const DateValue*>(v1)
+          == *reinterpret_cast<const DateValue*>(v2);
     case TYPE_BIGINT:
       return *reinterpret_cast<const int64_t*>(v1)
           == *reinterpret_cast<const int64_t*>(v2);
@@ -144,6 +200,7 @@ inline uint32_t RawValue::GetHashValueNonNull<float>(const float* v,
     const ColumnType& type, uint32_t seed) {
   DCHECK_EQ(type.type, TYPE_FLOAT);
   DCHECK(v != NULL);
+  if (std::isnan(*v)) v = &RawValue::CANONICAL_FLOAT_NAN;
   return HashUtil::MurmurHash2_64(v, 4, seed);
 }
 
@@ -152,6 +209,7 @@ inline uint32_t RawValue::GetHashValueNonNull<double>(const double* v,
     const ColumnType& type, uint32_t seed) {
   DCHECK_EQ(type.type, TYPE_DOUBLE);
   DCHECK(v != NULL);
+  if (std::isnan(*v)) v = &RawValue::CANONICAL_DOUBLE_NAN;
   return HashUtil::MurmurHash2_64(v, 8, seed);
 }
 
@@ -179,6 +237,14 @@ inline uint32_t RawValue::GetHashValueNonNull<TimestampValue>(
   DCHECK_EQ(type.type, TYPE_TIMESTAMP);
   DCHECK(v != NULL);
   return HashUtil::MurmurHash2_64(v, 12, seed);
+}
+
+template<>
+inline uint32_t RawValue::GetHashValueNonNull<DateValue>(const DateValue* v,
+    const ColumnType& type, uint32_t seed) {
+  DCHECK_EQ(type.type, TYPE_DATE);
+  DCHECK(v != NULL);
+  return HashUtil::MurmurHash2_64(v, 4, seed);
 }
 
 template<>

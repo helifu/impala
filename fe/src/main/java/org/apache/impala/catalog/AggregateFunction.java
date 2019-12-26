@@ -20,11 +20,16 @@ package org.apache.impala.catalog;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.FunctionCallExpr;
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.analysis.HdfsUri;
 import org.apache.impala.thrift.TAggregateFunction;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TSymbolLookupParams;
+import org.apache.impala.thrift.TSymbolType;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -68,7 +73,7 @@ public class AggregateFunction extends Function {
   // empty input in BE).
   private boolean returnsNonNullOnEmpty_;
 
-  public AggregateFunction(FunctionName fnName, ArrayList<Type> argTypes, Type retType,
+  public AggregateFunction(FunctionName fnName, List<Type> argTypes, Type retType,
       boolean hasVarArgs) {
     super(fnName, argTypes, retType, hasVarArgs);
   }
@@ -194,24 +199,49 @@ public class AggregateFunction extends Function {
   public void setFinalizeFnSymbol(String fn) { finalizeFnSymbol_ = fn; }
   public void setIntermediateType(Type t) { intermediateType_ = t; }
 
+  /**
+   * Simplifies and returns the children of the given distinct aggregate expression such
+   * that they are suitable for comparing/grouping using equals():
+   * - removes top-level implicit casts
+   * - removes the trailing constant separator for group_concat
+   * TODO: Deal with constant exprs more generally, instead of special-casing
+   * group_concat().
+   */
+  public static List<Expr> getCanonicalDistinctAggChildren(FunctionCallExpr aggFn) {
+    Preconditions.checkState(aggFn.isDistinct());
+    List<Expr> result = new ArrayList<>();
+    if (aggFn.getFnName().getFunction().equalsIgnoreCase("group_concat")) {
+      result.add(aggFn.getChild(0).ignoreImplicitCast());
+    } else {
+      for (Expr c : aggFn.getChildren()) result.add(c.ignoreImplicitCast());
+    }
+    return result;
+  }
+
+  @Override
+  protected TSymbolLookupParams getLookupParams() {
+    return buildLookupParams(getUpdateFnSymbol(), TSymbolType.UDF_EVALUATE,
+        intermediateType_, hasVarArgs(), false, getArgs());
+  }
+
   @Override
   public String toSql(boolean ifNotExists) {
     StringBuilder sb = new StringBuilder("CREATE AGGREGATE FUNCTION ");
     if (ifNotExists) sb.append("IF NOT EXISTS ");
-    sb.append(dbName() + "." + signatureString() + "\n")
-      .append(" RETURNS " + getReturnType() + "\n");
-    if (getIntermediateType() != null) {
-      sb.append(" INTERMEDIATE " + getIntermediateType() + "\n");
+    sb.append(dbName()).append(".").append(signatureString())
+      .append("\n RETURNS ").append(getReturnType());
+    if (intermediateType_ != null) {
+      sb.append("\n INTERMEDIATE ").append(intermediateType_);
     }
-    sb.append(" LOCATION '" + getLocation() + "'\n")
-      .append(" UPDATE_FN='" + getUpdateFnSymbol() + "'\n")
-      .append(" INIT_FN='" + getInitFnSymbol() + "'\n")
-      .append(" MERGE_FN='" + getMergeFnSymbol() + "'\n");
-    if (getSerializeFnSymbol() != null) {
-      sb.append(" SERIALIZE_FN='" + getSerializeFnSymbol() + "'\n");
+    sb.append("\n LOCATION '").append(location_)
+      .append("'\n UPDATE_FN='").append(updateFnSymbol_)
+      .append("'\n INIT_FN='").append(initFnSymbol_)
+      .append("'\n MERGE_FN='").append(mergeFnSymbol_).append("'");
+    if (serializeFnSymbol_ != null) {
+      sb.append("\n SERIALIZE_FN='").append(serializeFnSymbol_).append("'");
     }
-    if (getFinalizeFnSymbol() != null) {
-      sb.append(" FINALIZE_FN='" + getFinalizeFnSymbol() + "'\n");
+    if (finalizeFnSymbol_ != null) {
+      sb.append("\n FINALIZE_FN='").append(finalizeFnSymbol_).append("'");
     }
     return sb.toString();
   }

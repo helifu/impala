@@ -20,6 +20,7 @@
 #include <iostream>
 
 #include "testutil/gtest-util.h"
+#include "util/container-util.h"
 #include "util/uid-util.h"
 
 namespace impala {
@@ -38,4 +39,3 @@ TEST(UidUtil, FragmentInstanceId) {
 
 }
 
-IMPALA_TEST_MAIN();

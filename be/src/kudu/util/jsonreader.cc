@@ -17,6 +17,10 @@
 
 #include "kudu/util/jsonreader.h"
 
+#include <utility>
+#include <rapidjson/error/en.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 
 using rapidjson::Value;
@@ -34,8 +38,23 @@ JsonReader::~JsonReader() {
 Status JsonReader::Init() {
   document_.Parse<0>(text_.c_str());
   if (document_.HasParseError()) {
-    return Status::Corruption("JSON text is corrupt", document_.GetParseError());
+    return Status::Corruption("JSON text is corrupt",
+        GetParseError_En(document_.GetParseError()));
   }
+  return Status::OK();
+}
+
+Status JsonReader::ExtractBool(const Value* object,
+                               const char* field,
+                               bool* result) const {
+  const Value* val;
+  RETURN_NOT_OK(ExtractField(object, field, &val));
+  if (PREDICT_FALSE(!val->IsBool())) {
+    return Status::InvalidArgument(Substitute(
+        "Wrong type during field extraction: expected bool but got $0",
+        val->GetType()));
+  }
+  *result = val->GetBool();
   return Status::OK();
 }
 

@@ -22,15 +22,22 @@ import pytest
 
 from urllib2 import urlopen
 
+from tests.common.environ import IS_DOCKERIZED_TEST_CLUSTER
+from tests.common.impala_cluster import ImpalaCluster
 from tests.hs2.hs2_test_suite import HS2TestSuite
 from TCLIService import TCLIService
 
 class TestJsonEndpoints(HS2TestSuite):
   def _get_json_queries(self, http_addr):
     """Get the json output of the /queries page from the impalad web UI at http_addr."""
-    resp = urlopen("http://%s/queries?json" % http_addr)
-    assert resp.msg == 'OK'
-    return json.loads(resp.read())
+    if IS_DOCKERIZED_TEST_CLUSTER:
+      # The hostnames in the dockerized cluster may not be externally reachable.
+      cluster = ImpalaCluster.get_e2e_test_cluster()
+      return cluster.impalads[0].service.get_debug_webpage_json("/queries")
+    else:
+      resp = urlopen("http://%s/queries?json" % http_addr)
+      assert resp.msg == 'OK'
+      return json.loads(resp.read())
 
   @pytest.mark.execute_serially
   def test_waiting_in_flight_queries(self):
@@ -91,3 +98,10 @@ class TestJsonEndpoints(HS2TestSuite):
     assert queries_json["num_in_flight_queries"] == 0
     assert queries_json["num_executing_queries"] == 0
     assert queries_json["num_waiting_queries"] == 0
+
+    # Close the session so that subsequent tests that rely on an empty session list don't
+    # fail.
+    close_session_req = TCLIService.TCloseSessionReq()
+    close_session_req.sessionHandle = open_session_resp.sessionHandle
+    close_session_resp = self.hs2_client.CloseSession(close_session_req)
+    TestJsonEndpoints.check_response(close_session_resp)

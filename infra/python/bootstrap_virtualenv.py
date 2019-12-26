@@ -21,6 +21,8 @@
 # A multi-step bootstrapping process is required to build and install all of the
 # dependencies:
 # 1. install basic non-C/C++ packages into the virtualenv
+# 1b. install packages that depend on step 1 but cannot be installed together with their
+#     dependencies
 # 2. use the virtualenv Python to bootstrap the toolchain
 # 3. use toolchain gcc to build C/C++ packages
 # 4. build the kudu-python package with toolchain gcc and Cython
@@ -32,6 +34,7 @@
 # system. If the default 'python' command refers to < 2.6, python 2.6 will be used
 # instead.
 
+from __future__ import print_function
 import glob
 import logging
 import optparse
@@ -49,8 +52,12 @@ LOG = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
 DEPS_DIR = os.path.join(os.path.dirname(__file__), "deps")
 ENV_DIR = os.path.join(os.path.dirname(__file__), "env")
 
-# Generated using "pip install --download <DIR> -r requirements.txt"
+# Requirements file with packages we need for our build and tests.
 REQS_PATH = os.path.join(DEPS_DIR, "requirements.txt")
+
+# Second stage of requirements which cannot be installed together with their dependencies
+# in requirements.txt.
+REQS2_PATH = os.path.join(DEPS_DIR, "stage2-requirements.txt")
 
 # Requirements for the next bootstrapping step that builds compiled requirements
 # with toolchain gcc.
@@ -134,15 +141,37 @@ def exec_pip_install(args, cc="no-cc-available", env=None):
   # Don't call the virtualenv pip directly, it uses a hashbang to to call the python
   # virtualenv using an absolute path. If the path to the virtualenv is very long, the
   # hashbang won't work.
-  #
+  impala_pip_base_cmd = [os.path.join(ENV_DIR, "bin", "python"),
+                         os.path.join(ENV_DIR, "bin", "pip"), "install", "-v"]
+
   # Passes --no-binary for IMPALA-3767: without this, Cython (and
   # several other packages) fail download.
   #
   # --no-cache-dir is used to prevent caching of compiled artifacts, which may be built
   # with different compilers or settings.
-  exec_cmd([os.path.join(ENV_DIR, "bin", "python"), os.path.join(ENV_DIR, "bin", "pip"),
-    "install", "--no-binary", "--no-index", "--no-cache-dir", "--find-links",
-    "file://%s" % urllib.pathname2url(os.path.abspath(DEPS_DIR))] + args, env=env)
+  third_party_pkg_install_cmd = \
+      impala_pip_base_cmd[:] + ["--no-binary", ":all:", "--no-cache-dir"]
+
+  # When using a custom mirror, we also must use the index of that mirror.
+  if "PYPI_MIRROR" in os.environ:
+    third_party_pkg_install_cmd.extend(["--index-url",
+                                        "%s/simple" % os.environ["PYPI_MIRROR"]])
+  else:
+    # Prevent fetching additional packages from the index. If we forget to add a package
+    # to one of the requirements.txt files, this should trigger an error. However, we will
+    # still access the index for version/dependency resolution, hence we need to change it
+    # when using a private mirror.
+    third_party_pkg_install_cmd.append("--no-index")
+
+  third_party_pkg_install_cmd.extend(["--find-links",
+      "file://%s" % urllib.pathname2url(os.path.abspath(DEPS_DIR))])
+  third_party_pkg_install_cmd.extend(args)
+  exec_cmd(third_party_pkg_install_cmd, env=env)
+
+  # Finally, we want to install the packages from our own internal python lib
+  local_package_install_cmd = impala_pip_base_cmd + \
+      ['-e', os.path.join(os.getenv('IMPALA_HOME'), 'lib', 'python')]
+  exec_cmd(local_package_install_cmd)
 
 
 def find_file(*paths):
@@ -181,6 +210,9 @@ def install_deps():
   LOG.info("Installing packages into the virtualenv")
   exec_pip_install(["-r", REQS_PATH])
   mark_reqs_installed(REQS_PATH)
+  LOG.info("Installing stage 2 packages into the virtualenv")
+  exec_pip_install(["-r", REQS2_PATH])
+  mark_reqs_installed(REQS2_PATH)
 
 def have_toolchain():
   '''Return true if the Impala toolchain is available'''
@@ -208,7 +240,7 @@ def install_compiled_deps_if_possible():
   # problem with inline declarations in older libc headers. Setting -fgnu89-inline is a
   # workaround.
   distro_version = ''.join(exec_cmd(["lsb_release", "-irs"]).lower().split())
-  print distro_version
+  print(distro_version)
   if distro_version.startswith("centos5."):
     env["CFLAGS"] = "-fgnu89-inline"
 
@@ -242,12 +274,9 @@ def install_kudu_client_if_possible():
   if os.environ["KUDU_IS_SUPPORTED"] != "true":
     LOG.debug("Skipping Kudu: Kudu is not supported")
     return
-  if not have_toolchain():
-    LOG.debug("Skipping Kudu: IMPALA_TOOLCHAIN not set")
-    return
-  toolchain_kudu_dir = toolchain_pkg_dir("kudu")
-  if not os.path.exists(toolchain_kudu_dir):
-    LOG.debug("Skipping Kudu: %s doesn't exist" % toolchain_kudu_dir)
+  kudu_base_dir = os.environ["IMPALA_KUDU_HOME"]
+  if not os.path.exists(kudu_base_dir):
+    LOG.debug("Skipping Kudu: %s doesn't exist" % kudu_base_dir)
     return
 
   LOG.info("Installing Kudu into the virtualenv")
@@ -285,8 +314,7 @@ def find_kudu_client_install_dir():
     # If the toolchain appears to have been setup already, then the Kudu client is
     # required to exist. It's possible that the toolchain won't be setup yet though
     # since the toolchain bootstrap script depends on the virtualenv.
-    kudu_base_dir = os.path.join(os.environ["IMPALA_TOOLCHAIN"],
-        "kudu-%s" % os.environ["IMPALA_KUDU_VERSION"])
+    kudu_base_dir = os.environ["IMPALA_KUDU_HOME"]
     install_dir = os.path.join(kudu_base_dir, "debug")
     if os.path.exists(kudu_base_dir):
       error_if_kudu_client_not_found(install_dir)
@@ -335,7 +363,7 @@ def reqs_are_installed(reqs_path):
     installed_reqs_file.close()
 
 def setup_virtualenv_if_not_exists():
-  if not reqs_are_installed(REQS_PATH):
+  if not (reqs_are_installed(REQS_PATH) and reqs_are_installed(REQS2_PATH)):
     delete_virtualenv_if_exist()
     create_virtualenv()
     install_deps()
@@ -354,8 +382,8 @@ if __name__ == "__main__":
 
   if options.print_ld_library_path:
     kudu_client_dir = find_kudu_client_install_dir()
-    print os.path.pathsep.join([os.path.join(kudu_client_dir, 'lib'),
-                                os.path.join(kudu_client_dir, 'lib64')])
+    print(os.path.pathsep.join([os.path.join(kudu_client_dir, 'lib'),
+                                    os.path.join(kudu_client_dir, 'lib64')]))
     sys.exit()
 
   logging.basicConfig(level=getattr(logging, options.log_level))

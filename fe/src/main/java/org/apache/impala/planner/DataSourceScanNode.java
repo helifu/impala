@@ -17,6 +17,7 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.slf4j.Logger;
@@ -33,7 +34,7 @@ import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.catalog.DataSource;
-import org.apache.impala.catalog.DataSourceTable;
+import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.extdatasource.ExternalDataSourceExecutor;
@@ -55,6 +56,7 @@ import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TScanRange;
 import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
+import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TStatus;
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
@@ -68,7 +70,7 @@ import com.google.common.collect.Lists;
 public class DataSourceScanNode extends ScanNode {
   private final static Logger LOG = LoggerFactory.getLogger(DataSourceScanNode.class);
   private final TupleDescriptor desc_;
-  private final DataSourceTable table_;
+  private final FeDataSourceTable table_;
 
   // The converted conjuncts_ that were accepted by the data source. A conjunct can
   // be converted if it contains only disjunctive predicates of the form
@@ -86,7 +88,7 @@ public class DataSourceScanNode extends ScanNode {
   public DataSourceScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts) {
     super(id, desc, "SCAN DATA SOURCE");
     desc_ = desc;
-    table_ = (DataSourceTable) desc_.getTable();
+    table_ = (FeDataSourceTable) desc_.getTable();
     conjuncts_ = conjuncts;
     acceptedPredicates_ = null;
     acceptedConjuncts_ = null;
@@ -128,12 +130,13 @@ public class DataSourceScanNode extends ScanNode {
         return new TColumnValue().setDouble_val(
             ((NumericLiteral) expr).getDoubleValue());
       case STRING:
-        return new TColumnValue().setString_val(((StringLiteral) expr).getValue());
+        return new TColumnValue().setString_val(
+            ((StringLiteral) expr).getUnescapedValue());
       case DECIMAL:
       case DATE:
       case DATETIME:
       case TIMESTAMP:
-        // TODO: we support DECIMAL and TIMESTAMP but no way to specify it in SQL.
+        // TODO: we support DECIMAL, TIMESTAMP and DATE but no way to specify it in SQL.
         return null;
       default:
         Preconditions.checkState(false);
@@ -148,9 +151,9 @@ public class DataSourceScanNode extends ScanNode {
    */
   private void prepareDataSource() throws InternalException {
     // Binary predicates that will be offered to the data source.
-    List<List<TBinaryPredicate>> offeredPredicates = Lists.newArrayList();
+    List<List<TBinaryPredicate>> offeredPredicates = new ArrayList<>();
     // The index into conjuncts_ for each element in offeredPredicates.
-    List<Integer> conjunctsIdx = Lists.newArrayList();
+    List<Integer> conjunctsIdx = new ArrayList<>();
     for (int i = 0; i < conjuncts_.size(); ++i) {
       Expr conjunct = conjuncts_.get(i);
       List<TBinaryPredicate> disjuncts = getDisjuncts(conjunct);
@@ -197,7 +200,7 @@ public class DataSourceScanNode extends ScanNode {
     }
 
     numRowsEstimate_ = prepareResult.getNum_rows_estimate();
-    acceptedPredicates_ = Lists.newArrayList();
+    acceptedPredicates_ = new ArrayList<>();
     List<Integer> acceptedPredicatesIdx = prepareResult.isSetAccepted_conjuncts() ?
         prepareResult.getAccepted_conjuncts() : ImmutableList.<Integer>of();
     for (Integer acceptedIdx: acceptedPredicatesIdx) {
@@ -213,7 +216,7 @@ public class DataSourceScanNode extends ScanNode {
    * TODO: Move this to Expr.
    */
   private List<TBinaryPredicate> getDisjuncts(Expr conjunct) {
-    List<TBinaryPredicate> disjuncts = Lists.newArrayList();
+    List<TBinaryPredicate> disjuncts = new ArrayList<>();
     if (getDisjunctsHelper(conjunct, disjuncts)) return disjuncts;
     return null;
   }
@@ -264,9 +267,9 @@ public class DataSourceScanNode extends ScanNode {
     super.computeStats(analyzer);
     inputCardinality_ = numRowsEstimate_;
     cardinality_ = numRowsEstimate_;
-    cardinality_ *= computeSelectivity();
+    cardinality_ = applyConjunctsSelectivity(cardinality_);
     cardinality_ = Math.max(1, cardinality_);
-    cardinality_ = capAtLimit(cardinality_);
+    cardinality_ = capCardinalityAtLimit(cardinality_);
 
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats DataSourceScan: cardinality=" + Long.toString(cardinality_));
@@ -295,7 +298,7 @@ public class DataSourceScanNode extends ScanNode {
    */
   private void removeAcceptedConjuncts(List<Integer> acceptedPredicatesIdx,
       List<Integer> conjunctsIdx) {
-    acceptedConjuncts_ = Lists.newArrayList();
+    acceptedConjuncts_ = new ArrayList<>();
     // Because conjuncts_ is modified in place using positional indexes from
     // conjunctsIdx, we remove the accepted predicates in reverse order.
     for (int i = acceptedPredicatesIdx.size() - 1; i >= 0; --i) {
@@ -324,14 +327,20 @@ public class DataSourceScanNode extends ScanNode {
     // TODO: Does the port matter?
     TNetworkAddress networkAddress = addressToTNetworkAddress("localhost:12345");
     Integer hostIndex = analyzer.getHostIndex().getIndex(networkAddress);
-    scanRanges_ = Lists.newArrayList(
-        new TScanRangeLocationList(
-            new TScanRange(), Lists.newArrayList(new TScanRangeLocation(hostIndex))));
+    scanRangeSpecs_ = new TScanRangeSpec();
+    scanRangeSpecs_.addToConcrete_ranges(new TScanRangeLocationList(
+        new TScanRange(), Lists.newArrayList(new TScanRangeLocation(hostIndex))));
   }
 
   @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
-    // TODO: What's a good estimate of memory consumption?
+    // This node fetches a thrift representation of the rows from the data
+    // source. The memory used by it is unfortunately allocated on the heap and
+    // is never accounted for against its associated mem tracker. Therefore this
+    // node will never show any memory usage on the query summary. However,
+    // since it does contribute to untracked memory, retaining the conservative
+    // estimate of 1 GB to account for the thrift row-batch structure would
+    // ensure it does not change the current behavior.
     nodeResourceProfile_ = ResourceProfile.noReservation(1024L * 1024L * 1024L);
   }
 
@@ -348,11 +357,12 @@ public class DataSourceScanNode extends ScanNode {
         displayName_, table_.getFullName(), aliasStr));
 
     if (!acceptedConjuncts_.isEmpty()) {
-      output.append(prefix + "data source predicates: " +
-          getExplainString(acceptedConjuncts_) + "\n");
+      output.append(prefix + "data source predicates: "
+          + Expr.getExplainString(acceptedConjuncts_, detailLevel) + "\n");
     }
     if (!conjuncts_.isEmpty()) {
-      output.append(prefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+      output.append(prefix + "predicates: " +
+            Expr.getExplainString(conjuncts_, detailLevel) + "\n");
     }
 
     // Add table and column stats in verbose mode.

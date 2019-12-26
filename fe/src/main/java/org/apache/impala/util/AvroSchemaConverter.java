@@ -32,7 +32,6 @@ import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import com.google.common.collect.Lists;
 
@@ -55,11 +54,12 @@ public class AvroSchemaConverter {
   private static final String DEFAULT_SCHEMA_NAME = "baseRecord";
   private static final String RECORD_NAME_PREFIX = "record_";
 
-  // Constants for Avro logical types, in particular, for DECIMAL.
+  // Constants for Avro logical types, in particular, for DECIMAL and DATE.
   private static final String AVRO_LOGICAL_TYPE = "logicalType";
   private static final String PRECISION_PROP_NAME = "precision";
   private static final String SCALE_PROP_NAME = "scale";
   private static final String AVRO_DECIMAL_TYPE = "decimal";
+  private static final String AVRO_DATE_TYPE = "date";
 
   // Used to generate unique record names as required by Avro.
   private int recordCounter_ = 0;
@@ -159,11 +159,18 @@ public class AvroSchemaConverter {
       case FLOAT: return Schema.create(Schema.Type.FLOAT);
       case DOUBLE: return Schema.create(Schema.Type.DOUBLE);
       case TIMESTAMP: return Schema.create(Schema.Type.STRING);
+      case DATE: return createDateSchema();
       case DECIMAL: return createDecimalSchema(impalaScalarType);
       default:
         throw new UnsupportedOperationException(
             impalaScalarType.toSql() + " cannot be converted to an Avro type");
     }
+  }
+
+  private Schema createDateSchema() {
+    Schema dateSchema = Schema.create(Schema.Type.INT);
+    dateSchema.addProp(AVRO_LOGICAL_TYPE, AVRO_DATE_TYPE);
+    return dateSchema;
   }
 
   private Schema createDecimalSchema(ScalarType impalaDecimalType) {

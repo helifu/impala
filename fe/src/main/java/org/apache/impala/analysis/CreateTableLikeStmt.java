@@ -19,20 +19,21 @@ package org.apache.impala.analysis;
 
 import java.util.List;
 
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
 import org.apache.hadoop.fs.permission.FsAction;
-
-import org.apache.impala.analysis.TableDef;
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TCreateTableLikeParams;
 import org.apache.impala.thrift.THdfsFileFormat;
+import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTableName;
+
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 
 /**
  * Represents a CREATE TABLE LIKE statement which creates a new table based on
@@ -41,6 +42,7 @@ import org.apache.impala.thrift.TTableName;
 public class CreateTableLikeStmt extends StatementBase {
   private final TableName tableName_;
   private final List<String> sortColumns_;
+  private final TSortingOrder sortingOrder_;
   private final TableName srcTableName_;
   private final boolean isExternal_;
   private final String comment_;
@@ -53,10 +55,14 @@ public class CreateTableLikeStmt extends StatementBase {
   private String srcDbName_;
   private String owner_;
 
+  // Server name needed for privileges. Set during analysis.
+  private String serverName_;
+
   /**
    * Builds a CREATE TABLE LIKE statement
    * @param tableName - Name of the new table
-   * @param sortColumns - List of columns to sort by during inserts
+   * @param sortProperties - A pair, containing the list of columns to sort by during
+   *                         inserts and the order used in SORT BY queries.
    * @param srcTableName - Name of the source table (table to copy)
    * @param isExternal - If true, the table's data will be preserved if dropped.
    * @param comment - Comment to attach to the table
@@ -64,13 +70,15 @@ public class CreateTableLikeStmt extends StatementBase {
    * @param location - The HDFS location of where the table data will stored.
    * @param ifNotExists - If true, no errors are thrown if the table already exists
    */
-  public CreateTableLikeStmt(TableName tableName, List<String> sortColumns,
-      TableName srcTableName, boolean isExternal, String comment,
-      THdfsFileFormat fileFormat, HdfsUri location, boolean ifNotExists) {
+  public CreateTableLikeStmt(TableName tableName,
+      Pair<List<String>, TSortingOrder> sortProperties, TableName srcTableName,
+      boolean isExternal, String comment, THdfsFileFormat fileFormat, HdfsUri location,
+      boolean ifNotExists) {
     Preconditions.checkNotNull(tableName);
     Preconditions.checkNotNull(srcTableName);
     this.tableName_ = tableName;
-    this.sortColumns_ = sortColumns;
+    this.sortColumns_ = sortProperties.first;
+    this.sortingOrder_ = sortProperties.second;
     this.srcTableName_ = srcTableName;
     this.isExternal_ = isExternal;
     this.comment_ = comment;
@@ -85,6 +93,7 @@ public class CreateTableLikeStmt extends StatementBase {
   public boolean getIfNotExists() { return ifNotExists_; }
   public THdfsFileFormat getFileFormat() { return fileFormat_; }
   public HdfsUri getLocation() { return location_; }
+  public TSortingOrder getSortingOrder() { return sortingOrder_; }
 
   /**
    * Can only be called after analysis, returns the name of the database the table will
@@ -110,7 +119,7 @@ public class CreateTableLikeStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("CREATE ");
     if (isExternal_) sb.append("EXTERNAL ");
     sb.append("TABLE ");
@@ -118,7 +127,8 @@ public class CreateTableLikeStmt extends StatementBase {
     if (tableName_.getDb() != null) sb.append(tableName_.getDb() + ".");
     sb.append(tableName_.getTbl() + " ");
     if (sortColumns_ != null && !sortColumns_.isEmpty()) {
-      sb.append("SORT BY (" + Joiner.on(",").join(sortColumns_) + ") ");
+      sb.append(String.format("SORT BY %s (%s) ", sortingOrder_.toString(),
+          Joiner.on(",").join(sortColumns_)));
     }
     sb.append("LIKE ");
     if (srcTableName_.getDb() != null) sb.append(srcTableName_.getDb() + ".");
@@ -140,7 +150,15 @@ public class CreateTableLikeStmt extends StatementBase {
     params.setLocation(location_ == null ? null : location_.toString());
     params.setIf_not_exists(getIfNotExists());
     params.setSort_columns(sortColumns_);
+    params.setServer_name(serverName_);
+    params.setSorting_order(sortingOrder_);
     return params;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
+    tblRefs.add(new TableRef(srcTableName_.toPath(), null));
   }
 
   @Override
@@ -154,15 +172,22 @@ public class CreateTableLikeStmt extends StatementBase {
     }
 
     // Make sure the source table exists and the user has permission to access it.
-    Table srcTable = analyzer.getTable(srcTableName_, Privilege.VIEW_METADATA);
+    FeTable srcTable = analyzer.getTable(srcTableName_, Privilege.VIEW_METADATA);
+
+    analyzer.ensureTableNotFullAcid(srcTable);
+    analyzer.ensureTableNotBucketed(srcTable);
+
     if (KuduTable.isKuduTable(srcTable.getMetaStoreTable())) {
       throw new AnalysisException("Cloning a Kudu table using CREATE TABLE LIKE is " +
           "not supported.");
     }
     srcDbName_ = srcTable.getDb().getName();
-    tableName_.analyze();
+    analyzer.getFqTableName(tableName_).analyze();
     dbName_ = analyzer.getTargetDbName(tableName_);
-    owner_ = analyzer.getUser().getName();
+    owner_ = analyzer.getUserShortName();
+    // Set the servername here if authorization is enabled because analyzer_ is not
+    // available in the toThrift() method.
+    serverName_ = analyzer.getServerName();
 
     if (analyzer.dbContainsTable(dbName_, tableName_.getTbl(), Privilege.CREATE) &&
         !ifNotExists_) {
@@ -177,7 +202,7 @@ public class CreateTableLikeStmt extends StatementBase {
     }
 
     if (sortColumns_ != null) {
-      TableDef.analyzeSortColumns(sortColumns_, srcTable);
+      TableDef.analyzeSortColumns(sortColumns_, srcTable, sortingOrder_);
     }
   }
 }

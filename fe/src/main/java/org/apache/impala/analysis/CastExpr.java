@@ -17,7 +17,7 @@
 
 package org.apache.impala.analysis;
 
-import org.apache.impala.catalog.Catalog;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
@@ -26,9 +26,11 @@ import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.thrift.TCastExpr;
 import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
+
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -43,16 +45,23 @@ public class CastExpr extends Expr {
   // True if this cast does not change the type.
   private boolean noOp_ = false;
 
+  // Prefix for naming cast functions.
+  protected final static String CAST_FUNCTION_PREFIX = "castto";
+
+  // Stores the value of the FORMAT clause.
+  private final String castFormat_;
+
   /**
    * C'tor for "pre-analyzed" implicit casts.
    */
-  public CastExpr(Type targetType, Expr e) {
+  public CastExpr(Type targetType, Expr e, String format) {
     super();
     Preconditions.checkState(targetType.isValid());
     Preconditions.checkNotNull(e);
     type_ = targetType;
     targetTypeDef_ = null;
     isImplicit_ = true;
+    castFormat_ = format;
     // replace existing implicit casts
     if (e instanceof CastExpr) {
       CastExpr castExpr = (CastExpr) e;
@@ -74,15 +83,24 @@ public class CastExpr extends Expr {
     analysisDone();
   }
 
+  public CastExpr(Type targetType, Expr e) {
+    this(targetType, e, null);
+  }
+
   /**
    * C'tor for explicit casts.
    */
   public CastExpr(TypeDef targetTypeDef, Expr e) {
+    this(targetTypeDef, e, null);
+  }
+
+  public CastExpr(TypeDef targetTypeDef, Expr e, String format) {
     Preconditions.checkNotNull(targetTypeDef);
     Preconditions.checkNotNull(e);
     isImplicit_ = false;
     targetTypeDef_ = targetTypeDef;
     children_.add(e);
+    castFormat_ = format;
   }
 
   /**
@@ -93,10 +111,11 @@ public class CastExpr extends Expr {
     targetTypeDef_ = other.targetTypeDef_;
     isImplicit_ = other.isImplicit_;
     noOp_ = other.noOp_;
+    castFormat_ = other.castFormat_;
   }
 
   private static String getFnName(Type targetType) {
-    return "castTo" + targetType.getPrimitiveType().toString();
+    return CAST_FUNCTION_PREFIX + targetType.getPrimitiveType().toString();
   }
 
   public static void initBuiltins(Db db) {
@@ -106,8 +125,16 @@ public class CastExpr extends Expr {
         if (toType.isNull()) continue;
         // Disable casting from string to boolean
         if (fromType.isStringType() && toType.isBoolean()) continue;
-        // Disable casting from boolean/timestamp to decimal
-        if ((fromType.isBoolean() || fromType.isDateType()) && toType.isDecimal()) {
+        // Casting from date is only allowed when to-type is timestamp or string.
+        if (fromType.isDate() && !toType.isTimestamp() && !toType.isStringType()) {
+          continue;
+        }
+        // Casting to date is only allowed when from-type is timestamp or string.
+        if (toType.isDate() && !fromType.isTimestamp() && !fromType.isStringType()) {
+          continue;
+        }
+        // Disable casting from boolean/timestamp/date to decimal
+        if ((fromType.isBoolean() || fromType.isDateOrTimeType()) && toType.isDecimal()) {
           continue;
         }
         if (fromType.getPrimitiveType() == PrimitiveType.STRING
@@ -167,10 +194,44 @@ public class CastExpr extends Expr {
     }
   }
 
+  public String getCastFormatWithEscapedSingleQuotes() {
+    Preconditions.checkNotNull(castFormat_);
+    Preconditions.checkState(!castFormat_.isEmpty());
+    StringBuilder result = new StringBuilder();
+    for(int i = 0; i < castFormat_.length(); ++i) {
+      char currentChar = castFormat_.charAt(i);
+      if (currentChar == '\'') {
+        // Count the preceeding backslashes
+        int backslashCount = 0;
+        int j = i - 1;
+        while (j >= 0 && castFormat_.charAt(j) == '\\') {
+          ++backslashCount;
+          --j;
+        }
+        // If the single quote is not escaped then adds an extra backslash to escape it.
+        if (backslashCount % 2 == 0) result.append('\\');
+      }
+      result.append(currentChar);
+    }
+    return result.toString();
+  }
+
   @Override
-  public String toSqlImpl() {
-    if (isImplicit_) return getChild(0).toSql();
-    return "CAST(" + getChild(0).toSql() + " AS " + targetTypeDef_.toString() + ")";
+  public String toSqlImpl(ToSqlOptions options) {
+    if (isImplicit_) {
+      if (options.showImplictCasts()) {
+        // for implicit casts, targetTypeDef_ and castFormat_ are null
+        return "CAST(" + getChild(0).toSql(options) + " AS " + type_.toSql() + ")";
+      } else {
+        return getChild(0).toSql(options);
+      }
+    }
+    String formatClause = "";
+    if (castFormat_ != null && !castFormat_.isEmpty()) {
+      formatClause = " FORMAT '" + getCastFormatWithEscapedSingleQuotes() + "'";
+    }
+    return "CAST(" + getChild(0).toSql(options) + " AS " + targetTypeDef_.toString()
+        + formatClause + ")";
   }
 
   @Override
@@ -185,6 +246,13 @@ public class CastExpr extends Expr {
   @Override
   protected void toThrift(TExprNode msg) {
     msg.node_type = TExprNodeType.FUNCTION_CALL;
+    // Sets cast_expr in case FORMAT clause was provided and this is a cast between a
+    // datetime and a string.
+    if (null != castFormat_ &&
+        (type_.isDateOrTimeType() && getChild(0).getType().isStringType() ||
+         type_.isStringType() && getChild(0).getType().isDateOrTimeType())) {
+      msg.cast_expr = new TCastExpr(castFormat_);
+    }
   }
 
   @Override
@@ -192,6 +260,7 @@ public class CastExpr extends Expr {
     return Objects.toStringHelper(this)
         .add("isImplicit", isImplicit_)
         .add("target", type_)
+        .add("format", castFormat_)
         .addValue(super.debugString())
         .toString();
   }
@@ -218,17 +287,30 @@ public class CastExpr extends Expr {
           "Unsupported cast to complex type: " + type_.toSql());
     }
 
-    boolean readyForCharCast =
-        children_.get(0).getType().getPrimitiveType() == PrimitiveType.STRING ||
-        children_.get(0).getType().getPrimitiveType() == PrimitiveType.CHAR;
-    if (type_.getPrimitiveType() == PrimitiveType.CHAR && !readyForCharCast) {
+    boolean twoStepCastNeeded =
+        type_.getPrimitiveType() == PrimitiveType.CHAR &&
+        children_.get(0).getType().getPrimitiveType() != PrimitiveType.STRING &&
+        children_.get(0).getType().getPrimitiveType() != PrimitiveType.CHAR;
+    if (twoStepCastNeeded) {
       // Back end functions only exist to cast string types to CHAR, there is not a cast
       // for every type since it is redundant with STRING. Casts to go through 2 casts:
       // (1) cast to string, to stringify the value
       // (2) cast to CHAR, to truncate or pad with spaces
-      CastExpr tostring = new CastExpr(ScalarType.STRING, children_.get(0));
+      CastExpr tostring = new CastExpr(ScalarType.STRING, children_.get(0), castFormat_);
       tostring.analyze();
       children_.set(0, tostring);
+    }
+
+    if (null != castFormat_ && !twoStepCastNeeded) {
+      if (!(type_.isDateOrTimeType() && getChild(0).getType().isStringType()) &&
+          !(type_.isStringType() && getChild(0).getType().isDateOrTimeType())) {
+        // FORMAT clause works only for casting between date types and string types
+        throw new AnalysisException("FORMAT clause is not applicable from " +
+            getChild(0).getType() + " to " + type_);
+      }
+      if (castFormat_.isEmpty()) {
+        throw new AnalysisException("FORMAT clause can't be empty");
+      }
     }
 
     if (children_.get(0) instanceof NumericLiteral && type_.isFloatingPointType()) {
@@ -245,7 +327,7 @@ public class CastExpr extends Expr {
 
     // Ensure child has non-null type (even if it's a null literal). This is required
     // for the UDF interface.
-    if (children_.get(0) instanceof NullLiteral) {
+    if (Expr.IS_NULL_LITERAL.apply(children_.get(0))) {
       NullLiteral nullChild = (NullLiteral)(children_.get(0));
       nullChild.uncheckedCastTo(type_);
     }
@@ -258,18 +340,20 @@ public class CastExpr extends Expr {
     noOp_ = childType.equals(type_);
     if (noOp_) return;
 
-    FunctionName fnName = new FunctionName(Catalog.BUILTINS_DB, getFnName(type_));
+    FunctionName fnName = new FunctionName(BuiltinsDb.NAME, getFnName(type_));
     Type[] args = { childType };
     Function searchDesc = new Function(fnName, args, Type.INVALID, false);
     if (isImplicit_) {
-      fn_ = Catalog.getBuiltin(searchDesc, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+      fn_ = BuiltinsDb.getInstance().getFunction(searchDesc,
+          CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
       Preconditions.checkState(fn_ != null);
     } else {
-      fn_ = Catalog.getBuiltin(searchDesc, CompareMode.IS_IDENTICAL);
+      fn_ = BuiltinsDb.getInstance().getFunction(searchDesc,
+          CompareMode.IS_IDENTICAL);
       if (fn_ == null) {
         // allow for promotion from CHAR to STRING; only if no exact match is found
-        fn_ = Catalog.getBuiltin(searchDesc.promoteCharsToStrings(),
-            CompareMode.IS_IDENTICAL);
+        fn_ =  BuiltinsDb.getInstance().getFunction(
+            searchDesc.promoteCharsToStrings(), CompareMode.IS_IDENTICAL);
       }
     }
     if (fn_ == null) {
@@ -294,6 +378,11 @@ public class CastExpr extends Expr {
     } else {
       return this;
     }
+  }
+
+  @Override
+  public boolean isImplicitCast() {
+    return isImplicit();
   }
 
   @Override

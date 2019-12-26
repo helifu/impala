@@ -21,6 +21,7 @@ import org.apache.impala.authorization.Privilege;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.TShowFunctionsParams;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -67,7 +68,7 @@ public class ShowFunctionsStmt extends StatementBase {
   public String getPattern() { return pattern_; }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     String fnCategory = (fnCategory_ == null) ? "" : fnCategory_.toString() + " ";
     if (pattern_ == null) {
       return "SHOW " + fnCategory + "FUNCTIONS";

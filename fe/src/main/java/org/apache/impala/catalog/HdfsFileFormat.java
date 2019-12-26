@@ -17,13 +17,14 @@
 
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.impala.thrift.THdfsFileFormat;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
 
 /**
  * Supported HDFS file formats. Every file format specifies:
@@ -42,29 +43,34 @@ public enum HdfsFileFormat {
   RC_FILE("org.apache.hadoop.hive.ql.io.RCFileInputFormat",
       "org.apache.hadoop.hive.ql.io.RCFileOutputFormat",
       "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe",
-      false, true),
+      false, true, false),
   TEXT("org.apache.hadoop.mapred.TextInputFormat",
       "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
       "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
-      false, false),
+      false, false, true),
   LZO_TEXT("com.hadoop.mapred.DeprecatedLzoTextInputFormat",
       "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
-      "", false, false),
+      "", false, false, true),
   SEQUENCE_FILE("org.apache.hadoop.mapred.SequenceFileInputFormat",
       "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat",
       "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", false,
-      true),
+      true, false),
   AVRO("org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat",
       "org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat",
       "org.apache.hadoop.hive.serde2.avro.AvroSerDe",
-      false, false),
+      false, false, true),
   PARQUET("org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
       "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
       "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
-      true, true),
-  KUDU("org.apache.kudu.mapreduce.KuduTableInputFormat",
-      "org.apache.kudu.mapreduce.KuduTableOutputFormat",
-      "", false, false);
+      true, true, true),
+  ORC("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
+      "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat",
+      "org.apache.hadoop.hive.ql.io.orc.OrcSerde",
+      true, true, false),
+  KUDU("org.apache.hadoop.hive.kudu.KuduInputFormat",
+       "org.apache.hadoop.hive.kudu.KuduOutputFormat",
+       "org.apache.hadoop.hive.kudu.KuduSerDe",
+       false, false, false);
 
   private final String inputFormat_;
   private final String outputFormat_;
@@ -78,13 +84,18 @@ public enum HdfsFileFormat {
   // TODO: Remove this once we support complex types for all file formats.
   private final boolean canSkipColumnTypes_;
 
+  // Indicates whether we support scanning DATE type for this file format.
+  private final boolean isDateTypeSupported_;
+
   HdfsFileFormat(String inputFormat, String outputFormat, String serializationLib,
-      boolean isComplexTypesSupported, boolean canSkipColumnTypes) {
+      boolean isComplexTypesSupported, boolean canSkipColumnTypes,
+      boolean isDateTypeSupported) {
     inputFormat_ = inputFormat;
     outputFormat_ = outputFormat;
     serializationLib_ = serializationLib;
     isComplexTypesSupported_ = isComplexTypesSupported;
     canSkipColumnTypes_ = canSkipColumnTypes;
+    isDateTypeSupported_ = isDateTypeSupported;
   }
 
   public String inputFormat() { return inputFormat_; }
@@ -99,19 +110,20 @@ public enum HdfsFileFormat {
       "parquet.hive.MapredParquetInputFormat"
   };
 
-  private static final Map<String, HdfsFileFormat> VALID_INPUT_FORMATS =
+  private static Map<String, HdfsFileFormat> VALID_INPUT_FORMATS =
       ImmutableMap.<String, HdfsFileFormat>builder()
-          .put(RC_FILE.inputFormat(), RC_FILE)
-          .put(TEXT.inputFormat(), TEXT)
-          .put(LZO_TEXT.inputFormat(), TEXT)
-          .put(SEQUENCE_FILE.inputFormat(), SEQUENCE_FILE)
-          .put(AVRO.inputFormat(), AVRO)
-          .put(PARQUET.inputFormat(), PARQUET)
-          .put(PARQUET_LEGACY_INPUT_FORMATS[0], PARQUET)
-          .put(PARQUET_LEGACY_INPUT_FORMATS[1], PARQUET)
-          .put(PARQUET_LEGACY_INPUT_FORMATS[2], PARQUET)
-          .put(KUDU.inputFormat(), KUDU)
-          .build();
+      .put(RC_FILE.inputFormat(), RC_FILE)
+      .put(TEXT.inputFormat(), TEXT)
+      .put(LZO_TEXT.inputFormat(), TEXT)
+      .put(SEQUENCE_FILE.inputFormat(), SEQUENCE_FILE)
+      .put(AVRO.inputFormat(), AVRO)
+      .put(PARQUET.inputFormat(), PARQUET)
+      .put(PARQUET_LEGACY_INPUT_FORMATS[0], PARQUET)
+      .put(PARQUET_LEGACY_INPUT_FORMATS[1], PARQUET)
+      .put(PARQUET_LEGACY_INPUT_FORMATS[2], PARQUET)
+      .put(KUDU.inputFormat(), KUDU)
+      .put(ORC.inputFormat(), ORC).build();
+
 
   /**
    * Returns true if the string describes an input format class that we support.
@@ -145,6 +157,7 @@ public enum HdfsFileFormat {
       case TEXT: return HdfsFileFormat.TEXT;
       case SEQUENCE_FILE: return HdfsFileFormat.SEQUENCE_FILE;
       case AVRO: return HdfsFileFormat.AVRO;
+      case ORC: return HdfsFileFormat.ORC;
       case PARQUET: return HdfsFileFormat.PARQUET;
       case KUDU: return HdfsFileFormat.KUDU;
       default:
@@ -159,6 +172,7 @@ public enum HdfsFileFormat {
       case TEXT: return THdfsFileFormat.TEXT;
       case SEQUENCE_FILE: return THdfsFileFormat.SEQUENCE_FILE;
       case AVRO: return THdfsFileFormat.AVRO;
+      case ORC: return THdfsFileFormat.ORC;
       case PARQUET: return THdfsFileFormat.PARQUET;
       case KUDU: return THdfsFileFormat.KUDU;
       default:
@@ -170,6 +184,7 @@ public enum HdfsFileFormat {
   public String toSql(HdfsCompression compressionType) {
     switch (this) {
       case RC_FILE: return "RCFILE";
+      case ORC: return "ORC";
       case TEXT:
         if (compressionType == HdfsCompression.LZO ||
             compressionType == HdfsCompression.LZO_INDEX) {
@@ -190,45 +205,6 @@ public enum HdfsFileFormat {
     }
   }
 
-  /*
-   * Checks whether a file is supported in Impala based on the file extension.
-   * Returns true if the file format is supported. If the file format is not
-   * supported, then it returns false and 'errorMsg' contains details on the
-   * incompatibility.
-   *
-   * Impala supports LZO, GZIP, SNAPPY and BZIP2 on text files for partitions that have
-   * been declared in the metastore as TEXT. LZO files can have their own input format.
-   * For now, raise an error on any other type.
-   */
-  public boolean isFileCompressionTypeSupported(String fileName,
-      StringBuilder errorMsg) {
-    // Check to see if the file has a compression suffix.
-    // TODO: Add LZ4
-    HdfsCompression compressionType = HdfsCompression.fromFileName(fileName);
-    switch (compressionType) {
-      case LZO:
-      case LZO_INDEX:
-        // Index files are read by the LZO scanner directly.
-      case GZIP:
-      case SNAPPY:
-      case BZIP2:
-      case NONE:
-        return true;
-      case DEFLATE:
-        // TODO: Ensure that text/deflate works correctly
-        if (this == TEXT) {
-          errorMsg.append("Expected compressed text file with {.lzo,.gzip,.snappy,.bz2} "
-              + "suffix: " + fileName);
-          return false;
-        } else {
-          return true;
-        }
-      default:
-        errorMsg.append("Unknown compression suffix: " + fileName);
-        return false;
-    }
-  }
-
   /**
    * Returns true if this file format with the given compression format is splittable.
    */
@@ -240,6 +216,7 @@ public enum HdfsFileFormat {
       case SEQUENCE_FILE:
       case AVRO:
       case PARQUET:
+      case ORC:
         return true;
       case KUDU:
         return false;
@@ -262,10 +239,16 @@ public enum HdfsFileFormat {
   public boolean canSkipComplexTypes() { return canSkipColumnTypes_; }
 
   /**
+   * Returns true if Impala supports scanning DATE typed columns from a table/partition of
+   * this file format
+   */
+  public boolean isDateTypeSupported() { return isDateTypeSupported_; }
+
+  /**
    * Returns a list with all formats for which isComplexTypesSupported() is true.
    */
   public static List<HdfsFileFormat> complexTypesFormats() {
-    List<HdfsFileFormat> result = Lists.newArrayList();
+    List<HdfsFileFormat> result = new ArrayList<>();
     for (HdfsFileFormat f: values()) {
       if (f.isComplexTypesSupported()) result.add(f);
     }

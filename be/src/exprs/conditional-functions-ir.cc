@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "exprs/anyval-util.h"
 #include "exprs/conditional-functions.h"
+
+#include "exprs/anyval-util.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.inline.h"
 #include "udf/udf.h"
 
 using namespace impala;
 using namespace impala_udf;
 
 #define IS_NULL_COMPUTE_FUNCTION(type) \
-  type IsNullExpr::Get##type( \
+  type IsNullExpr::Get##type##Interpreted( \
       ScalarExprEvaluator* eval, const TupleRow* row) const { \
     DCHECK_EQ(children_.size(), 2); \
     type val = GetChild(0)->Get##type(eval, row);  \
@@ -42,6 +44,7 @@ IS_NULL_COMPUTE_FUNCTION(DoubleVal);
 IS_NULL_COMPUTE_FUNCTION(StringVal);
 IS_NULL_COMPUTE_FUNCTION(TimestampVal);
 IS_NULL_COMPUTE_FUNCTION(DecimalVal);
+IS_NULL_COMPUTE_FUNCTION(DateVal);
 
 #define NULL_IF_ZERO_COMPUTE_FUNCTION(type) \
   type ConditionalFunctions::NullIfZero(FunctionContext* ctx, const type& val) { \
@@ -90,7 +93,8 @@ ZERO_IF_NULL_COMPUTE_FUNCTION(DoubleVal);
 ZERO_IF_NULL_COMPUTE_FUNCTION(DecimalVal);
 
 #define IF_COMPUTE_FUNCTION(type) \
-  type IfExpr::Get##type(ScalarExprEvaluator* eval, const TupleRow* row) const { \
+  type IfExpr::Get##type##Interpreted( \
+      ScalarExprEvaluator* eval, const TupleRow* row) const { \
     DCHECK_EQ(children_.size(), 3); \
     BooleanVal cond = GetChild(0)->GetBooleanVal(eval, row); \
     if (cond.is_null || !cond.val) { \
@@ -109,9 +113,10 @@ IF_COMPUTE_FUNCTION(DoubleVal);
 IF_COMPUTE_FUNCTION(StringVal);
 IF_COMPUTE_FUNCTION(TimestampVal);
 IF_COMPUTE_FUNCTION(DecimalVal);
+IF_COMPUTE_FUNCTION(DateVal);
 
 #define COALESCE_COMPUTE_FUNCTION(type) \
-  type CoalesceExpr::Get##type( \
+  type CoalesceExpr::Get##type##Interpreted( \
       ScalarExprEvaluator* eval, const TupleRow* row) const { \
     DCHECK_GE(children_.size(), 1); \
     for (int i = 0; i < children_.size(); ++i) { \
@@ -131,6 +136,7 @@ COALESCE_COMPUTE_FUNCTION(DoubleVal);
 COALESCE_COMPUTE_FUNCTION(StringVal);
 COALESCE_COMPUTE_FUNCTION(TimestampVal);
 COALESCE_COMPUTE_FUNCTION(DecimalVal);
+COALESCE_COMPUTE_FUNCTION(DateVal);
 
 BooleanVal ConditionalFunctions::IsFalse(FunctionContext* ctx, const BooleanVal& val) {
   if (val.is_null) return BooleanVal(false);

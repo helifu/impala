@@ -27,6 +27,8 @@
 #include "common/object-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/bufferpool/suballocator.h"
+#include "runtime/test-env.h"
+#include "service/fe-support.h"
 #include "testutil/death-test-util.h"
 #include "testutil/gtest-util.h"
 #include "testutil/rand-util.h"
@@ -44,6 +46,9 @@ namespace impala {
 class SuballocatorTest : public ::testing::Test {
  public:
   virtual void SetUp() override {
+    test_env_.reset(new TestEnv);
+    test_env_->DisableBufferPool();
+    ASSERT_OK(test_env_->Init());
     RandTestUtil::SeedRng("SUBALLOCATOR_TEST_SEED", &rng_);
     profile_ = RuntimeProfile::Create(&obj_pool_, "test profile");
   }
@@ -67,7 +72,8 @@ class SuballocatorTest : public ::testing::Test {
   /// bytes of buffers of minimum length 'min_buffer_len'.
   void InitPool(int64_t min_buffer_len, int total_mem) {
     global_reservation_.InitRootTracker(nullptr, total_mem);
-    buffer_pool_.reset(new BufferPool(min_buffer_len, total_mem, 0));
+    buffer_pool_.reset(
+        new BufferPool(test_env_->metrics(), min_buffer_len, total_mem, 0));
   }
 
   /// Register a client with 'buffer_pool_'. The client is automatically deregistered
@@ -110,6 +116,8 @@ class SuballocatorTest : public ::testing::Test {
 
   /// Clients for the buffer pool. Deregistered and freed after every test.
   vector<unique_ptr<BufferPool::ClientHandle>> clients_;
+
+  boost::scoped_ptr<TestEnv> test_env_;
 
   /// Global profile - recreated for every test.
   RuntimeProfile* profile_;
@@ -361,5 +369,3 @@ void SuballocatorTest::AssertMemoryValid(
   }
 }
 }
-
-IMPALA_TEST_MAIN();

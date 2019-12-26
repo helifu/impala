@@ -28,6 +28,7 @@
 #include "runtime/tuple.h"
 #include "util/string-parser.h"
 #include "runtime/string-value.h"
+#include "runtime/date-value.h"
 #include "runtime/timestamp-value.h"
 #include "runtime/mem-pool.h"
 #include "runtime/string-value.inline.h"
@@ -83,7 +84,11 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
             reinterpret_cast<char*>(slot);
         if (UNLIKELY(str.ptr == NULL)) return false;
         if (need_escape) {
-          UnescapeString(data, str.ptr, &str.len, buffer_len);
+          // Use a temporary variable on the stack to avoid accessing an unaligned
+          // pointer.
+          int str_len = str.len;
+          UnescapeString(data, str.ptr, &str_len, buffer_len);
+          str.len = str_len;
         } else {
           memcpy(str.ptr, data, str.len);
         }
@@ -130,10 +135,15 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
       break;
     case TYPE_TIMESTAMP: {
       TimestampValue* ts_slot = reinterpret_cast<TimestampValue*>(slot);
-      *ts_slot = TimestampValue::Parse(data, len);
+      *ts_slot = TimestampValue::ParseSimpleDateFormat(data, len);
       if (!ts_slot->HasDateOrTime()) {
         parse_result = StringParser::PARSE_FAILURE;
       }
+      break;
+    }
+    case TYPE_DATE: {
+      *reinterpret_cast<DateValue*>(slot) =
+          StringParser::StringToDate(data, len, &parse_result);
       break;
     }
     case TYPE_DECIMAL: {

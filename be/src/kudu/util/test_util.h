@@ -19,21 +19,39 @@
 #ifndef KUDU_UTIL_TEST_UTIL_H
 #define KUDU_UTIL_TEST_UTIL_H
 
+#include <sys/types.h>
+
+#include <cstdint>
 #include <functional>
-#include <gtest/gtest.h>
+#include <memory>
 #include <string>
 
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/util/env.h"
+#include <boost/optional/optional.hpp>
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/test_macros.h"
+
+#define SKIP_IF_SLOW_NOT_ALLOWED() do { \
+  if (!AllowSlowTests()) { \
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run"; \
+    return; \
+  } \
+} while (0)
 
 #define ASSERT_EVENTUALLY(expr) do { \
   AssertEventually(expr); \
   NO_PENDING_FATALS(); \
 } while (0)
 
+namespace google {
+class FlagSaver;
+} // namespace google
+
 namespace kudu {
+
+class Env;
+class Status;
 
 extern const char* kInvalidPath;
 
@@ -55,10 +73,14 @@ class KuduTest : public ::testing::Test {
   // Returns absolute path based on a unit test-specific work directory, given
   // a relative path. Useful for writing test files that should be deleted after
   // the test ends.
-  std::string GetTestPath(const std::string& relative_path);
+  std::string GetTestPath(const std::string& relative_path) const;
 
   Env* env_;
-  google::FlagSaver flag_saver_;  // Reset flags on every test.
+
+  // Reset flags on every test. Allocated on the heap so it can be destroyed
+  // (and the flags reset) before test_dir_ is deleted.
+  std::unique_ptr<google::FlagSaver> flag_saver_;
+
   std::string test_dir_;
 };
 
@@ -90,6 +112,9 @@ int SeedRandom();
 // if a KuduTest instance is available.
 std::string GetTestDataDirectory();
 
+// Return the directory which contains the test's executable.
+std::string GetTestExecutableDirectory();
+
 // Wait until 'f()' succeeds without adding any GTest 'fatal failures'.
 // For example:
 //
@@ -97,17 +122,48 @@ std::string GetTestDataDirectory();
 //     ASSERT_GT(ReadValueOfMetric(), 10);
 //   });
 //
-// The function is run in a loop with exponential backoff, capped at once
-// a second.
+// The function is run in a loop with optional back-off.
 //
 // To check whether AssertEventually() eventually succeeded, call
 // NO_PENDING_FATALS() afterward, or use ASSERT_EVENTUALLY() which performs
 // this check automatically.
+enum class AssertBackoff {
+  // Use exponential back-off while looping, capped at one second.
+  EXPONENTIAL,
+
+  // Sleep for a millisecond while looping.
+  NONE,
+};
 void AssertEventually(const std::function<void(void)>& f,
-                      const MonoDelta& timeout = MonoDelta::FromSeconds(30));
+                      const MonoDelta& timeout = MonoDelta::FromSeconds(30),
+                      AssertBackoff backoff = AssertBackoff::EXPONENTIAL);
 
 // Count the number of open file descriptors in use by this process.
-int CountOpenFds(Env* env);
+// 'path_pattern' is a glob-style pattern. Only paths that match this
+// pattern are included. Note that '*' in this pattern is recursive
+// unlike the usual behavior of path globs.
+int CountOpenFds(Env* env, const std::string& path_pattern);
+
+// Waits for the subprocess to bind to any listening TCP port on the provided
+// IP address (if the address is not provided, it is a wildcard binding), and
+// returns the port.
+Status WaitForTcpBind(pid_t pid, uint16_t* port,
+                      const boost::optional<const std::string&>& addr,
+                      MonoDelta timeout) WARN_UNUSED_RESULT;
+
+// Similar to above but binds to any listening UDP port.
+Status WaitForUdpBind(pid_t pid, uint16_t* port,
+                      const boost::optional<const std::string&>& addr,
+                      MonoDelta timeout) WARN_UNUSED_RESULT;
+
+// Find the home directory of a Java-style application, e.g. JAVA_HOME or
+// HADOOP_HOME.
+//
+// Checks the environment, or falls back to a symlink in the bin installation
+// directory.
+Status FindHomeDir(const std::string& name,
+                   const std::string& bin_dir,
+                   std::string* home_dir) WARN_UNUSED_RESULT;
 
 } // namespace kudu
 #endif

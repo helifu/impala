@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "common/status.h"
 #include "exec/unnest-node.h"
+
+#include "common/status.h"
+#include "exec/exec-node-util.h"
 #include "exec/subplan-node.h"
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/slot-ref.h"
@@ -29,11 +31,41 @@ namespace impala {
 
 const CollectionValue UnnestNode::EMPTY_COLLECTION_VALUE;
 
-UnnestNode::UnnestNode(ObjectPool* pool, const TPlanNode& tnode,
-    const DescriptorTbl& descs)
-  : ExecNode(pool, tnode, descs),
+Status UnnestPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+  DCHECK(tnode.__isset.unnest_node);
+  RETURN_IF_ERROR(PlanNode::Init(tnode, state));
+  return Status::OK();
+}
+
+Status UnnestPlanNode::InitCollExpr(RuntimeState* state) {
+  DCHECK(containing_subplan_ != nullptr)
+      << "set_containing_subplan() must have been called";
+  const RowDescriptor& row_desc = *containing_subplan_->children_[0]->row_descriptor_;
+  RETURN_IF_ERROR(ScalarExpr::Create(
+      tnode_->unnest_node.collection_expr, row_desc, state, &collection_expr_));
+  DCHECK(collection_expr_->IsSlotRef());
+
+  // Set the coll_slot_desc_ and the corresponding tuple index used for manually
+  // evaluating the collection SlotRef and for projection.
+  DCHECK(collection_expr_->IsSlotRef());
+  const SlotRef* slot_ref = static_cast<SlotRef*>(collection_expr_);
+  coll_slot_desc_ = state->desc_tbl().GetSlotDescriptor(slot_ref->slot_id());
+  DCHECK(coll_slot_desc_ != nullptr);
+  coll_tuple_idx_ = row_desc.GetTupleIdx(coll_slot_desc_->parent()->id());
+  return Status::OK();
+}
+
+Status UnnestPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
+  ObjectPool* pool = state->obj_pool();
+  *node = pool->Add(new UnnestNode(pool, *this, state->desc_tbl()));
+  return Status::OK();
+}
+
+UnnestNode::UnnestNode(
+    ObjectPool* pool, const UnnestPlanNode& pnode, const DescriptorTbl& descs)
+  : ExecNode(pool, pnode, descs),
     item_byte_size_(0),
-    thrift_coll_expr_(tnode.unnest_node.collection_expr),
+    thrift_coll_expr_(pnode.tnode_->unnest_node.collection_expr),
     coll_expr_(nullptr),
     coll_expr_eval_(nullptr),
     coll_slot_desc_(nullptr),
@@ -48,21 +80,9 @@ UnnestNode::UnnestNode(ObjectPool* pool, const TPlanNode& tnode,
     max_collection_size_counter_(nullptr),
     min_collection_size_counter_(nullptr),
     num_collections_counter_(nullptr) {
-}
-
-Status UnnestNode::Init(const TPlanNode& tnode, RuntimeState* state) {
-  DCHECK(tnode.__isset.unnest_node);
-  RETURN_IF_ERROR(ExecNode::Init(tnode, state));
-  return Status::OK();
-}
-
-Status UnnestNode::InitCollExpr(RuntimeState* state) {
-  DCHECK(containing_subplan_ != nullptr)
-      << "set_containing_subplan() must have been called";
-  const RowDescriptor& row_desc = *containing_subplan_->child(0)->row_desc();
-  RETURN_IF_ERROR(ScalarExpr::Create(thrift_coll_expr_, row_desc, state, &coll_expr_));
-  DCHECK(coll_expr_->IsSlotRef());
-  return Status::OK();
+  coll_expr_ = pnode.collection_expr_;
+  coll_slot_desc_ = pnode.coll_slot_desc_;
+  coll_tuple_idx_ = pnode.coll_tuple_idx_;
 }
 
 Status UnnestNode::Prepare(RuntimeState* state) {
@@ -85,20 +105,12 @@ Status UnnestNode::Prepare(RuntimeState* state) {
 
   RETURN_IF_ERROR(ScalarExprEvaluator::Create(*coll_expr_, state, pool_,
       expr_perm_pool(), expr_results_pool(), &coll_expr_eval_));
-
-  // Set the coll_slot_desc_ and the corresponding tuple index used for manually
-  // evaluating the collection SlotRef and for projection.
-  DCHECK(coll_expr_->IsSlotRef());
-  const SlotRef* slot_ref = static_cast<SlotRef*>(coll_expr_);
-  coll_slot_desc_ = state->desc_tbl().GetSlotDescriptor(slot_ref->slot_id());
-  DCHECK(coll_slot_desc_ != nullptr);
-  const RowDescriptor* row_desc = containing_subplan_->child(0)->row_desc();
-  coll_tuple_idx_ = row_desc->GetTupleIdx(coll_slot_desc_->parent()->id());
-
   return Status::OK();
 }
 
 Status UnnestNode::Open(RuntimeState* state) {
+  DCHECK(IsInSubplan());
+  // Omit ScopedOpenEventAdder since this is always in a subplan.
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(coll_expr_eval_->Open(state));
@@ -161,23 +173,19 @@ Status UnnestNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) 
       if (row_batch->AtCapacity()) break;
     }
   }
-  num_rows_returned_ += row_batch->num_rows();
 
   // Checking the limit here is simpler/cheaper than doing it in the loop above.
-  if (ReachedLimit()) {
-    *eos = true;
-    row_batch->set_num_rows(row_batch->num_rows() - (num_rows_returned_ - limit_));
-    num_rows_returned_ = limit_;
-  } else if (item_idx_ == coll_value_->num_tuples) {
+  const bool reached_limit = CheckLimitAndTruncateRowBatchIfNeeded(row_batch, eos);
+  if (!reached_limit && item_idx_ == coll_value_->num_tuples) {
     *eos = true;
   }
-  COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+  COUNTER_SET(rows_returned_counter_, rows_returned());
   return Status::OK();
 }
 
-Status UnnestNode::Reset(RuntimeState* state) {
+Status UnnestNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   item_idx_ = 0;
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void UnnestNode::Close(RuntimeState* state) {

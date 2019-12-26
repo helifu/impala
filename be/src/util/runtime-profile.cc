@@ -17,15 +17,20 @@
 
 #include "util/runtime-profile-counters.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <utility>
 
 #include <boost/bind.hpp>
 #include <boost/thread/locks.hpp>
 #include <boost/thread/thread.hpp>
 
 #include "common/object-pool.h"
+#include "gutil/strings/strip.h"
+#include "kudu/util/logging.h"
 #include "rpc/thrift-util.h"
+#include "runtime/mem-tracker.h"
 #include "util/coding-util.h"
 #include "util/compress.h"
 #include "util/container-util.h"
@@ -34,8 +39,14 @@
 #include "util/pretty-printer.h"
 #include "util/redactor.h"
 #include "util/scope-exit-trigger.h"
+#include "util/ubsan.h"
 
 #include "common/names.h"
+
+DECLARE_int32(status_report_interval_ms);
+DECLARE_int32(periodic_counter_update_period_ms);
+
+using namespace rapidjson;
 
 namespace impala {
 
@@ -53,16 +64,80 @@ const string RuntimeProfile::TOTAL_TIME_COUNTER_NAME = "TotalTime";
 const string RuntimeProfile::LOCAL_TIME_COUNTER_NAME = "LocalTime";
 const string RuntimeProfile::INACTIVE_TIME_COUNTER_NAME = "InactiveTotalTime";
 
+constexpr ProfileEntryPrototype::Significance ProfileEntryPrototype::ALLSIGNIFICANCE[];
+
+void ProfileEntryPrototypeRegistry::AddPrototype(const ProfileEntryPrototype* prototype) {
+  boost::lock_guard<SpinLock> l(lock_);
+  DCHECK(prototypes_.find(prototype->name()) == prototypes_.end()) <<
+      "Found duplicate prototype name: " << prototype->name();
+  prototypes_.emplace(prototype->name(), prototype);
+}
+
+void ProfileEntryPrototypeRegistry::GetPrototypes(
+    vector<const ProfileEntryPrototype*>* out) {
+  lock_guard<SpinLock> l(lock_);
+  out->reserve(prototypes_.size());
+  for (auto p : prototypes_) out->push_back(p.second);
+}
+
+ProfileEntryPrototype::ProfileEntryPrototype(const char* name, Significance significance,
+    const char* desc, TUnit::type unit) :
+    name_(name), significance_(significance), desc_(desc),
+    unit_(unit) {
+  ProfileEntryPrototypeRegistry::get()->AddPrototype(this);
+}
+
+const char* ProfileEntryPrototype::SignificanceString(
+    ProfileEntryPrototype::Significance significance) {
+  switch (significance) {
+    case Significance::STABLE_HIGH:
+      return "STABLE & HIGH";
+    case Significance::STABLE_LOW:
+      return "STABLE & LOW";
+    case Significance::UNSTABLE:
+      return "UNSTABLE";
+    case Significance::DEBUG:
+      return "DEBUG";
+    default:
+      DCHECK(false);
+      return "";
+  }
+}
+
+const char* ProfileEntryPrototype::SignificanceDescription(
+    ProfileEntryPrototype::Significance significance) {
+  switch (significance) {
+    case Significance::STABLE_HIGH:
+      return "High level and stable counters - always useful for measuring query "
+             "performance and status. Counters that everyone is interested. should "
+             "rarely change and if it does we will make some effort to notify users.";
+    case Significance::STABLE_LOW:
+      return "Low level and stable counters - interesting counters to monitor and "
+             "analyze by machine. It will probably be interesting under some "
+             "circumstances for users.";
+    case Significance::UNSTABLE:
+      return "Unstable but useful - useful to understand query performance, but subject"
+             " to change, particularly if the implementation changes. E.g. "
+             "RowBatchQueuePutWaitTime, MaterializeTupleTimer";
+    case Significance::DEBUG:
+      return "Debugging counters - generally not useful to users of Impala, the main"
+             " use case is low-level debugging. Can be hidden to reduce noise for "
+             "most consumers of profiles.";
+    default:
+      DCHECK(false);
+      return "";
+  }
+}
+
 RuntimeProfile* RuntimeProfile::Create(ObjectPool* pool, const string& name,
     bool is_averaged_profile) {
   return pool->Add(new RuntimeProfile(pool, name, is_averaged_profile));
 }
 
-RuntimeProfile::RuntimeProfile(ObjectPool* pool, const string& name,
-    bool is_averaged_profile)
+RuntimeProfile::RuntimeProfile(
+    ObjectPool* pool, const string& name, bool is_averaged_profile)
   : pool_(pool),
     name_(name),
-    metadata_(-1),
     is_averaged_profile_(is_averaged_profile),
     counter_total_time_(TUnit::TIME_NS),
     inactive_timer_(TUnit::TIME_NS),
@@ -107,7 +182,9 @@ RuntimeProfile* RuntimeProfile::CreateFromThrift(ObjectPool* pool,
     const TRuntimeProfileTree& profiles) {
   if (profiles.nodes.size() == 0) return NULL;
   int idx = 0;
-  return RuntimeProfile::CreateFromThrift(pool, profiles.nodes, &idx);
+  RuntimeProfile* profile = RuntimeProfile::CreateFromThrift(pool, profiles.nodes, &idx);
+  profile->SetTExecSummary(profiles.exec_summary);
+  return profile;
 }
 
 RuntimeProfile* RuntimeProfile::CreateFromThrift(ObjectPool* pool,
@@ -116,11 +193,11 @@ RuntimeProfile* RuntimeProfile::CreateFromThrift(ObjectPool* pool,
 
   const TRuntimeProfileNode& node = nodes[*idx];
   RuntimeProfile* profile = Create(pool, node.name);
-  profile->metadata_ = node.metadata;
+  profile->metadata_ = node.node_metadata;
   for (int i = 0; i < node.counters.size(); ++i) {
     const TCounter& counter = node.counters[i];
     profile->counter_map_[counter.name] =
-      pool->Add(new Counter(counter.unit, counter.value));
+        pool->Add(new Counter(counter.unit, counter.value));
   }
 
   if (node.__isset.event_sequences) {
@@ -132,8 +209,10 @@ RuntimeProfile* RuntimeProfile::CreateFromThrift(ObjectPool* pool,
 
   if (node.__isset.time_series_counters) {
     for (const TTimeSeriesCounter& val: node.time_series_counters) {
-      profile->time_series_counter_map_[val.name] =
-          pool->Add(new TimeSeriesCounter(val.name, val.unit, val.period_ms, val.values));
+      // Capture all incoming time series counters with the same type since re-sampling
+      // will have happened on the sender side.
+      profile->time_series_counter_map_[val.name] = pool->Add(
+          new ChunkedTimeSeriesCounter(val.name, val.unit, val.period_ms, val.values));
     }
   }
 
@@ -202,19 +281,33 @@ void RuntimeProfile::UpdateAverage(RuntimeProfile* other) {
   {
     lock_guard<SpinLock> l(children_lock_);
     lock_guard<SpinLock> m(other->children_lock_);
-    // Recursively merge children with matching names
+    // Recursively merge children with matching names.
+    // Track the current position in the vector so we preserve the order of children
+    // if children are added after the first Update()/UpdateAverage() call (IMPALA-6694).
+    // E.g. if the first update sends [B, D] and the second update sends [A, B, C, D],
+    // then this code makes sure that children_ is [A, B, C, D] afterwards.
+    ChildVector::iterator insert_pos = children_.begin();
     for (int i = 0; i < other->children_.size(); ++i) {
       RuntimeProfile* other_child = other->children_[i].first;
       ChildMap::iterator j = child_map_.find(other_child->name_);
       RuntimeProfile* child = NULL;
       if (j != child_map_.end()) {
         child = j->second;
+        // Search forward until the insert position is either at the end of the vector
+        // or after this child. This preserves the order if the relative order of
+        // children in all updates is consistent.
+        bool found_child = false;
+        while (insert_pos != children_.end() && !found_child) {
+          found_child = insert_pos->first == child;
+          ++insert_pos;
+        }
       } else {
         child = Create(pool_, other_child->name_, true);
         child->metadata_ = other_child->metadata_;
         bool indent_other_child = other->children_[i].second;
         child_map_[child->name_] = child;
-        children_.push_back(make_pair(child, indent_other_child));
+        insert_pos = children_.insert(insert_pos, make_pair(child, indent_other_child));
+        ++insert_pos;
       }
       child->UpdateAverage(other_child);
     }
@@ -230,6 +323,7 @@ void RuntimeProfile::Update(const TRuntimeProfileTree& thrift_profile) {
 }
 
 void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) {
+  if (UNLIKELY(nodes.size()) == 0) return;
   DCHECK_LT(*idx, nodes.size());
   const TRuntimeProfileNode& node = nodes[*idx];
   {
@@ -275,7 +369,7 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
       DCHECK(it != info_strings.end());
       InfoStrings::iterator existing = info_strings_.find(key);
       if (existing == info_strings_.end()) {
-        info_strings_.insert(make_pair(key, it->second));
+        info_strings_.emplace(key, it->second);
         info_strings_display_order_.push_back(key);
       } else {
         info_strings_[key] = it->second;
@@ -289,10 +383,13 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
       const TTimeSeriesCounter& c = node.time_series_counters[i];
       TimeSeriesCounterMap::iterator it = time_series_counter_map_.find(c.name);
       if (it == time_series_counter_map_.end()) {
-        time_series_counter_map_[c.name] =
-            pool_->Add(new TimeSeriesCounter(c.name, c.unit, c.period_ms, c.values));
+        // Capture all incoming time series counters with the same type since re-sampling
+        // will have happened on the sender side.
+        time_series_counter_map_[c.name] = pool_->Add(
+            new ChunkedTimeSeriesCounter(c.name, c.unit, c.period_ms, c.values));
       } else {
-        it->second->samples_.SetSamples(c.period_ms, c.values);
+        int64_t start_idx = c.__isset.start_index ? c.start_index : 0;
+        it->second->SetSamples(c.period_ms, c.values, start_idx);
       }
     }
   }
@@ -329,6 +426,11 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
   ++*idx;
   {
     lock_guard<SpinLock> l(children_lock_);
+    // Track the current position in the vector so we preserve the order of children
+    // if children are added after the first Update()/UpdateAverage() call (IMPALA-6694).
+    // E.g. if the first update sends [B, D] and the second update sends [A, B, C, D],
+    // then this code makes sure that children_ is [A, B, C, D] afterwards.
+    ChildVector::iterator insert_pos = children_.begin();
     // Update children with matching names; create new ones if they don't match.
     for (int i = 0; i < node.num_children; ++i) {
       const TRuntimeProfileNode& tchild = nodes[*idx];
@@ -336,11 +438,20 @@ void RuntimeProfile::Update(const vector<TRuntimeProfileNode>& nodes, int* idx) 
       RuntimeProfile* child = NULL;
       if (j != child_map_.end()) {
         child = j->second;
+        // Search forward until the insert position is either at the end of the vector
+        // or after this child. This preserves the order if the relative order of
+        // children in all updates is consistent.
+        bool found_child = false;
+        while (insert_pos != children_.end() && !found_child) {
+          found_child = insert_pos->first == child;
+          ++insert_pos;
+        }
       } else {
         child = Create(pool_, tchild.name);
-        child->metadata_ = tchild.metadata;
+        child->metadata_ = tchild.node_metadata;
         child_map_[tchild.name] = child;
-        children_.push_back(make_pair(child, tchild.indent));
+        insert_pos = children_.insert(insert_pos, make_pair(child, tchild.indent));
+        ++insert_pos;
       }
       child->Update(nodes, idx);
     }
@@ -373,7 +484,26 @@ void RuntimeProfile::ComputeTimeInProfile() {
 }
 
 void RuntimeProfile::ComputeTimeInProfile(int64_t total) {
-  if (total == 0) return;
+  // Recurse on children. After this, childrens' total time is up to date.
+  {
+    lock_guard<SpinLock> l(children_lock_);
+    for (int i = 0; i < children_.size(); ++i) {
+      children_[i].first->ComputeTimeInProfile();
+    }
+  }
+
+  // Get total time from children
+  int64_t children_total_time = 0;
+  {
+    lock_guard<SpinLock> l(children_lock_);
+    for (int i = 0; i < children_.size(); ++i) {
+      children_total_time += children_[i].first->total_time();
+    }
+  }
+  // IMPALA-5200: Take the max, because the parent includes all of the time from the
+  // children, whether or not its total time counter has been updated recently enough
+  // to see this.
+  total_time_ns_ = max(children_total_time, total_time_counter()->value());
 
   // If a local time counter exists, use its value as local time. Otherwise, derive the
   // local time from total time and the child time.
@@ -386,14 +516,9 @@ void RuntimeProfile::ComputeTimeInProfile(int64_t total) {
       has_local_time_counter = true;
     }
   }
+
   if (!has_local_time_counter) {
-    // Add all the total times of all the children.
-    int64_t total_child_time = 0;
-    lock_guard<SpinLock> l(children_lock_);
-    for (int i = 0; i < children_.size(); ++i) {
-      total_child_time += children_[i].first->total_time_counter()->value();
-    }
-    local_time_ns_ = total_time_counter()->value() - total_child_time;
+    local_time_ns_ = total_time_ns_ - children_total_time;
     if (!is_averaged_profile_) {
       local_time_ns_ -= inactive_timer()->value();
     }
@@ -401,16 +526,8 @@ void RuntimeProfile::ComputeTimeInProfile(int64_t total) {
   // Counters have some margin, set to 0 if it was negative.
   local_time_ns_ = ::max<int64_t>(0, local_time_ns_);
   local_time_percent_ =
-      static_cast<double>(local_time_ns_) / total_time_counter()->value();
+      static_cast<double>(local_time_ns_) / total_time_ns_;
   local_time_percent_ = ::min(1.0, local_time_percent_) * 100;
-
-  // Recurse on children
-  {
-    lock_guard<SpinLock> l(children_lock_);
-    for (int i = 0; i < children_.size(); ++i) {
-      children_[i].first->ComputeTimeInProfile(total);
-    }
-  }
 }
 
 void RuntimeProfile::AddChild(RuntimeProfile* child, bool indent, RuntimeProfile* loc) {
@@ -462,9 +579,7 @@ RuntimeProfile* RuntimeProfile::CreateChild(const string& name, bool indent,
 void RuntimeProfile::GetChildren(vector<RuntimeProfile*>* children) {
   children->clear();
   lock_guard<SpinLock> l(children_lock_);
-  for (ChildMap::iterator i = child_map_.begin(); i != child_map_.end(); ++i) {
-    children->push_back(i->second);
-  }
+  for (const auto& entry : children_) children->push_back(entry.first);
 }
 
 void RuntimeProfile::GetAllChildren(vector<RuntimeProfile*>* children) {
@@ -473,6 +588,24 @@ void RuntimeProfile::GetAllChildren(vector<RuntimeProfile*>* children) {
     children->push_back(i->second);
     i->second->GetAllChildren(children);
   }
+}
+
+void RuntimeProfile::SortChildrenByTotalTime() {
+  lock_guard<SpinLock> l(children_lock_);
+  // Create a snapshot of total time values so that they don't change while we're
+  // sorting. Sort the <total_time, index> pairs, then reshuffle children_.
+  vector<pair<int64_t, int64_t>> total_times;
+  for (int i = 0; i < children_.size(); ++i) {
+    total_times.emplace_back(children_[i].first->total_time_counter()->value(), i);
+  }
+  // Order by descending total time.
+  sort(total_times.begin(), total_times.end(),
+      [](const pair<int64_t, int64_t>& p1, const pair<int64_t, int64_t>& p2) {
+        return p1.first > p2.first;
+      });
+  ChildVector new_children;
+  for (const auto& p : total_times) new_children.emplace_back(children_[p.second]);
+  children_ = move(new_children);
 }
 
 void RuntimeProfile::AddInfoString(const string& key, const string& value) {
@@ -487,21 +620,31 @@ void RuntimeProfile::AppendInfoString(const string& key, const string& value) {
   return AddInfoStringInternal(key, value, true);
 }
 
-void RuntimeProfile::AddInfoStringInternal(
-    const string& key, const string& value, bool append, bool redact) {
-  const string& info = redact ? RedactCopy(value): value;
+void RuntimeProfile::AddInfoStringInternal(const string& key, string value,
+    bool append, bool redact) {
+
+  if (redact) Redact(&value);
+
+  StripTrailingWhitespace(&value);
+
   lock_guard<SpinLock> l(info_strings_lock_);
   InfoStrings::iterator it = info_strings_.find(key);
   if (it == info_strings_.end()) {
-    info_strings_.insert(make_pair(key, info));
+    info_strings_.emplace(key, std::move(value));
     info_strings_display_order_.push_back(key);
   } else {
     if (append) {
-      it->second += ", " + value;
+      it->second += ", " + std::move(value);
     } else {
-      it->second = info;
+      it->second = std::move(value);
     }
   }
+}
+
+void RuntimeProfile::UpdateInfoString(const string& key, string value) {
+  lock_guard<SpinLock> l(info_strings_lock_);
+  InfoStrings::iterator it = info_strings_.find(key);
+  if (it != info_strings_.end()) it->second = std::move(value);
 }
 
 const string* RuntimeProfile::GetInfoString(const string& key) const {
@@ -551,7 +694,7 @@ ADD_COUNTER_IMPL(AddConcurrentTimerCounter, ConcurrentTimerCounter);
 
 RuntimeProfile::DerivedCounter* RuntimeProfile::AddDerivedCounter(
     const string& name, TUnit::type unit,
-    const DerivedCounterFunction& counter_fn, const string& parent_counter_name) {
+    const SampleFunction& counter_fn, const string& parent_counter_name) {
   DCHECK_EQ(is_averaged_profile_, false);
   lock_guard<SpinLock> l(counter_map_lock_);
   if (counter_map_.find(name) != counter_map_.end()) return NULL;
@@ -578,7 +721,7 @@ RuntimeProfile::ThreadCounters* RuntimeProfile::AddThreadCounters(
   return counter;
 }
 
-void RuntimeProfile::AddLocalTimeCounter(const DerivedCounterFunction& counter_fn) {
+void RuntimeProfile::AddLocalTimeCounter(const SampleFunction& counter_fn) {
   DerivedCounter* local_time_counter = pool_->Add(
       new DerivedCounter(TUnit::TIME_NS, counter_fn));
   lock_guard<SpinLock> l(counter_map_lock_);
@@ -593,6 +736,15 @@ RuntimeProfile::Counter* RuntimeProfile::GetCounter(const string& name) {
     return counter_map_[name];
   }
   return NULL;
+}
+
+RuntimeProfile::SummaryStatsCounter* RuntimeProfile::GetSummaryStatsCounter(
+    const string& name) {
+  lock_guard<SpinLock> l(summary_stats_map_lock_);
+  if (summary_stats_map_.find(name) != summary_stats_map_.end()) {
+    return summary_stats_map_[name];
+  }
+  return nullptr;
 }
 
 void RuntimeProfile::GetCounters(const string& name, vector<Counter*>* counters) {
@@ -611,6 +763,179 @@ RuntimeProfile::EventSequence* RuntimeProfile::GetEventSequence(const string& na
   EventSequenceMap::const_iterator it = event_sequence_map_.find(name);
   if (it == event_sequence_map_.end()) return NULL;
   return it->second;
+}
+
+void RuntimeProfile::ToJson(Document* d) const{
+  // queryObj that stores all JSON format profile information
+  Value queryObj(kObjectType);
+  RuntimeProfile::ToJsonHelper(&queryObj, d);
+  d->RemoveMember("contents");
+  d->AddMember("contents", queryObj, d->GetAllocator());
+}
+
+void RuntimeProfile::ToJsonCounters(Value* parent, Document* d,
+    const string& counter_name, const CounterMap& counter_map,
+    const ChildCounterMap& child_counter_map) const{
+  auto& allocator = d->GetAllocator();
+  ChildCounterMap::const_iterator itr = child_counter_map.find(counter_name);
+  if (itr != child_counter_map.end()) {
+    const set<string>& child_counters = itr->second;
+    for (const string& child_counter: child_counters) {
+      CounterMap::const_iterator iter = counter_map.find(child_counter);
+      if (iter == counter_map.end()) continue;
+
+      Value counter(kObjectType);
+      iter->second->ToJson(*d, &counter);
+      counter.AddMember("counter_name", StringRef(child_counter.c_str()), allocator);
+
+      Value child_counters_json(kArrayType);
+      RuntimeProfile::ToJsonCounters(&child_counters_json, d,
+          child_counter, counter_map,child_counter_map);
+      if (!child_counters_json.Empty()){
+        counter.AddMember("child_counters", child_counters_json, allocator);
+      }
+      parent->PushBack(counter, allocator);
+    }
+  }
+}
+
+void RuntimeProfile::ToJsonHelper(Value* parent, Document* d) const{
+  Document::AllocatorType& allocator = d->GetAllocator();
+  // Create copy of counter_map_ and child_counter_map_ so we don't need to hold lock
+  // while we call value() on the counters (some of those might be DerivedCounters).
+  CounterMap counter_map;
+  ChildCounterMap child_counter_map;
+  {
+    lock_guard<SpinLock> l(counter_map_lock_);
+    counter_map = counter_map_;
+    child_counter_map = child_counter_map_;
+  }
+
+  // 1. Name
+  Value name(name_.c_str(), allocator);
+  parent->AddMember("profile_name", name, allocator);
+
+  // 2. Num_children
+  parent->AddMember("num_children", children_.size(), allocator);
+
+  // 3. Metadata
+  // Set the required metadata field to the plan node ID for compatibility with any tools
+  // that rely on the plan node id being set there.
+  // Legacy field. May contain the node ID for plan nodes.
+  // Replaced by node_metadata, which contains richer metadata.
+  parent->AddMember("metadata",
+      metadata_.__isset.plan_node_id ? metadata_.plan_node_id : -1, allocator);
+  // requires exactly one field of a union to be set so we only mark node_metadata
+  // as set if that is the case.
+  if (metadata_.__isset.plan_node_id || metadata_.__isset.data_sink_id){
+    Value node_metadata_json(kObjectType);
+    if (metadata_.__isset.plan_node_id){
+      node_metadata_json.AddMember("plan_node_id", metadata_.plan_node_id, allocator);
+    }
+    if (metadata_.__isset.data_sink_id){
+      node_metadata_json.AddMember("data_sink_id", metadata_.data_sink_id, allocator);
+    }
+    parent->AddMember("node_metadata", node_metadata_json, allocator);
+  }
+
+  // 4. Info_strings
+  {
+    lock_guard<SpinLock> l(info_strings_lock_);
+    if (!info_strings_.empty()) {
+      Value info_strings_json(kArrayType);
+      for (const string& key : info_strings_display_order_) {
+        Value info_string_json(kObjectType);
+        Value key_json(key.c_str(), allocator);
+        auto value_itr = info_strings_.find(key);
+        DCHECK(value_itr != info_strings_.end());
+        Value value_json(value_itr->second.c_str(), allocator);
+        info_string_json.AddMember("key", key_json, allocator);
+        info_string_json.AddMember("value", value_json, allocator);
+        info_strings_json.PushBack(info_string_json, allocator);
+      }
+      parent->AddMember("info_strings", info_strings_json, allocator);
+    }
+  }
+
+  // 5. Events
+  {
+    lock_guard<SpinLock> l(event_sequence_lock_);
+    if (!event_sequence_map_.empty()) {
+      Value event_sequences_json(kArrayType);
+      for (EventSequenceMap::const_iterator it = event_sequence_map_.begin();
+           it != event_sequence_map_.end(); ++it) {
+        Value event_sequence_json(kObjectType);
+        it->second->ToJson(*d, &event_sequence_json);
+        event_sequences_json.PushBack(event_sequence_json, allocator);
+      }
+      parent->AddMember("event_sequences", event_sequences_json, allocator);
+    }
+  }
+
+
+  // 6. Counters
+  Value counters(kArrayType);
+  RuntimeProfile::ToJsonCounters(&counters , d, "", counter_map, child_counter_map);
+  if (!counters.Empty()) {
+    parent->AddMember("counters", counters, allocator);
+  }
+
+  // 7. SummaryStatsCounter
+  {
+    lock_guard<SpinLock> l(summary_stats_map_lock_);
+    if (!summary_stats_map_.empty()) {
+      Value summary_stats_counters_json(kArrayType);
+      for (const SummaryStatsCounterMap::value_type& v : summary_stats_map_) {
+        Value summary_stats_counter(kObjectType);
+        Value summary_name(v.first.c_str(), allocator);
+        v.second->ToJson(*d, &summary_stats_counter);
+        // Remove Kind here because it would be redundant information for users
+        summary_stats_counter.RemoveMember("kind");
+        summary_stats_counter.AddMember("counter_name", summary_name, allocator);
+        summary_stats_counters_json.PushBack(summary_stats_counter, allocator);
+      }
+      parent->AddMember(
+          "summary_stats_counters", summary_stats_counters_json, allocator);
+    }
+  }
+
+  // 8. Time_series_counter_map
+  {
+    // Print all time series counters as following:
+    //    - <Name> (<period>): <val1>, <val2>, <etc>
+    lock_guard<SpinLock> l(counter_map_lock_);
+    if (!time_series_counter_map_.empty()) {
+      Value time_series_counters_json(kArrayType);
+      for (const TimeSeriesCounterMap::value_type& v : time_series_counter_map_) {
+        TimeSeriesCounter* counter = v.second;
+        Value time_series_json(kObjectType);
+        counter->ToJson(*d, &time_series_json);
+        time_series_counters_json.PushBack(time_series_json, allocator);
+      }
+      parent->AddMember("time_series_counters", time_series_counters_json, allocator);
+    }
+  }
+
+  // 9. Children Runtime Profiles
+  //
+  // Create copy of children_ so we don't need to hold lock while we call
+  // ToJsonHelper() on the children.
+  ChildVector children;
+  {
+    lock_guard<SpinLock> l(children_lock_);
+    children = children_;
+  }
+
+  if (!children.empty()) {
+    Value child_profiles(kArrayType);
+    for (int i = 0; i < children.size(); ++i) {
+      RuntimeProfile* profile = children[i].first;
+      Value child_profile(kObjectType);
+      profile->ToJsonHelper(&child_profile, d);
+      child_profiles.PushBack(child_profile, allocator);
+    }
+    parent->AddMember("child_profiles", child_profiles, allocator);
+  }
 }
 
 // Print the profile:
@@ -691,23 +1016,30 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
 
   {
     // Print all time series counters as following:
-    // <Name> (<period>): <val1>, <val2>, <etc>
-    SpinLock* lock;
-    int num, period;
+    //    - <Name> (<period>): <val1>, <val2>, <etc>
     lock_guard<SpinLock> l(counter_map_lock_);
     for (const TimeSeriesCounterMap::value_type& v: time_series_counter_map_) {
-      const int64_t* samples = v.second->samples_.GetSamples(&num, &period, &lock);
+      const TimeSeriesCounter* counter = v.second;
+      lock_guard<SpinLock> l(counter->lock_);
+      int num, period;
+      const int64_t* samples = counter->GetSamplesLocked(&num, &period);
       if (num > 0) {
-        stream << prefix << "  " << v.first << "("
-               << PrettyPrinter::Print(period * 1000000L, TUnit::TIME_NS)
-               << "): ";
-        for (int i = 0; i < num; ++i) {
-          stream << PrettyPrinter::Print(samples[i], v.second->unit_);
-          if (i != num - 1) stream << ", ";
+        // Clamp number of printed values at 64, the maximum number of values in the
+        // SamplingTimeSeriesCounter.
+        int step = 1 + (num - 1) / 64;
+        period *= step;
+        stream << prefix << "   - " << v.first << " ("
+               << PrettyPrinter::Print(period * 1000000L, TUnit::TIME_NS) << "): ";
+        for (int i = 0; i < num; i += step) {
+          stream << PrettyPrinter::Print(samples[i], counter->unit());
+          if (i + step < num) stream << ", ";
+        }
+        if (step > 1) {
+          stream << " (Showing " << ((num + 1) / step) << " of " << num << " values from "
+            "Thrift Profile)";
         }
         stream << endl;
       }
-      lock->unlock();
     }
   }
 
@@ -719,7 +1051,7 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
     for (const SummaryStatsCounterMap::value_type& v: summary_stats_map_) {
       if (v.second->TotalNumValues() == 0) {
         // No point printing all the stats if number of samples is zero.
-        stream << prefix << "  - " << v.first << ": "
+        stream << prefix << "   - " << v.first << ": "
                << PrettyPrinter::Print(v.second->value(), v.second->unit(), true)
                << " (Number of samples: " << v.second->TotalNumValues() << ")" << endl;
       } else {
@@ -763,13 +1095,13 @@ Status RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
   const_cast<RuntimeProfile*>(this)->ToThrift(&thrift_object);
   ThriftSerializer serializer(true);
   vector<uint8_t> serialized_buffer;
-  RETURN_IF_ERROR(serializer.Serialize(&thrift_object, &serialized_buffer));
+  RETURN_IF_ERROR(serializer.SerializeToVector(&thrift_object, &serialized_buffer));
 
   // Compress the serialized thrift string.  This uses string keys and is very
   // easy to compress.
   scoped_ptr<Codec> compressor;
-  RETURN_IF_ERROR(
-      Codec::CreateCompressor(NULL, false, THdfsCompression::DEFAULT, &compressor));
+  Codec::CodecInfo codec_info(THdfsCompression::DEFAULT);
+  RETURN_IF_ERROR(Codec::CreateCompressor(NULL, false, codec_info, &compressor));
   const auto close_compressor =
       MakeScopeExitTrigger([&compressor]() { compressor->Close(); });
 
@@ -787,9 +1119,54 @@ Status RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
   return Status::OK();;
 }
 
+Status RuntimeProfile::DeserializeFromArchiveString(
+    const std::string& archive_str, TRuntimeProfileTree* out) {
+  int64_t decoded_max;
+  if (!Base64DecodeBufLen(archive_str.c_str(), archive_str.size(), &decoded_max)) {
+    return Status("Error in DeserializeFromArchiveString: Base64DecodeBufLen failed.");
+  }
+
+  vector<uint8_t> decoded_buffer;
+  decoded_buffer.resize(decoded_max);
+  int64_t decoded_len;
+  if (!Base64Decode(archive_str.c_str(), archive_str.size(), decoded_max,
+          reinterpret_cast<char*>(decoded_buffer.data()), &decoded_len)) {
+    return Status("Error in DeserializeFromArchiveString: Base64Decode failed.");
+  }
+  decoded_buffer.resize(decoded_len);
+
+  scoped_ptr<Codec> decompressor;
+  MemTracker mem_tracker;
+  MemPool mem_pool(&mem_tracker);
+  const auto close_mem_tracker = MakeScopeExitTrigger([&mem_pool, &mem_tracker]() {
+    mem_pool.FreeAll();
+    mem_tracker.Close();
+  });
+  RETURN_IF_ERROR(Codec::CreateDecompressor(
+      &mem_pool, false, THdfsCompression::DEFAULT, &decompressor));
+  const auto close_decompressor =
+      MakeScopeExitTrigger([&decompressor]() { decompressor->Close(); });
+
+  int64_t result_len;
+  uint8_t* decompressed_buffer;
+  RETURN_IF_ERROR(decompressor->ProcessBlock(
+      false, decoded_len, decoded_buffer.data(), &result_len, &decompressed_buffer));
+
+  uint32_t deserialized_len = static_cast<uint32_t>(result_len);
+  RETURN_IF_ERROR(
+      DeserializeThriftMsg(decompressed_buffer, &deserialized_len, true, out));
+  return Status::OK();
+}
+
+void RuntimeProfile::SetTExecSummary(const TExecSummary& summary) {
+  lock_guard<SpinLock> l(t_exec_summary_lock_);
+  t_exec_summary_ = summary;
+}
+
 void RuntimeProfile::ToThrift(TRuntimeProfileTree* tree) const {
   tree->nodes.clear();
   ToThrift(&tree->nodes);
+  ExecSummaryToThrift(tree);
 }
 
 void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
@@ -797,7 +1174,14 @@ void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
   nodes->push_back(TRuntimeProfileNode());
   TRuntimeProfileNode& node = (*nodes)[index];
   node.name = name_;
-  node.metadata = metadata_;
+  // Set the required metadata field to the plan node ID for compatibility with any tools
+  // that rely on the plan node id being set there.
+  node.metadata = metadata_.__isset.plan_node_id ? metadata_.plan_node_id : -1;
+  // Thrift requires exactly one field of a union to be set so we only mark node_metadata
+  // as set if that is the case.
+  if (metadata_.__isset.plan_node_id || metadata_.__isset.data_sink_id) {
+    node.__set_node_metadata(metadata_);
+  }
   node.indent = true;
 
   CounterMap counter_map;
@@ -878,11 +1262,29 @@ void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
   }
 }
 
+void RuntimeProfile::ExecSummaryToThrift(TRuntimeProfileTree* tree) const {
+  GetExecSummary(&tree->exec_summary);
+  tree->__isset.exec_summary = true;
+}
+
+void RuntimeProfile::GetExecSummary(TExecSummary* t_exec_summary) const {
+  lock_guard<SpinLock> l(t_exec_summary_lock_);
+  *t_exec_summary = t_exec_summary_;
+}
+
+void RuntimeProfile::SetPlanNodeId(int node_id) {
+  DCHECK(!metadata_.__isset.data_sink_id) << "Don't set conflicting metadata";
+  metadata_.__set_plan_node_id(node_id);
+}
+
+void RuntimeProfile::SetDataSinkId(int sink_id) {
+  DCHECK(!metadata_.__isset.plan_node_id) << "Don't set conflicting metadata";
+  metadata_.__set_data_sink_id(sink_id);
+}
+
 int64_t RuntimeProfile::UnitsPerSecond(
-    const RuntimeProfile::Counter* total_counter,
-    const RuntimeProfile::Counter* timer) {
-  DCHECK(total_counter->unit() == TUnit::BYTES ||
-         total_counter->unit() == TUnit::UNIT);
+    const RuntimeProfile::Counter* total_counter, const RuntimeProfile::Counter* timer) {
+  DCHECK(total_counter->unit() == TUnit::BYTES || total_counter->unit() == TUnit::UNIT);
   DCHECK(timer->unit() == TUnit::TIME_NS);
 
   if (timer->value() == 0) return 0;
@@ -926,7 +1328,7 @@ RuntimeProfile::Counter* RuntimeProfile::AddRateCounter(
 }
 
 RuntimeProfile::Counter* RuntimeProfile::AddRateCounter(
-    const string& name, DerivedCounterFunction fn, TUnit::type dst_unit) {
+    const string& name, SampleFunction fn, TUnit::type dst_unit) {
   lock_guard<SpinLock> l(counter_map_lock_);
   bool created;
   Counter* dst_counter = AddCounterLocked(name, dst_unit, "", &created);
@@ -953,7 +1355,7 @@ RuntimeProfile::Counter* RuntimeProfile::AddSamplingCounter(
 }
 
 RuntimeProfile::Counter* RuntimeProfile::AddSamplingCounter(
-    const string& name, DerivedCounterFunction sample_fn) {
+    const string& name, SampleFunction sample_fn) {
   lock_guard<SpinLock> l(counter_map_lock_);
   bool created;
   Counter* dst_counter = AddCounterLocked(name, TUnit::DOUBLE_VALUE, "", &created);
@@ -1031,44 +1433,153 @@ RuntimeProfile::SummaryStatsCounter* RuntimeProfile::AddSummaryStatsCounter(
   return counter;
 }
 
-RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddTimeSeriesCounter(
-    const string& name, TUnit::type unit, DerivedCounterFunction fn) {
+RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddSamplingTimeSeriesCounter(
+    const string& name, TUnit::type unit, SampleFunction fn) {
   DCHECK(fn != nullptr);
   lock_guard<SpinLock> l(counter_map_lock_);
   TimeSeriesCounterMap::iterator it = time_series_counter_map_.find(name);
   if (it != time_series_counter_map_.end()) return it->second;
-  TimeSeriesCounter* counter = pool_->Add(new TimeSeriesCounter(name, unit, fn));
+  TimeSeriesCounter* counter = pool_->Add(new SamplingTimeSeriesCounter(name, unit, fn));
   time_series_counter_map_[name] = counter;
   PeriodicCounterUpdater::RegisterTimeSeriesCounter(counter);
   has_active_periodic_counters_ = true;
   return counter;
 }
 
-RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddTimeSeriesCounter(
+RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddSamplingTimeSeriesCounter(
     const string& name, Counter* src_counter) {
   DCHECK(src_counter != NULL);
-  return AddTimeSeriesCounter(name, src_counter->unit(),
+  return AddSamplingTimeSeriesCounter(name, src_counter->unit(),
       bind(&Counter::value, src_counter));
 }
 
-void RuntimeProfile::TimeSeriesCounter::ToThrift(TTimeSeriesCounter* counter) {
-  counter->name = name_;
-  counter->unit = unit_;
-
-  int num, period;
-  SpinLock* lock;
-  const int64_t* samples = samples_.GetSamples(&num, &period, &lock);
-  counter->values.resize(num);
-  memcpy(&counter->values[0], samples, num * sizeof(int64_t));
-  lock->unlock();
-  counter->period_ms = period;
+void RuntimeProfile::TimeSeriesCounter::AddSample(int ms_elapsed) {
+  lock_guard<SpinLock> l(lock_);
+  int64_t sample = sample_fn_();
+  AddSampleLocked(sample, ms_elapsed);
 }
 
-string RuntimeProfile::TimeSeriesCounter::DebugString() const {
-  stringstream ss;
-  ss << "Counter=" << name_ << endl
-     << samples_.DebugString();
-  return ss.str();
+const int64_t* RuntimeProfile::TimeSeriesCounter::GetSamplesLockedForSend(
+    int* num_samples, int* period) {
+  return GetSamplesLocked(num_samples, period);
+}
+
+void RuntimeProfile::TimeSeriesCounter::SetSamples(
+      int period, const std::vector<int64_t>& samples, int64_t start_idx) {
+  DCHECK(false);
+}
+
+void RuntimeProfile::SamplingTimeSeriesCounter::AddSampleLocked(
+    int64_t sample, int ms_elapsed){
+  samples_.AddSample(sample, ms_elapsed);
+}
+
+const int64_t* RuntimeProfile::SamplingTimeSeriesCounter::GetSamplesLocked(
+    int* num_samples, int* period) const {
+  return samples_.GetSamples(num_samples, period);
+}
+
+RuntimeProfile::ChunkedTimeSeriesCounter::ChunkedTimeSeriesCounter(
+    const string& name, TUnit::type unit, SampleFunction fn)
+  : TimeSeriesCounter(name, unit, fn)
+  , period_(FLAGS_periodic_counter_update_period_ms)
+  , max_size_(10 * FLAGS_status_report_interval_ms / period_) {}
+
+void RuntimeProfile::ChunkedTimeSeriesCounter::Clear() {
+  lock_guard<SpinLock> l(lock_);
+  previous_sample_count_ += last_get_count_;
+  values_.erase(values_.begin(), values_.begin() + last_get_count_);
+  last_get_count_ = 0;
+}
+
+void RuntimeProfile::ChunkedTimeSeriesCounter::AddSampleLocked(
+    int64_t sample, int ms_elapsed) {
+  // We chose inefficiently erasing elements from a vector over using a std::deque because
+  // this should only happen very infrequently and we rely on contiguous storage in
+  // GetSamplesLocked*().
+  if (max_size_ > 0 && values_.size() == max_size_) {
+    KLOG_EVERY_N_SECS(WARNING, 60) << "ChunkedTimeSeriesCounter reached maximum size";
+    values_.erase(values_.begin(), values_.begin() + 1);
+  }
+  DCHECK_LT(values_.size(), max_size_);
+  values_.push_back(sample);
+}
+
+const int64_t* RuntimeProfile::ChunkedTimeSeriesCounter::GetSamplesLocked(
+    int* num_samples, int* period) const {
+  DCHECK(num_samples != nullptr);
+  DCHECK(period != nullptr);
+  *num_samples = values_.size();
+  *period = period_;
+  return values_.data();
+}
+
+const int64_t* RuntimeProfile::ChunkedTimeSeriesCounter::GetSamplesLockedForSend(
+    int* num_samples, int* period) {
+  last_get_count_ = values_.size();
+  return GetSamplesLocked(num_samples, period);
+}
+
+void RuntimeProfile::ChunkedTimeSeriesCounter::SetSamples(
+    int period, const std::vector<int64_t>& samples, int64_t start_idx) {
+  lock_guard<SpinLock> l(lock_);
+  if (start_idx == 0) {
+    // This could be coming from a SamplingTimeSeriesCounter or another
+    // ChunkedTimeSeriesCounter.
+    period_ = period;
+    values_ = samples;
+    return;
+  }
+  // Only ChunkedTimeSeriesCounter will set start_idx > 0.
+  DCHECK_GT(start_idx, 0);
+  DCHECK_EQ(period_, period);
+  if (values_.size() < start_idx) {
+    // Fill up with 0.
+    values_.resize(start_idx);
+  }
+  DCHECK_GE(values_.size(), start_idx);
+  // Skip values we already received.
+  auto start_it = samples.begin() + values_.size() - start_idx;
+  values_.insert(values_.end(), start_it, samples.end());
+}
+
+RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddChunkedTimeSeriesCounter(
+    const string& name, TUnit::type unit, SampleFunction fn) {
+  DCHECK(fn != nullptr);
+  lock_guard<SpinLock> l(counter_map_lock_);
+  TimeSeriesCounterMap::iterator it = time_series_counter_map_.find(name);
+  if (it != time_series_counter_map_.end()) return it->second;
+  TimeSeriesCounter* counter = pool_->Add(new ChunkedTimeSeriesCounter(name, unit, fn));
+  time_series_counter_map_[name] = counter;
+  PeriodicCounterUpdater::RegisterTimeSeriesCounter(counter);
+  has_active_periodic_counters_ = true;
+  return counter;
+}
+
+void RuntimeProfile::ClearChunkedTimeSeriesCounters() {
+  {
+    lock_guard<SpinLock> l(counter_map_lock_);
+    for (auto& it : time_series_counter_map_) it.second->Clear();
+  }
+  {
+    lock_guard<SpinLock> l(children_lock_);
+    for (int i = 0; i < children_.size(); ++i) {
+      children_[i].first->ClearChunkedTimeSeriesCounters();
+    }
+  }
+}
+
+void RuntimeProfile::TimeSeriesCounter::ToThrift(TTimeSeriesCounter* counter) {
+  lock_guard<SpinLock> l(lock_);
+  int num, period;
+  const int64_t* samples = GetSamplesLockedForSend(&num, &period);
+  counter->values.resize(num);
+  Ubsan::MemCpy(counter->values.data(), samples, num * sizeof(int64_t));
+
+  counter->name = name_;
+  counter->unit = unit_;
+  counter->period_ms = period;
+  counter->__set_start_index(previous_sample_count_);
 }
 
 void RuntimeProfile::EventSequence::ToThrift(TEventSequence* seq) {
@@ -1130,6 +1641,69 @@ int64_t RuntimeProfile::SummaryStatsCounter::MaxValue() {
 int32_t RuntimeProfile::SummaryStatsCounter::TotalNumValues() {
   lock_guard<SpinLock> l(lock_);
   return total_num_values_;
+}
+
+void RuntimeProfile::Counter::ToJson(Document& document, Value* val) const {
+  Value counter_json(kObjectType);
+  counter_json.AddMember("value", value(), document.GetAllocator());
+  auto unit_itr = _TUnit_VALUES_TO_NAMES.find(unit_);
+  DCHECK(unit_itr != _TUnit_VALUES_TO_NAMES.end());
+  Value unit_json(unit_itr->second, document.GetAllocator());
+  counter_json.AddMember("unit", unit_json, document.GetAllocator());
+  Value kind_json(CounterType().c_str(), document.GetAllocator());
+  counter_json.AddMember("kind", kind_json, document.GetAllocator());
+  *val = counter_json;
+}
+
+void RuntimeProfile::TimeSeriesCounter::ToJson(Document& document, Value* val) {
+  lock_guard<SpinLock> lock(lock_);
+  Value counter_json(kObjectType);
+  counter_json.AddMember("counter_name",
+      StringRef(name_.c_str()), document.GetAllocator());
+  auto unit_itr = _TUnit_VALUES_TO_NAMES.find(unit_);
+  DCHECK(unit_itr != _TUnit_VALUES_TO_NAMES.end());
+  Value unit_json(unit_itr->second, document.GetAllocator());
+  counter_json.AddMember("unit", unit_json, document.GetAllocator());
+
+  int num, period;
+  const int64_t* samples = GetSamplesLocked(&num, &period);
+
+  counter_json.AddMember("num", num, document.GetAllocator());
+  counter_json.AddMember("period", period, document.GetAllocator());
+  stringstream stream;
+  // Clamp number of printed values at 64, the maximum number of values in the
+  // SamplingTimeSeriesCounter.
+  int step = 1 + (num - 1) / 64;
+  period *= step;
+
+  for (int i = 0; i < num; i += step) {
+    stream << samples[i];
+    if (i + step < num) stream << ",";
+  }
+
+  Value samples_data_json(stream.str().c_str(), document.GetAllocator());
+  counter_json.AddMember("data", samples_data_json, document.GetAllocator());
+  *val = counter_json;
+}
+
+void RuntimeProfile::EventSequence::ToJson(Document& document, Value* value) {
+  boost::lock_guard<SpinLock> event_lock(lock_);
+  SortEvents();
+
+  Value event_sequence_json(kObjectType);
+  event_sequence_json.AddMember("offset", offset_, document.GetAllocator());
+
+  Value events_json(kArrayType);
+
+  for (const Event& ev: events_) {
+    Value event_json(kObjectType);
+    event_json.AddMember("label", StringRef(ev.first.c_str()), document.GetAllocator());
+    event_json.AddMember("timestamp", ev.second, document.GetAllocator());
+    events_json.PushBack(event_json, document.GetAllocator());
+  }
+
+  event_sequence_json.AddMember("events", events_json, document.GetAllocator());
+  *value = event_sequence_json;
 }
 
 }

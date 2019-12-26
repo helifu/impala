@@ -16,30 +16,84 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-# This script generates the "CREATE TABLE", "INSERT", and "LOAD" statements for loading
-# test data and writes them to create-*-generated.sql and
-# load-*-generated.sql. These files are then executed by hive or impala, depending
-# on their contents. Additionally, for hbase, the file is of the form
-# create-*hbase*-generated.create.
 #
-# The statements that are generated are based on an input test vector
-# (read from a file) that describes the coverage desired. For example, currently
-# we want to run benchmarks with different data sets, across different file types, and
-# with different compression algorithms set. To improve data loading performance this
-# script will generate an INSERT INTO statement to generate the data if the file does
-# not already exist in HDFS. If the file does already exist in HDFS then we simply issue a
-# LOAD statement which is much faster.
+# This script generates statements to create and populate
+# tables in a variety of formats. The tables and formats are
+# defined through a combination of files:
+# 1. Workload format specifics specify for each workload
+#    which formats are part of core, exhaustive, etc.
+#    This operates via the normal test dimensions.
+#    (see tests/common/test_dimension.py and
+#     testdata/workloads/*/*.csv)
+# 2. Workload table availability constraints specify which
+#    tables exist for which formats.
+#    (see testdata/datasets/*/schema_constraints.csv)
+# The arguments to this script specify the workload and
+# exploration strategy and can optionally restrict it
+# further to individual tables.
 #
-# The input test vectors are generated via the generate_test_vectors.py so
-# ensure that script has been run (or the test vector files already exist) before
-# running this script.
+# This script is generating several SQL scripts to be
+# executed by bin/load-data.py. The two scripts are tightly
+# coupled and any change in files generated must be
+# reflected in bin/load-data.py. Currently, this script
+# generates three things:
+# 1. It creates the directory (destroying the existing
+#    directory if necessary)
+#    ${IMPALA_DATA_LOADING_SQL_DIR}/${workload}
+# 2. It creates and populates a subdirectory
+#    avro_schemas/${workload} with JSON files specifying
+#    the Avro schema for each table.
+# 3. It generates SQL files with the following naming schema:
 #
-# Note: This statement generation is assuming the following data loading workflow:
-# 1) Load all the data in the specified source table
-# 2) Create tables for the new file formats and compression types
-# 3) Run INSERT OVERWRITE TABLE SELECT * from the source table into the new tables
-#    or LOAD directly if the file already exists in HDFS.
+#    Using the following variables:
+#    workload_exploration = ${workload}-${exploration_strategy} and
+#    file_format_suffix = ${file_format}-${codec}-${compression_type}
+#
+#    A. Impala table creation scripts run in Impala to create tables, partitions,
+#       and views. There is one for each file format. They take the form:
+#       create-${workload_exploration}-impala-generated-${file_format_suffix}.sql
+#
+#    B. Hive creation/load scripts run in Hive to load data into tables and create
+#       tables or views that Impala does not support. There is one for each
+#       file format. They take the form:
+#       load-${workload_exploration}-hive-generated-${file_format_suffix}.sql
+#
+#    C. HBase creation script runs through the hbase commandline to create
+#       HBase tables. (Only generated if loading HBase table.) It takes the form:
+#       load-${workload_exploration}-hbase-generated.create
+#
+#    D. HBase postload script runs through the hbase commandline to flush
+#       HBase tables. (Only generated if loading HBase table.) It takes the form:
+#       post-load-${workload_exploration}-hbase-generated.sql
+#
+#    E. Impala load scripts run in Impala to load data. Only Parquet and Kudu
+#       are loaded through Impala. There is one for each of those formats loaded.
+#       They take the form:
+#       load-${workload_exploration}-impala-generated-${file_format_suffix}.sql
+#
+#    F. Invalidation script runs through Impala to invalidate/refresh metadata
+#       for tables. It takes the form:
+#       invalidate-${workload_exploration}-impala-generated.sql
+#
+# In summary, table "CREATE" statements are mostly done by Impala. Any "CREATE"
+# statements that Impala does not support are done through Hive. Loading data
+# into tables mostly runs in Hive except for Parquet and Kudu tables.
+# Loading proceeds in two parts: First, data is loaded into text tables.
+# Second, almost all other formats are populated by inserts from the text
+# table. Since data loaded in Hive may not be visible in Impala, all tables
+# need to have metadata refreshed or invalidated before access in Impala.
+# This means that loading Parquet or Kudu requires invalidating source
+# tables. It also means that invalidate needs to happen at the end of dataload.
+#
+# For tables requiring customized actions to create schemas or place data,
+# this script allows the table specification to include commands that
+# this will execute as part of generating the SQL for table. If the command
+# generates output, that output is used for that section. This is useful
+# for custom tables that rely on loading specific files into HDFS or
+# for tables where specifying the schema is tedious (e.g. wide tables).
+# This should be used sparingly, because these commands are executed
+# serially.
+#
 import collections
 import csv
 import glob
@@ -65,7 +119,7 @@ parser.add_option("--hive_warehouse_dir", dest="hive_warehouse_dir",
                   default="/test-warehouse",
                   help="The HDFS path to the base Hive test warehouse directory")
 parser.add_option("-w", "--workload", dest="workload",
-                  help="The workload to generate schema for: tpch, hive-benchmark, ...")
+                  help="The workload to generate schema for: tpch, tpcds, ...")
 parser.add_option("-s", "--scale_factor", dest="scale_factor", default="",
                   help="An optional scale factor to generate the schema for")
 parser.add_option("-f", "--force_reload", dest="force_reload", action="store_true",
@@ -128,6 +182,7 @@ FILE_FORMAT_MAP = {
   'text': 'TEXTFILE',
   'seq': 'SEQUENCEFILE',
   'rc': 'RCFILE',
+  'orc': 'ORC',
   'parquet': 'PARQUET',
   'text_lzo':
     "\nINPUTFORMAT 'com.hadoop.mapred.DeprecatedLzoTextInputFormat'" +
@@ -168,9 +223,10 @@ WITH SERDEPROPERTIES (
 KNOWN_EXPLORATION_STRATEGIES = ['core', 'pairwise', 'exhaustive', 'lzo']
 
 def build_create_statement(table_template, table_name, db_name, db_suffix,
-                           file_format, compression, hdfs_location):
-  create_stmt = 'CREATE DATABASE IF NOT EXISTS %s%s;\n' % (db_name, db_suffix)
-  if (options.force_reload):
+                           file_format, compression, hdfs_location,
+                           force_reload):
+  create_stmt = ''
+  if (force_reload):
     create_stmt += 'DROP TABLE IF EXISTS %s%s.%s;\n' % (db_name, db_suffix, table_name)
   if compression == 'lzo':
     file_format = '%s_%s' % (file_format, compression)
@@ -188,8 +244,34 @@ def build_create_statement(table_template, table_name, db_name, db_suffix,
                                        hdfs_location=hdfs_location)
   return create_stmt
 
+
+def parse_table_properties(file_format, table_properties):
+  """
+  Read the properties specified in the TABLE_PROPERTIES section.
+  The table properties can be restricted to a file format or are applicable
+  for all formats.
+  For specific format the syntax is <fileformat>:<key>=<val>
+  """
+  tblproperties = {}
+  TABLE_PROPERTY_RE = re.compile(
+      # Optional '<data-format>:' prefix, capturing just the 'data-format' part.
+      r'(?:(\w+):)?' +
+      # Required key=value, capturing the key and value
+      r'(.+?)=(.*)')
+  for table_property in filter(None, table_properties.split("\n")):
+    m = TABLE_PROPERTY_RE.match(table_property)
+    if not m:
+      raise Exception("Invalid table property line: {0}", format(table_property))
+    only_format, key, val = m.groups()
+    if only_format is not None and only_format != file_format:
+      continue
+    tblproperties[key] = val
+
+  return tblproperties
+
+
 def build_table_template(file_format, columns, partition_columns, row_format,
-                         avro_schema_dir, table_name, table_properties):
+                         avro_schema_dir, table_name, tblproperties):
   if file_format == 'hbase':
     return build_hbase_create_stmt_in_hive(columns, partition_columns, table_name)
 
@@ -206,9 +288,8 @@ def build_table_template(file_format, columns, partition_columns, row_format,
   file_format_string = "STORED AS {file_format}"
 
   tblproperties_clause = "TBLPROPERTIES (\n{0}\n)"
-  tblproperties = {}
 
-  external = "EXTERNAL"
+  external = "" if is_transactional(tblproperties) else "EXTERNAL"
 
   if file_format == 'avro':
     # TODO Is this flag ever used?
@@ -218,32 +299,18 @@ def build_table_template(file_format, columns, partition_columns, row_format,
     else:
       tblproperties["avro.schema.url"] = "hdfs://%s/%s/%s/{table_name}.json" \
         % (options.hdfs_namenode, options.hive_warehouse_dir, avro_schema_dir)
-  elif file_format in 'parquet':
+  elif file_format in ['parquet', 'orc']:  # columnar formats don't need row format
     row_format_stmt = str()
   elif file_format == 'kudu':
     # Use partitioned_by to set a trivial hash distribution
     assert not partitioned_by, "Kudu table shouldn't have partition cols defined"
     partitioned_by = "partition by hash partitions 3"
 
-    # Fetch KUDU host and port from environment
-    kudu_master = os.getenv("KUDU_MASTER_HOSTS", "127.0.0.1")
-    kudu_master_port = os.getenv("KUDU_MASTER_PORT", "7051")
     row_format_stmt = str()
-    tblproperties["kudu.master_addresses"] = \
-      "{0}:{1}".format(kudu_master, kudu_master_port)
     primary_keys_clause = ", PRIMARY KEY (%s)" % columns.split("\n")[0].split(" ")[0]
     # Kudu's test tables are managed.
     external = ""
 
-  # Read the properties specified in the TABLE_PROPERTIES section. When the specified
-  # properties have the same key as a default property, the value for the specified
-  # property is used.
-  if table_properties:
-    for table_property in table_properties.split("\n"):
-      format_prop = table_property.split(":")
-      if format_prop[0] == file_format:
-        key_val = format_prop[1].split("=");
-        tblproperties[key_val[0]] = key_val[1]
 
   all_tblproperties = []
   for key, value in tblproperties.iteritems():
@@ -291,8 +358,8 @@ def build_hbase_create_stmt_in_hive(columns, partition_columns, table_name):
   # PARTITIONED BY is not supported and does not make sense for HBase.
   if partition_columns:
     columns.extend(partition_columns.split('\n'))
-  # stringid is a special case. It still points to functional_hbase.alltypesagg
-  if 'stringid' not in table_name:
+  # stringids is a special case. It still points to functional_hbase.alltypesagg
+  if 'stringids' not in table_name:
     tbl_properties = ('TBLPROPERTIES("hbase.table.name" = '
                       '"{db_name}{db_suffix}.{table_name}")')
   else:
@@ -334,8 +401,13 @@ def avro_schema(columns):
       type = {"type": "bytes", "logicalType": "decimal", "precision": precision,
               "scale": scale}
     else:
-      hive_type = column_spec.split()[1]
-      type = HIVE_TO_AVRO_TYPE_MAP[hive_type.upper()]
+      hive_type = column_spec.split()[1].upper()
+      if hive_type.startswith('CHAR(') or hive_type.startswith('VARCHAR('):
+        type = 'string'
+      elif hive_type == 'DATE':
+        type = {"type": "int", "logicalType": "date"}
+      else:
+        type = HIVE_TO_AVRO_TYPE_MAP[hive_type]
 
     record["fields"].append(
       {'name': name,
@@ -419,15 +491,19 @@ def build_load_statement(load_template, db_name, db_suffix, table_name):
                                          impala_home = base_load_dir)
   return load_template
 
-def build_hbase_create_stmt(db_name, table_name, column_families):
+def build_hbase_create_stmt(db_name, table_name, column_families, region_splits):
   hbase_table_name = "{db_name}_hbase.{table_name}".format(db_name=db_name,
                                                            table_name=table_name)
-  create_stmt = list()
-  create_stmt.append("disable '%s'" % hbase_table_name)
-  create_stmt.append("drop '%s'" % hbase_table_name)
+  create_stmts = list()
+  create_stmts.append("disable '%s'" % hbase_table_name)
+  create_stmts.append("drop '%s'" % hbase_table_name)
   column_families = ','.join(["'{0}'".format(cf) for cf in column_families.splitlines()])
-  create_stmt.append("create '%s', %s" % (hbase_table_name, column_families))
-  return create_stmt
+  create_statement = "create '%s', %s" % (hbase_table_name, column_families)
+  if (region_splits):
+    create_statement += ", {SPLITS => [" + region_splits.strip() + "]}"
+
+  create_stmts.append(create_statement)
+  return create_stmts
 
 # Does a hdfs directory listing and returns array with all the subdir names.
 def get_hdfs_subdirs_with_data(path):
@@ -451,13 +527,13 @@ class Statements(object):
 
   def write_to_file(self, filename):
     # If there is no content to write, skip
-    if self.__is_empty(): return
+    if not self: return
     output = self.create + self.load_base + self.load
     with open(filename, 'w') as f:
       f.write('\n\n'.join(output))
 
-  def __is_empty(self):
-    return not (self.create or self.load or self.load_base)
+  def __nonzero__(self):
+    return bool(self.create or self.load or self.load_base)
 
 def eval_section(section_str):
   """section_str should be the contents of a section (i.e. a string). If section_str
@@ -479,7 +555,6 @@ def generate_statements(output_name, test_vectors, sections,
   # TODO: This method has become very unwieldy. It has to be re-factored sooner than
   # later.
   # Parquet statements to be executed separately by Impala
-  hive_output = Statements()
   hbase_output = Statements()
   hbase_post_load = Statements()
   impala_invalidate = Statements()
@@ -490,25 +565,34 @@ def generate_statements(output_name, test_vectors, sections,
   existing_tables = get_hdfs_subdirs_with_data(options.hive_warehouse_dir)
   for row in test_vectors:
     impala_create = Statements()
+    hive_output = Statements()
     impala_load = Statements()
     file_format, data_set, codec, compression_type =\
         [row.file_format, row.dataset, row.compression_codec, row.compression_type]
     table_format = '%s/%s/%s' % (file_format, codec, compression_type)
+    db_suffix = row.db_suffix()
+    db_name = '{0}{1}'.format(data_set, options.scale_factor)
+    db = '{0}{1}'.format(db_name, db_suffix)
+    create_db_stmt = 'CREATE DATABASE IF NOT EXISTS {0};\n'.format(db)
+    impala_create.create.append(create_db_stmt)
     for section in sections:
       table_name = section['BASE_TABLE_NAME'].strip()
-      db_suffix = row.db_suffix()
-      db_name = '{0}{1}'.format(data_set, options.scale_factor)
-      db = '{0}{1}'.format(db_name, db_suffix)
-
 
       if table_names and (table_name.lower() not in table_names):
         print 'Skipping table: %s.%s, table is not in specified table list' % (db, table_name)
         continue
 
+      # Check Hive version requirement, if present.
+      if section['HIVE_MAJOR_VERSION'] and \
+         section['HIVE_MAJOR_VERSION'].strip() != \
+         os.environ['IMPALA_HIVE_MAJOR_VERSION'].strip():
+        print "Skipping table '{0}.{1}': wrong Hive major version".format(db, table_name)
+        continue
+
       if table_format in schema_only_constraints and \
          table_name.lower() not in schema_only_constraints[table_format]:
         print ('Skipping table: %s.%s, \'only\' constraint for format did not '
-               'include this table.') % (db, table_name)
+              'include this table.') % (db, table_name)
         continue
 
       if schema_include_constraints[table_name.lower()] and \
@@ -540,12 +624,6 @@ def generate_statements(output_name, test_vectors, sections,
       else:
         create_kudu = None
 
-      # For some datasets we may want to use a different load strategy when running local
-      # tests versus tests against large scale factors. The most common reason is to
-      # reduce he number of partitions for the local test environment
-      if not options.scale_factor and section['LOAD_LOCAL']:
-        load = section['LOAD_LOCAL']
-
       columns = eval_section(section['COLUMNS']).strip()
       partition_columns = section['PARTITION_COLUMNS'].strip()
       row_format = section['ROW_FORMAT'].strip()
@@ -555,19 +633,20 @@ def generate_statements(output_name, test_vectors, sections,
       # ensure the partition metadata is always properly created. The ALTER section is
       # used to create partitions, so if that section exists there is no need to force
       # reload.
+      # IMPALA-6579: Also force reload all Kudu tables. The Kudu entity referenced
+      # by the table may or may not exist, so requiring a force reload guarantees
+      # that the Kudu entity is always created correctly.
       # TODO: Rename the ALTER section to ALTER_TABLE_ADD_PARTITION
-      force_reload = options.force_reload or (partition_columns and not alter)
+      force_reload = options.force_reload or (partition_columns and not alter) or \
+          file_format == 'kudu'
 
       hdfs_location = '{0}.{1}{2}'.format(db_name, table_name, db_suffix)
-      # hdfs file names for hive-benchmark and functional datasets are stored
+      # hdfs file names for functional datasets are stored
       # directly under /test-warehouse
       # TODO: We should not need to specify the hdfs file path in the schema file.
       # This needs to be done programmatically.
-      if data_set in ['hive-benchmark', 'functional']:
+      if data_set == 'functional':
         hdfs_location = hdfs_location.split('.')[-1]
-      # hive does not allow hyphenated table names.
-      if data_set == 'hive-benchmark':
-        db_name = '{0}{1}'.format('hivebenchmark', options.scale_factor)
       data_path = os.path.join(options.hive_warehouse_dir, hdfs_location)
 
       # Empty tables (tables with no "LOAD" sections) are assumed to be used for insert
@@ -575,18 +654,22 @@ def generate_statements(output_name, test_vectors, sections,
       # HBASE we need to create these tables with a supported insert format.
       create_file_format = file_format
       create_codec = codec
-      if not (section['LOAD'] or section['LOAD_LOCAL'] or section['DEPENDENT_LOAD'] \
+      if not (section['LOAD'] or section['DEPENDENT_LOAD']
               or section['DEPENDENT_LOAD_HIVE']):
         create_codec = 'none'
         create_file_format = file_format
         if file_format not in IMPALA_SUPPORTED_INSERT_FORMATS:
           create_file_format = 'text'
 
+      tblproperties = parse_table_properties(create_file_format, table_properties)
+
       output = impala_create
       if create_hive or file_format == 'hbase':
         output = hive_output
       elif codec == 'lzo':
         # Impala CREATE TABLE doesn't allow INPUTFORMAT.
+        output = hive_output
+      elif is_transactional(tblproperties):
         output = hive_output
 
       # TODO: Currently, Kudu does not support partitioned tables via Impala.
@@ -613,7 +696,7 @@ def generate_statements(output_name, test_vectors, sections,
         avro_schema_dir = "%s/%s" % (AVRO_SCHEMA_DIR, data_set)
         table_template = build_table_template(
           create_file_format, columns, partition_columns,
-          row_format, avro_schema_dir, table_name, table_properties)
+          row_format, avro_schema_dir, table_name, tblproperties)
         # Write Avro schema to local file
         if file_format == 'avro':
           if not os.path.exists(avro_schema_dir):
@@ -625,17 +708,23 @@ def generate_statements(output_name, test_vectors, sections,
 
       if table_template:
         output.create.append(build_create_statement(table_template, table_name, db_name,
-            db_suffix, create_file_format, create_codec, data_path))
+            db_suffix, create_file_format, create_codec, data_path, force_reload))
       # HBASE create table
       if file_format == 'hbase':
         # If the HBASE_COLUMN_FAMILIES section does not exist, default to 'd'
         column_families = section.get('HBASE_COLUMN_FAMILIES', 'd')
+        region_splits = section.get('HBASE_REGION_SPLITS', None)
         hbase_output.create.extend(build_hbase_create_stmt(db_name, table_name,
-            column_families))
+            column_families, region_splits))
         hbase_post_load.load.append("flush '%s_hbase.%s'\n" % (db_name, table_name))
 
-      # Need to emit an "invalidate metadata" for each individual table
-      invalidate_table_stmt = "INVALIDATE METADATA {0}.{1};\n".format(db, table_name)
+      # Need to make sure that tables created and/or data loaded in Hive is seen
+      # in Impala. We only need to do a full invalidate if the table was created in Hive
+      # and Impala doesn't know about it. Otherwise, do a refresh.
+      if output == hive_output:
+        invalidate_table_stmt = "INVALIDATE METADATA {0}.{1};\n".format(db, table_name)
+      else:
+        invalidate_table_stmt = "REFRESH {0}.{1};\n".format(db, table_name)
       impala_invalidate.create.append(invalidate_table_stmt)
 
       # The ALTER statement in hive does not accept fully qualified table names so
@@ -653,7 +742,7 @@ def generate_statements(output_name, test_vectors, sections,
             # that weren't already added to the table. So, for force reload, manually
             # delete the partition directories.
             output.create.append(("DFS -rm -R {data_path};").format(
-              data_path=data_path));
+              data_path=data_path))
           else:
             # If this is not a force reload use msck repair to add the partitions
             # into the table.
@@ -695,23 +784,30 @@ def generate_statements(output_name, test_vectors, sections,
 
     impala_create.write_to_file("create-%s-impala-generated-%s-%s-%s.sql" %
         (output_name, file_format, codec, compression_type))
+    hive_output.write_to_file("load-%s-hive-generated-%s-%s-%s.sql" %
+        (output_name, file_format, codec, compression_type))
     impala_load.write_to_file("load-%s-impala-generated-%s-%s-%s.sql" %
         (output_name, file_format, codec, compression_type))
 
+  if hbase_output:
+    hbase_output.create.append("exit")
+    hbase_output.write_to_file('load-' + output_name + '-hbase-generated.create')
+  if hbase_post_load:
+    hbase_post_load.load.append("exit")
+    hbase_post_load.write_to_file('post-load-' + output_name + '-hbase-generated.sql')
+  impala_invalidate.write_to_file("invalidate-" + output_name + "-impala-generated.sql")
 
-  hive_output.write_to_file('load-' + output_name + '-hive-generated.sql')
-  hbase_output.create.append("exit")
-  hbase_output.write_to_file('load-' + output_name + '-hbase-generated.create')
-  hbase_post_load.load.append("exit")
-  hbase_post_load.write_to_file('post-load-' + output_name + '-hbase-generated.sql')
-  impala_invalidate.write_to_file('invalidate-' + output_name + '-impala-generated.sql')
+
+def is_transactional(table_properties):
+  return table_properties.get('transactional', "").lower() == 'true'
+
 
 def parse_schema_template_file(file_name):
   VALID_SECTION_NAMES = ['DATASET', 'BASE_TABLE_NAME', 'COLUMNS', 'PARTITION_COLUMNS',
                          'ROW_FORMAT', 'CREATE', 'CREATE_HIVE', 'CREATE_KUDU',
                          'DEPENDENT_LOAD', 'DEPENDENT_LOAD_KUDU', 'DEPENDENT_LOAD_HIVE',
-                         'LOAD', 'LOAD_LOCAL', 'ALTER', 'HBASE_COLUMN_FAMILIES',
-                         'TABLE_PROPERTIES']
+                         'LOAD', 'ALTER', 'HBASE_COLUMN_FAMILIES',
+                         'TABLE_PROPERTIES', 'HBASE_REGION_SPLITS', 'HIVE_MAJOR_VERSION']
   return parse_test_file(file_name, VALID_SECTION_NAMES, skip_unknown_sections=False)
 
 if __name__ == "__main__":

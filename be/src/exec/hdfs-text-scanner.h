@@ -25,6 +25,7 @@
 
 namespace impala {
 
+template<bool>
 class DelimitedTextParser;
 class ScannerContext;
 struct HdfsFileDesc;
@@ -63,6 +64,22 @@ class HdfsTextScanner : public HdfsScanner {
   static Status Codegen(HdfsScanNodeBase* node,
       const std::vector<ScalarExpr*>& conjuncts,
       llvm::Function** write_aligned_tuples_fn) WARN_UNUSED_RESULT;
+
+  /// Return true if we have builtin support for scanning text files compressed with this
+  /// codec.
+  static bool HasBuiltinSupport(THdfsCompression::type compression) {
+    switch (compression) {
+      case THdfsCompression::NONE:
+      case THdfsCompression::GZIP:
+      case THdfsCompression::SNAPPY:
+      case THdfsCompression::SNAPPY_BLOCKED:
+      case THdfsCompression::BZIP2:
+      case THdfsCompression::DEFLATE:
+        return true;
+      default:
+        return false;
+    }
+  }
 
   /// Suffix for lzo index files.
   const static std::string LZO_INDEX_SUFFIX;
@@ -237,7 +254,7 @@ class HdfsTextScanner : public HdfsScanner {
   int slot_idx_;
 
   /// Helper class for picking fields and rows from delimited text.
-  boost::scoped_ptr<DelimitedTextParser> delimited_text_parser_;
+  boost::scoped_ptr<DelimitedTextParser<true>> delimited_text_parser_;
 
   /// Return field locations from the Delimited Text Parser.
   std::vector<FieldLocation> field_locations_;

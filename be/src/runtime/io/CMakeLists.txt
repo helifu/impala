@@ -22,15 +22,29 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime/io")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime/io")
 
 add_library(Io
+  data-cache.cc
   disk-io-mgr.cc
   disk-io-mgr-stress.cc
+  local-file-system.cc
+  local-file-system-with-fault-injection.cc
+  error-converter.cc
   request-context.cc
   scan-range.cc
+  hdfs-file-reader.cc
+  local-file-reader.cc
+  hdfs-monitored-ops.cc
 )
 add_dependencies(Io gen-deps)
+
+add_library(IoTests STATIC
+  disk-io-mgr-test.cc
+)
+add_dependencies(IoTests gen-deps)
 
 # This test runs forever so should not be part of 'make test'
 add_executable(disk-io-mgr-stress-test disk-io-mgr-stress-test.cc)
 target_link_libraries(disk-io-mgr-stress-test ${IMPALA_TEST_LINK_LIBS})
 
-ADD_BE_TEST(disk-io-mgr-test)
+ADD_UNIFIED_BE_LSAN_TEST(disk-io-mgr-test DiskIoMgrTest.*)
+# Exception to unified be: Custom main function (platform tests)
+ADD_BE_LSAN_TEST(data-cache-test)

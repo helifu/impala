@@ -21,47 +21,76 @@
 
 #include "common/object-pool.h"
 #include "exec/exec-node.h"
+#include "exec/kudu-util.h"
 #include "exec/scan-node.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_sidecar.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "rpc/rpc-mgr.inline.h"
+#include "runtime/backend-client.h"
+#include "runtime/client-cache.h"
+#include "runtime/coordinator-filter-state.h"
+#include "runtime/debug-options.h"
 #include "runtime/exec-env.h"
 #include "runtime/fragment-instance-state.h"
-#include "runtime/debug-options.h"
-#include "runtime/client-cache.h"
-#include "runtime/backend-client.h"
-#include "runtime/coordinator-filter-state.h"
-#include "util/uid-util.h"
-#include "util/network-util.h"
+#include "runtime/krpc-data-stream-sender.h"
+#include "service/control-service.h"
 #include "util/counting-barrier.h"
-#include "gen-cpp/ImpalaInternalService_constants.h"
+#include "util/error-util-internal.h"
+#include "util/network-util.h"
+#include "util/pretty-printer.h"
+#include "util/runtime-profile-counters.h"
+#include "util/scope-exit-trigger.h"
+#include "util/uid-util.h"
 
 #include "common/names.h"
 
-using namespace impala;
+using kudu::MonoDelta;
+using kudu::rpc::RpcController;
+using kudu::rpc::RpcSidecar;
 using namespace rapidjson;
 namespace accumulators = boost::accumulators;
 
-Coordinator::BackendState::BackendState(
-    const TUniqueId& query_id, int state_idx, TRuntimeFilterMode::type filter_mode)
-  : query_id_(query_id),
+DECLARE_int32(backend_client_rpc_timeout_ms);
+DECLARE_int64(rpc_max_message_size);
+PROFILE_DECLARE_COUNTER(ScanRangesComplete);
+
+namespace impala {
+PROFILE_DECLARE_COUNTER(BytesRead);
+
+const char* Coordinator::BackendState::InstanceStats::LAST_REPORT_TIME_DESC =
+    "Last report received time";
+
+Coordinator::BackendState::BackendState(const QuerySchedule& schedule,
+    const TQueryCtx& query_ctx, int state_idx,
+    TRuntimeFilterMode::type filter_mode, const BackendExecParams& exec_params)
+  : schedule_(schedule),
     state_idx_(state_idx),
     filter_mode_(filter_mode),
-    rpc_latency_(0),
-    rpc_sent_(false),
-    peak_consumption_(0L) {
-}
+    backend_exec_params_(&exec_params),
+    query_ctx_(query_ctx),
+    query_id_(schedule.query_id()) {}
 
-void Coordinator::BackendState::Init(
-    const BackendExecParams& exec_params,
-    const vector<FragmentStats*>& fragment_stats, ObjectPool* obj_pool) {
-  backend_exec_params_ = &exec_params;
-  host_ = backend_exec_params_->instance_params[0]->host;
+void Coordinator::BackendState::Init(const vector<FragmentStats*>& fragment_stats,
+    RuntimeProfile* host_profile_parent, ObjectPool* obj_pool) {
+  host_ = backend_exec_params_->be_desc.address;
+  krpc_host_ = backend_exec_params_->be_desc.krpc_address;
   num_remaining_instances_ = backend_exec_params_->instance_params.size();
+
+  host_profile_ = RuntimeProfile::Create(obj_pool, TNetworkAddressToString(host_));
+  host_profile_parent->AddChild(host_profile_);
+  RuntimeProfile::Counter* admission_slots =
+      ADD_COUNTER(host_profile_, "AdmissionSlots", TUnit::UNIT);
+  admission_slots->Set(backend_exec_params_->slots_to_use);
 
   // populate instance_stats_map_ and install instance
   // profiles as child profiles in fragment_stats' profile
   int prev_fragment_idx = -1;
   for (const FInstanceExecParams* instance_params:
        backend_exec_params_->instance_params) {
-    DCHECK_EQ(host_, instance_params->host);  // all hosts must be the same
+    DCHECK(host_ == instance_params->host);  // all hosts must be the same
     int fragment_idx = instance_params->fragment().idx;
     DCHECK_LT(fragment_idx, fragment_stats.size());
     if (prev_fragment_idx != -1 && fragment_idx != prev_fragment_idx) {
@@ -78,29 +107,30 @@ void Coordinator::BackendState::Init(
   }
 }
 
-void Coordinator::BackendState::SetRpcParams(
-    const DebugOptions& debug_options, const FilterRoutingTable& filter_routing_table,
-    TExecQueryFInstancesParams* rpc_params) {
-  rpc_params->__set_protocol_version(ImpalaInternalServiceVersion::V1);
-  rpc_params->__set_coord_state_idx(state_idx_);
-  rpc_params->__set_min_reservation_bytes(backend_exec_params_->min_reservation_bytes);
-  rpc_params->__set_initial_reservation_total_claims(
-      backend_exec_params_->initial_reservation_total_claims);
+void Coordinator::BackendState::SetRpcParams(const DebugOptions& debug_options,
+    const FilterRoutingTable& filter_routing_table, ExecQueryFInstancesRequestPB* request,
+    TExecPlanFragmentInfo* fragment_info) {
+  request->set_coord_state_idx(state_idx_);
+  request->set_min_mem_reservation_bytes(backend_exec_params_->min_mem_reservation_bytes);
+  request->set_initial_mem_reservation_total_claims(
+      backend_exec_params_->initial_mem_reservation_total_claims);
+  request->set_per_backend_mem_limit(schedule_.per_backend_mem_limit());
 
   // set fragment_ctxs and fragment_instance_ctxs
-  rpc_params->__isset.fragment_ctxs = true;
-  rpc_params->__isset.fragment_instance_ctxs = true;
-  rpc_params->fragment_instance_ctxs.resize(backend_exec_params_->instance_params.size());
+  fragment_info->__isset.fragment_ctxs = true;
+  fragment_info->__isset.fragment_instance_ctxs = true;
+  fragment_info->fragment_instance_ctxs.resize(
+      backend_exec_params_->instance_params.size());
   for (int i = 0; i < backend_exec_params_->instance_params.size(); ++i) {
-    TPlanFragmentInstanceCtx& instance_ctx = rpc_params->fragment_instance_ctxs[i];
+    TPlanFragmentInstanceCtx& instance_ctx = fragment_info->fragment_instance_ctxs[i];
     const FInstanceExecParams& params = *backend_exec_params_->instance_params[i];
     int fragment_idx = params.fragment_exec_params.fragment.idx;
 
     // add a TPlanFragmentCtx, if we don't already have it
-    if (rpc_params->fragment_ctxs.empty()
-        || rpc_params->fragment_ctxs.back().fragment.idx != fragment_idx) {
-      rpc_params->fragment_ctxs.emplace_back();
-      TPlanFragmentCtx& fragment_ctx = rpc_params->fragment_ctxs.back();
+    if (fragment_info->fragment_ctxs.empty()
+        || fragment_info->fragment_ctxs.back().fragment.idx != fragment_idx) {
+      fragment_info->fragment_ctxs.emplace_back();
+      TPlanFragmentCtx& fragment_ctx = fragment_info->fragment_ctxs.back();
       fragment_ctx.__set_fragment(params.fragment_exec_params.fragment);
       fragment_ctx.__set_destinations(params.fragment_exec_params.destinations);
     }
@@ -120,79 +150,121 @@ void Coordinator::BackendState::SetRpcParams(
 
     if (filter_mode_ == TRuntimeFilterMode::OFF) continue;
 
-    // Remove filters that weren't selected during filter routing table construction.
-    // TODO: do this more efficiently, we're looping over the entire plan for each
-    // instance separately
-    DCHECK_EQ(rpc_params->query_ctx.client_request.query_options.mt_dop, 0);
     int instance_idx = GetInstanceIdx(params.instance_id);
-    for (TPlanNode& plan_node: rpc_params->fragment_ctxs.back().fragment.plan.nodes) {
-      if (!plan_node.__isset.hash_join_node) continue;
-      if (!plan_node.__isset.runtime_filters) continue;
-
-      vector<TRuntimeFilterDesc> required_filters;
-      for (const TRuntimeFilterDesc& desc: plan_node.runtime_filters) {
-        FilterRoutingTable::const_iterator filter_it =
-            filter_routing_table.find(desc.filter_id);
-        // filter was dropped in Coordinator::InitFilterRoutingTable()
-        if (filter_it == filter_routing_table.end()) continue;
-        const FilterState& f = filter_it->second;
-        if (f.src_fragment_instance_idxs().find(instance_idx)
-            == f.src_fragment_instance_idxs().end()) {
-          DCHECK(desc.is_broadcast_join);
-          continue;
-        }
-        // We don't need a target-side check here, because a filter is either sent to
-        // all its targets or none, and the none case is handled by checking if the
-        // filter is in the routing table.
-        required_filters.push_back(desc);
-      }
-      plan_node.__set_runtime_filters(required_filters);
-    }
+    auto& produced_map = filter_routing_table.finstance_filters_produced;
+    auto produced_it = produced_map.find(instance_idx);
+    if (produced_it == produced_map.end()) continue;
+    // Finstance needs list of source filters that were selected during filter routing
+    // table construction.
+    instance_ctx.__set_filters_produced(produced_it->second);
   }
 }
 
-void Coordinator::BackendState::Exec(
-    const TQueryCtx& query_ctx, const DebugOptions& debug_options,
+void Coordinator::BackendState::SetExecError(const Status& status) {
+  const string ERR_TEMPLATE = "ExecQueryFInstances rpc query_id=$0 failed: $1";
+  const string& err_msg =
+      Substitute(ERR_TEMPLATE, PrintId(query_id_), status.msg().GetFullMessageDetails());
+  LOG(ERROR) << err_msg;
+  status_ = Status::Expected(err_msg);
+}
+
+void Coordinator::BackendState::Exec(const DebugOptions& debug_options,
     const FilterRoutingTable& filter_routing_table,
-    CountingBarrier* exec_complete_barrier) {
-  NotifyBarrierOnExit notifier(exec_complete_barrier);
-  TExecQueryFInstancesParams rpc_params;
-  rpc_params.__set_query_ctx(query_ctx);
-  SetRpcParams(debug_options, filter_routing_table, &rpc_params);
+    const kudu::Slice& serialized_query_ctx, CountingBarrier* exec_complete_barrier) {
+  const auto trigger = MakeScopeExitTrigger([&]() {
+    // Ensure that 'last_report_time_ms_' is set prior to the barrier being notified.
+    last_report_time_ms_ = GenerateReportTimestamp();
+    exec_complete_barrier->Notify();
+  });
+
+  // Do not issue an ExecQueryFInstances RPC if there are no fragment instances
+  // scheduled to run on this backend.
+  if (IsEmptyBackend()) {
+    DCHECK(backend_exec_params_->is_coord_backend);
+    return;
+  }
+
+  std::unique_ptr<ControlServiceProxy> proxy;
+  Status get_proxy_status = ControlService::GetProxy(krpc_host_, host_.hostname, &proxy);
+  if (!get_proxy_status.ok()) {
+    SetExecError(get_proxy_status);
+    return;
+  }
+
+  ExecQueryFInstancesRequestPB request;
+  TExecPlanFragmentInfo fragment_info;
+  SetRpcParams(debug_options, filter_routing_table, &request, &fragment_info);
+
+  RpcController rpc_controller;
+  rpc_controller.set_timeout(
+      MonoDelta::FromMilliseconds(FLAGS_backend_client_rpc_timeout_ms));
+
+  // Serialize the sidecar and add it to the rpc controller. The serialized buffer is
+  // owned by 'serializer' and is freed when it is destructed.
+  ThriftSerializer serializer(true);
+  uint8_t* serialized_buf = nullptr;
+  uint32_t serialized_len = 0;
+  Status serialize_status =
+      serializer.SerializeToBuffer(&fragment_info, &serialized_len, &serialized_buf);
+  if (UNLIKELY(!serialize_status.ok())) {
+    SetExecError(serialize_status);
+    return;
+  } else if (serialized_len > FLAGS_rpc_max_message_size) {
+    SetExecError(
+        Status::Expected("Serialized Exec() request exceeds --rpc_max_message_size."));
+    return;
+  }
+
+  // TODO: eliminate the extra copy here by using a Slice
+  unique_ptr<kudu::faststring> sidecar_buf = make_unique<kudu::faststring>();
+  sidecar_buf->assign_copy(serialized_buf, serialized_len);
+  unique_ptr<RpcSidecar> rpc_sidecar = RpcSidecar::FromFaststring(move(sidecar_buf));
+
+  int sidecar_idx;
+  kudu::Status sidecar_status =
+      rpc_controller.AddOutboundSidecar(move(rpc_sidecar), &sidecar_idx);
+  if (!sidecar_status.ok()) {
+    SetExecError(FromKuduStatus(sidecar_status, "Failed to add sidecar"));
+    return;
+  }
+  request.set_plan_fragment_info_sidecar_idx(sidecar_idx);
+
+  // Add the serialized TQueryCtx as a sidecar.
+  unique_ptr<RpcSidecar> query_ctx_sidecar = RpcSidecar::FromSlice(serialized_query_ctx);
+  int query_ctx_sidecar_idx;
+  kudu::Status query_ctx_sidecar_status =
+      rpc_controller.AddOutboundSidecar(move(query_ctx_sidecar), &query_ctx_sidecar_idx);
+  if (!query_ctx_sidecar_status.ok()) {
+    SetExecError(
+        FromKuduStatus(query_ctx_sidecar_status, "Failed to add TQueryCtx sidecar"));
+    return;
+  }
+  request.set_query_ctx_sidecar_idx(query_ctx_sidecar_idx);
+
   VLOG_FILE << "making rpc: ExecQueryFInstances"
-      << " host=" << impalad_address() << " query_id=" << PrintId(query_id_);
+      << " host=" << TNetworkAddressToString(impalad_address()) << " query_id="
+      << PrintId(query_id_);
 
   // guard against concurrent UpdateBackendExecStatus() that may arrive after RPC returns
   lock_guard<mutex> l(lock_);
   int64_t start = MonotonicMillis();
 
-  ImpalaBackendConnection backend_client(
-      ExecEnv::GetInstance()->impalad_client_cache(), impalad_address(), &status_);
-  if (!status_.ok()) return;
+  ExecQueryFInstancesResponsePB response;
+  exec_rpc_status_ =
+      FromKuduStatus(proxy->ExecQueryFInstances(request, &response, &rpc_controller),
+          "Exec() rpc failed");
 
-  TExecQueryFInstancesResult thrift_result;
-  Status rpc_status = backend_client.DoRpc(
-      &ImpalaBackendClient::ExecQueryFInstances, rpc_params, &thrift_result);
   rpc_sent_ = true;
   rpc_latency_ = MonotonicMillis() - start;
 
-  const string ERR_TEMPLATE =
-      "ExecQueryFInstances rpc query_id=$0 failed: $1";
-
-  if (!rpc_status.ok()) {
-    const string& err_msg =
-        Substitute(ERR_TEMPLATE, PrintId(query_id_), rpc_status.msg().msg());
-    VLOG_QUERY << err_msg;
-    status_ = Status::Expected(err_msg);
+  if (!exec_rpc_status_.ok()) {
+    SetExecError(exec_rpc_status_);
     return;
   }
 
-  Status exec_status = Status(thrift_result.status);
+  Status exec_status = Status(response.status());
   if (!exec_status.ok()) {
-    const string& err_msg = Substitute(ERR_TEMPLATE, PrintId(query_id_),
-        exec_status.msg().GetFullMessageDetails());
-    VLOG_QUERY << err_msg;
-    status_ = Status(err_msg);
+    SetExecError(exec_status);
     return;
   }
 
@@ -211,9 +283,47 @@ Status Coordinator::BackendState::GetStatus(bool* is_fragment_failure,
   return status_;
 }
 
-int64_t Coordinator::BackendState::GetPeakConsumption() {
+Coordinator::ResourceUtilization Coordinator::BackendState::ComputeResourceUtilization() {
   lock_guard<mutex> l(lock_);
-  return peak_consumption_;
+  return ComputeResourceUtilizationLocked();
+}
+
+Coordinator::ResourceUtilization
+Coordinator::BackendState::ComputeResourceUtilizationLocked() {
+  ResourceUtilization result;
+  for (const auto& entry : instance_stats_map_) {
+    RuntimeProfile* profile = entry.second->profile_;
+    ResourceUtilization instance_utilization;
+    // Update resource utilization and apply delta.
+    RuntimeProfile::Counter* user_time = profile->GetCounter("TotalThreadsUserTime");
+    if (user_time != nullptr) instance_utilization.cpu_user_ns = user_time->value();
+
+    RuntimeProfile::Counter* system_time = profile->GetCounter("TotalThreadsSysTime");
+    if (system_time != nullptr) instance_utilization.cpu_sys_ns = system_time->value();
+
+    for (RuntimeProfile::Counter* c : entry.second->bytes_read_counters_) {
+      instance_utilization.bytes_read += c->value();
+    }
+
+    int64_t bytes_sent = 0;
+    for (RuntimeProfile::Counter* c : entry.second->bytes_sent_counters_) {
+      bytes_sent += c->value();
+    }
+
+    // Determine whether this instance had a scan node in its plan.
+    if (instance_utilization.bytes_read > 0) {
+      instance_utilization.scan_bytes_sent = bytes_sent;
+    } else {
+      instance_utilization.exchange_bytes_sent = bytes_sent;
+    }
+
+    RuntimeProfile::Counter* peak_mem =
+        profile->GetCounter(FragmentInstanceState::PER_HOST_PEAK_MEM_COUNTER);
+    if (peak_mem != nullptr)
+      instance_utilization.peak_per_host_mem_consumption = peak_mem->value();
+    result.Merge(instance_utilization);
+  }
+  return result;
 }
 
 void Coordinator::BackendState::MergeErrorLog(ErrorLogMap* merged) {
@@ -224,56 +334,97 @@ void Coordinator::BackendState::MergeErrorLog(ErrorLogMap* merged) {
 void Coordinator::BackendState::LogFirstInProgress(
     std::vector<Coordinator::BackendState*> backend_states) {
   for (Coordinator::BackendState* backend_state : backend_states) {
-    lock_guard<mutex> l(backend_state->lock_);
     if (!backend_state->IsDone()) {
-      VLOG_QUERY << "query_id=" << backend_state->query_id_
-                 << ": first in-progress backend: " << backend_state->impalad_address();
+      VLOG_QUERY << "query_id=" << PrintId(backend_state->query_id_)
+                 << ": first in-progress backend: "
+                 << TNetworkAddressToString(backend_state->impalad_address());
       break;
     }
   }
 }
 
-inline bool Coordinator::BackendState::IsDone() const {
+bool Coordinator::BackendState::IsDone() {
+  unique_lock<mutex> lock(lock_);
+  return IsDoneLocked(lock);
+}
+
+inline bool Coordinator::BackendState::IsDoneLocked(
+    const unique_lock<boost::mutex>& lock) const {
+  DCHECK(lock.owns_lock() && lock.mutex() == &lock_);
   return num_remaining_instances_ == 0 || !status_.ok();
 }
 
 bool Coordinator::BackendState::ApplyExecStatusReport(
-    const TReportExecStatusParams& backend_exec_status, ExecSummary* exec_summary,
-    ProgressUpdater* scan_range_progress) {
+    const ReportExecStatusRequestPB& backend_exec_status,
+    const TRuntimeProfileForest& thrift_profiles, ExecSummary* exec_summary,
+    ProgressUpdater* scan_range_progress, DmlExecState* dml_exec_state) {
+  DCHECK(!IsEmptyBackend());
+  // Hold the exec_summary's lock to avoid exposing it half-way through
+  // the update loop below.
   lock_guard<SpinLock> l1(exec_summary->lock);
-  lock_guard<mutex> l2(lock_);
-  last_report_time_ms_ = MonotonicMillis();
+  unique_lock<mutex> lock(lock_);
+  last_report_time_ms_ = GenerateReportTimestamp();
 
   // If this backend completed previously, don't apply the update.
-  if (IsDone()) return false;
-  for (const TFragmentInstanceExecStatus& instance_exec_status:
-      backend_exec_status.instance_exec_status) {
-    Status instance_status(instance_exec_status.status);
-    int instance_idx = GetInstanceIdx(instance_exec_status.fragment_instance_id);
+  if (IsDoneLocked(lock)) return false;
+
+  // Use empty profile in case profile serialization/deserialization failed.
+  // 'thrift_profiles' and 'instance_exec_status' vectors have one-to-one correspondance.
+  vector<TRuntimeProfileTree> empty_profiles;
+  vector<TRuntimeProfileTree>::const_iterator profile_iter;
+  if (UNLIKELY(thrift_profiles.profile_trees.size() == 0)) {
+    empty_profiles.resize(backend_exec_status.instance_exec_status().size());
+    profile_iter = empty_profiles.begin();
+  } else {
+    DCHECK_EQ(thrift_profiles.profile_trees.size(),
+        backend_exec_status.instance_exec_status().size());
+    profile_iter = thrift_profiles.profile_trees.begin();
+  }
+
+  for (auto status_iter = backend_exec_status.instance_exec_status().begin();
+       status_iter != backend_exec_status.instance_exec_status().end();
+       ++status_iter, ++profile_iter) {
+    const FragmentInstanceExecStatusPB& instance_exec_status = *status_iter;
+    int64_t report_seq_no = instance_exec_status.report_seq_no();
+    int instance_idx = GetInstanceIdx(instance_exec_status.fragment_instance_id());
     DCHECK_EQ(instance_stats_map_.count(instance_idx), 1);
     InstanceStats* instance_stats = instance_stats_map_[instance_idx];
-    DCHECK_EQ(instance_stats->exec_params_.instance_id,
-        instance_exec_status.fragment_instance_id);
+    int64_t last_report_seq_no = instance_stats->last_report_seq_no_;
+    DCHECK(instance_stats->exec_params_.instance_id ==
+        ProtoToQueryId(instance_exec_status.fragment_instance_id()));
     // Ignore duplicate or out-of-order messages.
-    if (instance_stats->done_) continue;
-
-    instance_stats->Update(instance_exec_status, exec_summary, scan_range_progress);
-    if (instance_stats->peak_mem_counter_ != nullptr) {
-      // protect against out-of-order status updates
-      peak_consumption_ =
-        max(peak_consumption_, instance_stats->peak_mem_counter_->value());
+    if (report_seq_no <= last_report_seq_no) {
+      VLOG_QUERY << Substitute("Ignoring stale update for query instance $0 with "
+          "seq no $1", PrintId(instance_stats->exec_params_.instance_id), report_seq_no);
+      continue;
     }
 
-    // If a query is aborted due to an error encountered by a single fragment instance,
-    // all other fragment instances will report a cancelled status; make sure not to mask
-    // the original error status.
-    if (!instance_status.ok() && (status_.ok() || status_.IsCancelled())) {
-      status_ = instance_status;
-      failed_instance_id_ = instance_exec_status.fragment_instance_id;
-      is_fragment_failure_ = true;
+    DCHECK(!instance_stats->done_);
+    instance_stats->Update(instance_exec_status, *profile_iter, exec_summary,
+        scan_range_progress);
+
+    // Update DML stats
+    if (instance_exec_status.has_dml_exec_status()) {
+      dml_exec_state->Update(instance_exec_status.dml_exec_status());
     }
+
+    // Handle the non-idempotent parts of the report for any sequence numbers that we
+    // haven't seen yet.
+    if (instance_exec_status.stateful_report_size() > 0) {
+      for (const auto& stateful_report : instance_exec_status.stateful_report()) {
+        DCHECK_LE(stateful_report.report_seq_no(), report_seq_no);
+        if (last_report_seq_no < stateful_report.report_seq_no()) {
+          // Append the log messages from each update with the global state of the query
+          // execution
+          MergeErrorMaps(stateful_report.error_log(), &error_log_);
+          VLOG_FILE << "host=" << TNetworkAddressToString(host_)
+                    << " error log: " << PrintErrorMapToString(error_log_);
+        }
+      }
+    }
+
     DCHECK_GT(num_remaining_instances_, 0);
-    if (instance_exec_status.done) {
+    if (instance_exec_status.done()) {
       DCHECK(!instance_stats->done_);
       instance_stats->done_ = true;
       --num_remaining_instances_;
@@ -297,21 +448,23 @@ bool Coordinator::BackendState::ApplyExecStatusReport(
   // status_ has incorporated the status from all fragment instances. If the overall
   // backend status is not OK, but no specific fragment instance reported an error, then
   // this is a general backend error. Incorporate the general error into status_.
-  Status overall_backend_status(backend_exec_status.status);
-  if (!overall_backend_status.ok() && (status_.ok() || status_.IsCancelled())) {
-    status_ = overall_backend_status;
-  }
-
-  // Log messages aggregated by type
-  if (backend_exec_status.__isset.error_log && backend_exec_status.error_log.size() > 0) {
-    // Append the log messages from each update with the global state of the query
-    // execution
-    MergeErrorMaps(backend_exec_status.error_log, &error_log_);
-    VLOG_FILE << "host=" << host_ << " error log: " << PrintErrorMapToString(error_log_);
+  Status overall_status(backend_exec_status.overall_status());
+  if (!overall_status.ok() && (status_.ok() || status_.IsCancelled())) {
+    status_ = overall_status;
+    if (backend_exec_status.has_fragment_instance_id()) {
+      failed_instance_id_ = ProtoToQueryId(backend_exec_status.fragment_instance_id());
+      is_fragment_failure_ = true;
+    }
   }
 
   // TODO: keep backend-wide stopwatch?
-  return IsDone();
+  return IsDoneLocked(lock);
+}
+
+void Coordinator::BackendState::UpdateHostProfile(
+    const TRuntimeProfileTree& thrift_profile) {
+  DCHECK(!IsEmptyBackend());
+  host_profile_->Update(thrift_profile);
 }
 
 void Coordinator::BackendState::UpdateExecStats(
@@ -333,13 +486,13 @@ void Coordinator::BackendState::UpdateExecStats(
 }
 
 bool Coordinator::BackendState::Cancel() {
-  lock_guard<mutex> l(lock_);
+  unique_lock<mutex> l(lock_);
 
   // Nothing to cancel if the exec rpc was not sent
   if (!rpc_sent_) return false;
 
   // don't cancel if it already finished (for any reason)
-  if (IsDone()) return false;
+  if (IsDoneLocked(l)) return false;
 
   /// If the status is not OK, we still try to cancel - !OK status might mean
   /// communication failure between backend and coordinator, but fragment
@@ -348,54 +501,54 @@ bool Coordinator::BackendState::Cancel() {
   // set an error status to make sure we only cancel this once
   if (status_.ok()) status_ = Status::CANCELLED;
 
-  TCancelQueryFInstancesParams params;
-  params.protocol_version = ImpalaInternalServiceVersion::V1;
-  params.__set_query_id(query_id_);
-  TCancelQueryFInstancesResult dummy;
-  VLOG_QUERY << "sending CancelQueryFInstances rpc for query_id="
-             << query_id_ << " backend=" << TNetworkAddressToString(impalad_address());
+  VLOG_QUERY << "Sending CancelQueryFInstances rpc for query_id=" << PrintId(query_id_)
+             << " backend=" << TNetworkAddressToString(krpc_host_);
 
-  Status rpc_status;
-  Status client_status;
-  // Try to send the RPC 3 times before failing.
-  for (int i = 0; i < 3; ++i) {
-    ImpalaBackendConnection backend_client(ExecEnv::GetInstance()->impalad_client_cache(),
-        impalad_address(), &client_status);
-    if (client_status.ok()) {
-      // The return value 'dummy' is ignored as it's only set if the fragment instance
-      // cannot be found in the backend. The fragment instances of a query can all be
-      // cancelled locally in a backend due to RPC failure to coordinator. In which case,
-      // the query state can be gone already.
-      rpc_status = backend_client.DoRpc(
-          &ImpalaBackendClient::CancelQueryFInstances, params, &dummy);
-      if (rpc_status.ok()) break;
-    }
-  }
-  if (!client_status.ok()) {
-    status_.MergeStatus(client_status);
-    VLOG_QUERY << "CancelQueryFInstances query_id= " << query_id_
-               << " failed to connect to " << TNetworkAddressToString(impalad_address())
-               << " :" << client_status.msg().msg();
+  std::unique_ptr<ControlServiceProxy> proxy;
+  Status get_proxy_status = ControlService::GetProxy(krpc_host_, host_.hostname, &proxy);
+  if (!get_proxy_status.ok()) {
+    status_.MergeStatus(get_proxy_status);
+    VLOG_QUERY << "Cancel query_id= " << PrintId(query_id_) << " could not get proxy to "
+               << TNetworkAddressToString(krpc_host_)
+               << " failure: " << get_proxy_status.msg().msg();
     return true;
   }
+
+  CancelQueryFInstancesRequestPB request;
+  TUniqueIdToUniqueIdPB(query_id_, request.mutable_query_id());
+  CancelQueryFInstancesResponsePB response;
+
+  const int num_retries = 3;
+  const int64_t timeout_ms = 10 * MILLIS_PER_SEC;
+  const int64_t backoff_time_ms = 3 * MILLIS_PER_SEC;
+  Status rpc_status =
+      RpcMgr::DoRpcWithRetry(proxy, &ControlServiceProxy::CancelQueryFInstances, request,
+          &response, query_ctx_, "Cancel() RPC failed", num_retries, timeout_ms,
+          backoff_time_ms, "COORD_CANCEL_QUERY_FINSTANCES_RPC");
+
   if (!rpc_status.ok()) {
     status_.MergeStatus(rpc_status);
-    VLOG_QUERY << "CancelQueryFInstances query_id= " << query_id_
-               << " rpc to " << TNetworkAddressToString(impalad_address())
-               << " failed: " << rpc_status.msg().msg();
+    VLOG_QUERY << "Cancel query_id= " << PrintId(query_id_) << " could not do rpc to "
+               << TNetworkAddressToString(krpc_host_)
+               << " failure: " << rpc_status.msg().msg();
+    return true;
+  }
+  Status cancel_status = Status(response.status());
+  if (!cancel_status.ok()) {
+    status_.MergeStatus(cancel_status);
+    VLOG_QUERY << "Cancel query_id= " << PrintId(query_id_)
+               << " got failure after rpc to " << TNetworkAddressToString(krpc_host_)
+               << " failure: " << cancel_status.msg().msg();
     return true;
   }
   return true;
 }
 
 void Coordinator::BackendState::PublishFilter(const TPublishFilterParams& rpc_params) {
-  DCHECK_EQ(rpc_params.dst_query_id, query_id_);
-  {
-    // If the backend is already done, it's not waiting for this filter, so we skip
-    // sending it in this case.
-    lock_guard<mutex> l(lock_);
-    if (IsDone()) return;
-  }
+  DCHECK(rpc_params.dst_query_id == query_id_);
+  // If the backend is already done, it's not waiting for this filter, so we skip
+  // sending it in this case.
+  if (IsDone()) return;
 
   if (fragments_.count(rpc_params.dst_fragment_idx) == 0) return;
   Status status;
@@ -413,14 +566,11 @@ Coordinator::BackendState::InstanceStats::InstanceStats(
     const FInstanceExecParams& exec_params, FragmentStats* fragment_stats,
     ObjectPool* obj_pool)
   : exec_params_(exec_params),
-    profile_(nullptr),
-    done_(false),
-    profile_created_(false),
-    total_split_size_(0),
-    total_ranges_complete_(0) {
+    profile_(nullptr) {
   const string& profile_name = Substitute("Instance $0 (host=$1)",
-      PrintId(exec_params.instance_id), lexical_cast<string>(exec_params.host));
+      PrintId(exec_params.instance_id), TNetworkAddressToString(exec_params.host));
   profile_ = RuntimeProfile::Create(obj_pool, profile_name);
+  profile_->AddInfoString(LAST_REPORT_TIME_DESC, ToStringFromUnixMillis(UnixMillis()));
   fragment_stats->root_profile()->AddChild(profile_);
 
   // add total split size to fragment_stats->bytes_assigned()
@@ -436,26 +586,30 @@ Coordinator::BackendState::InstanceStats::InstanceStats(
 void Coordinator::BackendState::InstanceStats::InitCounters() {
   vector<RuntimeProfile*> children;
   profile_->GetAllChildren(&children);
-  for (RuntimeProfile* p: children) {
-    PlanNodeId id = ExecNode::GetNodeIdFromProfile(p);
-    // This profile is not for an exec node.
-    if (id == g_ImpalaInternalService_constants.INVALID_PLAN_NODE_ID) continue;
-
-    RuntimeProfile::Counter* c =
-        p->GetCounter(ScanNode::SCAN_RANGES_COMPLETE_COUNTER);
+  for (RuntimeProfile* p : children) {
+    RuntimeProfile::Counter* c = p->GetCounter(PROFILE_ScanRangesComplete.name());
     if (c != nullptr) scan_ranges_complete_counters_.push_back(c);
-  }
 
-  peak_mem_counter_ =
-      profile_->GetCounter(FragmentInstanceState::PER_HOST_PEAK_MEM_COUNTER);
+    RuntimeProfile::Counter* bytes_read = p->GetCounter(PROFILE_BytesRead.name());
+    if (bytes_read != nullptr) bytes_read_counters_.push_back(bytes_read);
+
+    RuntimeProfile::Counter* bytes_sent =
+        p->GetCounter(KrpcDataStreamSender::TOTAL_BYTES_SENT_COUNTER);
+    if (bytes_sent != nullptr) bytes_sent_counters_.push_back(bytes_sent);
+  }
 }
 
 void Coordinator::BackendState::InstanceStats::Update(
-    const TFragmentInstanceExecStatus& exec_status,
-    ExecSummary* exec_summary, ProgressUpdater* scan_range_progress) {
-  last_report_time_ms_ = MonotonicMillis();
-  if (exec_status.done) stopwatch_.Stop();
-  profile_->Update(exec_status.profile);
+    const FragmentInstanceExecStatusPB& exec_status,
+    const TRuntimeProfileTree& thrift_profile, ExecSummary* exec_summary,
+    ProgressUpdater* scan_range_progress) {
+  last_report_time_ms_ = UnixMillis();
+  DCHECK_GT(exec_status.report_seq_no(), last_report_seq_no_);
+  last_report_seq_no_ = exec_status.report_seq_no();
+  if (exec_status.done()) stopwatch_.Stop();
+  profile_->UpdateInfoString(LAST_REPORT_TIME_DESC,
+      ToStringFromUnixMillis(last_report_time_ms_));
+  profile_->Update(thrift_profile);
   if (!profile_created_) {
     profile_created_ = true;
     InitCounters();
@@ -466,21 +620,28 @@ void Coordinator::BackendState::InstanceStats::Update(
   // TODO: why do this every time we get an updated instance profile?
   vector<RuntimeProfile*> children;
   profile_->GetAllChildren(&children);
-
   TExecSummary& thrift_exec_summary = exec_summary->thrift_exec_summary;
-  for (RuntimeProfile* child: children) {
-    int node_id = ExecNode::GetNodeIdFromProfile(child);
-    if (node_id == -1) continue;
+  for (RuntimeProfile* child : children) {
+    bool is_plan_node = child->metadata().__isset.plan_node_id;
+    bool is_data_sink = child->metadata().__isset.data_sink_id;
+    // Plan Nodes and data sinks get an entry in the summary.
+    if (!is_plan_node && !is_data_sink) continue;
 
-    // TODO: create plan_node_id_to_summary_map_
-    TPlanNodeExecSummary& node_exec_summary =
-        thrift_exec_summary.nodes[exec_summary->node_id_to_idx_map[node_id]];
+    int exec_summary_idx;
+    if (is_plan_node) {
+      exec_summary_idx = exec_summary->node_id_to_idx_map[child->metadata().plan_node_id];
+    } else {
+      exec_summary_idx =
+          exec_summary->data_sink_id_to_idx_map[child->metadata().data_sink_id];
+    }
+    TPlanNodeExecSummary& node_exec_summary = thrift_exec_summary.nodes[exec_summary_idx];
+    DCHECK_EQ(node_exec_summary.fragment_idx, exec_params_.fragment().idx);
     int per_fragment_instance_idx = exec_params_.per_fragment_instance_idx;
     DCHECK_LT(per_fragment_instance_idx, node_exec_summary.exec_stats.size())
-        << " node_id=" << node_id << " instance_id=" << PrintId(exec_params_.instance_id)
+        << " name=" << child->name()
+        << " instance_id=" << PrintId(exec_params_.instance_id)
         << " fragment_idx=" << exec_params_.fragment().idx;
-    TExecStats& instance_stats =
-        node_exec_summary.exec_stats[per_fragment_instance_idx];
+    TExecStats& instance_stats = node_exec_summary.exec_stats[per_fragment_instance_idx];
 
     RuntimeProfile::Counter* rows_counter = child->GetCounter("RowsReturned");
     RuntimeProfile::Counter* mem_counter = child->GetCounter("PeakMemoryUsage");
@@ -499,7 +660,7 @@ void Coordinator::BackendState::InstanceStats::Update(
   scan_range_progress->Update(delta);
 
   // extract the current execution state of this instance
-  current_state_ = exec_status.current_state;
+  current_state_ = exec_status.current_state();
 }
 
 void Coordinator::BackendState::InstanceStats::ToJson(Value* value, Document* document) {
@@ -521,7 +682,9 @@ void Coordinator::BackendState::InstanceStats::ToJson(Value* value, Document* do
 
   value->AddMember("first_status_update_received", last_report_time_ms_ > 0,
       document->GetAllocator());
-  value->AddMember("time_since_last_heard_from", MonotonicMillis() - last_report_time_ms_,
+  int64_t elapsed_time_ms =
+      std::max(static_cast<int64_t>(0), UnixMillis() - last_report_time_ms_);
+  value->AddMember("time_since_last_heard_from", elapsed_time_ms,
       document->GetAllocator());
 }
 
@@ -545,20 +708,8 @@ void Coordinator::FragmentStats::AddSplitStats() {
   avg_profile_->AddInfoString("split sizes", ss.str());
 }
 
-// Comparator to order RuntimeProfiles by descending total time
-typedef struct {
-  typedef pair<RuntimeProfile*, bool> Profile;
-  bool operator()(const Profile& a, const Profile& b) const {
-    // Reverse ordering: we want the longest first
-    return
-        a.first->total_time_counter()->value() > b.first->total_time_counter()->value();
-  }
-} InstanceComparator;
-
 void Coordinator::FragmentStats::AddExecStats() {
-  InstanceComparator comparator;
-  root_profile_->SortChildren(comparator);
-
+  root_profile_->SortChildrenByTotalTime();
   stringstream times_label;
   times_label
     << "min:" << PrettyPrinter::Print(
@@ -589,11 +740,18 @@ void Coordinator::FragmentStats::AddExecStats() {
 }
 
 void Coordinator::BackendState::ToJson(Value* value, Document* document) {
-  lock_guard<mutex> l(lock_);
+  unique_lock<mutex> l(lock_);
+  ResourceUtilization resource_utilization = ComputeResourceUtilizationLocked();
   value->AddMember("num_instances", fragments_.size(), document->GetAllocator());
-  value->AddMember("done", IsDone(), document->GetAllocator());
-  value->AddMember(
-      "peak_mem_consumption", peak_consumption_, document->GetAllocator());
+  value->AddMember("done", IsDoneLocked(l), document->GetAllocator());
+  value->AddMember("peak_per_host_mem_consumption",
+      resource_utilization.peak_per_host_mem_consumption, document->GetAllocator());
+  value->AddMember("bytes_read", resource_utilization.bytes_read,
+      document->GetAllocator());
+  value->AddMember("cpu_user_s", resource_utilization.cpu_user_ns / 1e9,
+      document->GetAllocator());
+  value->AddMember("cpu_sys_s", resource_utilization.cpu_sys_ns / 1e9,
+      document->GetAllocator());
 
   string host = TNetworkAddressToString(impalad_address());
   Value val(host.c_str(), document->GetAllocator());
@@ -620,7 +778,6 @@ void Coordinator::BackendState::InstanceStatsToJson(Value* value, Document* docu
       elem.second->ToJson(&val, document);
       instance_stats.PushBack(val, document->GetAllocator());
     }
-    DCHECK_EQ(instance_stats.Size(), fragments_.size());
   }
   value->AddMember("instance_stats", instance_stats, document->GetAllocator());
 
@@ -628,4 +785,6 @@ void Coordinator::BackendState::InstanceStatsToJson(Value* value, Document* docu
   // protected by Coordinator::lock_.
   Value val(TNetworkAddressToString(impalad_address()).c_str(), document->GetAllocator());
   value->AddMember("host", val, document->GetAllocator());
+}
+
 }

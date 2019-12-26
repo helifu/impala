@@ -52,7 +52,7 @@
 # otherwise. For example, if we want to make sure 'bool' columns are not used with 'sum':
 #
 # ImpalaTestMatrix.add_constraint(lambda v:\
-#    not (v.get_value('col_type') == 'bool and v.get_value('agg_func') == 'sum'))
+#    not (v.get_value('col_type') == 'bool' and v.get_value('agg_func') == 'sum'))
 #
 # Additional examples of usage can be found within the test suites.
 
@@ -72,8 +72,10 @@ class ImpalaTestVector(object):
     self.vector_values = vector_values
 
   def get_value(self, name):
-    return next(vector_value for vector_value in self.vector_values\
-                                              if vector_value.name == name).value
+    for vector_value in self.vector_values:
+      if vector_value.name == name:
+        return vector_value.value
+    raise ValueError("Test vector does not contain value '%s'" % name)
 
   def __str__(self):
       return ' | '.join(['%s' % vector_value for vector_value in self.vector_values])

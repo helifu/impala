@@ -16,20 +16,26 @@
 // under the License.
 
 #include <atomic>
-#include <glog/logging.h>
-#include <gmock/gmock.h>
+#include <cstdint>
+#include <ctime>
+#include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
+#include <gmock/gmock-matchers.h>
+#include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/async_logger.h"
 #include "kudu/util/barrier.h"
-#include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"  // IWYU pragma: keep
 #include "kudu/util/test_util.h"
 
 using std::string;
@@ -113,7 +119,7 @@ class CountingLogger : public google::base::Logger {
     flush_count_++;
   }
 
-  uint32 LogSize() override {
+  uint32_t LogSize() override {
     return 0;
   }
 
@@ -219,4 +225,25 @@ TEST(LoggingTest, TestRedactionIllustrateUsage) {
   });
 }
 
+
+TEST(LoggingTest, TestLogTiming) {
+  LOG_TIMING(INFO, "foo") {
+  }
+  {
+    SCOPED_LOG_TIMING(INFO, "bar");
+  }
+  LOG_SLOW_EXECUTION(INFO, 1, "baz") {
+  }
+
+  // Previous implementations of the above macro confused clang-tidy's use-after-move
+  // check and generated false positives.
+  string s1 = "hello";
+  string s2;
+  LOG_SLOW_EXECUTION(INFO, 1, "baz") {
+    LOG(INFO) << s1;
+    s2 = std::move(s1);
+  }
+
+  ASSERT_EQ("hello", s2);
+}
 } // namespace kudu

@@ -30,11 +30,13 @@ add_library(Exprs
   anyval-util.cc
   bit-byte-functions-ir.cc
   case-expr.cc
+  cast-format-expr.cc
   cast-functions-ir.cc
   compound-predicates.cc
   compound-predicates-ir.cc
   conditional-functions.cc
   conditional-functions-ir.cc
+  date-functions-ir.cc
   decimal-functions-ir.cc
   decimal-operators-ir.cc
   expr.cc
@@ -53,6 +55,7 @@ add_library(Exprs
   scalar-expr-evaluator.cc
   scalar-expr-ir.cc
   slot-ref.cc
+  string-functions.cc
   string-functions-ir.cc
   timestamp-functions.cc
   timestamp-functions-ir.cc
@@ -63,14 +66,25 @@ add_library(Exprs
   udf-builtins-ir.cc
   utility-functions.cc
   utility-functions-ir.cc
+  valid-tuple-id.cc
 )
 add_dependencies(Exprs gen-deps gen_ir_descriptions)
 
-ADD_BE_TEST(expr-test)
-ADD_BE_TEST(expr-codegen-test)
+add_library(ExprsTests STATIC
+  expr-test.cc
+  timezone_db-test.cc
+)
+add_dependencies(ExprsTests gen-deps)
+
+ADD_UNIFIED_BE_LSAN_TEST(expr-test "Instantiations/ExprTest.*")
+# Exception to unified be tests: custom main initiailizes LLVM
+ADD_BE_LSAN_TEST(expr-codegen-test)
+ADD_UNIFIED_BE_LSAN_TEST(timezone_db-test
+ "TimezoneDbNamesTest.*:TimezoneDbLoadAliasTest.*:TimezoneDbLoadZoneInfoTest.*")
 
 # expr-codegen-test includes test IR functions
 COMPILE_TO_IR(expr-codegen-test.cc)
 add_dependencies(expr-codegen-test-ir gen-deps)
+add_dependencies(expr-codegen-test expr-codegen-test-ir)
 
 ADD_UDF_TEST(aggregate-functions-test)

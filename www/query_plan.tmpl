@@ -24,6 +24,16 @@ under the License.
 <div class="container" style="width:1200px;margin:0 auto;">
 
 <style id="css">
+/* Text style for graph nodes */
+.node {
+  color: white;
+  font-size:14px;
+  font-weight:700;
+  text-align: center;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
 .node rect {
   stroke: #333;
   fill: #fff;
@@ -57,8 +67,8 @@ under the License.
 
 {{> www/common-footer.tmpl }}
 
-<script src="www/d3.v3.min.js" charset="utf-8"></script>
-<script src="www/dagre-d3.min.js"></script>
+<script src="{{ __common__.host-url }}/www/d3.v3.min.js" charset="utf-8"></script>
+<script src="{{ __common__.host-url }}/www/dagre-d3.min.js"></script>
 
 <!-- Builds and then renders a plan graph using Dagre / D3. The JSON for the current query
 is retrieved by an HTTP call, and then the graph of nodes and edges is built by walking
@@ -66,7 +76,7 @@ over each plan fragment in turn. Plan fragments are connected wherever a node ha
 data_stream_target attribute. -->
 
 <script>
-document.getElementById("plan-tab").className = "active";
+$("#plan-tab").addClass("active");
 
 var g = new dagreD3.graphlib.Graph().setGraph({rankDir: "BT"});
 
@@ -205,7 +215,7 @@ function renderGraph(ignored_arg) {
 function refresh() {
   req = new XMLHttpRequest();
   req.onload = renderGraph;
-  req.open("GET", "/query_plan?query_id={{query_id}}&json", true);
+  req.open("GET", make_url("/query_plan?query_id={{query_id}}&json"), true);
   req.send();
 }
 

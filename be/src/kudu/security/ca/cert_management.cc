@@ -17,14 +17,11 @@
 
 #include "kudu/security/ca/cert_management.h"
 
+#include <algorithm>
 #include <cstdio>
-#include <cstdlib>
-#include <functional>
-#include <iostream>
 #include <memory>
-#include <sstream>
+#include <mutex>
 #include <string>
-#include <type_traits>
 
 #include <glog/logging.h>
 #include <openssl/conf.h>
@@ -37,14 +34,14 @@
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/cert.h"
-#include "kudu/security/init.h"
+#include "kudu/security/crypto.h"
 #include "kudu/security/openssl_util.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 
 using std::lock_guard;
 using std::move;
-using std::ostringstream;
 using std::string;
 using strings::Substitute;
 
@@ -318,7 +315,7 @@ Status CertSigner::CopyExtensions(X509_REQ* req, X509* x) {
   CHECK(req);
   CHECK(x);
   STACK_OF(X509_EXTENSION)* exts = X509_REQ_get_extensions(req);
-  auto exts_cleanup = MakeScopedCleanup([&exts]() {
+  SCOPED_CLEANUP({
     sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
   });
   for (size_t i = 0; i < sk_X509_EXTENSION_num(exts); ++i) {
@@ -342,12 +339,16 @@ Status CertSigner::CopyExtensions(X509_REQ* req, X509* x) {
 Status CertSigner::FillCertTemplateFromRequest(X509_REQ* req, X509* tmpl) {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(req);
+
+  // As of OpenSSL 1.1, req's internals are hidden.
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   if (!req->req_info ||
       !req->req_info->pubkey ||
       !req->req_info->pubkey->public_key ||
       !req->req_info->pubkey->public_key->data) {
     return Status::RuntimeError("corrupted CSR: no public key");
   }
+#endif
   auto pub_key = ssl_make_unique(X509_REQ_get_pubkey(req));
   OPENSSL_RET_IF_NULL(pub_key, "error unpacking public key from CSR");
   const int rc = X509_REQ_verify(req, pub_key.get());

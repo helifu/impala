@@ -22,7 +22,7 @@ include "Status.thrift"
 include "Types.thrift"
 
 enum StatestoreServiceVersion {
-   V1
+   V1 = 0
 }
 
 // Structure serialized for the topic AdmissionController::IMPALA_REQUEST_QUEUE_TOPIC.
@@ -44,8 +44,17 @@ struct TPoolStats {
   3: required i64 backend_mem_reserved;
 }
 
+// Structure to describe an executor group. We use this to configure the executor group
+// for backends during startup and during cluster membership management.
+struct TExecutorGroupDesc {
+  // The name of the executor group.
+  1: required string name;
+  // The minimum size of the executor group to be considered healthy.
+  2: required i64 min_size;
+}
+
 // Structure serialised in the Impala backend topic. Each Impalad
-// constructs one TBackendDescriptor, and registers it in the backend
+// constructs one TBackendDescriptor, and registers it in the cluster-membership
 // topic. Impalads subscribe to this topic to learn of the location of
 // all other Impalads in the cluster. Impalads can act as coordinators, executors or
 // both.
@@ -71,6 +80,21 @@ struct TBackendDescriptor {
 
   // IP address + port of KRPC based ImpalaInternalService on this backend
   7: optional Types.TNetworkAddress krpc_address;
+
+  // The amount of memory that can be admitted to this backend (in bytes).
+  8: required i64 admit_mem_limit;
+
+  // True if fragment instances should not be scheduled on this daemon because the
+  // daemon has been quiescing, e.g. if it shutting down.
+  9: required bool is_quiescing;
+
+  // The list of executor groups that this backend belongs to. Only valid if is_executor
+  // is set, and currently must contain exactly one entry.
+  10: required list<TExecutorGroupDesc> executor_groups;
+
+  // The number of admission slots for this backend that can be occupied by running
+  // queries.
+  11: required i64 admission_slots;
 }
 
 // Description of a single entry in a topic
@@ -122,6 +146,10 @@ struct TTopicDelta {
   // keys with a version < min_subscriber_topic_version. Only used when sending an update
   // from the statestore to a subscriber.
   6: optional i64 min_subscriber_topic_version
+
+  // If set and true the statestore must clear the existing topic entries (if any) before
+  // applying the entries in topic_entries.
+  7: optional bool clear_topic_entries
 }
 
 // Description of a topic to subscribe to as part of a RegisterSubscriber call
@@ -132,6 +160,18 @@ struct TTopicRegistration {
   // True if updates to this topic from this subscriber should be removed upon the
   // subscriber's failure or disconnection
   2: required bool is_transient;
+
+  // If true, min_subscriber_topic_version is computed and set in topic updates sent
+  // to this subscriber to this subscriber. Should only be set to true if this is
+  // actually required - computing the version is relatively expensive compared to
+  // other aspects of preparing topic updates - see IMPALA-6816.
+  3: required bool populate_min_subscriber_topic_version = false;
+
+  // Restrict the items to receive on this subscription to only those items
+  // starting with the given prefix.
+  //
+  // If this is not specified, all items will be subscribed to.
+  4: optional string filter_prefix
 }
 
 struct TRegisterSubscriberRequest {

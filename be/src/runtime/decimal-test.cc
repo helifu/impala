@@ -19,9 +19,11 @@
 #include <stdio.h>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <boost/cstdint.hpp>
 #include <boost/lexical_cast.hpp>
 #include "runtime/decimal-value.inline.h"
+#include "runtime/raw-value.h"
 #include "runtime/types.h"
 #include "testutil/gtest-util.h"
 #include "util/string-parser.h"
@@ -96,7 +98,7 @@ void StringToAllDecimals(const string& s, int precision, int scale,
       Decimal16Value(val_v1), result_v1, Decimal16Value(val_v2), result_v2);
 }
 
-TEST(IntToDecimal, Basic) {
+TEST(DecimalTest, IntToDecimal) {
   Decimal16Value d16;
   bool overflow = false;
 
@@ -115,7 +117,7 @@ TEST(IntToDecimal, Basic) {
   // that.
 }
 
-TEST(DoubleToDecimal, Basic) {
+TEST(DecimalTest, DoubleToDecimal) {
   Decimal4Value d4;
   Decimal8Value d8;
   Decimal16Value d16;
@@ -268,7 +270,7 @@ TEST(DoubleToDecimal, Basic) {
   VerifyToString(d4, 1, 0, "-1");
 }
 
-TEST(StringToDecimal, Basic) {
+TEST(DecimalTest, StringToDecimalBasic) {
   StringToAllDecimals("       1234", 10, 0, 1234, StringParser::PARSE_SUCCESS);
   StringToAllDecimals("", 10, 0, 0, StringParser::PARSE_FAILURE);
   StringToAllDecimals("   ", 10, 0, 0, StringParser::PARSE_FAILURE);
@@ -356,7 +358,7 @@ TEST(StringToDecimal, Basic) {
   StringToAllDecimals("1.10e3 ", 2, 0, 11, StringParser::PARSE_OVERFLOW);
 }
 
-TEST(StringToDecimal, LargeDecimals) {
+TEST(DecimalTest, StringToDecimalLarge) {
   StringToAllDecimals("1", 1, 0, 1, StringParser::PARSE_SUCCESS);
   StringToAllDecimals("-1", 1, 0, -1, StringParser::PARSE_SUCCESS);
   StringToAllDecimals(".1", 1, 0, 0, StringParser::PARSE_UNDERFLOW);
@@ -708,6 +710,24 @@ TEST(DecimalTest, MultiplyScaleOverflow) {
   EXPECT_FALSE(overflow);
 }
 
+// Test that unaligned decimal values are handled correctly.
+TEST(DecimalTest, UnalignedValues) {
+  // Regression test for IMPALA-7473 that triggered a crash in release builds.
+  Decimal16Value aligned(12345);
+  uint8_t* unaligned_mem = reinterpret_cast<uint8_t*>(malloc(sizeof(Decimal16Value) + 9));
+  memcpy(&unaligned_mem[9], &aligned, sizeof(aligned));
+  Decimal16Value* unaligned = reinterpret_cast<Decimal16Value*>(&unaligned_mem[9]);
+  // VerifyToString() worked even prior to the bugfix because GCC happened to generate
+  // code without aligned load instructions.
+  VerifyToString(*unaligned, 28, 2, "123.45");
+  // PrintValue() contained different generated code that wasn't safe for unaligned
+  // values.
+  stringstream ss;
+  RawValue::PrintValue(unaligned, ColumnType::CreateDecimalType(28, 2), 0, &ss);
+  EXPECT_EQ("123.45", ss.str());
+  free(unaligned_mem);
+}
+
 enum Op {
   ADD,
   SUBTRACT,
@@ -752,7 +772,7 @@ ColumnType GetResultType(const ColumnType& t1, const ColumnType& t2, Op op, bool
   }
 }
 
-TEST(DecimalResultTypes, Basic) {
+TEST(DecimalTest, ResultTypes) {
   ColumnType t1 = ColumnType::CreateDecimalType(38, 10);
   ColumnType t2 = ColumnType::CreateDecimalType(38, 38);
   ColumnType t3 = ColumnType::CreateDecimalType(38, 0);
@@ -779,7 +799,7 @@ void VerifyFuzzyEquals(const T& actual, const ColumnType& t,
     << actual_d << " != " << expected;
 }
 
-TEST(DecimalArithmetic, Basic) {
+TEST(DecimalTest, BasicArithmetic) {
   ColumnType t1 = ColumnType::CreateDecimalType(5, 4);
   ColumnType t2 = ColumnType::CreateDecimalType(8, 3);
   ColumnType t1_plus_2 = GetResultType(t1, t2, ADD, false);
@@ -814,7 +834,7 @@ TEST(DecimalArithmetic, Basic) {
       t1_times_2, d1_double * d3_double, overflow);
 }
 
-TEST(DecimalArithmetic, Divide) {
+TEST(DecimalTest, Divide) {
   // Exhaustively test precision and scale for 4 byte decimals. The logic errors tend
   // to be by powers of 10 so not testing the other decimal types is okay.
   Decimal4Value x(123456789);
@@ -868,7 +888,7 @@ TEST(DecimalArithmetic, Divide) {
   EXPECT_FALSE(is_nan);
 }
 
-TEST(DecimalArithmetic, DivideLargeScales) {
+TEST(DecimalTest, DivideLargeScales) {
   ColumnType t1 = ColumnType::CreateDecimalType(38, 8);
   ColumnType t2 = ColumnType::CreateDecimalType(20, 0);
   ColumnType t3 = GetResultType(t1, t2, DIVIDE, false);
@@ -911,7 +931,7 @@ int DoubleCompare(double x, double y) {
 }
 
 // Randomly test decimal operations, comparing the result with a double ground truth.
-TEST(DecimalArithmetic, RandTesting) {
+TEST(DecimalTest, RandTesting) {
   int NUM_ITERS = 1000000;
   int seed = time(0);
   LOG(ERROR) << "Seed: " << seed;
@@ -962,7 +982,7 @@ TEST(DecimalArithmetic, RandTesting) {
   }
 }
 
-TEST(DecimalValidation, PrecisionScaleValidation) {
+TEST(DecimalTest, PrecisionScaleValidation) {
   // Valid precision and scale.
   EXPECT_TRUE(ColumnType::ValidateDecimalParams(1, 0));
   EXPECT_TRUE(ColumnType::ValidateDecimalParams(1, 1));
@@ -981,4 +1001,3 @@ TEST(DecimalValidation, PrecisionScaleValidation) {
 
 }
 
-IMPALA_TEST_MAIN();

@@ -15,21 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "exprs/math-functions.h"
-
 #include <iomanip>
 #include <random>
 #include <sstream>
 #include <math.h>
-
+#include <stdint.h>
+#include <string>
 #include "exprs/anyval-util.h"
 #include "exprs/scalar-expr.h"
 #include "exprs/operators.h"
+#include "exprs/math-functions.h"
 #include "util/string-parser.h"
+#include "runtime/decimal-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "thirdparty/pcg-cpp-0.98/include/pcg_random.hpp"
-
+#include "exprs/decimal-operators.h"
 #include "common/names.h"
 
 using std::uppercase;
@@ -61,11 +62,6 @@ DoubleVal MathFunctions::E(FunctionContext* ctx) {
     return RET_TYPE(FN(v1.val, v2.val)); \
   }
 
-// N.B. - for integer math, we have to promote ABS() to the next highest integer type
-// because in two's complement arithmetic, the largest negative value for any bit width
-// is not representable as a positive value within the same width.  For the largest width,
-// we simply overflow.  In the unlikely event a workaround is needed, one can simply
-// cast to a higher precision decimal type.
 BigIntVal MathFunctions::Abs(FunctionContext* ctx, const BigIntVal& v) {
   if (v.is_null) return BigIntVal::null();
   if (UNLIKELY(v.val == std::numeric_limits<BigIntVal::underlying_type_t>::min())) {
@@ -90,9 +86,9 @@ ONE_ARG_MATH_FN(Cosh, DoubleVal, DoubleVal, cosh);
 ONE_ARG_MATH_FN(Tanh, DoubleVal, DoubleVal, tanh);
 ONE_ARG_MATH_FN(Sinh, DoubleVal, DoubleVal, sinh);
 ONE_ARG_MATH_FN(Sqrt, DoubleVal, DoubleVal, sqrt);
-ONE_ARG_MATH_FN(Ceil, BigIntVal, DoubleVal, ceil);
-ONE_ARG_MATH_FN(Floor, BigIntVal, DoubleVal, floor);
-ONE_ARG_MATH_FN(Truncate, BigIntVal, DoubleVal, trunc);
+ONE_ARG_MATH_FN(Ceil, DoubleVal, DoubleVal, ceil);
+ONE_ARG_MATH_FN(Floor, DoubleVal, DoubleVal, floor);
+ONE_ARG_MATH_FN(Truncate, DoubleVal, DoubleVal, trunc);
 ONE_ARG_MATH_FN(Ln, DoubleVal, DoubleVal, log);
 ONE_ARG_MATH_FN(Log10, DoubleVal, DoubleVal, log10);
 ONE_ARG_MATH_FN(Exp, DoubleVal, DoubleVal, exp);
@@ -104,9 +100,9 @@ DoubleVal MathFunctions::Cot(FunctionContext* ctx, const DoubleVal& v) {
   return DoubleVal(tan(M_PI_2 - v.val));
 }
 
-FloatVal MathFunctions::Sign(FunctionContext* ctx, const DoubleVal& v) {
-  if (v.is_null) return FloatVal::null();
-  return FloatVal((v.val > 0) ? 1.0f : ((v.val < 0) ? -1.0f : 0.0f));
+DoubleVal MathFunctions::Sign(FunctionContext* ctx, const DoubleVal& v) {
+  if (v.is_null) return DoubleVal::null();
+  return DoubleVal((v.val > 0) ? 1 : ((v.val < 0) ? -1 : 0));
 }
 
 DoubleVal MathFunctions::Radians(FunctionContext* ctx, const DoubleVal& v) {
@@ -119,15 +115,43 @@ DoubleVal MathFunctions::Degrees(FunctionContext* ctx, const DoubleVal& v) {
   return DoubleVal(v.val * 180.0 / M_PI);
 }
 
-BigIntVal MathFunctions::Round(FunctionContext* ctx, const DoubleVal& v) {
-  if (v.is_null) return BigIntVal::null();
-  return BigIntVal(static_cast<int64_t>(v.val + ((v.val < 0) ? -0.5 : 0.5)));
+DoubleVal MathFunctions::Round(FunctionContext* ctx, const DoubleVal& v) {
+  if (v.is_null) return DoubleVal::null();
+  return DoubleVal(trunc(v.val + ((v.val < 0) ? -0.5 : 0.5)));
+}
+
+static double GetScaleMultiplier(int64_t scale) {
+  static const double values[] = {
+      1.0,
+      10.0,
+      100.0,
+      1000.0,
+      10000.0,
+      100000.0,
+      1000000.0,
+      10000000.0,
+      100000000.0,
+      1000000000.0,
+      10000000000.0,
+      100000000000.0,
+      1000000000000.0,
+      10000000000000.0,
+      100000000000000.0,
+      1000000000000000.0,
+      10000000000000000.0,
+      100000000000000000.0,
+      1000000000000000000.0,
+      10000000000000000000.0};
+  if (LIKELY(0 <= scale && scale < 20)) return values[scale];
+  return pow(10.0, scale);
 }
 
 DoubleVal MathFunctions::RoundUpTo(FunctionContext* ctx, const DoubleVal& v,
-    const IntVal& scale) {
+    const BigIntVal& scale) {
   if (v.is_null || scale.is_null) return DoubleVal::null();
-  return DoubleVal(floor(v.val * pow(10.0, scale.val) + 0.5) / pow(10.0, scale.val));
+  return DoubleVal(trunc(
+      v.val * GetScaleMultiplier(scale.val) + ((v.val < 0) ? -0.5 : 0.5)) /
+      GetScaleMultiplier(scale.val));
 }
 
 DoubleVal MathFunctions::Log2(FunctionContext* ctx, const DoubleVal& v) {
@@ -234,7 +258,7 @@ StringVal MathFunctions::Unhex(FunctionContext* ctx, const StringVal& s) {
   if (s.len % 2 != 0) return StringVal();
 
   int result_len = s.len / 2;
-  char result[result_len];
+  StringVal result(ctx, result_len);
   int res_index = 0;
   int s_index = 0;
   while (s_index < s.len) {
@@ -276,10 +300,10 @@ StringVal MathFunctions::Unhex(FunctionContext* ctx, const StringVal& s) {
           return StringVal();
       }
     }
-    result[res_index] = c;
+    result.ptr[res_index] = c;
     ++res_index;
   }
-  return AnyValUtil::FromBuffer(ctx, result, result_len);
+  return result;
 }
 
 StringVal MathFunctions::ConvInt(FunctionContext* ctx, const BigIntVal& num,
@@ -377,12 +401,13 @@ bool MathFunctions::DecimalInBaseToDecimal(int64_t src_num, int8_t src_base,
       *result = 0;
       place = 1;
     } else {
-      *result += digit * place;
-      place *= src_base;
+      *result +=
+          ArithmeticUtil::AsUnsigned<std::multiplies>(static_cast<int64_t>(digit), place);
       // Overflow.
       if (UNLIKELY(*result < digit)) {
         return false;
       }
+      place *= src_base;
     }
     temp_num /= 10;
   } while (temp_num > 0);
@@ -429,6 +454,123 @@ DoubleVal MathFunctions::FmodDouble(FunctionContext* ctx, const DoubleVal& a,
     const DoubleVal& b) {
   if (a.is_null || b.is_null || b.val == 0) return DoubleVal::null();
   return DoubleVal(fmod(a.val, b.val));
+}
+
+// The bucket_number is evaluated using the following formula:
+//
+//   bucket_number = dist_from_min * num_buckets / range_size + 1
+//      where -
+//        dist_from_min = expr - min_range
+//        range_size = max_range - min_range
+//        num_buckets = number of buckets
+//
+// Since expr, min_range, and max_range are all decimals with the same
+// byte size, precision, and scale we can interpret them as plain integers
+// and still calculate the proper bucket.
+//
+// There are some possibilities of overflowing during the calculation:
+// range_size = max_range - min_range
+// dist_from_min = expr - min_range
+// dist_from_min * num_buckets
+//
+// For all the above cases we use a bigger integer type provided by the
+// BitUtil::DoubleWidth<> metafunction.
+template <class  T1>
+BigIntVal MathFunctions::WidthBucketImpl(FunctionContext* ctx,
+    const T1& expr, const T1& min_range,
+    const T1& max_range, const IntVal& num_buckets) {
+  auto expr_val = expr.value();
+  using ActualType = decltype(expr_val);
+  auto min_range_val = min_range.value();
+  auto max_range_val = max_range.value();
+  auto num_buckets_val = static_cast<ActualType>(num_buckets.val);
+
+  if (UNLIKELY(num_buckets.val <= 0)) {
+    ostringstream error_msg;
+    error_msg << "Number of buckets should be greater than zero:" << num_buckets.val;
+    ctx->SetError(error_msg.str().c_str());
+    return BigIntVal::null();
+  }
+
+  if (UNLIKELY(min_range_val >= max_range_val)) {
+    ctx->SetError("Lower bound cannot be greater than or equal to the upper bound");
+    return BigIntVal::null();
+  }
+
+  if (expr_val < min_range_val) return 0;
+  if (expr_val >= max_range_val) {
+    return BigIntVal(static_cast<int64_t>(num_buckets.val) + 1);
+  }
+
+  bool bigger_type_needed = false;
+  // It is likely that this if stmt can be evaluated during codegen because
+  // 'max_range' and 'min_range' are almost certainly constant expressions:
+  if (max_range_val >= 0 && min_range_val < 0) {
+    if (static_cast<UnsignedType<ActualType>>(max_range_val) +
+        static_cast<UnsignedType<ActualType>>(abs(min_range_val)) >=
+        static_cast<UnsignedType<ActualType>>(BitUtil::Max<ActualType>())) {
+      bigger_type_needed = true;
+    }
+  }
+
+  auto MultiplicationOverflows = [](ActualType lhs, ActualType rhs) {
+    DCHECK(lhs > 0 && rhs > 0);
+    using ActualType = decltype(lhs);
+    return BitUtil::CountLeadingZeros(lhs) + BitUtil::CountLeadingZeros(rhs) <=
+        BitUtil::UnsignedWidth<ActualType>() + 1;
+  };
+
+  // It is likely that this can be evaluated during codegen:
+  bool multiplication_can_overflow = bigger_type_needed ||  MultiplicationOverflows(
+      max_range_val - min_range_val, num_buckets_val);
+  // 'expr_val' is not likely to be a constant expression, so this almost certainly
+  // needs runtime evaluation if 'bigger_type_needed' is false and
+  // 'multiplication_can_overflow' is true:
+  bigger_type_needed = bigger_type_needed || (
+      multiplication_can_overflow &&
+      expr_val != min_range_val &&
+      MultiplicationOverflows(expr_val - min_range_val, num_buckets_val));
+
+  auto BucketFunc = [](auto element, auto min_rng, auto max_rng, auto buckets) {
+    auto range_size = max_rng - min_rng;
+    auto dist_from_min = element - min_rng;
+    auto ret = dist_from_min * buckets / range_size;
+    return BigIntVal(static_cast<int64_t>(ret) + 1);
+  };
+
+  if (bigger_type_needed) {
+    using BiggerType = typename DoubleWidth<ActualType>::type;
+
+    return BucketFunc(static_cast<BiggerType>(expr_val),
+        static_cast<BiggerType>(min_range_val), static_cast<BiggerType>(max_range_val),
+        static_cast<BiggerType>(num_buckets.val));
+  } else {
+    return BucketFunc(expr_val, min_range_val, max_range_val, num_buckets.val);
+  }
+}
+
+BigIntVal MathFunctions::WidthBucket(FunctionContext* ctx, const DecimalVal& expr,
+    const DecimalVal& min_range, const DecimalVal& max_range,
+    const IntVal& num_buckets) {
+  if (expr.is_null || min_range.is_null || max_range.is_null || num_buckets.is_null) {
+    return BigIntVal::null();
+  }
+
+  int arg_size_type = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SIZE, 0);
+  switch (arg_size_type) {
+    case 4:
+      return WidthBucketImpl<Decimal4Value> (ctx, Decimal4Value(expr.val4),
+          Decimal4Value(min_range.val4), Decimal4Value(max_range.val4), num_buckets);
+    case 8:
+      return WidthBucketImpl<Decimal8Value> (ctx, Decimal8Value(expr.val8),
+          Decimal8Value(min_range.val8), Decimal8Value(max_range.val8), num_buckets);
+    case 16:
+      return WidthBucketImpl<Decimal16Value>(ctx, Decimal16Value(expr.val16),
+         Decimal16Value(min_range.val16), Decimal16Value(max_range.val16), num_buckets);
+    default:
+      DCHECK(false);
+      return BigIntVal::null();
+  }
 }
 
 template <typename T> T MathFunctions::Positive(FunctionContext* ctx, const T& val) {
@@ -561,6 +703,23 @@ template <bool ISLEAST> DecimalVal MathFunctions::LeastGreatest(
   return result_val;
 }
 
+template <bool ISLEAST> DateVal MathFunctions::LeastGreatest(
+    FunctionContext* ctx, int num_args, const DateVal* args) {
+  DCHECK_GT(num_args, 0);
+  if (args[0].is_null) return DateVal::null();
+  DateValue result_val = DateValue::FromDateVal(args[0]);
+  for (int i = 1; i < num_args; ++i) {
+    if (args[i].is_null) return DateVal::null();
+    DateValue val = DateValue::FromDateVal(args[i]);
+    if (ISLEAST) {
+      if (val < result_val) result_val = val;
+    } else {
+      if (val > result_val) result_val = val;
+    }
+  }
+  return result_val.ToDateVal();
+}
+
 template TinyIntVal MathFunctions::Positive<TinyIntVal>(
     FunctionContext* ctx, const TinyIntVal& val);
 template SmallIntVal MathFunctions::Positive<SmallIntVal>(
@@ -629,5 +788,10 @@ template DecimalVal MathFunctions::LeastGreatest<true>(
     FunctionContext* ctx, int num_args, const DecimalVal* args);
 template DecimalVal MathFunctions::LeastGreatest<false>(
     FunctionContext* ctx, int num_args, const DecimalVal* args);
+
+template DateVal MathFunctions::LeastGreatest<true>(
+    FunctionContext* ctx, int num_args, const DateVal* args);
+template DateVal MathFunctions::LeastGreatest<false>(
+    FunctionContext* ctx, int num_args, const DateVal* args);
 
 }

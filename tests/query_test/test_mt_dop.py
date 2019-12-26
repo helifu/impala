@@ -20,8 +20,10 @@
 import pytest
 
 from copy import deepcopy
+from tests.common.environ import ImpalaTestClusterProperties
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.kudu_test_suite import KuduTestSuite
+from tests.common.skip import SkipIfEC, SkipIfNotHdfsMinicluster
 from tests.common.test_vector import ImpalaTestDimension
 
 # COMPUTE STATS on Parquet tables automatically sets MT_DOP=4, so include
@@ -39,8 +41,10 @@ class TestMtDop(ImpalaTestSuite):
     return 'functional-query'
 
   def test_mt_dop(self, vector):
-    vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
-    self.run_test_case('QueryTest/mt-dop', vector)
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
+    del new_vector.get_value('exec_option')['batch_size']  # .test file sets batch_size
+    self.run_test_case('QueryTest/mt-dop', new_vector)
 
   def test_compute_stats(self, vector, unique_database):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
@@ -91,15 +95,19 @@ class TestMtDopParquet(ImpalaTestSuite):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-parquet', vector)
 
-  @pytest.mark.xfail(pytest.config.option.testing_remote_cluster,
+  @pytest.mark.xfail(ImpalaTestClusterProperties.get_instance().is_remote_cluster(),
                      reason='IMPALA-4641')
   def test_parquet_nested(self, vector):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-parquet-nested', vector)
 
+  # Impala scans fewer row groups than it should with erasure coding.
+  @SkipIfEC.fix_later
   def test_parquet_filtering(self, vector):
     """IMPALA-4624: Test that dictionary filtering eliminates row groups correctly."""
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
+    # Disable min-max stats to prevent interference with directionary filtering.
+    vector.get_value('exec_option')['parquet_read_statistics'] = '0'
     self.run_test_case('QueryTest/parquet-filtering', vector)
 
 class TestMtDopKudu(KuduTestSuite):
@@ -111,4 +119,26 @@ class TestMtDopKudu(KuduTestSuite):
   def test_kudu(self, vector, unique_database):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-kudu', vector, use_db=unique_database)
+
+
+@SkipIfNotHdfsMinicluster.tuned_for_minicluster
+class TestMtDopScheduling(ImpalaTestSuite):
+  """Test the number of fragment instances and admission slots computed by the scheduler
+  for different queries. This is always at most mt_dop per host, but is less where there
+  are fewer fragment instances per host. The mt_dop scheduling and slot calculation is
+  orthogonal to file format, so we only need to test on one format."""
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestMtDopScheduling, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('mt_dop', 4))
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('table_format').file_format == 'parquet')
+
+  def test_scheduling(self, vector):
+    vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
+    self.run_test_case('QueryTest/mt-dop-parquet-scheduling', vector)
 

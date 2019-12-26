@@ -19,6 +19,8 @@
 #ifndef IMPALA_EXPRS_TIMESTAMP_FUNCTIONS_H
 #define IMPALA_EXPRS_TIMESTAMP_FUNCTIONS_H
 
+#include <map>
+
 #include "common/status.h"
 #include "udf/udf.h"
 
@@ -64,6 +66,38 @@ class TimestampFunctions {
   static const int64_t MAX_SEC_INTERVAL = MAX_MINUTE_INTERVAL * 60;
   static const int64_t MAX_MILLI_INTERVAL = MAX_SEC_INTERVAL * 1000;
   static const int64_t MAX_MICRO_INTERVAL = MAX_MILLI_INTERVAL * 1000;
+
+  /// Use this as the first index for SHORT_MONTH_NAMES, MONTH_NAMES etc.
+  enum TextCase {CAPITALIZED, LOWERCASE, UPPERCASE};
+
+  /// Contains the short names of the months in 3 different case: Capitalized, full
+  /// lowercase and full uppercase.
+  static const std::string SHORT_MONTH_NAMES[3][12];
+
+  /// Contains the full names of the months in 3 different case: Capitalized, full
+  /// lowercase and full uppercase. E.g. "January", "january", "JANUARY", etc.
+  static const std::string MONTH_NAMES[3][12];
+
+  /// Similar to MONTH_NAMES but here the values are padded with spaces to the maximum
+  /// length.
+  static const std::string MONTH_NAMES_PADDED[3][12];
+
+  /// Contains the short day names in 3 different case: Capitalized, full
+  /// lowercase and full uppercase. E.g. "Sun", "sun", "SUN", etc.
+  static const std::string SHORT_DAY_NAMES[3][7];
+
+  /// Contains the full names of the days in 3 different case: Capitalized, full
+  /// lowercase and full uppercase. E.g. "Sunday", "sunday", "SUNDAY", etc.
+  static const std::string DAY_NAMES[3][7];
+
+  /// Similar to DAY_NAMES but here the values are padded with spaces to the maximum
+  /// length.
+  static const std::string DAY_NAMES_PADDED[3][7];
+
+  /// Maps full and abbreviated lowercase names of day-of-week to an int in the 0-6 range.
+  /// Sunday is mapped to 0 and Saturday is mapped to 6.
+  /// It is used in NextDay() function.
+  static const std::map<std::string, int> DAYNAME_MAP;
 
   /// Parse and initialize format string if it is a constant. Raise error if invalid.
   static void UnixAndFromUnixPrepare(FunctionContext* context,
@@ -123,11 +157,9 @@ class TimestampFunctions {
   static TimestampVal ToUtc(FunctionContext* context,
       const TimestampVal& ts_val, const StringVal& tz_string_val);
 
-  /// Returns the day's name as a string (e.g. 'Saturday').
-  static StringVal DayName(FunctionContext* context, const TimestampVal& dow);
-
   /// Functions to extract parts of the timestamp, return integers.
   static IntVal Year(FunctionContext* context, const TimestampVal& ts_val);
+  static IntVal Quarter(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal Month(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DayOfWeek(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DayOfMonth(FunctionContext* context, const TimestampVal& ts_val);
@@ -145,7 +177,9 @@ class TimestampFunctions {
   static IntVal DateDiff(FunctionContext* context, const TimestampVal& ts_val1,
       const TimestampVal& ts_val2);
   static std::string ShortDayName(FunctionContext* context, const TimestampVal& ts);
+  static StringVal LongDayName(FunctionContext* context, const TimestampVal& ts);
   static std::string ShortMonthName(FunctionContext* context, const TimestampVal& ts);
+  static StringVal LongMonthName(FunctionContext* context, const TimestampVal& ts);
 
   /// Return verbose string version of current time of day
   /// e.g. Mon Dec 01 16:25:05 2003 EST.
@@ -223,24 +257,6 @@ class TimestampFunctions {
   /// Helper function to check date/time format strings.
   /// TODO: eventually return format converted from Java to Boost.
   static StringValue* CheckFormat(StringValue* format);
-
-  /// Issue a warning for a bad format string.
-  static void ReportBadFormat(FunctionContext* context,
-      const StringVal& format, bool is_error);
-
- private:
-  /// Static result values for DayName() function.
-  static const char* MONDAY;
-  static const char* TUESDAY;
-  static const char* WEDNESDAY;
-  static const char* THURSDAY;
-  static const char* FRIDAY;
-  static const char* SATURDAY;
-  static const char* SUNDAY;
-
-  /// Static result values for ShortDayName() and ShortMonthName() functions.
-  static const std::string DAY_ARRAY[7];
-  static const std::string MONTH_ARRAY[12];
 };
 
 } // namespace impala

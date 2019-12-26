@@ -18,6 +18,7 @@
 package org.apache.impala.hive.executor;
 
 import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -66,8 +67,13 @@ public class UdfExecutor {
   private final static TBinaryProtocol.Factory PROTOCOL_FACTORY =
     new TBinaryProtocol.Factory();
 
+  // TODO UDF is deprecated in Hive and newer implementation of built-in functions using
+  // GenericUDF interface, we should consider supporting GenericUDFs in the future
   private UDF udf_;
+  // setup by init() and cleared by close()
   private Method method_;
+  // setup by init() and cleared by close()
+  private URLClassLoader classLoader_;
 
   // Return and argument types of the function inferred from the udf method signature.
   // The JavaUdfDataType enum maps it to corresponding primitive type.
@@ -224,12 +230,26 @@ public class UdfExecutor {
   }
 
   /**
-   * Releases any resources allocated off the native heap.
+   * Releases any resources allocated off the native heap and close the class
+   * loader we may have created.
    */
   public void close() {
     UnsafeUtil.UNSAFE.freeMemory(outBufferStringPtr_);
     outBufferStringPtr_ = 0;
     outBufferCapacity_ = 0;
+
+    if (classLoader_ != null) {
+      try {
+        classLoader_.close();
+      } catch (IOException e) {
+        // Log and ignore.
+        LOG.debug("Error closing the URLClassloader.", e);
+      }
+    }
+    // We are now un-usable (because the class loader has been
+    // closed), so null out method_ and classLoader_.
+    method_ = null;
+    classLoader_ = null;
   }
 
   /**
@@ -522,13 +542,9 @@ public class UdfExecutor {
     }
   }
 
-  private ClassLoader getClassLoader(String jarPath) throws MalformedURLException {
-    if (jarPath == null) {
-      return ClassLoader.getSystemClassLoader();
-    } else {
-      URL url = new File(jarPath).toURI().toURL();
-      return URLClassLoader.newInstance(new URL[] { url }, getClass().getClassLoader());
-    }
+  private URLClassLoader getClassLoader(String jarPath) throws MalformedURLException {
+    URL url = new File(jarPath).toURI().toURL();
+    return URLClassLoader.newInstance(new URL[] { url }, getClass().getClassLoader());
   }
 
   /**
@@ -579,7 +595,14 @@ public class UdfExecutor {
     ArrayList<String> signatures = Lists.newArrayList();
     try {
       LOG.debug("Loading UDF '" + udfPath + "' from " + jarPath);
-      ClassLoader loader = getClassLoader(jarPath);
+      ClassLoader loader;
+      if (jarPath != null) {
+        // Save for cleanup.
+        classLoader_ = getClassLoader(jarPath);
+        loader = classLoader_;
+      } else {
+        loader = ClassLoader.getSystemClassLoader();
+      }
       Class<?> c = Class.forName(udfPath, true, loader);
       Class<? extends UDF> udfClass = c.asSubclass(UDF.class);
       Constructor<? extends UDF> ctor = udfClass.getConstructor();

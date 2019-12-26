@@ -17,38 +17,43 @@
 
 package org.apache.impala.service;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.adl.AdlFileSystem;
+import org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem;
+import org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem;
+import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
+import org.apache.hadoop.security.Groups;
+import org.apache.hadoop.security.JniBasedUnixGroupsMappingWithFallback;
+import org.apache.hadoop.security.JniBasedUnixGroupsNetgroupMappingWithFallback;
+import org.apache.hadoop.security.ShellBasedUnixGroupsMapping;
+import org.apache.hadoop.security.ShellBasedUnixGroupsNetgroupMapping;
 import org.apache.impala.analysis.DescriptorTable;
 import org.apache.impala.analysis.ToSqlUtils;
-import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizationFactory;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
 import org.apache.impala.authorization.User;
-import org.apache.impala.catalog.DataSource;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDataSource;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
-import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.JniUtil;
+import org.apache.impala.common.TransactionException;
+import org.apache.impala.hooks.QueryCompleteContext;
+import org.apache.impala.service.Frontend.PlanCtx;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TBuildTestDescriptorTableParams;
 import org.apache.impala.thrift.TCatalogObject;
@@ -61,6 +66,7 @@ import org.apache.impala.thrift.TDescriptorTable;
 import org.apache.impala.thrift.TExecRequest;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.TGetAllHadoopConfigsResponse;
+import org.apache.impala.thrift.TGetCatalogMetricsResult;
 import org.apache.impala.thrift.TGetDataSrcsParams;
 import org.apache.impala.thrift.TGetDataSrcsResult;
 import org.apache.impala.thrift.TGetDbsParams;
@@ -69,24 +75,26 @@ import org.apache.impala.thrift.TGetFunctionsParams;
 import org.apache.impala.thrift.TGetFunctionsResult;
 import org.apache.impala.thrift.TGetHadoopConfigRequest;
 import org.apache.impala.thrift.TGetHadoopConfigResponse;
+import org.apache.impala.thrift.TGetHadoopGroupsRequest;
+import org.apache.impala.thrift.TGetHadoopGroupsResponse;
 import org.apache.impala.thrift.TGetTablesParams;
 import org.apache.impala.thrift.TGetTablesResult;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TLoadDataResp;
 import org.apache.impala.thrift.TLogLevel;
 import org.apache.impala.thrift.TMetadataOpRequest;
+import org.apache.impala.thrift.TQueryCompleteContext;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TShowFilesParams;
-import org.apache.impala.thrift.TShowGrantRoleParams;
+import org.apache.impala.thrift.TShowGrantPrincipalParams;
 import org.apache.impala.thrift.TShowRolesParams;
-import org.apache.impala.thrift.TShowRolesResult;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TShowStatsParams;
 import org.apache.impala.thrift.TTableName;
-import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
-import org.apache.impala.thrift.TUpdateMembershipRequest;
+import org.apache.impala.thrift.TUpdateExecutorMembershipRequest;
+import org.apache.impala.util.AuthorizationUtil;
 import org.apache.impala.util.GlogAppender;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.TSessionStateUtil;
@@ -98,10 +106,12 @@ import org.apache.thrift.protocol.TBinaryProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
+import java.io.File;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -125,22 +135,10 @@ public class JniFrontend {
     GlogAppender.Install(TLogLevel.values()[cfg.impala_log_lvl],
         TLogLevel.values()[cfg.non_impala_java_vlog]);
 
-    // Validate the authorization configuration before initializing the Frontend.
-    // If there are any configuration problems Impala startup will fail.
-    AuthorizationConfig authConfig = new AuthorizationConfig(cfg.server_name,
-        cfg.authorization_policy_file, cfg.sentry_config,
-        cfg.authorization_policy_provider_class);
-    authConfig.validateConfig();
-    if (authConfig.isEnabled()) {
-      LOG.info(String.format("Authorization is 'ENABLED' using %s",
-          authConfig.isFileBasedPolicy() ? " file based policy from: " +
-          authConfig.getPolicyFile() : " using Sentry Policy Service."));
-    } else {
-      LOG.info("Authorization is 'DISABLED'.");
-    }
+    final AuthorizationFactory authzFactory =
+        AuthorizationUtil.authzFactoryFrom(BackendConfig.INSTANCE);
     LOG.info(JniUtil.getJavaVersion());
-
-    frontend_ = new Frontend(authConfig, cfg.kudu_master_hosts);
+    frontend_ = new Frontend(authzFactory);
   }
 
   /**
@@ -152,10 +150,11 @@ public class JniFrontend {
     TQueryCtx queryCtx = new TQueryCtx();
     JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
 
-    StringBuilder explainString = new StringBuilder();
-    TExecRequest result = frontend_.createExecRequest(queryCtx, explainString);
-    if (explainString.length() > 0 && LOG.isTraceEnabled()) {
-      LOG.trace(explainString.toString());
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    TExecRequest result = frontend_.createExecRequest(planCtx);
+    if (LOG.isTraceEnabled()) {
+      String explainStr = planCtx.getExplainString();
+      if (!explainStr.isEmpty()) LOG.trace(explainStr);
     }
 
     // TODO: avoid creating serializer for each query?
@@ -168,40 +167,22 @@ public class JniFrontend {
   }
 
   // Deserialize and merge each thrift catalog update into a single merged update
-  public byte[] updateCatalogCache(byte[][] thriftCatalogUpdates) throws ImpalaException {
-    TUniqueId defaultCatalogServiceId = new TUniqueId(0L, 0L);
-    TUpdateCatalogCacheRequest mergedUpdateRequest = new TUpdateCatalogCacheRequest(
-        false, defaultCatalogServiceId, new ArrayList<TCatalogObject>(),
-        new ArrayList<TCatalogObject>());
-    for (byte[] catalogUpdate: thriftCatalogUpdates) {
-      TUpdateCatalogCacheRequest incrementalRequest = new TUpdateCatalogCacheRequest();
-      JniUtil.deserializeThrift(protocolFactory_, incrementalRequest, catalogUpdate);
-      mergedUpdateRequest.is_delta |= incrementalRequest.is_delta;
-      if (!incrementalRequest.getCatalog_service_id().equals(defaultCatalogServiceId)) {
-        mergedUpdateRequest.setCatalog_service_id(
-            incrementalRequest.getCatalog_service_id());
-      }
-      mergedUpdateRequest.getUpdated_objects().addAll(
-          incrementalRequest.getUpdated_objects());
-      mergedUpdateRequest.getRemoved_objects().addAll(
-          incrementalRequest.getRemoved_objects());
-    }
-    TSerializer serializer = new TSerializer(protocolFactory_);
-    try {
-      return serializer.serialize(frontend_.updateCatalogCache(mergedUpdateRequest));
-    } catch (TException e) {
-      throw new InternalException(e.getMessage());
-    }
+  public byte[] updateCatalogCache(byte[] req) throws ImpalaException, TException {
+    TUpdateCatalogCacheRequest request = new TUpdateCatalogCacheRequest();
+    JniUtil.deserializeThrift(protocolFactory_, request, req);
+    return new TSerializer(protocolFactory_).serialize(
+        frontend_.updateCatalogCache(request));
   }
 
   /**
    * Jni wrapper for Frontend.updateMembership(). Accepts a serialized
-   * TUpdateMembershipRequest.
+   * TUpdateExecutorMembershipRequest.
    */
-  public void updateMembership(byte[] thriftMembershipUpdate) throws ImpalaException {
-    TUpdateMembershipRequest req = new TUpdateMembershipRequest();
+  public void updateExecutorMembership(byte[] thriftMembershipUpdate)
+      throws ImpalaException {
+    TUpdateExecutorMembershipRequest req = new TUpdateExecutorMembershipRequest();
     JniUtil.deserializeThrift(protocolFactory_, req, thriftMembershipUpdate);
-    frontend_.updateMembership(req);
+    frontend_.updateExecutorMembership(req);
   }
 
   /**
@@ -233,6 +214,16 @@ public class JniFrontend {
     String plan = frontend_.getExplainString(queryCtx);
     if (LOG.isTraceEnabled()) LOG.trace("Explain plan: " + plan);
     return plan;
+  }
+
+  public byte[] getCatalogMetrics() throws ImpalaException {
+    TGetCatalogMetricsResult metrics = frontend_.getCatalogMetrics();
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(metrics);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
   }
 
   /**
@@ -306,11 +297,11 @@ public class JniFrontend {
     User user = params.isSetSession() ?
         new User(TSessionStateUtil.getEffectiveUser(params.getSession())) :
         ImpalaInternalAdminUser.getInstance();
-    List<Db> dbs = frontend_.getDbs(
+    List<? extends FeDb> dbs = frontend_.getDbs(
         PatternMatcher.createHivePatternMatcher(params.pattern), user);
     TGetDbsResult result = new TGetDbsResult();
     List<TDatabase> tDbs = Lists.newArrayListWithCapacity(dbs.size());
-    for (Db db: dbs) tDbs.add(db.toThrift());
+    for (FeDb db: dbs) tDbs.add(db.toThrift());
     result.setDbs(tDbs);
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
@@ -331,12 +322,12 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, thriftParams);
 
     TGetDataSrcsResult result = new TGetDataSrcsResult();
-    List<DataSource> dataSources = frontend_.getDataSrcs(params.pattern);
+    List<? extends FeDataSource> dataSources = frontend_.getDataSrcs(params.pattern);
     result.setData_src_names(Lists.<String>newArrayListWithCapacity(dataSources.size()));
     result.setLocations(Lists.<String>newArrayListWithCapacity(dataSources.size()));
     result.setClass_names(Lists.<String>newArrayListWithCapacity(dataSources.size()));
     result.setApi_versions(Lists.<String>newArrayListWithCapacity(dataSources.size()));
-    for (DataSource dataSource: dataSources) {
+    for (FeDataSource dataSource: dataSources) {
       result.addToData_src_names(dataSource.getName());
       result.addToLocations(dataSource.getLocation());
       result.addToClass_names(dataSource.getClassName());
@@ -450,9 +441,10 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, thriftDescribeTableParams);
 
     Preconditions.checkState(params.isSetTable_name() ^ params.isSetResult_struct());
+    User user = new User(TSessionStateUtil.getEffectiveUser(params.getSession()));
     TDescribeResult result = null;
     if (params.isSetTable_name()) {
-      result = frontend_.describeTable(params.getTable_name(), params.output_style);
+      result = frontend_.describeTable(params.getTable_name(), params.output_style, user);
     } else {
       Preconditions.checkState(params.output_style == TDescribeOutputStyle.MINIMAL);
       StructType structType = (StructType)Type.fromThrift(params.result_struct);
@@ -511,53 +503,29 @@ public class JniFrontend {
   }
 
   /**
-   * Gets all roles
+   * Gets all roles.
    */
   public byte[] getRoles(byte[] showRolesParams) throws ImpalaException {
     TShowRolesParams params = new TShowRolesParams();
     JniUtil.deserializeThrift(protocolFactory_, params, showRolesParams);
-    TShowRolesResult result = new TShowRolesResult();
-
-    List<Role> roles = Lists.newArrayList();
-    if (params.isIs_show_current_roles() || params.isSetGrant_group()) {
-      User user = new User(params.getRequesting_user());
-      Set<String> groupNames;
-      if (params.isIs_show_current_roles()) {
-        groupNames = frontend_.getAuthzChecker().getUserGroups(user);
-      } else {
-        Preconditions.checkState(params.isSetGrant_group());
-        groupNames = Sets.newHashSet(params.getGrant_group());
-      }
-      for (String groupName: groupNames) {
-        roles.addAll(frontend_.getCatalog().getAuthPolicy().getGrantedRoles(groupName));
-      }
-    } else {
-      Preconditions.checkState(!params.isIs_show_current_roles());
-      roles = frontend_.getCatalog().getAuthPolicy().getAllRoles();
-    }
-
-    result.setRole_names(Lists.<String>newArrayListWithExpectedSize(roles.size()));
-    for (Role role: roles) {
-      result.getRole_names().add(role.getName());
-    }
-
-    Collections.sort(result.getRole_names());
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
-      return serializer.serialize(result);
+      return serializer.serialize(frontend_.getAuthzManager().getRoles(params));
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
   }
 
-  public byte[] getRolePrivileges(byte[] showGrantRolesParams) throws ImpalaException {
-    TShowGrantRoleParams params = new TShowGrantRoleParams();
-    JniUtil.deserializeThrift(protocolFactory_, params, showGrantRolesParams);
-    TResultSet result = frontend_.getCatalog().getAuthPolicy().getRolePrivileges(
-        params.getRole_name(), params.getPrivilege());
+  /**
+   * Gets the principal privileges for the given principal.
+   */
+  public byte[] getPrincipalPrivileges(byte[] showGrantPrincipalParams)
+      throws ImpalaException {
+    TShowGrantPrincipalParams params = new TShowGrantPrincipalParams();
+    JniUtil.deserializeThrift(protocolFactory_, params, showGrantPrincipalParams);
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
-      return serializer.serialize(result);
+      return serializer.serialize(frontend_.getAuthzManager().getPrivileges(params));
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
@@ -588,6 +556,7 @@ public class JniFrontend {
 
   // Caching this saves ~50ms per call to getHadoopConfigAsHtml
   private static final Configuration CONF = new Configuration();
+  private static final Groups GROUPS = Groups.getUserToGroupsMappingService(CONF);
 
   /**
    * Returns a string of all loaded Hadoop configuration parameters as a table of keys
@@ -627,14 +596,99 @@ public class JniFrontend {
   }
 
   /**
+   * Returns the list of Hadoop groups for the given user name.
+   */
+  public byte[] getHadoopGroups(byte[] serializedRequest) throws ImpalaException {
+    TGetHadoopGroupsRequest request = new TGetHadoopGroupsRequest();
+    JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
+    TGetHadoopGroupsResponse result = new TGetHadoopGroupsResponse();
+    try {
+      result.setGroups(GROUPS.getGroups(request.getUser()));
+    } catch (IOException e) {
+      // HACK: https://issues.apache.org/jira/browse/HADOOP-15505
+      // There is no easy way to know if no groups found for a user
+      // other than reading the exception message.
+      if (e.getMessage().startsWith("No groups found for user")) {
+        result.setGroups(Collections.<String>emptyList());
+      } else {
+        LOG.error("Error getting Hadoop groups for user: " + request.getUser(), e);
+        throw new InternalException(e.getMessage());
+      }
+    }
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(result);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
+  }
+
+  /**
+   * JNI wrapper for {@link Frontend#callQueryCompleteHooks(QueryCompleteContext)}.
+   *
+   * @param serializedRequest
+   */
+  public void callQueryCompleteHooks(byte[] serializedRequest) throws ImpalaException {
+    final TQueryCompleteContext request = new TQueryCompleteContext();
+    JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
+
+    final QueryCompleteContext context =
+        new QueryCompleteContext(request.getLineage_string());
+    this.frontend_.callQueryCompleteHooks(context);
+  }
+
+  /**
+   * Aborts a transaction.
+   * @param transactionId the id of the transaction to abort.
+   * @throws TransactionException
+   */
+  public void abortTransaction(long transactionId) throws TransactionException {
+    this.frontend_.abortTransaction(transactionId);
+  }
+
+  /**
+   * Unregister an already committed transaction.
+   * @param transactionId the id of the transaction to clear.
+   */
+  public void unregisterTransaction(long transactionId) {
+    this.frontend_.unregisterTransaction(transactionId);
+  }
+
+  /**
+   * Returns an error string describing configuration issue with the groups mapping
+   * provider implementation.
+   */
+  @VisibleForTesting
+  protected static String checkGroupsMappingProvider(Configuration conf) {
+    String provider = conf.get(CommonConfigurationKeys.HADOOP_SECURITY_GROUP_MAPPING);
+    // Shell-based groups mapping providers fork a new process for each call.
+    // This can cause issues such as zombie processes, running out of file descriptors,
+    // etc.
+    if (ShellBasedUnixGroupsNetgroupMapping.class.getName().equals(provider)) {
+      return String.format("Hadoop groups mapping provider: %s is " +
+          "known to be problematic. Consider using: %s instead.",
+          provider, JniBasedUnixGroupsNetgroupMappingWithFallback.class.getName());
+    }
+    if (ShellBasedUnixGroupsMapping.class.getName().equals(provider)) {
+      return String.format("Hadoop groups mapping provider: %s is " +
+          "known to be problematic. Consider using: %s instead.",
+          provider, JniBasedUnixGroupsMappingWithFallback.class.getName());
+    }
+    return "";
+  }
+
+  /**
    * Returns an error string describing all configuration issues. If no config issues are
    * found, returns an empty string.
    */
-  public String checkConfiguration() {
+  public String checkConfiguration() throws ImpalaException {
     StringBuilder output = new StringBuilder();
     output.append(checkLogFilePermission());
     output.append(checkFileSystem(CONF));
     output.append(checkShortCircuitRead(CONF));
+    if (BackendConfig.INSTANCE.isAuthorizedProxyGroupEnabled()) {
+      output.append(checkGroupsMappingProvider(CONF));
+    }
     return output.toString();
   }
 
@@ -721,6 +775,8 @@ public class JniFrontend {
       FileSystem fs = FileSystem.get(CONF);
       if (!(fs instanceof DistributedFileSystem ||
             fs instanceof S3AFileSystem ||
+            fs instanceof AzureBlobFileSystem ||
+            fs instanceof SecureAzureBlobFileSystem ||
             fs instanceof AdlFileSystem)) {
         return "Currently configured default filesystem: " +
             fs.getClass().getSimpleName() + ". " +

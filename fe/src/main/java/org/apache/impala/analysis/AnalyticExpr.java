@@ -17,7 +17,6 @@
 
 package org.apache.impala.analysis;
 
-import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
@@ -64,7 +63,7 @@ public class AnalyticExpr extends Expr {
   private final List<Expr> partitionExprs_;
   // These elements are modified to point to the corresponding child exprs to keep them
   // in sync through expr substitutions.
-  private List<OrderByElement> orderByElements_ = Lists.newArrayList();
+  private List<OrderByElement> orderByElements_ = new ArrayList<>();
   private AnalyticWindow window_;
 
   // If set, requires the window to be set to null in resetAnalysisState(). Required for
@@ -98,7 +97,7 @@ public class AnalyticExpr extends Expr {
       List<OrderByElement> orderByElements, AnalyticWindow window) {
     Preconditions.checkNotNull(fnCall);
     fnCall_ = fnCall;
-    partitionExprs_ = partitionExprs != null ? partitionExprs : new ArrayList<Expr>();
+    partitionExprs_ = partitionExprs != null ? partitionExprs : new ArrayList<>();
     if (orderByElements != null) orderByElements_.addAll(orderByElements);
     window_ = window;
     setChildren();
@@ -147,19 +146,19 @@ public class AnalyticExpr extends Expr {
   public Expr clone() { return new AnalyticExpr(this); }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     if (sqlString_ != null) return sqlString_;
     StringBuilder sb = new StringBuilder();
-    sb.append(fnCall_.toSql()).append(" OVER (");
+    sb.append(fnCall_.toSql(options)).append(" OVER (");
     boolean needsSpace = false;
     if (!partitionExprs_.isEmpty()) {
-      sb.append("PARTITION BY ").append(Expr.toSql(partitionExprs_));
+      sb.append("PARTITION BY ").append(Expr.toSql(partitionExprs_, options));
       needsSpace = true;
     }
     if (!orderByElements_.isEmpty()) {
-      List<String> orderByStrings = Lists.newArrayList();
+      List<String> orderByStrings = new ArrayList<>();
       for (OrderByElement e: orderByElements_) {
-        orderByStrings.add(e.toSql());
+        orderByStrings.add(e.toSql(options));
       }
       if (needsSpace) sb.append(" ");
       sb.append("ORDER BY ").append(Joiner.on(", ").join(orderByStrings));
@@ -167,7 +166,7 @@ public class AnalyticExpr extends Expr {
     }
     if (window_ != null) {
       if (needsSpace) sb.append(" ");
-      sb.append(window_.toSql());
+      sb.append(window_.toSql(options));
     }
     sb.append(")");
     return sb.toString();
@@ -263,8 +262,8 @@ public class AnalyticExpr extends Expr {
     Preconditions.checkState(
         AnalyticExpr.isPercentRankFn(analyticExpr.getFnCall().getFn()));
 
-    NumericLiteral zero = new NumericLiteral(BigInteger.valueOf(0), ScalarType.BIGINT);
-    NumericLiteral one = new NumericLiteral(BigInteger.valueOf(1), ScalarType.BIGINT);
+    NumericLiteral zero = NumericLiteral.create(0, ScalarType.BIGINT);
+    NumericLiteral one = NumericLiteral.create(1, ScalarType.BIGINT);
     AnalyticExpr countExpr = create("count", analyticExpr, false, false);
     AnalyticExpr rankExpr = create("rank", analyticExpr, true, false);
 
@@ -273,7 +272,7 @@ public class AnalyticExpr extends Expr {
         new ArithmeticExpr(ArithmeticExpr.Operator.SUBTRACT, rankExpr, one),
         new ArithmeticExpr(ArithmeticExpr.Operator.SUBTRACT, countExpr, one));
 
-    List<Expr> ifParams = Lists.newArrayList();
+    List<Expr> ifParams = new ArrayList<>();
     ifParams.add(
       new BinaryPredicate(BinaryPredicate.Operator.EQ, one, countExpr));
     ifParams.add(zero);
@@ -297,7 +296,7 @@ public class AnalyticExpr extends Expr {
         AnalyticExpr.isCumeDistFn(analyticExpr.getFnCall().getFn()));
     AnalyticExpr rankExpr = create("rank", analyticExpr, true, true);
     AnalyticExpr countExpr = create("count", analyticExpr, false, false);
-    NumericLiteral one = new NumericLiteral(BigInteger.valueOf(1), ScalarType.BIGINT);
+    NumericLiteral one = NumericLiteral.create(1, ScalarType.BIGINT);
     ArithmeticExpr arithmeticRewrite =
         new ArithmeticExpr(ArithmeticExpr.Operator.DIVIDE,
           new ArithmeticExpr(ArithmeticExpr.Operator.ADD,
@@ -323,13 +322,13 @@ public class AnalyticExpr extends Expr {
     AnalyticExpr rowNumExpr = create("row_number", analyticExpr, true, false);
     AnalyticExpr countExpr = create("count", analyticExpr, false, false);
 
-    List<Expr> ifParams = Lists.newArrayList();
+    List<Expr> ifParams = new ArrayList<>();
     ifParams.add(
         new BinaryPredicate(BinaryPredicate.Operator.LT, bucketExpr, countExpr));
     ifParams.add(bucketExpr);
     ifParams.add(countExpr);
 
-    NumericLiteral one = new NumericLiteral(BigInteger.valueOf(1), ScalarType.BIGINT);
+    NumericLiteral one = NumericLiteral.create(1, ScalarType.BIGINT);
     ArithmeticExpr minMultiplyRowMinusOne =
         new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY,
           new ArithmeticExpr(ArithmeticExpr.Operator.SUBTRACT, rowNumExpr, one),
@@ -351,14 +350,14 @@ public class AnalyticExpr extends Expr {
    */
   private static AnalyticExpr create(String fnName,
       AnalyticExpr referenceExpr, boolean copyOrderBy, boolean reverseOrderBy) {
-    FunctionCallExpr fnExpr = new FunctionCallExpr(fnName, new ArrayList<Expr>());
+    FunctionCallExpr fnExpr = new FunctionCallExpr(fnName, new ArrayList<>());
     fnExpr.setIsAnalyticFnCall(true);
     List<OrderByElement> orderByElements = null;
     if (copyOrderBy) {
       if (reverseOrderBy) {
         orderByElements = OrderByElement.reverse(referenceExpr.getOrderByElements());
       } else {
-        orderByElements = Lists.newArrayList();
+        orderByElements = new ArrayList<>();
         for (OrderByElement elem: referenceExpr.getOrderByElements()) {
           orderByElements.add(elem.clone());
         }
@@ -373,8 +372,8 @@ public class AnalyticExpr extends Expr {
    * Checks that the value expr of an offset boundary of a RANGE window is compatible
    * with orderingExprs (and that there's only a single ordering expr).
    */
-  private void checkRangeOffsetBoundaryExpr(AnalyticWindow.Boundary boundary)
-      throws AnalysisException {
+  private void checkRangeOffsetBoundaryExpr(
+      AnalyticWindow.Boundary boundary) throws AnalysisException {
     Preconditions.checkState(boundary.getType().isOffset());
     if (orderByElements_.size() > 1) {
       throw new AnalysisException("Only one ORDER BY expression allowed if used with "
@@ -382,7 +381,7 @@ public class AnalyticExpr extends Expr {
     }
     Expr rangeExpr = boundary.getExpr();
     if (!Type.isImplicitlyCastable(
-        rangeExpr.getType(), orderByElements_.get(0).getExpr().getType(), false)) {
+        rangeExpr.getType(), orderByElements_.get(0).getExpr().getType(), false, true)) {
       throw new AnalysisException(
           "The value expression of a PRECEDING/FOLLOWING clause of a RANGE window must "
             + "be implicitly convertable to the ORDER BY expression's type: "
@@ -424,22 +423,14 @@ public class AnalyticExpr extends Expr {
     type_ = getFnCall().getType();
 
     for (Expr e: partitionExprs_) {
-      if (e.isConstant()) {
-        throw new AnalysisException(
-            "Expressions in the PARTITION BY clause must not be constant: "
-              + e.toSql() + " (in " + toSql() + ")");
-      } else if (e.getType().isComplexType()) {
+      if (e.getType().isComplexType()) {
         throw new AnalysisException(String.format("PARTITION BY expression '%s' with " +
             "complex type '%s' is not supported.", e.toSql(),
             e.getType().toSql()));
       }
     }
     for (OrderByElement e: orderByElements_) {
-      if (e.getExpr().isConstant()) {
-        throw new AnalysisException(
-            "Expressions in the ORDER BY clause must not be constant: "
-              + e.getExpr().toSql() + " (in " + toSql() + ")");
-      } else if (e.getExpr().getType().isComplexType()) {
+      if (e.getExpr().getType().isComplexType()) {
         throw new AnalysisException(String.format("ORDER BY expression '%s' with " +
             "complex type '%s' is not supported.", e.getExpr().toSql(),
             e.getExpr().getType().toSql()));
@@ -624,7 +615,7 @@ public class AnalyticExpr extends Expr {
         newExprParams = Lists.newArrayListWithExpectedSize(3);
         newExprParams.addAll(getFnCall().getChildren());
         // Default offset is 1.
-        newExprParams.add(new NumericLiteral(BigDecimal.valueOf(1)));
+        newExprParams.add(NumericLiteral.create(1));
         // Default default value is NULL.
         newExprParams.add(new NullLiteral());
       } else if (getFnCall().getChildren().size() == 2) {
@@ -674,13 +665,13 @@ public class AnalyticExpr extends Expr {
         if (window_.getRightBoundary().getType() == BoundaryType.PRECEDING) {
           // The number of rows preceding for the end bound determines the number of
           // rows at the beginning of each partition that should have a NULL value.
-          paramExprs.add(new NumericLiteral(window_.getRightBoundary().getOffsetValue(),
-              Type.BIGINT));
+          paramExprs.add(NumericLiteral.create(
+              window_.getRightBoundary().getOffsetValue(), Type.BIGINT));
         } else {
           // -1 indicates that no NULL values are inserted even though we set the end
           // bound to the start bound (which is PRECEDING) below; this is different from
           // the default behavior of windows with an end bound PRECEDING.
-          paramExprs.add(new NumericLiteral(BigInteger.valueOf(-1), Type.BIGINT));
+          paramExprs.add(NumericLiteral.create(-1, Type.BIGINT));
         }
 
         window_ = new AnalyticWindow(window_.getType(),
@@ -778,7 +769,7 @@ public class AnalyticExpr extends Expr {
     Preconditions.checkState(isOffsetFn(getFnCall().getFn()));
     if (offsetFnCall.getChild(1) != null) return offsetFnCall.getChild(1);
     // The default offset is 1.
-    return new NumericLiteral(BigDecimal.valueOf(1));
+    return NumericLiteral.create(1);
   }
 
   /**

@@ -15,18 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
-#include <glog/stl_logging.h>
+#include <cctype>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <ostream>
 #include <string>
+#include <thread>
+#include <vector>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 #include <rapidjson/document.h>
 #include <rapidjson/rapidjson.h>
 
-#include "kudu/util/trace.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/walltime.h"
+#include "kudu/util/atomic.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/debug/trace_event.h"
+#include "kudu/util/debug/trace_event_impl.h"
 #include "kudu/util/debug/trace_event_synthetic_delay.h"
 #include "kudu/util/debug/trace_logging.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
+#include "kudu/util/trace_metrics.h"
+#include "kudu/util/trace.h"
 
 using kudu::debug::TraceLog;
 using kudu::debug::TraceResultBuffer;
@@ -34,6 +55,7 @@ using kudu::debug::CategoryFilter;
 using rapidjson::Document;
 using rapidjson::Value;
 using std::string;
+using std::thread;
 using std::vector;
 
 namespace kudu {
@@ -83,10 +105,10 @@ TEST_F(TraceTest, TestAttach) {
   EXPECT_TRUE(Trace::CurrentTrace() == nullptr);
   TRACE("this goes nowhere");
 
-  EXPECT_EQ(XOutDigits(traceA->DumpToString(Trace::NO_FLAGS)),
-            "XXXX XX:XX:XX.XXXXXX trace-test.cc:XX] hello from traceA\n");
-  EXPECT_EQ(XOutDigits(traceB->DumpToString(Trace::NO_FLAGS)),
-            "XXXX XX:XX:XX.XXXXXX trace-test.cc:XX] hello from traceB\n");
+  EXPECT_EQ("XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceA\n",
+            XOutDigits(traceA->DumpToString(Trace::NO_FLAGS)));
+  EXPECT_EQ("XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceB\n",
+            XOutDigits(traceB->DumpToString(Trace::NO_FLAGS)));
 }
 
 TEST_F(TraceTest, TestChildTrace) {
@@ -99,10 +121,10 @@ TEST_F(TraceTest, TestChildTrace) {
     ADOPT_TRACE(traceB.get());
     TRACE("hello from traceB");
   }
-  EXPECT_EQ(XOutDigits(traceA->DumpToString(Trace::NO_FLAGS)),
-            "XXXX XX:XX:XX.XXXXXX trace-test.cc:XX] hello from traceA\n"
+  EXPECT_EQ("XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceA\n"
             "Related trace 'child':\n"
-            "XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceB\n");
+            "XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceB\n",
+            XOutDigits(traceA->DumpToString(Trace::NO_FLAGS)));
 }
 
 static void GenerateTraceEvents(int thread_id,
@@ -439,9 +461,9 @@ class TraceEventCallbackTest : public KuduTest {
                        const uint64_t arg_values[],
                        unsigned char flags) {
     s_instance->collected_events_phases_.push_back(phase);
-    s_instance->collected_events_categories_.push_back(
+    s_instance->collected_events_categories_.emplace_back(
         TraceLog::GetCategoryGroupName(category_group_enabled));
-    s_instance->collected_events_names_.push_back(name);
+    s_instance->collected_events_names_.emplace_back(name);
     s_instance->collected_events_timestamps_.push_back(timestamp);
   }
 };
@@ -841,5 +863,29 @@ TEST_F(TraceTest, TestTraceMetrics) {
   EXPECT_GE(m["test_scope_us"], 80 * 1000);
 }
 
+// Regression test for KUDU-2075: using tracing from vanilla threads
+// should work fine, even if some pthread_self identifiers have been
+// reused.
+TEST_F(TraceTest, TestTraceFromVanillaThreads) {
+  TraceLog::GetInstance()->SetEnabled(
+      CategoryFilter(CategoryFilter::kDefaultCategoryFilterString),
+      TraceLog::RECORDING_MODE,
+      TraceLog::RECORD_CONTINUOUSLY);
+  SCOPED_CLEANUP({ TraceLog::GetInstance()->SetDisabled(); });
+
+  // Do several passes to make it more likely that the thread identifiers
+  // will get reused.
+  for (int pass = 0; pass < 10; pass++) {
+    vector<thread> threads;
+    for (int i = 0; i < 100; i++) {
+      threads.emplace_back([i] {
+          GenerateTraceEvents(i, 1);
+        });
+    }
+    for (auto& t : threads) {
+      t.join();
+    }
+  }
+}
 } // namespace debug
 } // namespace kudu

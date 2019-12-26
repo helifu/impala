@@ -21,23 +21,28 @@
 #ifndef KUDU_UTIL_PB_UTIL_H
 #define KUDU_UTIL_PB_UTIL_H
 
+#include <cstdint>
+#include <iosfwd>
 #include <memory>
 #include <string>
 
+#include <boost/optional/optional.hpp>
+#include <google/protobuf/message.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/util/debug/trace_event.h"
-#include "kudu/util/faststring.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/mutex.h"
+#include "kudu/util/debug/trace_event_impl.h"
 
 namespace google {
 namespace protobuf {
+class DescriptorPool;
 class FileDescriptor;
 class FileDescriptorSet;
 class MessageLite;
-class Message;
-}
-}
+class SimpleDescriptorDatabase;
+} // namespace protobuf
+} // namespace google
 
 namespace kudu {
 
@@ -47,10 +52,9 @@ class SequentialFile;
 class Slice;
 class Status;
 class RWFile;
+class faststring;
 
 namespace pb_util {
-
-using google::protobuf::MessageLite;
 
 enum SyncMode {
   SYNC,
@@ -72,28 +76,29 @@ enum class FileState {
 extern const int kPBContainerMinimumValidLength;
 
 // See MessageLite::AppendToString
-void AppendToString(const MessageLite &msg, faststring *output);
+void AppendToString(const google::protobuf::MessageLite &msg, faststring *output);
 
 // See MessageLite::AppendPartialToString
-void AppendPartialToString(const MessageLite &msg, faststring *output);
+void AppendPartialToString(const google::protobuf::MessageLite &msg, faststring *output);
 
 // See MessageLite::SerializeToString.
-void SerializeToString(const MessageLite &msg, faststring *output);
+void SerializeToString(const google::protobuf::MessageLite &msg, faststring *output);
 
 // See MessageLite::ParseFromZeroCopyStream
-Status ParseFromSequentialFile(MessageLite *msg, SequentialFile *rfile);
+Status ParseFromSequentialFile(google::protobuf::MessageLite *msg, SequentialFile *rfile);
 
 // Similar to MessageLite::ParseFromArray, with the difference that it returns
 // Status::Corruption() if the message could not be parsed.
-Status ParseFromArray(MessageLite* msg, const uint8_t* data, uint32_t length);
+Status ParseFromArray(google::protobuf::MessageLite* msg, const uint8_t* data, uint32_t length);
 
 // Load a protobuf from the given path.
-Status ReadPBFromPath(Env* env, const std::string& path, MessageLite* msg);
+Status ReadPBFromPath(Env* env, const std::string& path, google::protobuf::MessageLite* msg);
 
 // Serialize a protobuf to the given path.
 //
 // If SyncMode SYNC is provided, ensures the changes are made durable.
-Status WritePBToPath(Env* env, const std::string& path, const MessageLite& msg, SyncMode sync);
+Status WritePBToPath(Env* env, const std::string& path,
+                     const google::protobuf::MessageLite& msg, SyncMode sync);
 
 // Truncate any 'bytes' or 'string' fields of this message to max_len.
 // The text "<truncated>" is appended to any such truncated fields.
@@ -394,9 +399,17 @@ class ReadablePBContainerFile {
   // Dumps any unread protobuf messages in the container to 'os'. Each
   // message's DebugString() method is invoked to produce its textual form.
   // File must be open.
-  //
-  // If 'oneline' is true, prints each message on a single line.
-  Status Dump(std::ostream* os, bool oneline);
+  enum class Format {
+    // Print each message on multiple lines, with intervening headers.
+    DEFAULT,
+    // Same as DEFAULT but includes additional metadata information.
+    DEBUG,
+    // Print each message on its own line.
+    ONELINE,
+    // Dump in JSON.
+    JSON
+  };
+  Status Dump(std::ostream* os, Format format);
 
   // Closes the container.
   Status Close();
@@ -408,6 +421,10 @@ class ReadablePBContainerFile {
   const google::protobuf::FileDescriptorSet* protos() const {
     return protos_.get();
   }
+
+  // Get the prototype instance for the type of messages stored in this
+  // file. The returned Message is owned by this ReadablePBContainerFile instance.
+  Status GetPrototype(const google::protobuf::Message** prototype);
 
   // Return the protobuf container file format version.
   // File must be open.
@@ -422,11 +439,21 @@ class ReadablePBContainerFile {
   int version_;
   uint64_t offset_;
 
+  // The size of the file we are reading, or 'none' if it hasn't yet been
+  // read.
+  boost::optional<uint64_t> cached_file_size_;
+
   // The fully-qualified PB type name of the messages in the container.
   std::string pb_type_;
 
   // Wrapped in a unique_ptr so that clients need not include PB headers.
   std::unique_ptr<google::protobuf::FileDescriptorSet> protos_;
+
+  // Protobuf infrastructure which owns the message prototype 'prototype_'.
+  std::unique_ptr<google::protobuf::SimpleDescriptorDatabase> db_;
+  std::unique_ptr<google::protobuf::DescriptorPool> descriptor_pool_;
+  std::unique_ptr<google::protobuf::MessageFactory> message_factory_;
+  const google::protobuf::Message* prototype_ = nullptr;
 
   std::shared_ptr<RandomAccessFile> reader_;
 };
@@ -481,12 +508,6 @@ class PbTracer : public debug::ConvertableToTraceFormat {
 };
 
 } // namespace pb_util
-
-// TODO(todd) Replacing all Message::ToString call sites for KUDU-1812
-// is much easier if these are available in the 'kudu' namespace. We should
-// consider removing these imports and move them to all call sites.
-using pb_util::SecureDebugString; // NOLINT
-using pb_util::SecureShortDebugString; // NOLINT
 
 } // namespace kudu
 #endif

@@ -17,7 +17,7 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
+import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.common.AnalysisException;
@@ -26,16 +26,14 @@ import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.service.BackendConfig;
 
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 
 /**
  * Represents a CREATE VIEW statement.
  */
 public class CreateViewStmt extends CreateOrAlterViewStmtBase {
-
   public CreateViewStmt(boolean ifNotExists, TableName tableName,
-      ArrayList<ColumnDef> columnDefs, String comment, QueryStmt viewDefStmt) {
+      List<ColumnDef> columnDefs, String comment, QueryStmt viewDefStmt) {
     super(ifNotExists, tableName, columnDefs, comment, viewDefStmt);
   }
 
@@ -43,7 +41,7 @@ public class CreateViewStmt extends CreateOrAlterViewStmtBase {
   public void analyze(Analyzer analyzer) throws AnalysisException {
     Preconditions.checkState(tableName_ != null && !tableName_.isEmpty());
 
-    tableName_.analyze();
+    analyzer.getFqTableName(tableName_).analyze();
     // Use a child analyzer to let views have complex-typed columns.
     Analyzer viewAnalyzerr = new Analyzer(analyzer);
     // Enforce Hive column labels for view compatibility.
@@ -51,7 +49,11 @@ public class CreateViewStmt extends CreateOrAlterViewStmtBase {
     viewDefStmt_.analyze(viewAnalyzerr);
 
     dbName_ = analyzer.getTargetDbName(tableName_);
-    owner_ = analyzer.getUser().getName();
+    owner_ = analyzer.getUserShortName();
+    // Set the servername here if authorization is enabled because analyzer_ is not
+    // available in the toThrift() method.
+    serverName_ = analyzer.getServerName();
+
     if (analyzer.dbContainsTable(dbName_, tableName_.getTbl(), Privilege.CREATE) &&
         !ifNotExists_) {
       throw new AnalysisException(Analyzer.TBL_ALREADY_EXISTS_ERROR_MSG +
@@ -67,15 +69,15 @@ public class CreateViewStmt extends CreateOrAlterViewStmtBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder();
     sb.append("CREATE VIEW ");
     if (ifNotExists_) sb.append("IF NOT EXISTS ");
     if (tableName_.getDb() != null) sb.append(tableName_.getDb() + ".");
-    sb.append(tableName_.getTbl() + " (");
-    sb.append(Joiner.on(", ").join(columnDefs_));
-    sb.append(") AS ");
-    sb.append(viewDefStmt_.toSql());
+    sb.append(tableName_.getTbl());
+    if (columnDefs_ != null) sb.append("(" + getColumnNames() + ")");
+    sb.append(" AS ");
+    sb.append(viewDefStmt_.toSql(options));
     return sb.toString();
   }
 }

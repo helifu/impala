@@ -35,6 +35,7 @@ using impala_udf::DoubleVal;
 using impala_udf::TimestampVal;
 using impala_udf::StringVal;
 using impala_udf::DecimalVal;
+using impala_udf::DateVal;
 
 class Expr;
 class OpcodeRegistry;
@@ -90,6 +91,10 @@ class UtilityFunctions {
       FunctionContext::FunctionStateScope scope);
   static void UuidClose(FunctionContext* ctx,
       FunctionContext::FunctionStateScope scope);
+
+  /// Implementation of the coordinator() function.
+  /// Returns the name of the host where the coordinator is running.
+  static StringVal Coordinator(FunctionContext* ctx);
 
   /// Implementation of the typeOf() function. Returns the type of the input
   /// expression. input_val is not used and it is kept here in order to let

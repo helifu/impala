@@ -17,10 +17,11 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import com.google.common.base.Preconditions;
+
+import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 
 /**
  * Representation of a values() statement with a list of constant-expression lists.
@@ -32,7 +33,7 @@ import com.google.common.base.Preconditions;
 public class ValuesStmt extends UnionStmt {
 
   public ValuesStmt(List<UnionOperand> operands,
-      ArrayList<OrderByElement> orderByElements, LimitElement limitElement) {
+      List<OrderByElement> orderByElements, LimitElement limitElement) {
     super(operands, orderByElements, limitElement);
   }
 
@@ -45,23 +46,24 @@ public class ValuesStmt extends UnionStmt {
   protected String queryStmtToSql(QueryStmt queryStmt) {
     StringBuilder strBuilder = new StringBuilder();
     strBuilder.append("(");
-    appendSelectList((SelectStmt) queryStmt, strBuilder);
+    appendSelectList((SelectStmt) queryStmt, strBuilder, DEFAULT);
     strBuilder.append(")");
     return strBuilder.toString();
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
+    if (options.showRewritten()) return super.toSql(options);
     StringBuilder strBuilder = new StringBuilder();
     if (withClause_ != null) {
-      strBuilder.append(withClause_.toSql());
+      strBuilder.append(withClause_.toSql(options));
       strBuilder.append(" ");
     }
     Preconditions.checkState(operands_.size() > 0);
     strBuilder.append("VALUES(");
     for (int i = 0; i < operands_.size(); ++i) {
       if (operands_.size() != 1) strBuilder.append("(");
-      appendSelectList((SelectStmt) operands_.get(i).getQueryStmt(), strBuilder);
+      appendSelectList((SelectStmt) operands_.get(i).getQueryStmt(), strBuilder, options);
       if (operands_.size() != 1) strBuilder.append(")");
       strBuilder.append((i+1 != operands_.size()) ? ", " : "");
     }
@@ -69,10 +71,11 @@ public class ValuesStmt extends UnionStmt {
     return strBuilder.toString();
   }
 
-  private void appendSelectList(SelectStmt select, StringBuilder strBuilder) {
+  private void appendSelectList(
+      SelectStmt select, StringBuilder strBuilder, ToSqlOptions options) {
     SelectList selectList = select.getSelectList();
     for (int j = 0; j < selectList.getItems().size(); ++j) {
-      strBuilder.append(selectList.getItems().get(j).toSql());
+      strBuilder.append(selectList.getItems().get(j).toSql(options));
       strBuilder.append((j+1 != selectList.getItems().size()) ? ", " : "");
     }
   }

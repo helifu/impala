@@ -18,6 +18,9 @@
 #ifndef IMPALA_EXEC_ANALYTIC_EVAL_NODE_H
 #define IMPALA_EXEC_ANALYTIC_EVAL_NODE_H
 
+#include <deque>
+#include <memory>
+
 #include "exec/exec-node.h"
 #include "runtime/buffered-tuple-stream.h"
 #include "runtime/tuple.h"
@@ -28,6 +31,27 @@ class AggFn;
 class AggFnEvaluator;
 class ScalarExpr;
 class ScalarExprEvaluator;
+
+class AnalyticEvalPlanNode : public PlanNode {
+ public:
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) override;
+  virtual Status CreateExecNode(RuntimeState* state, ExecNode** node) const override;
+
+  ~AnalyticEvalPlanNode(){}
+
+  /// Analytic functions which live in the runtime-state's objpool.
+  std::vector<AggFn*> analytic_fns_;
+
+  /// Indicates if each evaluator is the lead() fn. Used by ResetLeadFnSlots() to
+  /// determine which slots need to be reset.
+  std::vector<bool> is_lead_fn_;
+
+  /// A predicate that checks if child tuple '<' buffered tuple for partitioning exprs.
+  ScalarExpr* partition_by_eq_expr_ = nullptr;
+
+  /// A predicate that checks if child tuple '<' buffered tuple for order by exprs.
+  ScalarExpr* order_by_eq_expr_ = nullptr;
+};
 
 /// Evaluates analytic functions with a single pass over input rows. It is assumed
 /// that the input has already been sorted on all of the partition exprs and then the
@@ -58,16 +82,17 @@ class ScalarExprEvaluator;
 /// multiple rows have the same values for the order by exprs. The number of buffered
 /// rows may be an entire partition or even the entire input. Therefore, the output
 /// rows are buffered and may spill to disk via the BufferedTupleStream.
+
 class AnalyticEvalNode : public ExecNode {
  public:
-  AnalyticEvalNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  AnalyticEvalNode(ObjectPool* pool, const AnalyticEvalPlanNode& pnode,
+      const TAnalyticNode& analytic_node, const DescriptorTbl& descs);
   virtual ~AnalyticEvalNode();
 
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
-  virtual Status Reset(RuntimeState* state);
+  virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
   virtual void Close(RuntimeState* state);
 
  protected:
@@ -128,19 +153,20 @@ class AnalyticEvalNode : public ExecNode {
   /// Adds the row to the evaluators and the tuple stream.
   Status AddRow(int64_t stream_idx, TupleRow* row);
 
-  /// Determines if there is a window ending at the previous row, and if so, calls
-  /// AddResultTuple() with the index of the previous row in 'input_stream_'.
-  /// 'next_partition' indicates if the current row is the start of a new partition.
-  /// 'stream_idx' is the index of the current input row from 'input_stream_'.
-  /// Returns an error when memory limit is exceeded.
-  Status TryAddResultTupleForPrevRow(bool next_partition, int64_t stream_idx,
-      TupleRow* row);
+  /// Determines if there is a window ending at the previous row by evaluating
+  /// 'child_tuple_cmp_row', and if so, calls AddResultTuple() with the index
+  /// of the previous row in 'input_stream_'. 'next_partition' indicates if
+  /// the current row is the start of a new partition. 'stream_idx' is the
+  /// index of the current input row from 'input_stream_'.  Returns an error
+  /// when memory limit is exceeded.
+  Status TryAddResultTupleForPrevRow(
+      const TupleRow* child_tuple_cmp_row, bool next_partition, int64_t stream_idx);
 
   /// Determines if there is a window ending at the current row, and if so, calls
   /// AddResultTuple() with the index of the current row in 'input_stream_'.
   /// 'stream_idx' is the index of the current input row from 'input_stream_'.
   /// Returns an error when memory limit is exceeded.
-  Status TryAddResultTupleForCurrRow(int64_t stream_idx, TupleRow* row);
+  Status TryAddResultTupleForCurrRow(int64_t stream_idx);
 
   /// Adds additional result tuples at the end of a partition, e.g. if the end bound is
   /// FOLLOWING. partition_idx is the index into input_stream_ of the new partition,
@@ -172,10 +198,17 @@ class AnalyticEvalNode : public ExecNode {
   /// This is necessary to produce the default value (set by Init()).
   void ResetLeadFnSlots();
 
-  /// Evaluates the predicate pred_eval over child_tuple_cmp_row_, which is
-  /// a TupleRow* containing the previous row and the current row set during
-  /// ProcessChildBatch().
-  bool PrevRowCompare(ScalarExprEvaluator* pred_eval);
+  /// Evaluates the predicate pred_eval over child_tuple_cmp_row, which is
+  /// a TupleRow* containing the previous row and the current row.
+  bool PrevRowCompare(
+      ScalarExprEvaluator* pred_eval, const TupleRow* child_tuple_cmp_row);
+
+  /// Return true if there are partition or order by expression evaluators. These
+  /// evaluators are created in Prepare() if PARTITION BY or ORDER BY clauses exist
+  /// for the analytics.
+  bool has_partition_or_order_by_expr_eval() const {
+    return partition_by_eq_expr_eval_ != nullptr || order_by_eq_expr_eval_ != nullptr;
+  }
 
   /// Debug string containing current state. If 'detailed', per-row state is included.
   std::string DebugStateString(bool detailed) const;
@@ -223,8 +256,8 @@ class AnalyticEvalNode : public ExecNode {
   /// Offset from the current row for ROWS windows with start or end bounds specified
   /// with offsets. Is positive if the offset is FOLLOWING, negative if PRECEDING, and 0
   /// if type is CURRENT ROW or UNBOUNDED PRECEDING/FOLLOWING.
-  int64_t rows_start_offset_;
-  int64_t rows_end_offset_;
+  int64_t rows_start_offset_ = 0;
+  int64_t rows_end_offset_ = 0;
 
   /// Analytic functions and their evaluators. 'analytic_fns_' live in the query-state's
   /// objpool while the evaluators live in the exec node's objpool.
@@ -237,8 +270,8 @@ class AnalyticEvalNode : public ExecNode {
 
   /// If true, evaluating FIRST_VALUE requires special null handling when initializing new
   /// partitions determined by the offset. Set in Open() by inspecting the agg fns.
-  bool has_first_val_null_offset_;
-  long first_val_null_offset_;
+  bool has_first_val_null_offset_ = false;
+  long first_val_null_offset_ = 0;
 
   /// Pools used to allocate result tuples (added to result_tuples_ and later returned)
   /// and window tuples (added to window_tuples_ to buffer the current window). Resources
@@ -249,13 +282,14 @@ class AnalyticEvalNode : public ExecNode {
   boost::scoped_ptr<MemPool> curr_tuple_pool_;
   boost::scoped_ptr<MemPool> prev_tuple_pool_;
 
+  /// A tuple described by result_tuple_desc_ used when calling Finalize() on the
+  /// analytic_fn_evals_ to release resources between partitions; the value is never used.
+  /// Owned by expr_perm_pool_ and allocated in Prepare()
+  /// TODO: Remove when agg fns implement a separate Close() method to release resources.
+  Tuple* dummy_result_tuple_ = nullptr;
+
   /////////////////////////////////////////
   /// BEGIN: Members that must be Reset()
-
-  /// TupleRow* composed of the first child tuple and the buffered tuple, used by
-  /// partition_by_eq_expr_eval_ and order_by_eq_expr_eval_. Set in Open() if
-  /// buffered_tuple_desc_ is not NULL, allocated from mem_pool_.
-  TupleRow* child_tuple_cmp_row_ = nullptr;
 
   /// Queue of tuples which are ready to be set in output rows, with the index into
   /// the input_stream_ stream of the last TupleRow that gets the Tuple, i.e. this is a
@@ -269,56 +303,56 @@ class AnalyticEvalNode : public ExecNode {
   /// output row and result_tuples_.size() may be one less than the row batch size, in
   /// which case we will process another input row batch (inserting one result tuple per
   /// input row) before returning a row batch.
-  std::list<std::pair<int64_t, Tuple*>> result_tuples_;
+  std::deque<std::pair<int64_t, Tuple*>> result_tuples_;
 
   /// Index in input_stream_ of the most recently added result tuple.
-  int64_t last_result_idx_;
+  int64_t last_result_idx_ = -1;
 
   /// Child tuples that are currently within the window and the index into input_stream_
   /// of the row they're associated with. Only used when window start bound is PRECEDING
   /// or FOLLOWING. Tuples in this list are deep copied and owned by
   /// curr_window_tuple_pool_.
   /// TODO: Remove and use BufferedTupleStream (needs support for multiple readers).
-  std::list<std::pair<int64_t, Tuple*>> window_tuples_;
+  std::deque<std::pair<int64_t, Tuple*>> window_tuples_;
 
   /// The index of the last row from input_stream_ associated with output row containing
   /// resources in prev_tuple_pool_. -1 when the pool is empty. Resources from
   /// prev_tuple_pool_ can only be transferred to an output batch once all rows containing
   /// these tuples have been returned.
-  int64_t prev_pool_last_result_idx_;
+  int64_t prev_pool_last_result_idx_ = -1;
 
   /// The index of the last row from input_stream_ associated with window tuples
   /// containing resources in prev_tuple_pool_. -1 when the pool is empty. Resources from
   /// prev_tuple_pool_ can only be transferred to an output batch once all rows containing
   /// these tuples are no longer needed (removed from the window_tuples_).
-  int64_t prev_pool_last_window_idx_;
+  int64_t prev_pool_last_window_idx_ = -1;
 
   /// The tuple described by intermediate_tuple_desc_ storing intermediate state for the
   /// analytic_eval_fns_. When enough input rows have been consumed to produce the
   /// analytic function results, a result tuple (described by result_tuple_desc_) is
   /// created and the agg fn results are written to that tuple by calling Finalize()/
-  /// GetValue() on the evaluators with curr_tuple_ as the source tuple.
+  /// GetValue() on the evaluators with curr_tuple_ as the source tuple. Owned by
+  /// expr_perm_pool_, allocated in Prepare() and initialized in Open().
   Tuple* curr_tuple_ = nullptr;
 
-  /// A tuple described by result_tuple_desc_ used when calling Finalize() on the
-  /// analytic_fn_evals_ to release resources between partitions; the value is never used.
-  /// TODO: Remove when agg fns implement a separate Close() method to release resources.
-  Tuple* dummy_result_tuple_ = nullptr;
+  /// True if AggFnEvaluator::Init() was called on 'curr_tuple_', which means that
+  /// AggFnEvaluator::Finalize() needs to be called on it.
+  bool curr_tuple_init_ = false;
 
   /// Index of the row in input_stream_ at which the current partition started.
-  int64_t curr_partition_idx_;
+  int64_t curr_partition_idx_ = -1;
 
-  /// Previous input row used to compare partition boundaries and to determine when the
-  /// order-by expressions change.
-  TupleRow* prev_input_row_ = nullptr;
+  /// Previous input tuple used to compare partition boundaries and to determine when the
+  /// order-by expressions change. We only need to store the first tuple of the row
+  /// because all the partitioning and ordering columns are in the first tuple. Initially
+  /// this points to the first tuple of the last row processed from 'curr_child_batch_',
+  /// but it is later deep copied into 'prev_input_tuple_pool_' before 'curr_child_batch_'
+  /// is reset.
+  Tuple* prev_input_tuple_ = nullptr;
+  std::unique_ptr<MemPool> prev_input_tuple_pool_;
 
-  /// Current and previous input row batches from the child. RowBatches are allocated
-  /// once and reused. Previous input row batch owns prev_input_row_ between calls to
-  /// ProcessChildBatch(). The prev batch is Reset() after calling ProcessChildBatch()
-  /// and then swapped with the curr batch so the RowBatch owning prev_input_row_ is
-  /// stored in prev_child_batch_ for the next call to ProcessChildBatch().
-  boost::scoped_ptr<RowBatch> prev_child_batch_;
-  boost::scoped_ptr<RowBatch> curr_child_batch_;
+  /// Current input row batch from the child. Allocated once and reused.
+  std::unique_ptr<RowBatch> curr_child_batch_;
 
   /// Buffers input rows added in ProcessChildBatch() until enough rows are able to
   /// be returned by GetNextOutputBatch(), in which case row batches are returned from
@@ -333,19 +367,14 @@ class AnalyticEvalNode : public ExecNode {
   /// TODO: Consider re-pinning unpinned streams when possible.
   boost::scoped_ptr<BufferedTupleStream> input_stream_;
 
-  /// Pool used for O(1) allocations that live until Close() or Reset().
-  /// Does not own data backing tuples returned in GetNext(), so it does not
-  /// need to be transferred to an output batch.
-  boost::scoped_ptr<MemPool> mem_pool_;
-
   /// True when there are no more input rows to consume from our child.
-  bool input_eos_;
+  bool input_eos_ = false;
 
   /// END: Members that must be Reset()
   /////////////////////////////////////////
 
   /// Time spent processing the child rows.
-  RuntimeProfile::Counter* evaluation_timer_;
+  RuntimeProfile::Counter* evaluation_timer_ = nullptr;
 };
 
 }

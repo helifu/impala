@@ -16,9 +16,11 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <set>
 #include <string>
 
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/status.h"
 
@@ -49,7 +51,7 @@ class RequestTracker : public RefCountedThreadSafe<RequestTracker> {
  public:
   typedef int64_t SequenceNumber;
   static const RequestTracker::SequenceNumber kNoSeqNo;
-  explicit RequestTracker(const std::string& client_id);
+  explicit RequestTracker(std::string client_id);
 
   // Creates a new, unique, sequence number.
   // Sequence numbers are assigned in increasing integer order.

@@ -17,17 +17,22 @@
 
 #include "kudu/security/tls_context.h"
 
+#include <algorithm>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/ca/cert_management.h"
 #include "kudu/security/cert.h"
@@ -42,11 +47,36 @@
 #include "kudu/util/status.h"
 #include "kudu/util/user.h"
 
+// Hard code OpenSSL flag values from OpenSSL 1.0.1e[1][2] when compiling
+// against OpenSSL 1.0.0 and below. We detect when running against a too-old
+// version of OpenSSL using these definitions at runtime so that Kudu has full
+// functionality when run against a new OpenSSL version, even if it's compiled
+// against an older version.
+//
+// [1]: https://github.com/openssl/openssl/blob/OpenSSL_1_0_1e/ssl/ssl.h#L605-L609
+// [2]: https://github.com/openssl/openssl/blob/OpenSSL_1_0_1e/ssl/tls1.h#L166-L172
+#ifndef SSL_OP_NO_TLSv1
+#define SSL_OP_NO_TLSv1 0x04000000U
+#endif
+#ifndef SSL_OP_NO_TLSv1_1
+#define SSL_OP_NO_TLSv1_1 0x10000000U
+#endif
+#ifndef SSL_OP_NO_TLSv1_3
+#define SSL_OP_NO_TLSv1_3 0x20000000U
+#endif
+#ifndef TLS1_1_VERSION
+#define TLS1_1_VERSION 0x0302
+#endif
+#ifndef TLS1_2_VERSION
+#define TLS1_2_VERSION 0x0303
+#endif
+
 using strings::Substitute;
 using std::string;
 using std::unique_lock;
+using std::vector;
 
-DEFINE_int32_hidden(ipki_server_key_size, 2048,
+DEFINE_int32(ipki_server_key_size, 2048,
              "the number of bits for server cert's private key. The server cert "
              "is used for TLS connections to and from clients and other servers.");
 TAG_FLAG(ipki_server_key_size, experimental);
@@ -62,6 +92,26 @@ template<> struct SslTypeTraits<SSL> {
 template<> struct SslTypeTraits<X509_STORE_CTX> {
   static constexpr auto kFreeFunc = &X509_STORE_CTX_free;
 };
+
+namespace {
+
+Status CheckMaxSupportedTlsVersion(int tls_version, const char* tls_version_str) {
+  // OpenSSL 1.1 and newer supports all of the TLS versions we care about, so
+  // the below check is only necessary in older versions of OpenSSL.
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+  auto max_supported_tls_version = SSLv23_method()->version;
+  DCHECK_GE(max_supported_tls_version, TLS1_VERSION);
+
+  if (max_supported_tls_version < tls_version) {
+    return Status::InvalidArgument(
+        Substitute("invalid minimum TLS protocol version (--rpc_tls_min_protocol): "
+                   "this platform does not support $0", tls_version_str));
+  }
+#endif
+  return Status::OK();
+}
+
+} // anonymous namespace
 
 TlsContext::TlsContext()
     : tls_ciphers_(kudu::security::SecurityDefaults::kDefaultTlsCiphers),
@@ -96,7 +146,7 @@ Status TlsContext::Init() {
   if (!ctx_) {
     return Status::RuntimeError("failed to create TLS context", GetOpenSSLErrors());
   }
-  SSL_CTX_set_mode(ctx_.get(), SSL_MODE_AUTO_RETRY);
+  SSL_CTX_set_mode(ctx_.get(), SSL_MODE_AUTO_RETRY | SSL_MODE_ENABLE_PARTIAL_WRITE);
 
   // Disable SSLv2 and SSLv3 which are vulnerable to various issues such as POODLE.
   // We support versions back to TLSv1.0 since OpenSSL on RHEL 6.4 and earlier does not
@@ -108,25 +158,19 @@ Status TlsContext::Init() {
   auto options = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION;
 
   if (boost::iequals(tls_min_protocol_, "TLSv1.2")) {
-#if OPENSSL_VERSION_NUMBER < 0x10001000L
-    return Status::InvalidArgument(
-        "--rpc_tls_min_protocol=TLSv1.2 is not be supported on this platform. "
-        "TLSv1 is the latest supported TLS protocol.");
-#else
+    RETURN_NOT_OK(CheckMaxSupportedTlsVersion(TLS1_2_VERSION, "TLSv1.2"));
     options |= SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1;
-#endif
   } else if (boost::iequals(tls_min_protocol_, "TLSv1.1")) {
-#if OPENSSL_VERSION_NUMBER < 0x10001000L
-    return Status::InvalidArgument(
-        "--rpc_tls_min_protocol=TLSv1.1 is not be supported on this platform. "
-        "TLSv1 is the latest supported TLS protocol.");
-#else
+    RETURN_NOT_OK(CheckMaxSupportedTlsVersion(TLS1_1_VERSION, "TLSv1.1"));
     options |= SSL_OP_NO_TLSv1;
-#endif
   } else if (!boost::iequals(tls_min_protocol_, "TLSv1")) {
     return Status::InvalidArgument("unknown value provided for --rpc_tls_min_protocol flag",
                                    tls_min_protocol_);
   }
+
+  // We don't currently support TLS 1.3 because the one-and-a-half-RTT negotiation
+  // confuses our RPC negotiation protocol. See KUDU-2871.
+  options |= SSL_OP_NO_TLSv1_3;
 
   SSL_CTX_set_options(ctx_.get(), options);
 
@@ -163,8 +207,8 @@ Status TlsContext::VerifyCertChainUnlocked(const Cert& cert) {
   X509_STORE* store = SSL_CTX_get_cert_store(ctx_.get());
   auto store_ctx = ssl_make_unique<X509_STORE_CTX>(X509_STORE_CTX_new());
 
-  OPENSSL_RET_NOT_OK(X509_STORE_CTX_init(store_ctx.get(), store, cert.GetTopOfChainX509(), nullptr),
-                     "could not init X509_STORE_CTX");
+  OPENSSL_RET_NOT_OK(X509_STORE_CTX_init(store_ctx.get(), store, cert.GetTopOfChainX509(),
+                     cert.GetRawData()), "could not init X509_STORE_CTX");
   int rc = X509_verify_cert(store_ctx.get());
   if (rc != 1) {
     int err = X509_STORE_CTX_get_error(store_ctx.get());
@@ -263,15 +307,32 @@ Status TlsContext::DumpTrustedCerts(vector<string>* cert_ders) const {
   vector<string> ret;
   auto* cert_store = SSL_CTX_get_cert_store(ctx_.get());
 
-  CRYPTO_w_lock(CRYPTO_LOCK_X509_STORE);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#define STORE_LOCK(CS) CRYPTO_w_lock(CRYPTO_LOCK_X509_STORE)
+#define STORE_UNLOCK(CS) CRYPTO_w_unlock(CRYPTO_LOCK_X509_STORE)
+#define STORE_GET_X509_OBJS(CS) (CS)->objs
+#define X509_OBJ_GET_TYPE(X509_OBJ) (X509_OBJ)->type
+#define X509_OBJ_GET_X509(X509_OBJ) (X509_OBJ)->data.x509
+#else
+#define STORE_LOCK(CS) CHECK_EQ(1, X509_STORE_lock(CS)) << "Could not lock certificate store"
+#define STORE_UNLOCK(CS) CHECK_EQ(1, X509_STORE_unlock(CS)) << "Could not unlock certificate store"
+#define STORE_GET_X509_OBJS(CS) X509_STORE_get0_objects(CS)
+#define X509_OBJ_GET_TYPE(X509_OBJ) X509_OBJECT_get_type(X509_OBJ)
+#define X509_OBJ_GET_X509(X509_OBJ) X509_OBJECT_get0_X509(X509_OBJ)
+#endif
+
+  STORE_LOCK(cert_store);
   auto unlock = MakeScopedCleanup([&]() {
-      CRYPTO_w_unlock(CRYPTO_LOCK_X509_STORE);
+      STORE_UNLOCK(cert_store);
     });
-  for (int i = 0; i < sk_X509_OBJECT_num(cert_store->objs); i++) {
-    X509_OBJECT* obj = sk_X509_OBJECT_value(cert_store->objs, i);
-    if (obj->type != X509_LU_X509) continue;
+  auto* objects = STORE_GET_X509_OBJS(cert_store);
+  int num_objects = sk_X509_OBJECT_num(objects);
+  for (int i = 0; i < num_objects; i++) {
+    auto* obj = sk_X509_OBJECT_value(objects, i);
+    if (X509_OBJ_GET_TYPE(obj) != X509_LU_X509) continue;
+    auto* x509 = X509_OBJ_GET_X509(obj);
     Cert c;
-    c.AdoptAndAddRefX509(obj->data.x509);
+    c.AdoptAndAddRefX509(x509);
     string der;
     RETURN_NOT_OK(c.ToString(&der, DataFormat::DER));
     ret.emplace_back(std::move(der));
@@ -364,15 +425,15 @@ Status TlsContext::AdoptSignedCert(const Cert& cert) {
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
   unique_lock<RWMutex> lock(lock_);
 
-  // Verify that the appropriate CA certs have been loaded into the context
-  // before we adopt a cert. Otherwise, client connections without the CA cert
-  // available would fail.
-  RETURN_NOT_OK(VerifyCertChainUnlocked(cert));
-
   if (!csr_) {
     // A signed cert has already been adopted.
     return Status::OK();
   }
+
+  // Verify that the appropriate CA certs have been loaded into the context
+  // before we adopt a cert. Otherwise, client connections without the CA cert
+  // available would fail.
+  RETURN_NOT_OK(VerifyCertChainUnlocked(cert));
 
   PublicKey csr_key;
   RETURN_NOT_OK(csr_->GetPublicKey(&csr_key));

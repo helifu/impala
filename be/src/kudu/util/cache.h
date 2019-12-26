@@ -18,6 +18,7 @@
 #ifndef KUDU_UTIL_CACHE_H_
 #define KUDU_UTIL_CACHE_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -29,7 +30,6 @@
 namespace kudu {
 
 class Cache;
-struct CacheMetrics;
 class MetricEntity;
 
 enum CacheType {
@@ -129,12 +129,6 @@ class Cache {
   // to it have been released.
   virtual void Erase(const Slice& key) = 0;
 
-  // Return a new numeric id.  May be used by multiple clients who are
-  // sharing the same cache to partition the key space.  Typically the
-  // client will allocate a new id at startup and prepend the id to
-  // its cache keys.
-  virtual uint64_t NewId() = 0;
-
   // Pass a metric entity in order to start recoding metrics.
   virtual void SetMetrics(const scoped_refptr<MetricEntity>& metric_entity) = 0;
 
@@ -163,11 +157,20 @@ class Cache {
   // the cache.
   struct PendingHandle { };
 
+  // Indicates that the charge of an item in the cache should be calculated
+  // based on its memory consumption.
+  static constexpr int kAutomaticCharge = -1;
+
   // Allocate space for a new entry to be inserted into the cache.
   //
   // The provided 'key' is copied into the resulting handle object.
   // The allocated handle has enough space such that the value can
   // be written into cache_->MutableValue(handle).
+  //
+  // If 'charge' is not 'kAutomaticCharge', then the cache capacity will be charged
+  // the explicit amount. This is useful when caching items that are small but need to
+  // maintain a bounded count (eg file descriptors) rather than caring about their actual
+  // memory usage.
   //
   // Note that this does not mutate the cache itself: lookups will
   // not be able to find the provided key until it is inserted.
@@ -178,6 +181,12 @@ class Cache {
   // NOTE: the returned memory is not automatically freed by the cache: the
   // caller must either free it using Free(), or insert it using Insert().
   virtual PendingHandle* Allocate(Slice key, int val_len, int charge) = 0;
+
+  // Default 'charge' should be kAutomaticCharge.
+  // (default arguments on virtual functions are prohibited)
+  PendingHandle* Allocate(Slice key, int val_len) {
+    return Allocate(key, val_len, kAutomaticCharge);
+  }
 
   virtual uint8_t* MutableValue(PendingHandle* handle) = 0;
 

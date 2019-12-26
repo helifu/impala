@@ -17,19 +17,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# defaults for OptionParser options stored in dict
+# default options used by the Impala shell stored in a dict
 
 import getpass
 import os
 import socket
 
+_histfile_from_env = os.environ.get(
+    'IMPALA_HISTFILE', '~/.impalahistory')
+
 impala_shell_defaults = {
             'ca_cert': None,
             'config_file': os.path.expanduser("~/.impalarc"),
             'default_db': None,
+            'history_file': _histfile_from_env,
             'history_max': 1000,
             'ignore_query_failure': False,
-            'impalad': socket.getfqdn() + ':21000',
+            'impalad': socket.getfqdn(),
+            'kerberos_host_fqdn': None,
             'kerberos_service_name': 'impala',
             'output_delimiter': '\\t',
             'output_file': None,
@@ -46,4 +51,6 @@ impala_shell_defaults = {
             'verbose': True,
             'version': False,
             'write_delimited': False,
-            }
+            'client_connect_timeout_ms': 60000,
+            'global_config_default_path': '/etc/impalarc',
+    }

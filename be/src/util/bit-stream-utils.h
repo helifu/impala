@@ -23,16 +23,17 @@
 #include <string.h>
 #include "common/compiler-util.h"
 #include "common/logging.h"
+#include "util/bit-packing.h"
 #include "util/bit-util.h"
 
 namespace impala {
 
-/// Utility class to write bit/byte streams.  This class can write data to either be
+/// Utility class to write bit/byte streams. This class can write data to either be
 /// bit packed or byte aligned (and a single stream that has a mix of both).
 /// This class does not allocate memory.
 class BitWriter {
  public:
-  /// buffer: buffer to write bits to.  Buffer should be preallocated with
+  /// buffer: buffer to write bits to. Buffer should be preallocated with
   /// 'buffer_len' bytes.
   BitWriter(uint8_t* buffer, int buffer_len) :
       buffer_(buffer),
@@ -53,7 +54,7 @@ class BitWriter {
   int buffer_len() const { return max_bytes_; }
 
   /// Writes a value to buffered_values_, flushing to buffer_ if necessary.  This is bit
-  /// packed.  Returns false if there was not enough space. num_bits must be <= 32.
+  /// packed.  Returns false if there was not enough space. num_bits must be <= 64.
   bool PutValue(uint64_t v, int num_bits);
 
   /// Writes v to the next aligned byte using num_bytes. If T is larger than num_bytes, the
@@ -61,11 +62,19 @@ class BitWriter {
   template<typename T>
   bool PutAligned(T v, int num_bytes);
 
-  /// Write a Vlq encoded int to the buffer.  Returns false if there was not enough
-  /// room.  The value is written byte aligned.
-  /// For more details on vlq:
-  /// en.wikipedia.org/wiki/Variable-length_quantity
-  bool PutVlqInt(int32_t v);
+  /// Write an unsigned ULEB-128 encoded int to the buffer. Return false if there was not
+  /// enough room. The value is written byte aligned. For more details on ULEB-128:
+  /// https://en.wikipedia.org/wiki/LEB128
+  /// UINT_T must be an unsigned integer type.
+  template<typename UINT_T>
+  bool PutUleb128(UINT_T v);
+
+  /// Write a ZigZag encoded int to the buffer. Return false if there was not enough
+  /// room. The value is written byte aligned. For more details on ZigZag encoding:
+  /// https://developers.google.com/protocol-buffers/docs/encoding#signed-integers
+  /// INT_T must be a signed integer type.
+  template<typename INT_T>
+  bool PutZigZagInteger(INT_T v);
 
   /// Get a pointer to the next aligned byte and advance the underlying buffer
   /// by num_bytes.
@@ -78,7 +87,7 @@ class BitWriter {
   void Flush(bool align=false);
 
   /// Maximum supported bitwidth for writer.
-  static const int MAX_BITWIDTH = 32;
+  static const int MAX_BITWIDTH = 64;
 
  private:
   uint8_t* buffer_;
@@ -114,12 +123,14 @@ class BatchedBitReader {
   /// Resets the read to start reading from the start of 'buffer'. The buffer's
   /// length is 'buffer_len'. Does not take ownership of the buffer.
   void Reset(const uint8_t* buffer, int64_t buffer_len) {
+    DCHECK(buffer != nullptr);
+    DCHECK_GE(buffer_len, 0);
     buffer_pos_ = buffer;
     buffer_end_ = buffer + buffer_len;
   }
 
   /// Gets up to 'num_values' bit-packed values, starting from the current byte in the
-  /// buffer and advance the read position. 'bit_width' must be <= 32.
+  /// buffer and advance the read position. 'bit_width' must be <= 64.
   /// If 'bit_width' * 'num_values' is not a multiple of 8, the trailing bytes are
   /// skipped and the next UnpackBatch() call will start reading from the next byte.
   ///
@@ -128,17 +139,25 @@ class BatchedBitReader {
   /// 'bit_width' * 'num_values' must be a multiple of 8. This condition is always
   /// satisfied if 'num_values' is a multiple of 32.
   ///
+  /// The output type 'T' must be an unsigned integer.
+  ///
   /// Returns the number of values read.
   template<typename T>
   int UnpackBatch(int bit_width, int num_values, T* v);
 
+  /// Skip 'num_values_to_skip' bit-packed values.
+  /// 'num_values_to_skip * bit_width' is either divisible by 8, or
+  /// 'num_values_to_skip' equals to the count of the remaining bit-packed values.
+  bool SkipBatch(int bit_width, int num_values_to_skip);
+
   /// Unpack bit-packed values in the same way as UnpackBatch() and decode them using the
   /// dictionary 'dict' with 'dict_len' entries. Return -1 if a decoding error is
   /// encountered, i.e. if the bit-packed values are not valid indices in 'dict'.
-  /// Otherwise returns the number of values decoded.
-  template<typename T>
+  /// Otherwise returns the number of values decoded. The values are written to 'v' with
+  /// a stride of 'stride' bytes.
+  template <typename T>
   int UnpackAndDecodeBatch(
-      int bit_width, T* dict, int64_t dict_len, int num_values, T* v);
+      int bit_width, T* dict, int64_t dict_len, int num_values, T* v, int64_t stride);
 
   /// Reads an unpacked 'num_bytes'-sized value from the buffer and stores it in 'v'. T
   /// needs to be a little-endian native type and big enough to store 'num_bytes'.
@@ -146,19 +165,33 @@ class BatchedBitReader {
   template<typename T>
   bool GetBytes(int num_bytes, T* v);
 
-  /// Reads a vlq encoded int from the stream.  The encoded int must start at the
+  /// Read an unsigned ULEB-128 encoded int from the stream. The encoded int must start
+  /// at the beginning of a byte. Return false if there were not enough bytes in the
+  /// buffer or the int is invalid. For more details on ULEB-128:
+  /// https://en.wikipedia.org/wiki/LEB128
+  /// UINT_T must be an unsigned integer type.
+  template<typename UINT_T>
+  bool GetUleb128(UINT_T* v);
+
+  /// Read a ZigZag encoded int from the stream. The encoded int must start at the
   /// beginning of a byte. Return false if there were not enough bytes in the buffer or
-  /// the int is invalid.
-  bool GetVlqInt(int32_t* v);
+  /// the int is invalid. For more details on ZigZag encoding:
+  /// https://developers.google.com/protocol-buffers/docs/encoding#signed-integers
+  /// INT_T must be a signed integer type.
+  template<typename INT_T>
+  bool GetZigZagInteger(INT_T* v);
 
   /// Returns the number of bytes left in the stream.
   int bytes_left() { return buffer_end_ - buffer_pos_; }
 
-  /// Maximum byte length of a vlq encoded int
-  static const int MAX_VLQ_BYTE_LEN = 5;
+  /// Maximum byte length of a vlq encoded integer of type T.
+  template <typename T>
+  static constexpr int max_vlq_byte_len() {
+    return BitUtil::Ceil(sizeof(T) * 8, 7);
+  }
 
   /// Maximum supported bitwidth for reader.
-  static const int MAX_BITWIDTH = 32;
+  static const int MAX_BITWIDTH = BitPacking::MAX_BITWIDTH;
 
  private:
   /// Current read position in the buffer.

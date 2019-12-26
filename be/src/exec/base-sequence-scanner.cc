@@ -46,6 +46,7 @@ static const int MIN_SYNC_READ_SIZE = 64 * 1024; // bytes
 
 Status BaseSequenceScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const vector<HdfsFileDesc*>& files) {
+  DCHECK(!files.empty());
   // Issue just the header range for each file.  When the header is complete,
   // we'll issue the splits for that file.  Splits cannot be processed until the
   // header is parsed (the header object is then shared across splits for that file).
@@ -61,14 +62,18 @@ Status BaseSequenceScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     // it is not cached.
     // TODO: add remote disk id and plumb that through to the io mgr.  It should have
     // 1 queue for each NIC as well?
+    bool expected_local = false;
+    int cache_options = !scan_node->IsDataCacheDisabled() ? BufferOpts::USE_DATA_CACHE :
+        BufferOpts::NO_CACHING;
     ScanRange* header_range = scan_node->AllocateScanRange(files[i]->fs,
-        files[i]->filename.c_str(), header_size, 0, header_metadata, -1, false,
-        BufferOpts::Uncached());
+        files[i]->filename.c_str(), header_size, 0, header_metadata, -1, expected_local,
+        files[i]->is_erasure_coded, files[i]->mtime, BufferOpts(cache_options));
     header_ranges.push_back(header_range);
   }
-  // Issue the header ranges only. GetNextInternal() will issue the files' scan ranges
-  // and those ranges will need scanner threads, so no files are marked completed yet.
-  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(header_ranges, 0));
+  // When the header is parsed, we will issue more AddDiskIoRanges in
+  // the scanner threads.
+  scan_node->UpdateRemainingScanRangeSubmissions(header_ranges.size());
+  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(header_ranges, EnqueueLocation::TAIL));
   return Status::OK();
 }
 
@@ -156,6 +161,7 @@ Status BaseSequenceScanner::GetNextInternal(RowBatch* row_batch) {
     header_ = state_->obj_pool()->Add(AllocateFileHeader());
     Status status = ReadFileHeader();
     if (!status.ok()) {
+      scan_node_->UpdateRemainingScanRangeSubmissions(-1);
       RETURN_IF_ERROR(state_->LogOrReturnError(status.msg()));
       // We need to complete the ranges for this file.
       CloseFileRanges(stream_->filename());
@@ -166,8 +172,10 @@ Status BaseSequenceScanner::GetNextInternal(RowBatch* row_batch) {
         context_->partition_descriptor()->id(), stream_->filename(), header_);
     HdfsFileDesc* desc = scan_node_->GetFileDesc(
         context_->partition_descriptor()->id(), stream_->filename());
-    RETURN_IF_ERROR(scan_node_->AddDiskIoRanges(desc));
-    return Status::OK();
+    // Issue the scan range with priority since it would result in producing a RowBatch.
+    status = scan_node_->AddDiskIoRanges(desc, EnqueueLocation::HEAD);
+    scan_node_->UpdateRemainingScanRangeSubmissions(-1);
+    return status;
   }
   if (eos_) return Status::OK();
 
@@ -184,7 +192,8 @@ Status BaseSequenceScanner::GetNextInternal(RowBatch* row_batch) {
     if (!status.IsCancelled() &&
         !status.IsMemLimitExceeded() &&
         !status.IsInternalError() &&
-        !status.IsDiskIoError()) {
+        !status.IsDiskIoError() &&
+        !status.IsThreadPoolError()) {
       state_->LogError(ErrorMsg(TErrorCode::SEQUENCE_SCANNER_PARSE_ERROR,
           stream_->filename(), stream_->file_offset(),
           (stream_->eof() ? "(EOF)" : "")));
@@ -205,27 +214,36 @@ Status BaseSequenceScanner::GetNextInternal(RowBatch* row_batch) {
 }
 
 Status BaseSequenceScanner::ReadSync() {
-  uint8_t* hash;
-  int64_t out_len;
-  bool success = stream_->GetBytes(SYNC_HASH_SIZE, &hash, &out_len, &parse_status_);
-  // We are done when we read a sync marker occurring completely in the next scan range.
-  eos_ = stream_->eosr() || stream_->eof();
-  if (!success) return parse_status_;
-  if (out_len != SYNC_HASH_SIZE) {
-    return Status(Substitute("Hit end of stream after reading $0 bytes of $1-byte "
-        "synchronization marker", out_len, SYNC_HASH_SIZE));
-  } else if (memcmp(hash, header_->sync, SYNC_HASH_SIZE) != 0) {
-    stringstream ss;
-    ss  << "Bad synchronization marker" << endl
-        << "  Expected: '"
-        << ReadWriteUtil::HexDump(header_->sync, SYNC_HASH_SIZE) << "'" << endl
-        << "  Actual:   '"
-        << ReadWriteUtil::HexDump(hash, SYNC_HASH_SIZE) << "'";
-    return Status(ss.str());
+  DCHECK(!eos_);
+  if (stream_->eosr()) {
+    // Either we're at the end of file or the next sync marker is completely in the next
+    // scan range.
+    eos_ = true;
+  } else {
+    // Not at end of scan range or file - we expect there to be another sync marker, which
+    // is either followed by another block or the end of the file.
+    uint8_t* hash;
+    int64_t out_len;
+    bool success = stream_->GetBytes(SYNC_HASH_SIZE, &hash, &out_len, &parse_status_);
+    if (!success) return parse_status_;
+    if (out_len != SYNC_HASH_SIZE) {
+      return Status(Substitute("Hit end of stream after reading $0 bytes of $1-byte "
+          "synchronization marker", out_len, SYNC_HASH_SIZE));
+    } else if (memcmp(hash, header_->sync, SYNC_HASH_SIZE) != 0) {
+      stringstream ss;
+      ss  << "Bad synchronization marker" << endl
+          << "  Expected: '"
+          << ReadWriteUtil::HexDump(header_->sync, SYNC_HASH_SIZE) << "'" << endl
+          << "  Actual:   '"
+          << ReadWriteUtil::HexDump(hash, SYNC_HASH_SIZE) << "'";
+      return Status(ss.str());
+    }
+    // If we read the sync marker at end of file then we're done!
+    eos_ = stream_->eof();
+    ++num_syncs_;
+    block_start_ = stream_->file_offset();
   }
   total_block_size_ += stream_->file_offset() - block_start_;
-  block_start_ = stream_->file_offset();
-  ++num_syncs_;
   return Status::OK();
 }
 
@@ -315,9 +333,9 @@ void BaseSequenceScanner::CloseFileRanges(const char* filename) {
       context_->partition_descriptor()->id(), filename);
   const vector<ScanRange*>& splits = desc->splits;
   for (int i = 0; i < splits.size(); ++i) {
-    COUNTER_ADD(bytes_skipped_counter_, splits[i]->len());
-    scan_node_->RangeComplete(file_format(), THdfsCompression::NONE);
+    COUNTER_ADD(bytes_skipped_counter_, splits[i]->bytes_to_read());
   }
+  scan_node_->SkipFile(file_format(), desc);
 }
 
 int BaseSequenceScanner::ReadPastSize(int64_t file_offset) {

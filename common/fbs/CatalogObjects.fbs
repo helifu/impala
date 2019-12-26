@@ -29,7 +29,8 @@ enum FbCompression: byte {
   SNAPPY_BLOCKED,
   LZO,
   LZ4,
-  ZLIB
+  ZLIB,
+  ZSTD
 }
 
 table FbFileBlock {
@@ -54,10 +55,11 @@ table FbFileBlock {
 }
 
 table FbFileDesc {
-  // The name of the file (not the full path). The parent path is assumed to be the
-  // 'location' of the Partition this file resides within.
-  // TODO: Investigate the use of prefix-based compression for file names.
-  file_name: string (id: 0);
+  // The path of the file relative to the 'location' of the Partition this file
+  // resides within.
+  // TODO: Investigate better compression of filenames which contain common
+  // components.
+  relative_path: string (id: 0);
 
   // The total length of the file, in bytes.
   length: long (id: 1);
@@ -72,4 +74,7 @@ table FbFileDesc {
 
   // List of FbFileBlocks that make up this file.
   file_blocks: [FbFileBlock] (id: 4);
+
+  // Whether this file is erasure-coded
+  is_ec: bool = false (id: 5);
 }

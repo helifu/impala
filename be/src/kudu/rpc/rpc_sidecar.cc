@@ -17,9 +17,16 @@
 
 #include "kudu/rpc/rpc_sidecar.h"
 
-#include "kudu/util/status.h"
-#include "kudu/rpc/transfer.h"
+#include <cstdint>
+#include <memory>
+#include <utility>
+
+#include <google/protobuf/repeated_field.h>
+
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/transfer.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/status.h"
 
 using std::unique_ptr;
 
@@ -64,8 +71,14 @@ Status RpcSidecar::ParseSidecars(
   int last = offsets.size() - 1;
   if (last >= TransferLimits::kMaxSidecars) {
     return Status::Corruption(strings::Substitute(
-            "Received $0 additional payload slices, expected at most %d",
+            "Received $0 additional payload slices, expected at most $1",
             last, TransferLimits::kMaxSidecars));
+  }
+
+  if (buffer.size() > TransferLimits::kMaxTotalSidecarBytes) {
+    return Status::Corruption(strings::Substitute(
+            "Received $0 payload bytes, expected at most $1",
+            buffer.size(), TransferLimits::kMaxTotalSidecarBytes));
   }
 
   for (int i = 0; i < last; ++i) {

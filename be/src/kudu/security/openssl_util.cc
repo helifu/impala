@@ -17,30 +17,31 @@
 
 #include "kudu/security/openssl_util.h"
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include <glog/logging.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
-#include <openssl/ssl.h>
 
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/strip.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
-#include "kudu/util/thread.h"
 
 using std::ostringstream;
 using std::string;
+using std::vector;
 
 namespace kudu {
 namespace security {
@@ -63,6 +64,9 @@ bool g_disable_ssl_init = false;
 
 // Array of locks used by OpenSSL.
 // We use an intentionally-leaked C-style array here to avoid non-POD static data.
+//
+// As of OpenSSL 1.1, locking callbacks are no longer used.
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 Mutex* kCryptoLocks = nullptr;
 
 // Lock/Unlock the nth lock. Only to be used by OpenSSL.
@@ -75,20 +79,65 @@ void LockingCB(int mode, int type, const char* /*file*/, int /*line*/) {
     m->unlock();
   }
 }
+#endif
 
 Status CheckOpenSSLInitialized() {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+  // Starting with OpenSSL 1.1.0, the old thread API became obsolete
+  // (see changelist 2e52e7df5 in the OpenSSL upstream repo), and
+  // CRYPTO_get_locking_callback() always returns nullptr. Also, the library
+  // always initializes its internals for multi-threaded usage.
+  // Another point is that starting with version 1.1.0, SSL_CTX_new()
+  // initializes the OpenSSL library under the hood, so SSL_CTX_new() would
+  // not return nullptr unless there was an error during the initialization
+  // of the library. That makes this code in CheckOpenSSLInitialized() obsolete
+  // starting with OpenSSL version 1.1.0.
+  //
+  // Starting with OpenSSL 1.1.0, there isn't a straightforward way to
+  // determine whether the library has already been initialized if using just
+  // the API (well, there is CRYPTO_secure_malloc_initialized() but that's just
+  // for the crypto library and it's implementation-dependent). But from the
+  // other side, the whole idea that this method should check whether the
+  // library has already been initialized is not relevant anymore: even if it's
+  // not yet initialized, the first call to SSL_CTX_new() (from, say,
+  // TlsContext::Init()) will initialize the library under the hood, so the
+  // library will be ready for multi-thread usage by Kudu.
   if (!CRYPTO_get_locking_callback()) {
     return Status::RuntimeError("Locking callback not initialized");
   }
   auto ctx = ssl_make_unique(SSL_CTX_new(SSLv23_method()));
   if (!ctx) {
     ERR_clear_error();
-    return Status::RuntimeError("SSL library appears uninitialized (cannot create SSL_CTX)");
+    return Status::RuntimeError(
+        "SSL library appears uninitialized (cannot create SSL_CTX)");
   }
+#endif
   return Status::OK();
 }
 
 void DoInitializeOpenSSL() {
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+  // The OPENSSL_init_ssl manpage [1] says "As of version 1.1.0 OpenSSL will
+  // automatically allocate all resources it needs so no explicit initialisation
+  // is required." However, eliding library initialization leads to a memory
+  // leak in some versions of OpenSSL 1.1 when the first OpenSSL call is
+  // ERR_peek_error (see [2] for details; the issue was addressed in OpenSSL
+  // 1.1.0i (OPENSSL_VERSION_NUMBER 0x1010009f)). In Kudu this is often the
+  // case due to prolific application of the SCOPED_OPENSSL_NO_PENDING_ERRORS
+  // macro.
+  //
+  // Rather than determine whether this particular OpenSSL instance is
+  // leak-free, we'll initialize the library explicitly.
+  //
+  // 1. https://www.openssl.org/docs/man1.1.0/ssl/OPENSSL_init_ssl.html
+  // 2. https://github.com/openssl/openssl/issues/5899
+  if (g_disable_ssl_init) {
+    VLOG(2) << "Not initializing OpenSSL (disabled by application)";
+    return;
+  }
+  CHECK_EQ(1, OPENSSL_init_ssl(0, nullptr));
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+#else
   // In case the user's thread has left some error around, clear it.
   ERR_clear_error();
   SCOPED_OPENSSL_NO_PENDING_ERRORS;
@@ -105,8 +154,11 @@ void DoInitializeOpenSSL() {
   auto ctx = ssl_make_unique(SSL_CTX_new(SSLv23_method()));
   if (ctx) {
     LOG(WARNING) << "It appears that OpenSSL has been previously initialized by "
-                 << "code outside of Kudu. Please use kudu::client::DisableOpenSSLInitialization() "
-                 << "to avoid potential crashes due to conflicting initialization.";
+                    "code outside of Kudu. Please first properly initialize "
+                    "OpenSSL for multi-threaded usage (setting thread callback "
+                    "functions for OpenSSL of versions earlier than 1.1.0) and "
+                    "then call kudu::client::DisableOpenSSLInitialization() "
+                    "to avoid potential crashes due to conflicting initialization.";
     // Continue anyway; all of the below is idempotent, except for the locking callback,
     // which we check before overriding. They aren't thread-safe, however -- that's why
     // we try to get embedding applications to do the right thing here rather than risk a
@@ -133,6 +185,7 @@ void DoInitializeOpenSSL() {
     // Callbacks used by OpenSSL required in a multi-threaded setting.
     CRYPTO_set_locking_callback(LockingCB);
   }
+#endif
 
   g_ssl_is_initialized = true;
 }
@@ -145,7 +198,7 @@ STACK_OF(X509)* PEM_read_STACK_OF_X509(BIO* bio, void* /* unused */, pem_passwor
   // Extract information from the chain certificate.
   STACK_OF(X509_INFO)* info = PEM_X509_INFO_read_bio(bio, nullptr, nullptr, nullptr);
   if (!info) return nullptr;
-  auto cleanup = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
     sk_X509_INFO_pop_free(info, X509_INFO_free);
   });
 

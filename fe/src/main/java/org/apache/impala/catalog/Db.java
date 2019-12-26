@@ -17,33 +17,40 @@
 
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
-import org.apache.commons.codec.binary.Base64;
-import org.apache.thrift.protocol.TCompactProtocol;
-import org.apache.thrift.TException;
-import org.apache.thrift.TSerializer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.impala.catalog.Function;
+import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.impala.analysis.ColumnDef;
+import org.apache.impala.analysis.KuduPartitionParam;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.common.JniUtil;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDatabase;
-import org.apache.impala.thrift.TFunction;
+import org.apache.impala.thrift.TDbInfoSelector;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TFunctionCategory;
+import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
+import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
+import org.apache.impala.thrift.TPartialDbInfo;
+import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.util.PatternMatcher;
+import org.apache.thrift.TException;
+import org.apache.thrift.TSerializer;
+import org.apache.thrift.protocol.TCompactProtocol;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 /**
  * Internal representation of db-related metadata. Owned by Catalog instance.
@@ -60,10 +67,12 @@ import com.google.common.collect.Maps;
  * value is the base64 representation of the thrift serialized function object.
  *
  */
-public class Db extends CatalogObjectImpl {
+public class Db extends CatalogObjectImpl implements FeDb {
   private static final Logger LOG = LoggerFactory.getLogger(Db.class);
-  private final Catalog parentCatalog_;
-  private final TDatabase thriftDb_;
+  // TODO: We should have a consistent synchronization model for Db and Table
+  // Right now, we synchronize functions and thriftDb_ object in-place and do
+  // not take read lock on catalogVersion. See IMPALA-8366 for details
+  private final AtomicReference<TDatabase> thriftDb_ = new AtomicReference<>();
 
   public static final String FUNCTION_INDEX_PREFIX = "impala_registered_function_";
 
@@ -81,19 +90,24 @@ public class Db extends CatalogObjectImpl {
   // on this map. When a new Db object is initialized, this list is updated with the
   // UDF/UDAs already persisted, if any, in the metastore DB. Functions are sorted in a
   // canonical order defined by FunctionResolutionOrder.
-  private final HashMap<String, List<Function>> functions_;
+  private final Map<String, List<Function>> functions_;
 
   // If true, this database is an Impala system database.
   // (e.g. can't drop it, can't add tables to it, etc).
   private boolean isSystemDb_ = false;
 
-  public Db(String name, Catalog catalog,
-      org.apache.hadoop.hive.metastore.api.Database msDb) {
-    thriftDb_ = new TDatabase(name.toLowerCase());
-    parentCatalog_ = catalog;
-    thriftDb_.setMetastore_db(msDb);
-    tableCache_ = new CatalogObjectCache<Table>();
-    functions_ = new HashMap<String, List<Function>>();
+  // maximum number of catalog versions to store for in-flight events for this database
+  private static final int MAX_NUMBER_OF_INFLIGHT_EVENTS = 10;
+
+  // FIFO list of versions for all the in-flight metastore events in this database
+  // This queue can only grow up to MAX_NUMBER_OF_INFLIGHT_EVENTS size. Anything which
+  // is attempted to be added to this list when its at maximum capacity is ignored
+  private final LinkedList<Long> versionsForInflightEvents_ = new LinkedList<>();
+
+  public Db(String name, org.apache.hadoop.hive.metastore.api.Database msDb) {
+    setMetastoreDb(name, msDb);
+    tableCache_ = new CatalogObjectCache<>();
+    functions_ = new HashMap<>();
   }
 
   public void setIsSystemDb(boolean b) { isSystemDb_ = b; }
@@ -101,18 +115,18 @@ public class Db extends CatalogObjectImpl {
   /**
    * Creates a Db object with no tables based on the given TDatabase thrift struct.
    */
-  public static Db fromTDatabase(TDatabase db, Catalog parentCatalog) {
-    return new Db(db.getDb_name(), parentCatalog, db.getMetastore_db());
+  public static Db fromTDatabase(TDatabase db) {
+    return new Db(db.getDb_name(), db.getMetastore_db());
   }
 
   /**
    * Updates the hms parameters map by adding the input <k,v> pair.
    */
   private void putToHmsParameters(String k, String v) {
-    org.apache.hadoop.hive.metastore.api.Database msDb = thriftDb_.metastore_db;
+    org.apache.hadoop.hive.metastore.api.Database msDb = thriftDb_.get().metastore_db;
     Preconditions.checkNotNull(msDb);
     Map<String, String> hmsParams = msDb.getParameters();
-    if (hmsParams == null) hmsParams = Maps.newHashMap();
+    if (hmsParams == null) hmsParams = new HashMap<>();
     hmsParams.put(k,v);
     msDb.setParameters(hmsParams);
   }
@@ -123,20 +137,20 @@ public class Db extends CatalogObjectImpl {
    * corresponding to input k and it is removed, false otherwise.
    */
   private boolean removeFromHmsParameters(String k) {
-    org.apache.hadoop.hive.metastore.api.Database msDb = thriftDb_.metastore_db;
+    org.apache.hadoop.hive.metastore.api.Database msDb = thriftDb_.get().metastore_db;
     Preconditions.checkNotNull(msDb);
     if (msDb.getParameters() == null) return false;
     return msDb.getParameters().remove(k) != null;
   }
 
+  @Override // FeDb
   public boolean isSystemDb() { return isSystemDb_; }
-  public TDatabase toThrift() { return thriftDb_; }
-  @Override
-  public String getName() { return thriftDb_.getDb_name(); }
+  @Override // FeDb
+  public TDatabase toThrift() { return thriftDb_.get(); }
+  @Override // FeDb
+  public String getName() { return thriftDb_.get().getDb_name(); }
   @Override
   public TCatalogObjectType getCatalogObjectType() { return TCatalogObjectType.DATABASE; }
-  @Override
-  public String getUniqueName() { return "DATABASE:" + getName().toLowerCase(); }
 
   /**
    * Adds a table to the table cache.
@@ -146,6 +160,7 @@ public class Db extends CatalogObjectImpl {
   /**
    * Gets all table names in the table cache.
    */
+  @Override
   public List<String> getAllTableNames() {
     return Lists.newArrayList(tableCache_.keySet());
   }
@@ -155,6 +170,7 @@ public class Db extends CatalogObjectImpl {
    */
   public List<Table> getTables() { return tableCache_.getValues(); }
 
+  @Override
   public boolean containsTable(String tableName) {
     return tableCache_.contains(tableName.toLowerCase());
   }
@@ -163,7 +179,16 @@ public class Db extends CatalogObjectImpl {
    * Returns the Table with the given name if present in the table cache or null if the
    * table does not exist in the cache.
    */
+  @Override // FeTable
   public Table getTable(String tblName) { return tableCache_.get(tblName); }
+
+  /**
+   * Returns the Table with the given name if present in the table cache or null if the
+   * table does not exist in the cache. If the table is unloaded, the result is an
+   * IncompleteTable.
+   */
+  @Override
+  public Table getTableIfCached(String tblName) { return getTable(tblName); }
 
   /**
    * Removes the table name and any cached metadata from the Table cache.
@@ -172,65 +197,34 @@ public class Db extends CatalogObjectImpl {
     return tableCache_.remove(tableName.toLowerCase());
   }
 
-  /**
-   * Comparator that sorts function overloads. We want overloads to be always considered
-   * in a canonical order so that overload resolution in the case of multiple valid
-   * overloads does not depend on the order in which functions are added to the Db. The
-   * order is based on the PrimitiveType enum because this was the order used implicitly
-   * for builtin operators and functions in earlier versions of Impala.
-   */
-  private static class FunctionResolutionOrder implements Comparator<Function> {
-    @Override
-    public int compare(Function f1, Function f2) {
-      int numSharedArgs = Math.min(f1.getNumArgs(), f2.getNumArgs());
-      for (int i = 0; i < numSharedArgs; ++i) {
-        int cmp = typeCompare(f1.getArgs()[i], f2.getArgs()[i]);
-        if (cmp < 0) {
-          return -1;
-        } else if (cmp > 0) {
-          return 1;
-        }
-      }
-      // Put alternative with fewer args first.
-      if (f1.getNumArgs() < f2.getNumArgs()) {
-        return -1;
-      } else if (f1.getNumArgs() > f2.getNumArgs()) {
-        return 1;
-      }
-      return 0;
-    }
-
-    private int typeCompare(Type t1, Type t2) {
-      Preconditions.checkState(!t1.isComplexType());
-      Preconditions.checkState(!t2.isComplexType());
-      return Integer.compare(t1.getPrimitiveType().ordinal(),
-          t2.getPrimitiveType().ordinal());
-    }
+  @Override
+  public FeKuduTable createKuduCtasTarget(
+      org.apache.hadoop.hive.metastore.api.Table msTbl,
+      List<ColumnDef> columnDefs, List<ColumnDef> primaryKeyColumnDefs,
+      List<KuduPartitionParam> kuduPartitionParams) {
+    return KuduTable.createCtasTarget(this, msTbl, columnDefs, primaryKeyColumnDefs,
+        kuduPartitionParams);
   }
 
-  private static final FunctionResolutionOrder FUNCTION_RESOLUTION_ORDER =
-      new FunctionResolutionOrder();
+  @Override
+  public FeFsTable createFsCtasTarget(org.apache.hadoop.hive.metastore.api.Table msTbl)
+      throws CatalogException {
+    return HdfsTable.createCtasTarget(this, msTbl);
+  }
 
-  /**
-   * Returns the metastore.api.Database object this Database was created from.
-   * Returns null if it is not related to a hive database such as builtins_db.
-   */
+  @Override // FeDb
   public org.apache.hadoop.hive.metastore.api.Database getMetaStoreDb() {
-    return thriftDb_.getMetastore_db();
+    return thriftDb_.get().getMetastore_db();
   }
 
-  /**
-   * Returns the number of functions in this database.
-   */
+  @Override // FeDb
   public int numFunctions() {
     synchronized (functions_) {
       return functions_.size();
     }
   }
 
-  /**
-   * See comment in Catalog.
-   */
+  @Override // FeDb
   public boolean containsFunction(String name) {
     synchronized (functions_) {
       return functions_.get(name) != null;
@@ -240,35 +234,13 @@ public class Db extends CatalogObjectImpl {
   /*
    * See comment in Catalog.
    */
+  @Override // FeDb
   public Function getFunction(Function desc, Function.CompareMode mode) {
     synchronized (functions_) {
       List<Function> fns = functions_.get(desc.functionName());
       if (fns == null) return null;
-
-      // First check for identical
-      for (Function f: fns) {
-        if (f.compare(desc, Function.CompareMode.IS_IDENTICAL)) return f;
-      }
-      if (mode == Function.CompareMode.IS_IDENTICAL) return null;
-
-      // Next check for indistinguishable
-      for (Function f: fns) {
-        if (f.compare(desc, Function.CompareMode.IS_INDISTINGUISHABLE)) return f;
-      }
-      if (mode == Function.CompareMode.IS_INDISTINGUISHABLE) return null;
-
-      // Next check for strict supertypes
-      for (Function f: fns) {
-        if (f.compare(desc, Function.CompareMode.IS_SUPERTYPE_OF)) return f;
-      }
-      if (mode == Function.CompareMode.IS_SUPERTYPE_OF) return null;
-
-      // Finally check for non-strict supertypes
-      for (Function f: fns) {
-        if (f.compare(desc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF)) return f;
-      }
+      return FunctionUtils.resolveFunction(fns, desc, mode);
     }
-    return null;
   }
 
   public Function getFunction(String signatureString) {
@@ -295,7 +267,7 @@ public class Db extends CatalogObjectImpl {
       TSerializer serializer =
           new TSerializer(new TCompactProtocol.Factory());
       byte[] serializedFn = serializer.serialize(fn.toThrift());
-      String base64Fn = Base64.encodeBase64String(serializedFn);
+      String base64Fn = Base64.getEncoder().encodeToString(serializedFn);
       String fnKey = FUNCTION_INDEX_PREFIX + fn.signatureString();
       if (base64Fn.length() > HIVE_METASTORE_DB_PARAM_LIMIT_BYTES) {
         throw new ImpalaRuntimeException(
@@ -331,12 +303,12 @@ public class Db extends CatalogObjectImpl {
       }
       List<Function> fns = functions_.get(fn.functionName());
       if (fns == null) {
-        fns = Lists.newArrayList();
+        fns = new ArrayList<>();
         functions_.put(fn.functionName(), fns);
       }
       if (addToDbParams && !addFunctionToDbParams(fn)) return false;
       fns.add(fn);
-      Collections.sort(fns, FUNCTION_RESOLUTION_ORDER);
+      Collections.sort(fns, FunctionUtils.FUNCTION_RESOLUTION_ORDER);
       return true;
     }
   }
@@ -416,7 +388,7 @@ public class Db extends CatalogObjectImpl {
    * This is not thread safe so a higher level lock must be taken while iterating
    * over the returned functions.
    */
-  protected HashMap<String, List<Function>> getAllFunctions() {
+  public Map<String, List<Function>> getAllFunctions() {
     return functions_;
   }
 
@@ -424,7 +396,7 @@ public class Db extends CatalogObjectImpl {
    * Returns a list of transient functions in this Db.
    */
   protected List<Function> getTransientFunctions() {
-    List<Function> result = Lists.newArrayList();
+    List<Function> result = new ArrayList<>();
     synchronized (functions_) {
       for (String fnKey: functions_.keySet()) {
         for (Function fn: functions_.get(fnKey)) {
@@ -440,10 +412,11 @@ public class Db extends CatalogObjectImpl {
   /**
    * Returns all functions that match the pattern of 'matcher'.
    */
+  @Override
   public List<Function> getFunctions(TFunctionCategory category,
       PatternMatcher matcher) {
     Preconditions.checkNotNull(matcher);
-    List<Function> result = Lists.newArrayList();
+    List<Function> result = new ArrayList<>();
     synchronized (functions_) {
       for (Map.Entry<String, List<Function>> fns: functions_.entrySet()) {
         if (!matcher.matches(fns.getKey())) continue;
@@ -461,40 +434,113 @@ public class Db extends CatalogObjectImpl {
   /**
    * Returns all functions with the given name
    */
+  @Override // FeDb
   public List<Function> getFunctions(String name) {
-    List<Function> result = Lists.newArrayList();
     Preconditions.checkNotNull(name);
     synchronized (functions_) {
-      if (!functions_.containsKey(name)) return result;
-      for (Function fn: functions_.get(name)) {
-        if (fn.userVisible()) result.add(fn);
-      }
+      List<Function> candidates = functions_.get(name);
+      if (candidates == null) return new ArrayList<>();
+      return FunctionUtils.getVisibleFunctions(candidates);
     }
-    return result;
   }
 
-  /**
-   * Returns all functions with the given name and category.
-   */
+  @Override
   public List<Function> getFunctions(TFunctionCategory category, String name) {
-    List<Function> result = Lists.newArrayList();
     Preconditions.checkNotNull(category);
     Preconditions.checkNotNull(name);
     synchronized (functions_) {
-      if (!functions_.containsKey(name)) return result;
-      for (Function fn: functions_.get(name)) {
-        if (fn.userVisible() && Function.categoryMatch(fn, category)) {
-          result.add(fn);
-        }
-      }
+      List<Function> candidates = functions_.get(name);
+      if (candidates == null) return new ArrayList<>();
+      return FunctionUtils.getVisibleFunctionsInCategory(candidates, category);
     }
-    return result;
   }
 
-  public TCatalogObject toTCatalogObject() {
-    TCatalogObject catalogObj =
-        new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
-    catalogObj.setDb(toThrift());
-    return catalogObj;
+  @Override
+  protected void setTCatalogObject(TCatalogObject catalogObject) {
+    catalogObject.setDb(toThrift());
+  }
+
+  /**
+   * Get partial information about this DB in order to service CatalogdMetaProvider
+   * running in a remote impalad.
+   */
+  public TGetPartialCatalogObjectResponse getPartialInfo(
+      TGetPartialCatalogObjectRequest req) {
+    TDbInfoSelector selector = Preconditions.checkNotNull(req.db_info_selector,
+        "no db_info_selector");
+
+    TGetPartialCatalogObjectResponse resp = new TGetPartialCatalogObjectResponse();
+    resp.setObject_version_number(getCatalogVersion());
+    resp.db_info = new TPartialDbInfo();
+    if (selector.want_hms_database) {
+      // TODO(todd): we need to deep-copy here because 'addFunction' other DDLs
+      // modify the parameter map in place. We need to change those to copy-on-write
+      // instead to avoid this copy.
+      resp.db_info.hms_database = getMetaStoreDb().deepCopy();
+    }
+    if (selector.want_table_names) {
+      resp.db_info.table_names = getAllTableNames();
+    }
+    if (selector.want_function_names) {
+      resp.db_info.function_names = ImmutableList.copyOf(functions_.keySet());
+    }
+    return resp;
+  }
+
+  /**
+   * Replaces the metastore db object of this Db with the given Metastore Database object
+   * @param msDb
+   */
+  public void setMetastoreDb(String name, Database msDb) {
+    Preconditions.checkNotNull(name);
+    Preconditions.checkNotNull(msDb);
+    // create the TDatabase first before atomically replacing setting it in the thriftDb_
+    TDatabase tDatabase = new TDatabase(name.toLowerCase());
+    tDatabase.setMetastore_db(msDb);
+    thriftDb_.set(tDatabase);
+  }
+
+  /**
+   * Gets the current list of versions for in-flight events for this database
+   */
+  public List<Long> getVersionsForInflightEvents() {
+    return Collections.unmodifiableList(versionsForInflightEvents_);
+  }
+
+  /**
+   * Removes a given version from the collection of version numbers for in-flight events
+   * @param versionNumber version number to remove from the collection
+   * @return true if version was successfully removed, false if didn't exist
+   */
+  public boolean removeFromVersionsForInflightEvents(long versionNumber) {
+    return versionsForInflightEvents_.remove(versionNumber);
+  }
+
+  /**
+   * Adds a version number to the collection of versions for in-flight events. If the
+   * collection is already at the max size defined by
+   * <code>MAX_NUMBER_OF_INFLIGHT_EVENTS</code>, then it ignores the given version and
+   * does not add it
+   * @param versionNumber version number to add
+   * @return True if version number was added, false if the collection is at its max
+   * capacity
+   */
+  public boolean addToVersionsForInflightEvents(long versionNumber) {
+    if (versionsForInflightEvents_.size() >= MAX_NUMBER_OF_INFLIGHT_EVENTS) {
+      LOG.warn(String.format("Number of versions to be stored for database %s is at "
+              + " its max capacity %d. Ignoring add request for version number %d. This "
+              + "could cause unnecessary database invalidation when the event is "
+              + "processed",
+          getName(), MAX_NUMBER_OF_INFLIGHT_EVENTS, versionNumber));
+      return false;
+    }
+    versionsForInflightEvents_.add(versionNumber);
+    return true;
+  }
+
+  @Override // FeDb
+  public String getOwnerUser() {
+    org.apache.hadoop.hive.metastore.api.Database db = getMetaStoreDb();
+    return db == null ? null : db.getOwnerName();
   }
 }

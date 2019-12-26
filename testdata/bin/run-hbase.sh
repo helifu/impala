@@ -18,7 +18,8 @@
 # under the License.
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 CLUSTER_BIN=${IMPALA_HOME}/testdata/bin
 HBASE_JAAS_CLIENT=${HBASE_CONF_DIR}/hbase-jaas-client.conf
@@ -36,6 +37,8 @@ cat > ${HBASE_CONF_DIR}/hbase-env.sh <<EOF
 export JAVA_HOME=${JAVA_HOME}
 export HBASE_LOG_DIR=${HBASE_LOGDIR}
 export HBASE_PID_DIR=${HBASE_LOGDIR}
+export HBASE_CLASSPATH=${HADOOP_CLASSPATH}
+export HBASE_HEAPSIZE=1g
 EOF
 
 # Put zookeeper things in the logs/cluster/zoo directory.

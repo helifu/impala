@@ -33,7 +33,7 @@ cross join
 'millisecond',10
 'epoch',1361205960
 ---- TYPES
-string, int
+string, bigint
 ====
 ---- QUERY
 # EXTRACT fields from timestamp
@@ -46,7 +46,7 @@ from alltypesagg order by id limit 5
 2010,100
 2010,300
 ---- TYPES
-int, int
+bigint, bigint
 ====
 ---- QUERY
 # IS NULL predicate
@@ -72,7 +72,6 @@ bigint
 ====
 ---- QUERY
 # boolean test: IS [NOT] (TRUE | FALSE | UNKNOWN)
----- QUERY
 select count(*) from alltypesagg where (int_col < 100) is unknown;
 ---- RESULTS
 20
@@ -1259,7 +1258,7 @@ where day = 1 and id < 3 and decode(tinyint_col, null, 4) is not null
 INT
 ====
 ---- QUERY
-select distinct decode(id, tinyint_col, round(float_col)) from alltypestiny
+select distinct decode(id, tinyint_col, cast(round(float_col) as bigint)) from alltypestiny
 ---- RESULTS
 NULL
 0
@@ -1879,9 +1878,9 @@ string
 ---- QUERY
 select 1.1 * 1.1 + cast(1.1 as float)
 ---- RESULTS
-2.310000023841858
+2.31000002
 ---- TYPES
-double
+DECIMAL
 ====
 ---- QUERY
 select 1.1 * 1.1 + cast(1.1 as decimal(2,1))
@@ -1900,10 +1899,10 @@ decimal
 ---- QUERY
 select 1.1 * 1.1 + float_col from functional.alltypestiny limit 2;
 ---- RESULTS
-1.21
-2.310000023841858
+1.21000000
+2.31000002
 ---- TYPES
-double
+DECIMAL
 ====
 ---- QUERY
 select 1.1 * 1.1 + c3 from functional.decimal_tiny limit 2;
@@ -2236,7 +2235,7 @@ select tmp.str from (values
 ('multi\nfield\ntwo')) as tmp
 where regexp_like(tmp.str, '^multi.*$')
 ---- RESULTS
-----TYPES
+---- TYPES
 string
 ====
 ---- QUERY
@@ -2356,8 +2355,8 @@ select dayofyear(trunc('2014-11-11', string_col)) from functional.alltypestiny l
 Invalid Truncate Unit: 0
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern) from (values
-('aaa' as str, 'a' as pattern),
+select regexp_match_count(tmp.str, tmp.`pattern`) from (values
+('aaa' as str, 'a' as `pattern`),
 ('aaa', 'aa'),
 ('aaaa', 'aa'),
 ('', ''),
@@ -2402,8 +2401,8 @@ select regexp_match_count(tmp.str, tmp.pattern) from (values
 int
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from (values
-('aaa' as str, 'A' as pattern, 1 as start_pos, 'i' as params),
+select regexp_match_count(tmp.str, tmp.`pattern`, tmp.start_pos, tmp.params) from (values
+('aaa' as str, 'A' as `pattern`, 1 as start_pos, 'i' as params),
 ('aaa', 'A', 1, 'c'),
 ('this\nis\nnewline', '.*', 1, ''),
 ('this\nis\nnewline', '.*', 1, 'n'),
@@ -2436,20 +2435,48 @@ select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from 
 int
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from (values
-('a' as str, 'a' as pattern, -1 as start_pos, '' as params),
+select regexp_match_count(tmp.str, tmp.`pattern`, tmp.start_pos, tmp.params) from (values
+('a' as str, 'a' as `pattern`, -1 as start_pos, '' as params),
 ('foobar', 'foobar', 1, 'i'),
 ('iPhone\niPad\niPod', '^I.*$', 1, 'imn')) as tmp
 ---- CATCH
 Illegal starting position -1
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from (values
-('a' as str, 'a' as pattern, 1 as start_pos, 'xyz' as params),
+select regexp_match_count(tmp.str, tmp.`pattern`, tmp.start_pos, tmp.params) from (values
+('a' as str, 'a' as `pattern`, 1 as start_pos, 'xyz' as params),
 ('foobar', 'foobar', 1, 'i'),
 ('iPhone\niPad\niPod', '^I.*$', 1, 'imn')) as tmp
 ---- CATCH
 Illegal match parameter x
+====
+---- QUERY
+select regexp_escape(tmp.str) from (values
+('a.b\\c+d*e?f[g]h$i(j)k{l}m=n!o<p>q|r:s-t' as str)) as tmp
+---- RESULTS
+'a\\.b\\\\c\\+d\\*e\\?f\\[g\\]h\\$i\\(j\\)k\\{l\\}m\\=n\\!o\\<p\\>q\\|r\\:s\\-t'
+---- TYPES
+string
+====
+---- QUERY
+select regexp_extract(regexp_escape(tmp.str),
+tmp.`pattern`, tmp.index) from (values
+('Hello\\world' as str, '([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)' as `pattern`, 2 as index)
+) as tmp
+---- RESULTS
+'\\\\'
+---- TYPES
+string
+====
+---- QUERY
+select regexp_extract(regexp_escape(tmp.str),
+tmp.`pattern`, tmp.index) from (values
+('Hello\\world' as str, '([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)' as `pattern`, 3 as index)
+) as tmp
+---- RESULTS
+'world'
+---- TYPES
+string
 ====
 ---- QUERY
 # IMPALA-2147: IS [NOT] DISTINCT FROM and "<=>"
@@ -2622,7 +2649,8 @@ select count(now()) c, avg(cast('2016-11-22 16:40:00.00' as timestamp)) a,
 from functional_parquet.alltypes
 where timestamp_col < cast('2013-02-18 20:46:00.01' as timestamp)
 group by g
-having a = cast('2016-11-22 16:40:00.00' as timestamp)
+having avg(cast('2016-11-22 16:40:00.00' as timestamp)) =
+           cast('2016-11-22 16:40:00.00' as timestamp)
 order by c, cast('2016-11-22 16:40:00.00' as timestamp)
 ---- RESULTS
 7300,2016-11-22 16:40:00,2016-11-22 16:40:00
@@ -2651,8 +2679,8 @@ BIGINT
 select tinyint_col, count(*) cnt
 from functional_parquet.alltypesagg
 group by 1
-having cnt > 1000 or cnt > 1000
-  and cnt between 1500 and 2500
+having count(*) > 1000 or count(*) > 1000
+  and count(*) between 1500 and 2500
 ---- TYPES
 TINYINT, BIGINT
 ---- RESULTS
@@ -2682,7 +2710,7 @@ TIMESTAMP
 UDF WARNING: Timestamp '1400-01-01 05:00:00' did not convert to a valid local time in timezone 'PST'
 ====
 ---- QUERY
-# Test from_utc_timestamp() returning out-of-range result.
+# Test to_utc_timestamp() returning out-of-range result.
 select to_utc_timestamp(CAST("1400-01-01 05:00:00" as TIMESTAMP), "JST")
 from alltypes
 limit 1
@@ -2911,15 +2939,6 @@ where id = case cast('nan' as double) when cast('nan' as double) then 0 else 1 e
 INT
 ====
 ---- QUERY
-# Test expr rewrite behavior of RemoveRedundantStringCast with timestamp column
-select id, timestamp_col from functional.alltypestiny
-where cast(timestamp_col as string) = '2009-02-01 00:00:00'
----- RESULTS
-2,2009-02-01 00:00:00
----- TYPES
-int, timestamp
-====
----- QUERY
 select
 murmur_hash(bool_col), murmur_hash(tinyint_col), murmur_hash(smallint_col),
 murmur_hash(int_col), murmur_hash(bigint_col), murmur_hash(float_col),
@@ -2930,4 +2949,148 @@ from functional.alltypes where id = 7
 6351753276682545529,-8688181892109895221,5243888771994935971,988560926123810380,7108101660231151623,-8653637999116590182,-6387622242983883150,3788918177590065252,-7446916648201533712,7077699884854357665,7331012058162401363,-780611581681153783
 ---- TYPES
 BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT
+====
+---- QUERY
+# IMPALA-5315: Test support for non zero-padded date/time strings cast as timestamp
+select cast('2001-1-21 12:5:30' as timestamp)
+---- RESULTS
+2001-01-21 12:05:30
+---- TYPES
+timestamp
+====
+---- QUERY
+select cast('2001-1-2 1:5:3.123' as timestamp)
+---- RESULTS
+2001-01-02 01:05:03.123000000
+---- TYPES
+timestamp
+====
+---- QUERY
+select cast('1:5:3' as timestamp)
+---- RESULTS
+01:05:03
+---- TYPES
+timestamp
+====
+---- QUERY
+select cast('1:5:3.1234567' as timestamp)
+---- RESULTS
+01:05:03.123456700
+---- TYPES
+timestamp
+====
+---- QUERY
+select cast('2001-1-2' as timestamp)
+---- RESULTS
+2001-01-02 00:00:00
+---- TYPES
+timestamp
+====
+---- QUERY
+# IMPALA-6771: Test that the in-predicate set does not have default initialized
+# values that can result in wrong results. For a string column the default initialized
+# value is an empty string.
+select count(*) from functional.alltypes
+where regexp_replace(string_col, '1', '')
+in ('0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
+---- RESULTS
+6570
+---- TYPES
+bigint
+====
+---- QUERY
+# test coordinator() function in a real query
+select coordinator(), count(*) from functional.alltypesagg where int_col = 1
+---- TYPES
+string, bigint
+====
+---- QUERY
+# IMPALA-376: Test get_json_object builtin function
+select get_json_object(t.json, '$.a.b.c') from (values (
+  ('{"a": {"b": {"c": 1}}}' as json),
+  ('{"a": {"b": {"c": 2}}}'),
+  ('{"a": {"b": {"c": 3}}}')
+)) t
+---- RESULTS
+'1'
+'2'
+'3'
+---- TYPES
+STRING
+====
+---- QUERY
+select get_json_object(t.json, '$.a'),
+  get_json_object(t.json, '$.b'),
+  get_json_object(t.json, '$.c')
+from (values (
+  ('{"a":1, "b":2, "c":3}' as json),
+  ('{"b":2, "c":3}'),
+  ('{"c":3}')
+)) t
+---- RESULTS
+'1','2','3'
+'NULL','2','3'
+'NULL','NULL','3'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+select get_json_object(t.json, '$[0]'),
+  get_json_object(t.json, '$[1]'),
+  get_json_object(t.json, '$[2]')
+from (values (
+  ('["a", "b", "c"]' as json),
+  ('["b", "c"]'),
+  ('["c"]')
+)) t
+---- RESULTS
+'a','b','c'
+'b','c','NULL'
+'c','NULL','NULL'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+select count(*) from (values (
+  ('{"a": {"b": {"c": 1}}}' as json),
+  ('{"a": {"b": {"c": 2}}}'),
+  ('{"a": {"b": {"c": 3}}}')
+)) t
+where cast(get_json_object(t.json, '$.a.b.c') as int) > 1
+---- RESULTS
+2
+---- TYPES
+BIGINT
+====
+---- QUERY
+# IMPALA-6661 - NaN should not evaluate as the same as any other NaN via <=>
+WITH W AS (SELECT T.*, CAST(SQRT(X) AS FLOAT)  P, CAST(SQRT(Y) AS FLOAT) Q
+FROM (VALUES((CAST(-1.0 AS FLOAT) X, CAST(-1.0 AS FLOAT) Y), (-1.0, 0), (0, -1.0), (0, 0))) T )
+SELECT * FROM W WHERE W.Q<=>W.P
+---- RESULTS
+0,0,0,0
+---- TYPES
+FLOAT, FLOAT, FLOAT, FLOAT
+====
+---- QUERY
+# IMPALA-9023 - verify that case when true appears in where clause will not throw IllegalStateException
+select id, bool_col from functional.alltypessmall where case when true then id = 50 END
+---- RESULTS
+50,true
+---- TYPES
+int, boolean
+====
+---- QUERY
+select distinct year from functional.alltypes where case when true = true then year < 2010 when false then year > 2010 end;
+---- RESULTS
+2009
+---- TYPES
+int
+====
+---- QUERY
+select distinct year from functional.alltypes where case when year = 2010 then month < 5 when year = 2009 then month < 4 end AND year = 2010;
+---- RESULTS
+2010
+---- TYPES
+int
 ====

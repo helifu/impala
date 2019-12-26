@@ -55,6 +55,14 @@ class CatalogServiceClientWrapper : public CatalogServiceClient {
     recv_GetCatalogObject(_return);
   }
 
+  void GetPartialCatalogObject(TGetPartialCatalogObjectResponse& _return,
+      const TGetPartialCatalogObjectRequest& req, bool* send_done) {
+    DCHECK(!*send_done);
+    send_GetPartialCatalogObject(req);
+    *send_done = true;
+    recv_GetPartialCatalogObject(_return);
+  }
+
   void ResetMetadata(TResetMetadataResponse& _return, const TResetMetadataRequest& req,
       bool* send_done) {
     DCHECK(!*send_done);
@@ -87,6 +95,14 @@ class CatalogServiceClientWrapper : public CatalogServiceClient {
     recv_PrioritizeLoad(_return);
   }
 
+  void GetPartitionStats(TGetPartitionStatsResponse& _return,
+      const TGetPartitionStatsRequest& req, bool* send_done) {
+    DCHECK(!*send_done);
+    send_GetPartitionStats(req);
+    *send_done = true;
+    recv_GetPartitionStats(_return);
+  }
+
   void SentryAdminCheck(TSentryAdminCheckResponse& _return,
       const TSentryAdminCheckRequest& req, bool* send_done) {
     DCHECK(!*send_done);
@@ -95,6 +111,13 @@ class CatalogServiceClientWrapper : public CatalogServiceClient {
     recv_SentryAdminCheck(_return);
   }
 
+  void UpdateTableUsage(TUpdateTableUsageResponse& _return,
+      const TUpdateTableUsageRequest& req, bool* send_done) {
+    DCHECK(!*send_done);
+    send_UpdateTableUsage(req);
+    *send_done = true;
+    recv_UpdateTableUsage(_return);
+  }
 #pragma clang diagnostic pop
 };
 

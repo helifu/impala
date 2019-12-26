@@ -20,14 +20,15 @@
 #include <sstream>
 
 #include "codegen/llvm-codegen.h"
+#include "exec/exec-node-util.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
-#include "runtime/tuple.h"
 #include "runtime/tuple-row.h"
+#include "runtime/tuple.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
 
@@ -39,9 +40,31 @@
 using std::priority_queue;
 using namespace impala;
 
-TopNNode::TopNNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
-  : ExecNode(pool, tnode, descs),
-    offset_(tnode.sort_node.__isset.offset ? tnode.sort_node.offset : 0),
+Status TopNPlanNode::Init(const TPlanNode& tnode, RuntimeState* state) {
+  const TSortInfo& tsort_info = tnode.sort_node.sort_info;
+  RETURN_IF_ERROR(PlanNode::Init(tnode, state));
+  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.ordering_exprs, *row_descriptor_,
+      state, &ordering_exprs_));
+  DCHECK(tsort_info.__isset.sort_tuple_slot_exprs);
+  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.sort_tuple_slot_exprs,
+      *children_[0]->row_descriptor_, state, &output_tuple_exprs_));
+  is_asc_order_ = tnode.sort_node.sort_info.is_asc_order;
+  nulls_first_ = tnode.sort_node.sort_info.nulls_first;
+  DCHECK_EQ(conjuncts_.size(), 0)
+      << "TopNNode should never have predicates to evaluate.";
+  return Status::OK();
+}
+
+Status TopNPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const {
+  ObjectPool* pool = state->obj_pool();
+  *node = pool->Add(new TopNNode(pool, *this, state->desc_tbl()));
+  return Status::OK();
+}
+
+TopNNode::TopNNode(
+    ObjectPool* pool, const TopNPlanNode& pnode, const DescriptorTbl& descs)
+  : ExecNode(pool, pnode, descs),
+    offset_(pnode.tnode_->sort_node.__isset.offset ? pnode.tnode_->sort_node.offset : 0),
     output_tuple_desc_(row_descriptor_.tuple_descriptors()[0]),
     tuple_row_less_than_(NULL),
     tmp_tuple_(NULL),
@@ -50,22 +73,11 @@ TopNNode::TopNNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
     rows_to_reclaim_(0),
     tuple_pool_reclaim_counter_(NULL),
     num_rows_skipped_(0) {
-}
-
-Status TopNNode::Init(const TPlanNode& tnode, RuntimeState* state) {
-  const TSortInfo& tsort_info = tnode.sort_node.sort_info;
-  RETURN_IF_ERROR(ExecNode::Init(tnode, state));
-  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.ordering_exprs, row_descriptor_,
-      state, &ordering_exprs_));
-  DCHECK(tsort_info.__isset.sort_tuple_slot_exprs);
-  RETURN_IF_ERROR(ScalarExpr::Create(tsort_info.sort_tuple_slot_exprs,
-      *child(0)->row_desc(), state, &output_tuple_exprs_));
-  is_asc_order_ = tnode.sort_node.sort_info.is_asc_order;
-  nulls_first_ = tnode.sort_node.sort_info.nulls_first;
-  DCHECK_EQ(conjuncts_.size(), 0)
-      << "TopNNode should never have predicates to evaluate.";
+  ordering_exprs_ = pnode.ordering_exprs_;
+  output_tuple_exprs_ = pnode.output_tuple_exprs_;
+  is_asc_order_ = pnode.is_asc_order_;
+  nulls_first_ = pnode.nulls_first_;
   runtime_profile()->AddInfoString("SortType", "TopN");
-  return Status::OK();
 }
 
 Status TopNNode::Prepare(RuntimeState* state) {
@@ -79,7 +91,7 @@ Status TopNNode::Prepare(RuntimeState* state) {
       new TupleRowComparator(ordering_exprs_, is_asc_order_, nulls_first_));
   output_tuple_desc_ = row_descriptor_.tuple_descriptors()[0];
   insert_batch_timer_ = ADD_TIMER(runtime_profile(), "InsertBatchTime");
-  AddCodegenDisabledMessage(state);
+  state->CheckAndAddCodegenDisabledMessage(runtime_profile());
   tuple_pool_reclaim_counter_ = ADD_COUNTER(runtime_profile(), "TuplePoolReclamations",
       TUnit::UNIT);
   return Status::OK();
@@ -118,11 +130,11 @@ void TopNNode::Codegen(RuntimeState* state) {
       if (codegen_status.ok()) {
         int replaced = codegen->ReplaceCallSites(insert_batch_fn,
             materialize_exprs_tuple_pool_fn, Tuple::MATERIALIZE_EXPRS_SYMBOL);
-        DCHECK_EQ(replaced, 1) << LlvmCodeGen::Print(insert_batch_fn);
+        DCHECK_REPLACE_COUNT(replaced, 1) << LlvmCodeGen::Print(insert_batch_fn);
 
         replaced = codegen->ReplaceCallSites(insert_batch_fn,
             materialize_exprs_no_pool_fn, Tuple::MATERIALIZE_EXPRS_NULL_POOL_SYMBOL);
-        DCHECK_EQ(replaced, 1) << LlvmCodeGen::Print(insert_batch_fn);
+        DCHECK_REPLACE_COUNT(replaced, 1) << LlvmCodeGen::Print(insert_batch_fn);
 
         insert_batch_fn = codegen->FinalizeFunction(insert_batch_fn);
         DCHECK(insert_batch_fn != NULL);
@@ -136,6 +148,7 @@ void TopNNode::Codegen(RuntimeState* state) {
 
 Status TopNNode::Open(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_ERROR(
       tuple_row_less_than_->Open(pool_, state, expr_perm_pool(), expr_results_pool()));
@@ -183,6 +196,7 @@ Status TopNNode::Open(RuntimeState* state) {
 
 Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
@@ -199,8 +213,8 @@ Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     row_batch->CopyRow(src_row, dst_row);
     ++get_next_iter_;
     row_batch->CommitLastRow();
-    ++num_rows_returned_;
-    COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+    IncrementNumRowsReturned(1);
+    COUNTER_SET(rows_returned_counter_, rows_returned());
   }
   *eos = get_next_iter_ == sorted_top_n_.end();
 
@@ -212,12 +226,14 @@ Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   return Status::OK();
 }
 
-Status TopNNode::Reset(RuntimeState* state) {
+Status TopNNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   priority_queue_.clear();
   num_rows_skipped_ = 0;
+  // Transfer ownership of tuple data to output batch.
+  row_batch->tuple_data_pool()->AcquireData(tuple_pool_.get(), false);
   // We deliberately do not free the tuple_pool_ here to allow selective transferring
   // of resources in the future.
-  return ExecNode::Reset(state);
+  return ExecNode::Reset(state, row_batch);
 }
 
 void TopNNode::Close(RuntimeState* state) {

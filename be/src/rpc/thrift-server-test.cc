@@ -35,6 +35,9 @@ using namespace strings;
 using namespace apache::thrift;
 using apache::thrift::transport::SSLProtocol;
 
+DECLARE_string(principal);
+DECLARE_string(be_principal);
+DECLARE_string(keytab_file);
 DECLARE_string(ssl_client_ca_certificate);
 DECLARE_string(ssl_cipher_list);
 DECLARE_string(ssl_minimum_version);
@@ -44,22 +47,27 @@ DECLARE_int32(state_store_port);
 DECLARE_int32(be_port);
 DECLARE_int32(beeswax_port);
 
-string IMPALA_HOME(getenv("IMPALA_HOME"));
-const string& SERVER_CERT =
+static string IMPALA_HOME(getenv("IMPALA_HOME"));
+static const string& SERVER_CERT =
     Substitute("$0/be/src/testutil/server-cert.pem", IMPALA_HOME);
-const string& PRIVATE_KEY =
+static const string& PRIVATE_KEY =
     Substitute("$0/be/src/testutil/server-key.pem", IMPALA_HOME);
-const string& BAD_SERVER_CERT =
+static const string& BAD_SERVER_CERT =
     Substitute("$0/be/src/testutil/bad-cert.pem", IMPALA_HOME);
-const string& BAD_PRIVATE_KEY =
+static const string& BAD_PRIVATE_KEY =
     Substitute("$0/be/src/testutil/bad-key.pem", IMPALA_HOME);
-const string& PASSWORD_PROTECTED_PRIVATE_KEY =
+static const string& PASSWORD_PROTECTED_PRIVATE_KEY =
     Substitute("$0/be/src/testutil/server-key-password.pem", IMPALA_HOME);
+
+// The principal name and the realm used for creating the mini-KDC.
+static const string principal = "impala/localhost";
+static const string realm = "KRBTEST.COM";
+static string principal_kt_path;
 
 // Only use TLSv1.0 compatible ciphers, as tests might run on machines with only TLSv1.0
 // support.
-const string TLS1_0_COMPATIBLE_CIPHER = "RC4-SHA";
-const string TLS1_0_COMPATIBLE_CIPHER_2 = "RC4-MD5";
+static const string TLS1_0_COMPATIBLE_CIPHER = "AES128-SHA";
+static const string TLS1_0_COMPATIBLE_CIPHER_2 = "AES256-SHA";
 
 /// Dummy server class (chosen because it has the smallest interface to implement) that
 /// tests can use to start Thrift servers.
@@ -76,12 +84,10 @@ boost::shared_ptr<TProcessor> MakeProcessor() {
 }
 
 int GetServerPort() {
-  int port = FindUnusedEphemeralPort(nullptr);
+  int port = FindUnusedEphemeralPort();
   EXPECT_FALSE(port == -1);
   return port;
 }
-
-static int kdc_port = GetServerPort();
 
 template <class T> class ThriftTestBase : public T {
  protected:
@@ -95,31 +101,33 @@ static string CURRENT_EXECUTABLE_PATH;
 
 class ThriftKerberizedParamsTest :
     public ThriftTestBase<testing::TestWithParam<KerberosSwitch> > {
-  virtual void SetUp() {
-    kdc_wrapper_.reset(new MiniKdcWrapper(
-        "impala/localhost", "KRBTEST.COM", "24h", "7d", kdc_port));
-    DCHECK(kdc_wrapper_.get() != nullptr);
 
-    ASSERT_OK(kdc_wrapper_->SetupAndStartMiniKDC(GetParam()));
+  virtual void SetUp() override {
+    KerberosSwitch k = GetParam();
+    if (k == KERBEROS_OFF) {
+      FLAGS_principal.clear();
+      FLAGS_be_principal.clear();
+      FLAGS_keytab_file.clear();
+    } else {
+      FLAGS_principal = "dummy-service/host@realm";
+      FLAGS_be_principal = strings::Substitute("$0@$1", principal, realm);
+      FLAGS_keytab_file = principal_kt_path;
+    }
     ASSERT_OK(InitAuth(CURRENT_EXECUTABLE_PATH));
-
     ThriftTestBase::SetUp();
   }
 
-  virtual void TearDown() {
-    ASSERT_OK(kdc_wrapper_->TearDownMiniKDC(GetParam()));
-    ThriftTestBase::TearDown();
+  virtual void TearDown() override {
+    FLAGS_principal.clear();
+    FLAGS_be_principal.clear();
+    FLAGS_keytab_file.clear();
   }
-
- private:
-  boost::scoped_ptr<MiniKdcWrapper> kdc_wrapper_;
 };
 
 INSTANTIATE_TEST_CASE_P(KerberosOnAndOff,
                         ThriftKerberizedParamsTest,
                         ::testing::Values(KERBEROS_OFF,
-                                          USE_KUDU_KERBEROS,
-                                          USE_IMPALA_KERBEROS));
+                                          KERBEROS_ON));
 
 TEST(ThriftTestBase, Connectivity) {
   int port = GetServerPort();
@@ -172,8 +180,14 @@ TEST_P(ThriftKerberizedParamsTest, SslConnectivity) {
     // When Kerberos is ON, the SASL negotiation happens inside Open(). We expect that to
     // fail beacuse the server expects the client to negotiate over an encrypted
     // connection.
-    EXPECT_STR_CONTAINS(non_ssl_client.Open().GetDetail(),
-        "No more data to read");
+    // The expected error message can either state "No more data to read" or
+    // "Couldn't open transport".
+    const std::string& status = non_ssl_client.Open().GetDetail();
+    size_t found_substr = status.find("No more data to read");
+    if (found_substr == string::npos) {
+      EXPECT_STR_CONTAINS(non_ssl_client.Open().GetDetail(),
+          "Couldn't open transport");
+    }
   }
 
 }
@@ -319,7 +333,7 @@ TEST(SslTest, MismatchedCiphers) {
 TEST(SslTest, StringToProtocol) {
   SSLProtocol version;
   map<string, SSLProtocol> TEST_CASES = {
-      {"tlsv1", TLSv1_0_plus}, {"tlsv1.1", TLSv1_1_plus}, {"tlsv1.2", TLSv1_2_plus}};
+      {"tlsv1", TLSv1_0}, {"tlsv1.1", TLSv1_1}, {"tlsv1.2", TLSv1_2}};
   for (auto p : TEST_CASES) {
     EXPECT_OK(SSLProtoVersions::StringToProtocol(p.first, &version));
     EXPECT_EQ(p.second, version) << "TLS version: " << p.first;
@@ -339,16 +353,12 @@ TEST(SslTest, TLSVersionControl) {
     set<SSLProtocol> whitelist;
   };
 
-  // Test all configurations supported by Thrift, even if some won't work with the linked
-  // OpenSSL(). We catch those by checking IsSupported() for both the client and ther
-  // server.
-  vector<Config> configs = {{TLSv1_0, {TLSv1_0, TLSv1_0_plus}},
-      {TLSv1_0_plus,
-          {TLSv1_0, TLSv1_1, TLSv1_2, TLSv1_0_plus, TLSv1_1_plus, TLSv1_2_plus}},
-      {TLSv1_1, {TLSv1_1_plus, TLSv1_1, TLSv1_0_plus}},
-      {TLSv1_1_plus, {TLSv1_1, TLSv1_2, TLSv1_0_plus, TLSv1_1_plus, TLSv1_2_plus}},
-      {TLSv1_2, {TLSv1_2, TLSv1_0_plus, TLSv1_1_plus, TLSv1_2_plus}},
-      {TLSv1_2_plus, {TLSv1_2, TLSv1_0_plus, TLSv1_1_plus, TLSv1_2_plus}}};
+  // All configurations supported by linked OpenSSL should work. We catch unsupported
+  // protocols by checking IsSupported() for both the client and the server.
+  vector<Config> configs = {
+      {TLSv1_0, {TLSv1_0, TLSv1_1, TLSv1_2}},
+      {TLSv1_1, {TLSv1_0, TLSv1_1, TLSv1_2}},
+      {TLSv1_2, {TLSv1_0, TLSv1_1, TLSv1_2}}};
 
   for (const auto& config : configs) {
     // For each config, start a server with the requested protocol spec, and then try to
@@ -551,7 +561,21 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   impala::InitCommonRuntime(argc, argv, false, impala::TestInfo::BE_TEST);
 
+  int port = impala::FindUnusedEphemeralPort();
+  std::unique_ptr<impala::MiniKdcWrapper> kdc;
+  Status status =
+      impala::MiniKdcWrapper::SetupAndStartMiniKDC(realm, "24h", "7d", port, &kdc);
+  DCHECK(status.ok());
+
+  // Create the service principal and keytab used for this test.
+  status = kdc->CreateServiceKeytab(principal, &principal_kt_path);
+  DCHECK(status.ok());
+
   // Fill in the path of the current binary for use by the tests.
   CURRENT_EXECUTABLE_PATH = argv[0];
-  return RUN_ALL_TESTS();
+  int retval = RUN_ALL_TESTS();
+
+  status = kdc->TearDownMiniKDC();
+  DCHECK(status.ok());
+  return retval;
 }

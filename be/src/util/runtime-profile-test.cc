@@ -16,19 +16,22 @@
 // under the License.
 
 #include <stdlib.h>
-#include <stdio.h>
+#include <algorithm>
 #include <iostream>
+
 #include <boost/bind.hpp>
 
 #include "common/object-pool.h"
 #include "testutil/gtest-util.h"
+#include "util/container-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/runtime-profile-counters.h"
-#include "util/streaming-sampler.h"
 #include "util/thread.h"
-#include "util/time.h"
 
 #include "common/names.h"
+
+DECLARE_int32(status_report_interval_ms);
+DECLARE_int32(periodic_counter_update_period_ms);
 
 namespace impala {
 
@@ -44,7 +47,7 @@ TEST(CountersTest, Basic) {
   profile_a->AddChild(profile_a2);
 
   // Test Empty
-  profile_a->ToThrift(&thrift_profile.nodes);
+  profile_a->ToThrift(&thrift_profile);
   EXPECT_EQ(thrift_profile.nodes.size(), 3);
   thrift_profile.nodes.clear();
 
@@ -64,12 +67,36 @@ TEST(CountersTest, Basic) {
   counter_b = profile_a2->AddCounter("B", TUnit::BYTES);
   EXPECT_TRUE(counter_b != NULL);
 
-  // Serialize/deserialize
-  profile_a->ToThrift(&thrift_profile.nodes);
+  // Update status to be included in ExecSummary
+  TExecSummary exec_summary;
+  TStatus status;
+  status.__set_status_code(TErrorCode::CANCELLED);
+  exec_summary.__set_status(status);
+  profile_a->SetTExecSummary(exec_summary);
+
+  // Serialize/deserialize to thrift
+  profile_a->ToThrift(&thrift_profile);
   RuntimeProfile* from_thrift = RuntimeProfile::CreateFromThrift(&pool, thrift_profile);
   counter_merged = from_thrift->GetCounter("A");
   EXPECT_EQ(counter_merged->value(), 1);
   EXPECT_TRUE(from_thrift->GetCounter("Not there") ==  NULL);
+  TExecSummary exec_summary_result;
+  from_thrift->GetExecSummary(&exec_summary_result);
+  EXPECT_EQ(exec_summary_result.status, status);
+
+  // Serialize/deserialize to archive string
+  string archive_str;
+  EXPECT_OK(profile_a->SerializeToArchiveString(&archive_str));
+  TRuntimeProfileTree deserialized_thrift_profile;
+  EXPECT_OK(RuntimeProfile::DeserializeFromArchiveString(
+      archive_str, &deserialized_thrift_profile));
+  RuntimeProfile* deserialized_profile =
+      RuntimeProfile::CreateFromThrift(&pool, deserialized_thrift_profile);
+  counter_merged = deserialized_profile->GetCounter("A");
+  EXPECT_EQ(counter_merged->value(), 1);
+  EXPECT_TRUE(deserialized_profile->GetCounter("Not there") == nullptr);
+  deserialized_profile->GetExecSummary(&exec_summary_result);
+  EXPECT_EQ(exec_summary_result.status, status);
 
   // Averaged
   RuntimeProfile* averaged_profile = RuntimeProfile::Create(&pool, "Merged", true);
@@ -223,6 +250,172 @@ TEST(CountersTest, MergeAndUpdate) {
 
   // make sure we can print
   profile2->PrettyPrint(&dummy);
+}
+
+// Regression test for IMPALA-6694 - child order isn't preserved if a child
+// is prepended between updates.
+TEST(CountersTest, MergeAndUpdateChildOrder) {
+  ObjectPool pool;
+  // Add Child2 first.
+  RuntimeProfile* profile1 = RuntimeProfile::Create(&pool, "Parent");
+  RuntimeProfile* p1_child2 = RuntimeProfile::Create(&pool, "Child2");
+  profile1->AddChild(p1_child2);
+  TRuntimeProfileTree tprofile1_v1, tprofile1_v2, tprofile1_v3;
+  profile1->ToThrift(&tprofile1_v1);
+
+  // Update averaged and deserialized profiles from the serialized profile.
+  RuntimeProfile* averaged_profile = RuntimeProfile::Create(&pool, "merged", true);
+  RuntimeProfile* deserialized_profile = RuntimeProfile::Create(&pool, "Parent");
+  averaged_profile->UpdateAverage(profile1);
+  deserialized_profile->Update(tprofile1_v1);
+
+  std::vector<RuntimeProfile*> tmp_children;
+  averaged_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(1, tmp_children.size());
+  EXPECT_EQ("Child2", tmp_children[0]->name());
+  deserialized_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(1, tmp_children.size());
+  EXPECT_EQ("Child2", tmp_children[0]->name());
+
+  // Prepend Child1 and update profiles.
+  RuntimeProfile* p1_child1 = RuntimeProfile::Create(&pool, "Child1");
+  profile1->PrependChild(p1_child1);
+  profile1->ToThrift(&tprofile1_v2);
+  averaged_profile->UpdateAverage(profile1);
+  deserialized_profile->Update(tprofile1_v2);
+
+  averaged_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+  deserialized_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+
+  // Test that changes in order of children is handled gracefully by preserving the
+  // order from the previous update. Sorting puts the children in descending total time
+  // order.
+  p1_child1->total_time_counter()->Set(1);
+  p1_child2->total_time_counter()->Set(2);
+  profile1->SortChildrenByTotalTime();
+  profile1->GetChildren(&tmp_children);
+  EXPECT_EQ("Child2", tmp_children[0]->name());
+  EXPECT_EQ("Child1", tmp_children[1]->name());
+  profile1->ToThrift(&tprofile1_v3);
+  averaged_profile->UpdateAverage(profile1);
+  deserialized_profile->Update(tprofile1_v2);
+
+  // The previous order of children that were already present is preserved.
+  averaged_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+  deserialized_profile->GetChildren(&tmp_children);
+  EXPECT_EQ(2, tmp_children.size());
+  EXPECT_EQ("Child1", tmp_children[0]->name());
+  EXPECT_EQ("Child2", tmp_children[1]->name());
+
+  // Make sure we can print the profiles.
+  stringstream dummy;
+  averaged_profile->PrettyPrint(&dummy);
+  deserialized_profile->PrettyPrint(&dummy);
+}
+
+TEST(CountersTest, TotalTimeCounters) {
+  ObjectPool pool;
+
+  // Set up a three layer profile: parent -> child1 -> child2
+  RuntimeProfile* parent = RuntimeProfile::Create(&pool, "Parent");
+  RuntimeProfile* child1 = RuntimeProfile::Create(&pool, "Child1");
+  RuntimeProfile* child2 = RuntimeProfile::Create(&pool, "Child2");
+  child1->AddChild(child2);
+  parent->AddChild(child1);
+
+  // Part 1: Test accumulation of time up from child2 to child1 to parent
+  // One millisecond passes in child2
+  int64_t one_milli_ns = 1 * NANOS_PER_MICRO * MICROS_PER_MILLI;
+  child2->total_time_counter()->Add(1 * NANOS_PER_MICRO * MICROS_PER_MILLI);
+  parent->ComputeTimeInProfile();
+  EXPECT_EQ(child2->total_time(), one_milli_ns);
+  EXPECT_EQ(child2->local_time(), one_milli_ns);
+
+  // Child1 is a parent of child2, so it is expected to contain at least as much time
+  // as in child2. In this case, it is equal. However, none of the time is local.
+  EXPECT_EQ(child1->total_time(), one_milli_ns);
+  EXPECT_EQ(child1->local_time(), 0);
+
+  // The parent is in the same situation as child1
+  EXPECT_EQ(parent->total_time(), one_milli_ns);
+  EXPECT_EQ(parent->local_time(), 0);
+
+  // Time now accumulates up to child1
+  child1->total_time_counter()->Add(child2->total_time());
+  parent->ComputeTimeInProfile();
+
+  // This doesn't change anything for anyone
+  EXPECT_EQ(child2->total_time(), one_milli_ns);
+  EXPECT_EQ(child2->local_time(), one_milli_ns);
+  EXPECT_EQ(child1->total_time(), one_milli_ns);
+  EXPECT_EQ(child1->local_time(), 0);
+  EXPECT_EQ(parent->total_time(), one_milli_ns);
+  EXPECT_EQ(parent->local_time(), 0);
+
+  // Time now accumulates up to parent
+  parent->total_time_counter()->Add(child1->total_time());
+  parent->ComputeTimeInProfile();
+
+  // This doesn't change anything for the parent
+  EXPECT_EQ(child2->total_time(), one_milli_ns);
+  EXPECT_EQ(child2->local_time(), one_milli_ns);
+  EXPECT_EQ(child1->total_time(), one_milli_ns);
+  EXPECT_EQ(child1->local_time(), 0);
+  EXPECT_EQ(parent->total_time(), one_milli_ns);
+  EXPECT_EQ(parent->local_time(), 0);
+
+  // Part 2: Time accumulated in middle child
+  // Add 1ms to the middle child
+  child1->total_time_counter()->Add(one_milli_ns);
+  parent->ComputeTimeInProfile();
+
+  // Child2 did not change
+  EXPECT_EQ(child2->total_time(), one_milli_ns);
+  EXPECT_EQ(child2->local_time(), one_milli_ns);
+
+  // Child1 has 1ms more of total time and local time
+  EXPECT_EQ(child1->total_time(), 2 * one_milli_ns);
+  EXPECT_EQ(child1->local_time(), one_milli_ns);
+
+  // Parent has more total time, but no local time
+  EXPECT_EQ(parent->total_time(), 2 * one_milli_ns);
+  EXPECT_EQ(parent->local_time(), 0);
+
+  // Accumulate the middle child up to the parent
+  parent->total_time_counter()->Add(one_milli_ns);
+  parent->ComputeTimeInProfile();
+
+  // Doesn't change anything
+  EXPECT_EQ(child2->total_time(), one_milli_ns);
+  EXPECT_EQ(child2->local_time(), one_milli_ns);
+  EXPECT_EQ(child1->total_time(), 2 * one_milli_ns);
+  EXPECT_EQ(child1->local_time(), one_milli_ns);
+  EXPECT_EQ(parent->total_time(), 2 * one_milli_ns);
+  EXPECT_EQ(parent->local_time(), 0);
+
+  // Part 3: Time accumulated at parent
+  // Add 1ms to the parent
+  parent->total_time_counter()->Add(one_milli_ns);
+  parent->ComputeTimeInProfile();
+
+  // Child1 and child2 don't change
+  EXPECT_EQ(child2->total_time(), one_milli_ns);
+  EXPECT_EQ(child2->local_time(), one_milli_ns);
+  EXPECT_EQ(child1->total_time(), 2 * one_milli_ns);
+  EXPECT_EQ(child1->local_time(), one_milli_ns);
+
+  // Parent has 1ms more total time and local time
+  EXPECT_EQ(parent->total_time(), 3 * one_milli_ns);
+  EXPECT_EQ(parent->local_time(), one_milli_ns);
 }
 
 TEST(CountersTest, HighWaterMarkCounters) {
@@ -544,6 +737,38 @@ TEST(CountersTest, EventSequences) {
   }
 }
 
+TEST(CountersTest, UpdateEmptyEventSequence) {
+  // IMPALA-6824: This test makes sure that adding events to an empty event sequence does
+  // not crash.
+  ObjectPool pool;
+
+  // Create the profile to send in the update and add some events.
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+  RuntimeProfile::EventSequence* seq = profile->AddEventSequence("event sequence");
+  seq->Start();
+  // Sleep for 10ms to make sure the events are logged at a time > 0.
+  SleepForMs(10);
+  seq->MarkEvent("aaaa");
+  seq->MarkEvent("bbbb");
+
+  vector<RuntimeProfile::EventSequence::Event> events;
+  seq->GetEvents(&events);
+  EXPECT_EQ(2, events.size());
+
+  TRuntimeProfileTree thrift_profile;
+  profile->ToThrift(&thrift_profile);
+
+  // Create the profile that will be updated and add the empty event sequence to it.
+  RuntimeProfile* updated_profile = RuntimeProfile::Create(&pool, "Updated Profile");
+  seq = updated_profile->AddEventSequence("event sequence");
+  updated_profile->Update(thrift_profile);
+
+  // Verify that the events have been updated successfully.
+  events.clear();
+  seq->GetEvents(&events);
+  EXPECT_EQ(2, events.size());
+}
+
 void ValidateSampler(const StreamingSampler<int, 10>& sampler, int expected_num,
     int expected_period, int expected_delta) {
   const int* samples = NULL;
@@ -668,7 +893,7 @@ class TimerCounterTest {
 };
 
 void ValidateTimerValue(const TimerCounterTest& timer, int64_t start) {
-  int64_t expected_value = MonotonicNanos() - start;
+  int64_t expected_value = MonotonicStopWatch::Now() - start;
   int64_t stopwatch_value = timer.csw_.TotalRunningTime();
   EXPECT_GE(stopwatch_value, expected_value - TimerCounterTest::MAX_TIMER_ERROR_NS);
   EXPECT_LE(stopwatch_value, expected_value + TimerCounterTest::MAX_TIMER_ERROR_NS);
@@ -690,7 +915,7 @@ void ValidateLapTime(TimerCounterTest* timer, int64_t expected_value) {
 
 TEST(TimerCounterTest, CountersTestOneThread) {
   TimerCounterTest tester;
-  uint64_t start = MonotonicNanos();
+  int64_t start = MonotonicStopWatch::Now();
   tester.StartWorkers(1, 0);
   SleepForMs(500);
   ValidateTimerValue(tester, start);
@@ -700,7 +925,7 @@ TEST(TimerCounterTest, CountersTestOneThread) {
 
 TEST(TimerCounterTest, CountersTestTwoThreads) {
   TimerCounterTest tester;
-  uint64_t start = MonotonicNanos();
+  int64_t start = MonotonicStopWatch::Now();
   tester.StartWorkers(2, 10);
   SleepForMs(500);
   ValidateTimerValue(tester, start);
@@ -710,7 +935,7 @@ TEST(TimerCounterTest, CountersTestTwoThreads) {
 
 TEST(TimerCounterTest, CountersTestRandom) {
   TimerCounterTest tester;
-  uint64_t start = MonotonicNanos();
+  int64_t start = MonotonicStopWatch::Now();
   ValidateTimerValue(tester, start);
   // First working period
   tester.StartWorkers(5, 10);
@@ -726,25 +951,381 @@ TEST(TimerCounterTest, CountersTestRandom) {
   ValidateTimerValue(tester, start);
   tester.Reset();
 
-  ValidateLapTime(&tester, MonotonicNanos() - start);
-  uint64_t first_run_end = MonotonicNanos();
+  ValidateLapTime(&tester, MonotonicStopWatch::Now() - start);
+  int64_t first_run_end = MonotonicStopWatch::Now();
   // Adding some idle time. concurrent stopwatch and timer should not count the idle time.
   SleepForMs(200);
-  start += MonotonicNanos() - first_run_end;
+  start += MonotonicStopWatch::Now() - first_run_end;
 
   // Second working period
   tester.StartWorkers(2, 0);
   // We just get lap time after first run finish. so at start of second run, expect lap time == 0
   ValidateLapTime(&tester, 0);
-  uint64_t lap_time_start = MonotonicNanos();
+  int64_t lap_time_start = MonotonicStopWatch::Now();
   SleepForMs(200);
   ValidateTimerValue(tester, start);
   SleepForMs(200);
   tester.StopWorkers(-1);
   ValidateTimerValue(tester, start);
-  ValidateLapTime(&tester, MonotonicNanos() - lap_time_start);
+  ValidateLapTime(&tester, MonotonicStopWatch::Now() - lap_time_start);
 }
+
+
+TEST(TimeSeriesCounterTest, TestAddClearRace) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+  int i = 0;
+  // Return and increment i
+  auto f = [&i]() { return i++; };
+  RuntimeProfile::TimeSeriesCounter* counter =
+      profile->AddChunkedTimeSeriesCounter("Counter", TUnit::UNIT, f);
+  // Sleep 1 second for some values to accumulate.
+  sleep(1);
+  int num_samples, period;
+  counter->GetSamplesTest(&num_samples, &period);
+  EXPECT_GT(num_samples, 0);
+
+  // Wait for more values to show up
+  sleep(1);
+
+  // Stop the counters. The rest of the test assumes that no new values will be added.
+  profile->StopPeriodicCounters();
+
+  // Clear the counter
+  profile->ClearChunkedTimeSeriesCounters();
+
+  // Check that clearing multiple times doesn't affect valued that have not been
+  // retrieved.
+  profile->ClearChunkedTimeSeriesCounters();
+
+  // Make sure that it still has values in it.
+  counter->GetSamplesTest(&num_samples, &period);
+  EXPECT_GT(num_samples, 0);
+
+  // Clear it again
+  profile->ClearChunkedTimeSeriesCounters();
+
+  // Make sure the values are gone.
+  counter->GetSamplesTest(&num_samples, &period);
+  EXPECT_EQ(num_samples, 0);
+}
+
+/// Stops the periodic counter updater in 'profile' and then clears the samples in
+/// 'counter'.
+void StopAndClearCounter(RuntimeProfile* profile,
+    RuntimeProfile::TimeSeriesCounter* counter) {
+  // There's a race between adding the counter and calling StopPeriodicCounters so we
+  // sleep here to make sure we exercise the code that handles the race.
+  sleep(1);
+  profile->StopPeriodicCounters();
+
+  // Reset the counter state by reading and clearing its samples.
+  int num_samples = 0;
+  int result_period_unused = 0;
+  counter->GetSamplesTest(&num_samples, &result_period_unused);
+  ASSERT_GT(num_samples, 0);
+  profile->ClearChunkedTimeSeriesCounters();
+  // Ensure clean state.
+  counter->GetSamplesTest(&num_samples, &result_period_unused);
+  ASSERT_EQ(num_samples, 0);
+}
+
+/// Tests that ChunkedTimeSeriesCounters are bounded by a maximum size.
+TEST(TimeSeriesCounterTest, TestMaximumSize) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+
+  const int test_period = FLAGS_periodic_counter_update_period_ms;
+
+  // Add a counter with a sample function that counts up, starting from 0.
+  int value = 0;
+  auto sample_fn = [&value]() { return value++; };
+  RuntimeProfile::TimeSeriesCounter* counter =
+      profile->AddChunkedTimeSeriesCounter("TestCounter", TUnit::UNIT, sample_fn);
+
+  // Stop counter updates from interfering with the rest of the test.
+  StopAndClearCounter(profile, counter);
+
+  // Reset value after previous values have been retrieved.
+  value = 0;
+
+  int64_t max_size = 10 * FLAGS_status_report_interval_ms / test_period;
+  for (int i = 0; i < 10 + max_size; ++i) counter->AddSample(test_period);
+
+  int num_samples = 0;
+  int result_period = 0;
+  // Retrieve and validate samples.
+  const int64_t* samples = counter->GetSamplesTest(&num_samples, &result_period);
+  ASSERT_EQ(num_samples, max_size);
+  // No resampling happens with ChunkedTimeSeriesCounter.
+  ASSERT_EQ(result_period, test_period);
+
+  // First 10 samples have been truncated
+  ASSERT_EQ(samples[0], 10);
+}
+
+/// Test parameter class that helps to test time series resampling during profile pretty
+/// printing with a varying number of test samples.
+struct TimeSeriesTestParam {
+  TimeSeriesTestParam(int num_samples, vector<const char*> expected)
+    : num_samples(num_samples), expected(expected) {}
+  int num_samples;
+  vector<const char*> expected;
+
+  // Used by gtest to print values of this struct
+  friend std::ostream& operator<<(std::ostream& os, const TimeSeriesTestParam& p) {
+    return os << "num_samples: " << p.num_samples << endl;
+  }
+};
+
+class TimeSeriesCounterResampleTest : public testing::TestWithParam<TimeSeriesTestParam> {
+};
+
+/// Tests that pretty-printing a ChunkedTimeSeriesCounter limits the number or printed
+/// samples to 64 or lower.
+TEST_P(TimeSeriesCounterResampleTest, TestPrettyPrint) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+
+  const TimeSeriesTestParam& param = GetParam();
+  const int test_period = FLAGS_periodic_counter_update_period_ms;
+
+  // Add a counter with a sample function that counts up, starting from 0.
+  int value = 0;
+  auto sample_fn = [&value]() { return value++; };
+  // We increase the value of this flag to allow the counter to store enough samples.
+  FLAGS_status_report_interval_ms = 50000;
+  RuntimeProfile::TimeSeriesCounter* counter =
+      profile->AddChunkedTimeSeriesCounter("TestCounter", TUnit::UNIT, sample_fn);
+
+  // Stop counter updates from interfering with the rest of the test.
+  StopAndClearCounter(profile, counter);
+
+  // Reset value after previous values have been retrieved.
+  value = 0;
+  for (int i = 0; i < param.num_samples; ++i) counter->AddSample(test_period);
+
+  int num_samples = 0;
+  int result_period = 0;
+  // Retrieve and validate samples.
+  const int64_t* samples = counter->GetSamplesTest(&num_samples, &result_period);
+  ASSERT_EQ(num_samples, param.num_samples);
+  // No resampling happens with ChunkedTimeSeriesCounter.
+  ASSERT_EQ(result_period, test_period);
+
+  for (int i = 0; i < param.num_samples; ++i) ASSERT_EQ(samples[i], i);
+
+  stringstream pretty;
+  profile->PrettyPrint(&pretty);
+  const string pretty_str = pretty.str();
+
+  for (const char* e : param.expected) EXPECT_STR_CONTAINS(pretty_str, e);
+}
+
+INSTANTIATE_TEST_CASE_P(VariousNumbers, TimeSeriesCounterResampleTest,
+    ::testing::Values(
+    TimeSeriesTestParam(64, {"TestCounter (500.000ms): 0, 1, 2, 3", "61, 62, 63"}),
+
+    TimeSeriesTestParam(65, {"TestCounter (1s000ms): 0, 2, 4, 6,",
+    "60, 62, 64 (Showing 33 of 65 values from Thrift Profile)"}),
+
+    TimeSeriesTestParam(80, {"TestCounter (1s000ms): 0, 2, 4, 6,",
+    "74, 76, 78 (Showing 40 of 80 values from Thrift Profile)"}),
+
+    TimeSeriesTestParam(127, {"TestCounter (1s000ms): 0, 2, 4, 6,",
+    "122, 124, 126 (Showing 64 of 127 values from Thrift Profile)"}),
+
+    TimeSeriesTestParam(128, {"TestCounter (1s000ms): 0, 2, 4, 6,",
+    "122, 124, 126 (Showing 64 of 128 values from Thrift Profile)"}),
+
+    TimeSeriesTestParam(129, {"TestCounter (1s500ms): 0, 3, 6, 9,",
+    "120, 123, 126 (Showing 43 of 129 values from Thrift Profile)"})
+    ));
+
+// Tests that the __isset field for TRuntimeProfileNode.node_metadata is set correctly
+// (IMPALA-8252).
+TEST(ToThrift, NodeMetadataIsSetCorrectly) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+  TRuntimeProfileTree thrift_profile;
+  profile->ToThrift(&thrift_profile);
+  // Profile is empty, expect 0 nodes
+  EXPECT_EQ(thrift_profile.nodes.size(), 1);
+  EXPECT_FALSE(thrift_profile.nodes[0].__isset.node_metadata);
+
+  // Set the plan node ID and make sure that the field is marked correctly
+  profile->SetPlanNodeId(1);
+  profile->ToThrift(&thrift_profile);
+  EXPECT_TRUE(thrift_profile.nodes[0].__isset.node_metadata);
+}
+
+TEST(ToJson, RuntimeProfileToJsonTest) {
+  ObjectPool pool;
+  RuntimeProfile* profile_a = RuntimeProfile::Create(&pool, "ProfileA");
+  RuntimeProfile* profile_a1 = RuntimeProfile::Create(&pool, "ProfileA1");
+  RuntimeProfile* profile_ab = RuntimeProfile::Create(&pool, "ProfileAb");
+  RuntimeProfile::Counter* counter_a;
+
+  // Initialize for further validation
+  profile_a->AddChild(profile_a1);
+  profile_a->AddChild(profile_ab);
+  profile_a->AddInfoString("Key", "Value");
+
+  counter_a = profile_a->AddCounter("A", TUnit::UNIT);
+  counter_a->Set(1);
+  RuntimeProfile::HighWaterMarkCounter* high_water_counter =
+      profile_a->AddHighWaterMarkCounter("high_water_counter", TUnit::BYTES);
+  high_water_counter->Set(10);
+  high_water_counter->Add(10);
+  high_water_counter->Set(10);
+
+  RuntimeProfile::SummaryStatsCounter* summary_stats_counter =
+      profile_a->AddSummaryStatsCounter("summary_stats_counter", TUnit::TIME_NS);
+  summary_stats_counter->UpdateCounter(10);
+  summary_stats_counter->UpdateCounter(20);
+
+  // Serialize to json
+  rapidjson::Document doc(rapidjson::kObjectType);
+  profile_a->ToJson(&doc);
+  rapidjson::Value& content = doc["contents"];
+
+  // Check profile correct
+  EXPECT_EQ("ProfileA", content["profile_name"]);
+  EXPECT_EQ("ProfileA1", content["child_profiles"][0]["profile_name"]);
+  EXPECT_EQ("ProfileAb", content["child_profiles"][1]["profile_name"]);
+
+  // Check Info String correct
+  EXPECT_EQ(1, content["info_strings"].Size());
+  EXPECT_EQ("Key", content["info_strings"][0]["key"]);
+  EXPECT_EQ("Value", content["info_strings"][0]["value"]);
+
+  // Check counter value matches
+  EXPECT_EQ(2, content["counters"].Size());
+  for (auto& itr : content["counters"].GetArray()) {
+    // check normal Counter
+    if (itr["counter_name"] == "A") {
+      EXPECT_EQ(1, itr["value"].GetInt());
+      EXPECT_EQ("UNIT", itr["unit"]);
+      EXPECT_EQ("Counter", itr["kind"]);
+    }// check HighWaterMarkCounter
+    else if (itr["counter_name"] == "high_water_counter") {
+      EXPECT_EQ(20, itr["value"].GetInt());
+      EXPECT_EQ("BYTES", itr["unit"]);
+      EXPECT_EQ("HighWaterMarkCounter", itr["kind"]);
+    } else {
+      DCHECK(false);
+    }
+  }
+
+  // Check SummaryStatsCounter
+  EXPECT_EQ(1, content["summary_stats_counters"].Size());
+  for (auto& itr : content["summary_stats_counters"].GetArray()) {
+    if (itr["counter_name"] == "summary_stats_counter") {
+      EXPECT_EQ(10, itr["min"].GetInt());
+      EXPECT_EQ(20, itr["max"].GetInt());
+      EXPECT_EQ(15, itr["avg"].GetInt());
+      EXPECT_EQ(2, itr["num_of_samples"].GetInt());
+      EXPECT_EQ("TIME_NS", itr["unit"]);
+      EXPECT_TRUE(!itr.HasMember("kind"));
+    }
+  }
+}
+
+// Test when some fields are not set. ToJson will not add them as a member
+TEST(ToJson, EmptyTest) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+
+  // Serialize to json
+  rapidjson::Document doc(rapidjson::kObjectType);
+  profile->ToJson(&doc);
+  rapidjson::Value& content = doc["contents"];
+
+  EXPECT_EQ("Profile", content["profile_name"]);
+  EXPECT_TRUE(content.HasMember("num_children"));
+
+  // Empty profile should not have following members
+  EXPECT_TRUE(!content.HasMember("info_strings"));
+  EXPECT_TRUE(!content.HasMember("event_sequences"));
+  EXPECT_TRUE(!content.HasMember("counters"));
+  EXPECT_TRUE(!content.HasMember("summary_stats_counters"));
+  EXPECT_TRUE(!content.HasMember("time_series_counters"));
+  EXPECT_TRUE(!content.HasMember("child_profiles"));
 
 }
 
-IMPALA_TEST_MAIN();
+TEST(ToJson, EventSequenceToJsonTest) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+  RuntimeProfile::EventSequence* seq = profile->AddEventSequence("event sequence");
+  seq->MarkEvent("aaaa");
+  seq->MarkEvent("bbbb");
+  seq->MarkEvent("cccc");
+
+  // Serialize to json
+  rapidjson::Document doc(rapidjson::kObjectType);
+  rapidjson::Value event_sequence_json(rapidjson::kObjectType);
+  seq->ToJson(doc, &event_sequence_json);
+
+  EXPECT_EQ(0, event_sequence_json["offset"].GetInt());
+
+  uint64_t last_timestamp = 0;
+  string last_string = "";
+  for (auto& itr : event_sequence_json["events"].GetArray()) {
+    EXPECT_TRUE(itr["timestamp"].GetInt() >= last_timestamp);
+    last_timestamp = itr["timestamp"].GetInt();
+    string label = string(itr["label"].GetString());
+    EXPECT_TRUE(label > last_string);
+    last_string = label;
+  }
+}
+
+TEST(ToJson, TimeSeriesCounterToJsonTest) {
+  ObjectPool pool;
+  RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
+
+  // 1. TimeSeriesCounter should be empty
+  rapidjson::Document doc(rapidjson::kObjectType);
+  profile->ToJson(&doc);
+  EXPECT_TRUE(!doc["contents"].HasMember("time_series_counters"));
+
+  // 2. Check Serialize to json
+  const int test_period = FLAGS_periodic_counter_update_period_ms;
+
+  // Add a counter with a sample function that counts up, starting from 0.
+  int value = 0;
+  auto sample_fn = [&value]() { return value++; };
+
+  // We increase the value of this flag to allow the counter to store enough samples.
+  FLAGS_status_report_interval_ms = 50000;
+  RuntimeProfile::TimeSeriesCounter* counter =
+      profile->AddChunkedTimeSeriesCounter("TimeSeriesCounter", TUnit::UNIT, sample_fn);
+  RuntimeProfile::TimeSeriesCounter* counter2 =
+      profile->AddSamplingTimeSeriesCounter("SamplingCounter", TUnit::UNIT, sample_fn);
+
+  // Stop counter updates from interfering with the rest of the test.
+  StopAndClearCounter(profile, counter);
+
+  // Reset value after previous values have been retrieved.
+  value = 0;
+  for (int i = 0; i < 64; ++i) counter->AddSample(test_period);
+
+  value = 0;
+  for (int i = 0; i < 80; ++i) counter2->AddSample(test_period);
+
+  profile->ToJson(&doc);
+  EXPECT_STR_CONTAINS(
+      doc["contents"]["time_series_counters"][1]["data"].GetString(), "0,1,2,3,4");
+
+  EXPECT_STR_CONTAINS(
+      doc["contents"]["time_series_counters"][1]["data"].GetString(), "60,61,62,63");
+
+  EXPECT_STR_CONTAINS(
+      doc["contents"]["time_series_counters"][0]["data"].GetString(), "0,2,4,6");
+
+  EXPECT_STR_CONTAINS(
+      doc["contents"]["time_series_counters"][0]["data"].GetString(), "72,74,76,78");
+}
+
+} // namespace impala
+

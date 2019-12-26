@@ -17,20 +17,25 @@
 
 #include "kudu/rpc/server_negotiation.h"
 
-#include <limits>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <ostream>
 #include <set>
 #include <string>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
-#include <google/protobuf/message_lite.h>
 #include <sasl/sasl.h>
 
-#include "kudu/gutil/casts.h"
-#include "kudu/gutil/endian.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/constants.h"
@@ -41,23 +46,25 @@
 #include "kudu/security/init.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/tls_handshake.h"
-#include "kudu/security/tls_socket.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
-#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/trace.h"
 
 using std::set;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 
 // Fault injection flags.
-DEFINE_double_hidden(rpc_inject_invalid_authn_token_ratio, 0,
+DEFINE_double(rpc_inject_invalid_authn_token_ratio, 0,
               "If set higher than 0, AuthenticateByToken() randomly injects "
               "errors replying with FATAL_INVALID_AUTHENTICATION_TOKEN code. "
               "The flag's value corresponds to the probability of the fault "
@@ -67,7 +74,7 @@ TAG_FLAG(rpc_inject_invalid_authn_token_ratio, unsafe);
 
 DECLARE_bool(rpc_encrypt_loopback_connections);
 
-DEFINE_string_hidden(trusted_subnets,
+DEFINE_string(trusted_subnets,
               "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16",
               "A trusted subnet whitelist. If set explicitly, all unauthenticated "
               "or unencrypted connections are prohibited except the ones from the "
@@ -176,7 +183,7 @@ Status ServerNegotiation::Negotiate() {
   DCHECK(token_verifier_);
 
   // Ensure we can use blocking calls on the socket during negotiation.
-  RETURN_NOT_OK(EnsureBlockingMode(socket_.get()));
+  RETURN_NOT_OK(CheckInBlockingMode(socket_.get()));
 
   faststring recv_buf;
 
@@ -373,12 +380,25 @@ Status ServerNegotiation::InitSaslServer() {
   unsigned secflags = 0;
 
   sasl_conn_t* sasl_conn = nullptr;
+
+  const char* server_fqdn = helper_.server_fqdn();
+  // If not explicitly set, use the host's FQDN here.
+  // SASL handles this itself if we pass null, but in a buggy way[1] that fails
+  // if the FQDN is >64 characters.
+  //
+  // [1] https://github.com/cyrusimap/cyrus-sasl/issues/583
+  string default_server_fqdn;
+  if (server_fqdn == nullptr) {
+    RETURN_NOT_OK_PREPEND(GetFQDN(&default_server_fqdn), "could not determine own FQDN");
+    server_fqdn = default_server_fqdn.c_str();
+  }
+
   RETURN_NOT_OK_PREPEND(WrapSaslCall(nullptr /* no conn */, [&]() {
       return sasl_server_new(
           // Registered name of the service using SASL. Required.
           sasl_proto_name_.c_str(),
           // The fully qualified domain name of this server.
-          helper_.server_fqdn(),
+          server_fqdn,
           // Permits multiple user realms on server. NULL == use default.
           nullptr,
           // Local and remote IP address strings. We don't use any mechanisms
@@ -565,13 +585,13 @@ Status ServerNegotiation::HandleTlsHandshake(const NegotiatePB& request) {
   // TLS handshake is finished.
   if (ContainsKey(server_features_, TLS_AUTHENTICATION_ONLY) &&
       ContainsKey(client_features_, TLS_AUTHENTICATION_ONLY)) {
-    TRACE("Negotiated auth-only $0 with cipher suite $1",
-          tls_handshake_.GetProtocol(), tls_handshake_.GetCipherSuite());
+    TRACE("Negotiated auth-only $0 with cipher $1",
+          tls_handshake_.GetProtocol(), tls_handshake_.GetCipherDescription());
     return tls_handshake_.FinishNoWrap(*socket_);
   }
 
-  TRACE("Negotiated $0 with cipher suite $1",
-        tls_handshake_.GetProtocol(), tls_handshake_.GetCipherSuite());
+  TRACE("Negotiated $0 with cipher $1",
+        tls_handshake_.GetProtocol(), tls_handshake_.GetCipherDescription());
   return tls_handshake_.Finish(&socket_);
 }
 
@@ -702,10 +722,8 @@ Status ServerNegotiation::AuthenticateByToken(faststring* recv_buf) {
         res = security::VerificationResult::EXPIRED_SIGNING_KEY;
         break;
     }
-    const Status s = kudu::fault_injection::MaybeReturnFailure(
-        FLAGS_rpc_inject_invalid_authn_token_ratio,
-        Status::NotAuthorized(VerificationResultToString(res)));
-    if (!s.ok()) {
+    if (kudu::fault_injection::MaybeTrue(FLAGS_rpc_inject_invalid_authn_token_ratio)) {
+      Status s = Status::NotAuthorized(VerificationResultToString(res));
       RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN, s));
       return s;
     }
@@ -784,7 +802,7 @@ Status ServerNegotiation::HandleSaslInitiate(const NegotiatePB& request) {
   // integrity protection so that the channel bindings and nonce can be
   // verified.
   if (negotiated_mech_ == SaslMechanism::GSSAPI) {
-    RETURN_NOT_OK(EnableIntegrityProtection(sasl_conn_.get()));
+    RETURN_NOT_OK(EnableProtection(sasl_conn_.get(), SaslProtection::kIntegrity));
   }
 
   const char* server_out = nullptr;
@@ -879,9 +897,12 @@ Status ServerNegotiation::SendSaslSuccess() {
 
       string plaintext_channel_bindings;
       RETURN_NOT_OK(cert.GetServerEndPointChannelBindings(&plaintext_channel_bindings));
+
+      Slice ciphertext;
       RETURN_NOT_OK(SaslEncode(sasl_conn_.get(),
                                plaintext_channel_bindings,
-                               response.mutable_channel_bindings()));
+                               &ciphertext));
+      *response.mutable_channel_bindings() = ciphertext.ToString();
     }
   }
 
@@ -914,7 +935,7 @@ Status ServerNegotiation::RecvConnectionContext(faststring* recv_buf) {
       return Status::NotAuthorized("ConnectionContextPB wrapped nonce missing");
     }
 
-    string decoded_nonce;
+    Slice decoded_nonce;
     s = SaslDecode(sasl_conn_.get(), conn_context.encoded_nonce(), &decoded_nonce);
     if (!s.ok()) {
       return Status::NotAuthorized("failed to decode nonce", s.message());
@@ -941,11 +962,11 @@ int ServerNegotiation::GetOptionCb(const char* plugin_name,
 }
 
 int ServerNegotiation::PlainAuthCb(sasl_conn_t* /*conn*/,
-                                   const char*  /*user*/,
-                                   const char*  /*pass*/,
+                                   const char* user,
+                                   const char* /*pass*/,
                                    unsigned /*passlen*/,
                                    struct propctx*  /*propctx*/) {
-  TRACE("Received PLAIN auth.");
+  TRACE("Received PLAIN auth, user=$0", user);
   if (PREDICT_FALSE(!helper_.IsPlainEnabled())) {
     LOG(DFATAL) << "Password authentication callback called while PLAIN auth disabled";
     return SASL_BADPARAM;

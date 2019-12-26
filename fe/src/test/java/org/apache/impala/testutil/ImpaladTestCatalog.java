@@ -17,16 +17,27 @@
 
 package org.apache.impala.testutil;
 
-import org.apache.impala.authorization.AuthorizationConfig;
+import com.google.common.base.Preconditions;
+import org.apache.impala.analysis.TableName;
+import org.apache.impala.authorization.AuthorizationFactory;
+import org.apache.impala.authorization.NoopAuthorizationFactory;
+import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.HdfsCachePool;
-import org.apache.impala.catalog.ImpaladCatalog;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.PrincipalPrivilege;
+import org.apache.impala.catalog.Role;
+import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.User;
+import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.util.PatternMatcher;
-import com.google.common.base.Preconditions;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
  * Mock catalog used for running FE tests that allows lazy-loading of tables without a
@@ -37,24 +48,55 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
   private final CatalogServiceCatalog srcCatalog_;
 
   public ImpaladTestCatalog() {
-    this(AuthorizationConfig.createAuthDisabledConfig());
+    this(new NoopAuthorizationFactory());
   }
 
   /**
-   * Takes an AuthorizationConfig to bootstrap the backing CatalogServiceCatalog.
+   * Takes an {@link AuthorizationFactory} to bootstrap the backing CatalogServiceCatalog.
    */
-  public ImpaladTestCatalog(AuthorizationConfig authzConfig) {
-    super("127.0.0.1");
+  public ImpaladTestCatalog(AuthorizationFactory authzFactory) {
+    super("127.0.0.1", null);
     CatalogServiceCatalog catalogServerCatalog =
-        CatalogServiceTestCatalog.createWithAuth(authzConfig.getSentryConfig());
-    // Bootstrap the catalog by adding all dbs, tables, and functions.
-    for (Db db: catalogServerCatalog.getDbs(PatternMatcher.MATCHER_MATCH_ALL)) {
-      // Adding DB should include all tables/fns in that database.
-      addDb(db);
-    }
+        CatalogServiceTestCatalog.createWithAuth(authzFactory);
     authPolicy_ = catalogServerCatalog.getAuthPolicy();
     srcCatalog_ = catalogServerCatalog;
+    srcCatalog_.addDb(BuiltinsDb.getInstance());
     setIsReady(true);
+  }
+
+  /**
+   * Creates ImpaladTestCatalog backed by a given catalog instance.
+   */
+  public ImpaladTestCatalog(CatalogServiceCatalog catalog) {
+    super("127.0.0.1", null);
+    srcCatalog_ = Preconditions.checkNotNull(catalog);
+    authPolicy_ = srcCatalog_.getAuthPolicy();
+    setIsReady(true);
+  }
+
+  @Override
+  public void addDb(Db db) {
+    // Builtins are loaded explicitly after the srcCatalog_ is initialized.
+    if (db == BuiltinsDb.getInstance()) return;
+    srcCatalog_.addDb(db);
+  }
+
+  @Override
+  public Db removeDb(String dbName) {
+    return srcCatalog_.removeDb(dbName);
+  }
+
+  /**
+   * Delegates the getDb() request to the source catalog.
+   */
+  public Db getDb(String dbName) {
+    if (dbName.equals(BuiltinsDb.NAME)) return BuiltinsDb.getInstance();
+    return srcCatalog_.getDb(dbName);
+  }
+
+  @Override
+  public List<Db> getDbs(PatternMatcher matcher) {
+    return srcCatalog_.getDbs(matcher);
   }
 
   @Override
@@ -62,33 +104,87 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
     return srcCatalog_.getHdfsCachePool(poolName);
   }
 
+  public CatalogServiceCatalog getSrcCatalog() { return srcCatalog_; }
+
   /**
    * Reloads all metadata from the source catalog.
    */
   public void reset() throws CatalogException { srcCatalog_.reset(); }
 
   /**
-   * Overrides ImpaladCatalog.getTable to load the table metadata if it is missing.
+   * Returns the Table for the given name, loading the table's metadata if necessary.
+   * Returns null if the database or table does not exist.
    */
-  @Override
-  public Table getTable(String dbName, String tableName)
-      throws CatalogException {
-    Table existingTbl = super.getTable(dbName, tableName);
-    // Table doesn't exist or is already loaded. Just return it.
+  public Table getOrLoadTable(String dbName, String tblName) {
+    Db db = getDb(dbName);
+    if (db == null) return null;
+    Table existingTbl = db.getTable(tblName);
+    // Table doesn't exist or is already loaded.
     if (existingTbl == null || existingTbl.isLoaded()) return existingTbl;
 
-    // The table was not yet loaded. Load it in to the catalog and try getTable()
-    // again.
-    Table newTbl = srcCatalog_.getOrLoadTable(dbName,  tableName);
+    // The table was not yet loaded. Load it in to the catalog now.
+    Table newTbl = null;
+    try {
+      newTbl = srcCatalog_.getOrLoadTable(dbName, tblName, "test");
+    } catch (CatalogException e) {
+      throw new IllegalStateException("Unexpected table loading failure.", e);
+    }
     Preconditions.checkNotNull(newTbl);
     Preconditions.checkState(newTbl.isLoaded());
-    Db db = getDb(dbName);
-    Preconditions.checkNotNull(db);
-    db.addTable(newTbl);
-    Table resultTable = super.getTable(dbName, tableName);
-    if (resultTable instanceof HdfsTable) {
-      ((HdfsTable) resultTable).computeHdfsStatsForTesting();
+    if (newTbl instanceof HdfsTable) {
+      ((HdfsTable) newTbl).computeHdfsStatsForTesting();
     }
-    return resultTable;
+    db.addTable(newTbl);
+    return newTbl;
+  }
+
+  /**
+   * Fast loading path for FE unit testing. Immediately loads the given tables into
+   * this catalog from this thread without involving the catalogd/statestored.
+   */
+  @Override
+  public void prioritizeLoad(Set<TableName> tableNames) {
+    for (TableName tbl: tableNames) getOrLoadTable(tbl.getDb(), tbl.getTbl());
+  }
+
+  /**
+   * No-op. Metadata loading does not go through the catalogd/statestored in a
+   * FE test environment.
+   */
+  @Override
+  public void waitForCatalogUpdate(long timeoutMs) {
+  }
+
+  public Role addRole(String roleName) {
+    return srcCatalog_.addRole(roleName, new HashSet<String>());
+  }
+
+  public Role addRoleGrantGroup(String roleName, String groupName)
+      throws CatalogException {
+    return srcCatalog_.addRoleGrantGroup(roleName, groupName);
+  }
+
+  public PrincipalPrivilege addRolePrivilege(String roleName, TPrivilege privilege)
+      throws CatalogException {
+    return srcCatalog_.addRolePrivilege(roleName, privilege);
+  }
+
+  public void removeRole(String roleName) { srcCatalog_.removeRole(roleName); }
+
+  public User addUser(String userName) {
+    return srcCatalog_.addUser(userName);
+  }
+
+  public PrincipalPrivilege addUserPrivilege(String userName, TPrivilege privilege)
+      throws CatalogException {
+    return srcCatalog_.addUserPrivilege(userName, privilege);
+  }
+
+  public void removeUser(String userName) { srcCatalog_.removeUser(userName); }
+
+  @Override
+  public void close() {
+    super.close();
+    srcCatalog_.close();
   }
 }

@@ -15,21 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/callback.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/request_tracker.h"
+#include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/retriable_rpc.h"
 #include "kudu/rpc/rpc-test-base.h"
 #include "kudu/rpc/rpc.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rtest.pb.h"
+#include "kudu/rpc/rtest.proxy.h"
+#include "kudu/util/countdown_latch.h"
+#include "kudu/util/mem_tracker.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
 DECLARE_int64(remember_clients_ttl_ms);
 DECLARE_int64(remember_responses_ttl_ms);
 DECLARE_int64(result_tracker_gc_interval_ms);
 
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
 using std::atomic_int;
 using std::shared_ptr;
 using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace rpc {
+
+class Messenger;
 
 namespace {
 
@@ -162,15 +199,17 @@ class ExactlyOnceRpcTest : public RpcTestBase {
     SeedRandom();
   }
 
-  void StartServer() {
+  Status StartServer() {
     // Set up server.
-    StartTestServerWithGeneratedCode(&server_addr_);
-    client_messenger_ = CreateMessenger("Client");
+    RETURN_NOT_OK(StartTestServerWithGeneratedCode(&server_addr_));
+    RETURN_NOT_OK(CreateMessenger("Client", &client_messenger_));
     proxy_.reset(new CalculatorServiceProxy(
         client_messenger_, server_addr_, server_addr_.host()));
     test_picker_.reset(new TestServerPicker(proxy_.get()));
     request_tracker_.reset(new RequestTracker(kClientId));
     attempt_nos_ = 0;
+
+    return Status::OK();
   }
 
   // An exactly once adder that uses RetriableRpc to perform the requests.
@@ -349,7 +388,7 @@ class ExactlyOnceRpcTest : public RpcTestBase {
 // Tests that we get exactly once semantics on RPCs when we send a bunch of requests with the
 // same sequence number as previous requests.
 TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsAfterRpcCompleted) {
-  StartServer();
+  ASSERT_OK(StartServer());
   ExactlyOnceResponsePB original_resp;
   int mem_consumption = mem_tracker_->consumption();
   {
@@ -412,7 +451,7 @@ TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsAfterRpcCompleted) {
 // In CalculatorServiceRpc we sure that the same response is returned by all retries and,
 // after all the rpcs are done, we make sure that final result is the expected one.
 TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsWithReplicatedRpc) {
-  StartServer();
+  ASSERT_OK(StartServer());
   int kNumIterations = 10;
   int kNumRpcs = 10;
 
@@ -442,7 +481,7 @@ TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsWithReplicatedRpc) {
 // On each iteration, after all the threads complete, we expect that the add operation was
 // executed exactly once.
 TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsWithConcurrentUpdaters) {
-  StartServer();
+  ASSERT_OK(StartServer());
   int kNumIterations = 10;
   int kNumThreads = 10;
 
@@ -495,7 +534,7 @@ TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsGarbageCollection) {
   FLAGS_remember_clients_ttl_ms = 500;
   FLAGS_remember_responses_ttl_ms = 100;
 
-  StartServer();
+  ASSERT_OK(StartServer());
 
   // Make a request.
   ExactlyOnceResponsePB original;
@@ -542,7 +581,7 @@ TEST_F(ExactlyOnceRpcTest, TestExactlyOnceSemanticsGarbageCollectionStressTest) 
   FLAGS_remember_responses_ttl_ms = 10;
   FLAGS_result_tracker_gc_interval_ms = 10;
 
-  StartServer();
+  ASSERT_OK(StartServer());
 
   // The write thread runs for a shorter period to make sure client GC has a
   // chance to run.

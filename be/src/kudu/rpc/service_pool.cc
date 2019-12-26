@@ -17,26 +17,37 @@
 
 #include "kudu/rpc/service_pool.h"
 
-#include <glog/logging.h>
+#include <cstdint>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
+
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/inbound_call.h"
-#include "kudu/rpc/messenger.h"
+#include "kudu/rpc/remote_method.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/service_queue.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 #include "kudu/util/trace.h"
 
 using std::shared_ptr;
+using std::string;
+using std::vector;
 using strings::Substitute;
 
 METRIC_DEFINE_histogram(server, rpc_incoming_queue_time,
@@ -120,6 +131,10 @@ void ServicePool::RejectTooBusy(InboundCall* c) {
                     Status::ServiceUnavailable(err_msg));
   DLOG(INFO) << err_msg << " Contents of service queue:\n"
              << service_queue_.ToString();
+
+  if (too_busy_hook_) {
+    too_busy_hook_();
+  }
 }
 
 RpcMethodInfo* ServicePool::LookupMethod(const RemoteMethod& method) {
@@ -184,7 +199,7 @@ void ServicePool::RunThread() {
       return;
     }
 
-    incoming->RecordHandlingStarted(incoming_queue_time_);
+    incoming->RecordHandlingStarted(incoming_queue_time_.get());
     ADOPT_TRACE(incoming->trace());
 
     if (PREDICT_FALSE(incoming->ClientTimedOut())) {

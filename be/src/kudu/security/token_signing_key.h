@@ -16,14 +16,15 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include <gtest/gtest_prod.h>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/util/status.h"
 
@@ -36,7 +37,7 @@ namespace security {
 // This represents a standalone public key useful for token verification.
 class TokenSigningPublicKey {
  public:
-  explicit TokenSigningPublicKey(const TokenSigningPublicKeyPB& pb);
+  explicit TokenSigningPublicKey(TokenSigningPublicKeyPB pb);
   ~TokenSigningPublicKey();
 
   const TokenSigningPublicKeyPB& pb() const {

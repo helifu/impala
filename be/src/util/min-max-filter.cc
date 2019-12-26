@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "common/object-pool.h"
+#include "runtime/decimal-value.inline.h"
 #include "runtime/raw-value.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.inline.h"
@@ -39,7 +40,8 @@ static std::unordered_map<int, string> MIN_MAX_FILTER_LLVM_CLASS_NAMES = {
     {PrimitiveType::TYPE_FLOAT, FloatMinMaxFilter::LLVM_CLASS_NAME},
     {PrimitiveType::TYPE_DOUBLE, DoubleMinMaxFilter::LLVM_CLASS_NAME},
     {PrimitiveType::TYPE_STRING, StringMinMaxFilter::LLVM_CLASS_NAME},
-    {PrimitiveType::TYPE_TIMESTAMP, TimestampMinMaxFilter::LLVM_CLASS_NAME}};
+    {PrimitiveType::TYPE_TIMESTAMP, TimestampMinMaxFilter::LLVM_CLASS_NAME},
+    {PrimitiveType::TYPE_DECIMAL, DecimalMinMaxFilter::LLVM_CLASS_NAME}};
 
 static std::unordered_map<int, IRFunction::Type> MIN_MAX_FILTER_IR_FUNCTION_TYPES = {
     {PrimitiveType::TYPE_BOOLEAN, IRFunction::BOOL_MIN_MAX_FILTER_INSERT},
@@ -52,12 +54,32 @@ static std::unordered_map<int, IRFunction::Type> MIN_MAX_FILTER_IR_FUNCTION_TYPE
     {PrimitiveType::TYPE_STRING, IRFunction::STRING_MIN_MAX_FILTER_INSERT},
     {PrimitiveType::TYPE_TIMESTAMP, IRFunction::TIMESTAMP_MIN_MAX_FILTER_INSERT}};
 
+static std::unordered_map<int, IRFunction::Type>
+    DECIMAL_MIN_MAX_FILTER_IR_FUNCTION_TYPES = {
+        {DECIMAL_SIZE_4BYTE, IRFunction::DECIMAL_MIN_MAX_FILTER_INSERT4},
+        {DECIMAL_SIZE_8BYTE, IRFunction::DECIMAL_MIN_MAX_FILTER_INSERT8},
+        {DECIMAL_SIZE_16BYTE, IRFunction::DECIMAL_MIN_MAX_FILTER_INSERT16}};
+
 string MinMaxFilter::GetLlvmClassName(PrimitiveType type) {
-  return MIN_MAX_FILTER_LLVM_CLASS_NAMES[type];
+  auto llvm_class = MIN_MAX_FILTER_LLVM_CLASS_NAMES.find(type);
+  DCHECK(llvm_class != MIN_MAX_FILTER_LLVM_CLASS_NAMES.end())
+      << "Not a valid type: " << type;
+  return llvm_class->second;
 }
 
-IRFunction::Type MinMaxFilter::GetInsertIRFunctionType(PrimitiveType type) {
-  return MIN_MAX_FILTER_IR_FUNCTION_TYPES[type];
+IRFunction::Type MinMaxFilter::GetInsertIRFunctionType(ColumnType column_type) {
+  if (column_type.type != PrimitiveType::TYPE_DECIMAL) {
+    auto ir_function_type = MIN_MAX_FILTER_IR_FUNCTION_TYPES.find(column_type.type);
+    DCHECK(ir_function_type != MIN_MAX_FILTER_IR_FUNCTION_TYPES.end())
+        << "Not a valid type: " << column_type.type;
+    return ir_function_type->second;
+  } else {
+    auto ir_function_type = DECIMAL_MIN_MAX_FILTER_IR_FUNCTION_TYPES.find(
+        ColumnType::GetDecimalByteSize(column_type.precision));
+    DCHECK(ir_function_type != DECIMAL_MIN_MAX_FILTER_IR_FUNCTION_TYPES.end())
+        << "Not a valid precision: " << column_type.precision;
+    return ir_function_type->second;
+  }
 }
 
 #define NUMERIC_MIN_MAX_FILTER_FUNCS(NAME, TYPE, THRIFT_TYPE, PRIMITIVE_TYPE)  \
@@ -199,8 +221,11 @@ NUMERIC_MIN_MAX_FILTER_NO_CAST(Double);
 const char* StringMinMaxFilter::LLVM_CLASS_NAME = "class.impala::StringMinMaxFilter";
 const int StringMinMaxFilter::MAX_BOUND_LENGTH = 1024;
 
-StringMinMaxFilter::StringMinMaxFilter(const TMinMaxFilter& thrift, MemPool* mem_pool)
-  : min_buffer_(mem_pool), max_buffer_(mem_pool) {
+StringMinMaxFilter::StringMinMaxFilter(
+    const TMinMaxFilter& thrift, MemTracker* mem_tracker)
+  : mem_pool_(mem_tracker),
+    min_buffer_(&mem_pool_),
+    max_buffer_(&mem_pool_) {
   always_false_ = thrift.always_false;
   always_true_ = thrift.always_true;
   if (!always_true_ && !always_false_) {
@@ -380,6 +405,159 @@ void TimestampMinMaxFilter::Copy(const TMinMaxFilter& in, TMinMaxFilter* out) {
   out->__isset.max = true;
 }
 
+// DECIMAL
+const char* DecimalMinMaxFilter::LLVM_CLASS_NAME = "class.impala::DecimalMinMaxFilter";
+#define DECIMAL_SET_MINMAX(SIZE)                                       \
+  do {                                                                 \
+    DCHECK(thrift.min.__isset.decimal_val);                            \
+    DCHECK(thrift.max.__isset.decimal_val);                            \
+    min##SIZE##_ = Decimal##SIZE##Value::FromTColumnValue(thrift.min); \
+    max##SIZE##_ = Decimal##SIZE##Value::FromTColumnValue(thrift.max); \
+  } while (false)
+
+// Construct the Decimal min-max filter when the min-max filter information
+// comes in through thrift.  This can get called in coordinator, after the filter
+// is sent by executor
+DecimalMinMaxFilter::DecimalMinMaxFilter(const TMinMaxFilter& thrift, int precision)
+  : size_(ColumnType::GetDecimalByteSize(precision)), always_false_(thrift.always_false) {
+  if (!always_false_) {
+    switch (size_) {
+      case DECIMAL_SIZE_4BYTE:
+        DECIMAL_SET_MINMAX(4);
+        break;
+      case DECIMAL_SIZE_8BYTE:
+        DECIMAL_SET_MINMAX(8);
+        break;
+      case DECIMAL_SIZE_16BYTE:
+        DECIMAL_SET_MINMAX(16);
+        break;
+      default:
+        DCHECK(false) << "DecimalMinMaxFilter: Unknown decimal byte size: " << size_;
+    }
+  }
+}
+
+PrimitiveType DecimalMinMaxFilter::type() {
+  return PrimitiveType::TYPE_DECIMAL;
+}
+
+#define DECIMAL_TO_THRIFT(SIZE)                \
+  do {                                         \
+    min##SIZE##_.ToTColumnValue(&thrift->min); \
+    max##SIZE##_.ToTColumnValue(&thrift->max); \
+  } while (false)
+
+// Construct a thrift min-max filter.  Will be called by the executor
+// to be sent to the coordinator
+void DecimalMinMaxFilter::ToThrift(TMinMaxFilter* thrift) const {
+  if (!always_false_) {
+    switch (size_) {
+      case DECIMAL_SIZE_4BYTE:
+        DECIMAL_TO_THRIFT(4);
+        break;
+      case DECIMAL_SIZE_8BYTE:
+        DECIMAL_TO_THRIFT(8);
+        break;
+      case DECIMAL_SIZE_16BYTE:
+        DECIMAL_TO_THRIFT(16);
+        break;
+      default:
+        DCHECK(false) << "DecimalMinMaxFilter: Unknown decimal byte size: " << size_;
+    }
+    thrift->__isset.min = true;
+    thrift->__isset.max = true;
+  }
+  thrift->__set_always_false(always_false_);
+  thrift->__set_always_true(false);
+}
+
+void DecimalMinMaxFilter::Insert(void* val) {
+  if (val == nullptr) return;
+  switch (size_) {
+    case 4:
+      Insert4(val);
+      break;
+    case 8:
+      Insert8(val);
+      break;
+    case 16:
+      Insert16(val);
+      break;
+    default:
+      DCHECK(false) << "Unknown decimal size: " << size_;
+  }
+}
+
+#define DECIMAL_DEBUG_STRING(SIZE)                                                \
+  do {                                                                            \
+    out << "DecimalMinMaxFilter(min=" << min##SIZE##_ << ", max=" << max##SIZE##_ \
+        << " always_false=" << (always_false_ ? "true" : "false") << ")";         \
+  } while (false)
+
+string DecimalMinMaxFilter::DebugString() const {
+  stringstream out;
+
+  switch (size_) {
+    case DECIMAL_SIZE_4BYTE:
+      DECIMAL_DEBUG_STRING(4);
+      break;
+    case DECIMAL_SIZE_8BYTE:
+      DECIMAL_DEBUG_STRING(8);
+      break;
+    case DECIMAL_SIZE_16BYTE:
+      DECIMAL_DEBUG_STRING(16);
+      break;
+    default:
+      DCHECK(false) << "DecimalMinMaxFilter: Unknown decimal byte size: " << size_;
+  }
+
+  return out.str();
+}
+
+#define DECIMAL_OR(SIZE)                                    \
+  do {                                                      \
+    if (Decimal##SIZE##Value::FromTColumnValue(in.min)      \
+        < Decimal##SIZE##Value::FromTColumnValue(out->min)) \
+      out->min.__set_decimal_val(in.min.decimal_val);       \
+    if (Decimal##SIZE##Value::FromTColumnValue(in.max)      \
+        > Decimal##SIZE##Value::FromTColumnValue(out->max)) \
+      out->max.__set_decimal_val(in.max.decimal_val);       \
+  } while (false)
+
+void DecimalMinMaxFilter::Or(const TMinMaxFilter& in, TMinMaxFilter* out, int precision) {
+  if (in.always_false) {
+    return;
+  } else if (out->always_false) {
+    out->min.__set_decimal_val(in.min.decimal_val);
+    out->__isset.min = true;
+    out->max.__set_decimal_val(in.max.decimal_val);
+    out->__isset.max = true;
+    out->__set_always_false(false);
+  } else {
+    int size = ColumnType::GetDecimalByteSize(precision);
+    switch (size) {
+      case DECIMAL_SIZE_4BYTE:
+        DECIMAL_OR(4);
+        break;
+      case DECIMAL_SIZE_8BYTE:
+        DECIMAL_OR(8);
+        break;
+      case DECIMAL_SIZE_16BYTE:
+        DECIMAL_OR(16);
+        break;
+      default:
+        DCHECK(false) << "Unknown decimal size: " << size;
+    }
+  }
+}
+
+void DecimalMinMaxFilter::Copy(const TMinMaxFilter& in, TMinMaxFilter* out) {
+  out->min.__set_decimal_val(in.min.decimal_val);
+  out->__isset.min = true;
+  out->max.__set_decimal_val(in.max.decimal_val);
+  out->__isset.max = true;
+}
+
 // MinMaxFilter
 bool MinMaxFilter::GetCastIntMinMax(
     const ColumnType& type, int64_t* out_min, int64_t* out_max) {
@@ -388,7 +566,8 @@ bool MinMaxFilter::GetCastIntMinMax(
   return true;
 }
 
-MinMaxFilter* MinMaxFilter::Create(ColumnType type, ObjectPool* pool, MemPool* mem_pool) {
+MinMaxFilter* MinMaxFilter::Create(
+    ColumnType type, ObjectPool* pool, MemTracker* mem_tracker) {
   switch (type.type) {
     case PrimitiveType::TYPE_BOOLEAN:
       return pool->Add(new BoolMinMaxFilter());
@@ -405,17 +584,19 @@ MinMaxFilter* MinMaxFilter::Create(ColumnType type, ObjectPool* pool, MemPool* m
     case PrimitiveType::TYPE_DOUBLE:
       return pool->Add(new DoubleMinMaxFilter());
     case PrimitiveType::TYPE_STRING:
-      return pool->Add(new StringMinMaxFilter(mem_pool));
+      return pool->Add(new StringMinMaxFilter(mem_tracker));
     case PrimitiveType::TYPE_TIMESTAMP:
       return pool->Add(new TimestampMinMaxFilter());
+    case PrimitiveType::TYPE_DECIMAL:
+      return pool->Add(new DecimalMinMaxFilter(type.precision));
     default:
       DCHECK(false) << "Unsupported MinMaxFilter type: " << type;
   }
   return nullptr;
 }
 
-MinMaxFilter* MinMaxFilter::Create(
-    const TMinMaxFilter& thrift, ColumnType type, ObjectPool* pool, MemPool* mem_pool) {
+MinMaxFilter* MinMaxFilter::Create(const TMinMaxFilter& thrift, ColumnType type,
+    ObjectPool* pool, MemTracker* mem_tracker) {
   switch (type.type) {
     case PrimitiveType::TYPE_BOOLEAN:
       return pool->Add(new BoolMinMaxFilter(thrift));
@@ -432,16 +613,19 @@ MinMaxFilter* MinMaxFilter::Create(
     case PrimitiveType::TYPE_DOUBLE:
       return pool->Add(new DoubleMinMaxFilter(thrift));
     case PrimitiveType::TYPE_STRING:
-      return pool->Add(new StringMinMaxFilter(thrift, mem_pool));
+      return pool->Add(new StringMinMaxFilter(thrift, mem_tracker));
     case PrimitiveType::TYPE_TIMESTAMP:
       return pool->Add(new TimestampMinMaxFilter(thrift));
+    case PrimitiveType::TYPE_DECIMAL:
+      return pool->Add(new DecimalMinMaxFilter(thrift, type.precision));
     default:
       DCHECK(false) << "Unsupported MinMaxFilter type: " << type;
   }
   return nullptr;
 }
 
-void MinMaxFilter::Or(const TMinMaxFilter& in, TMinMaxFilter* out) {
+void MinMaxFilter::Or(
+    const TMinMaxFilter& in, TMinMaxFilter* out, const ColumnType& columnType) {
   if (in.always_false || out->always_true) return;
   if (in.always_true) {
     out->__set_always_true(true);
@@ -479,6 +663,10 @@ void MinMaxFilter::Or(const TMinMaxFilter& in, TMinMaxFilter* out) {
   } else if (in.min.__isset.timestamp_val) {
     DCHECK(out->min.__isset.timestamp_val);
     TimestampMinMaxFilter::Or(in, out);
+    return;
+  } else if (in.min.__isset.decimal_val) {
+    DCHECK(out->min.__isset.decimal_val);
+    DecimalMinMaxFilter::Or(in, out, columnType.precision);
     return;
   }
   DCHECK(false) << "Unsupported MinMaxFilter type.";
@@ -521,6 +709,10 @@ void MinMaxFilter::Copy(const TMinMaxFilter& in, TMinMaxFilter* out) {
   } else if (in.min.__isset.timestamp_val) {
     DCHECK(!out->min.__isset.timestamp_val);
     TimestampMinMaxFilter::Copy(in, out);
+    return;
+  } else if (in.min.__isset.decimal_val) {
+    DCHECK(!out->min.__isset.decimal_val);
+    DecimalMinMaxFilter::Copy(in, out);
     return;
   }
   DCHECK(false) << "Unsupported MinMaxFilter type.";

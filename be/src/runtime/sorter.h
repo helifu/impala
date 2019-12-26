@@ -95,7 +95,7 @@ class Sorter {
   /// 'sort_tuple_exprs' are the slot exprs used to materialize the tuples to be
   /// sorted. 'ordering_exprs', 'is_asc_order' and 'nulls_first' are parameters
   /// for the comparator for the sort tuples.
-  /// 'node_id' is the ID of the exec node using the sorter for error reporting.
+  /// 'node_label' is the label of the exec node using the sorter for error reporting.
   /// 'enable_spilling' should be set to false to reduce the number of requested buffers
   /// if the caller will use AddBatchNoSpill().
   ///
@@ -107,7 +107,7 @@ class Sorter {
       const std::vector<bool>& is_asc_order, const std::vector<bool>& nulls_first,
       const std::vector<ScalarExpr*>& sort_tuple_exprs, RowDescriptor* output_row_desc,
       MemTracker* mem_tracker, BufferPool::ClientHandle* client, int64_t page_len,
-      RuntimeProfile* profile, RuntimeState* state, int node_id,
+      RuntimeProfile* profile, RuntimeState* state, const std::string& node_label,
       bool enable_spilling);
   ~Sorter();
 
@@ -149,8 +149,9 @@ class Sorter {
   void Close(RuntimeState* state);
 
   /// Compute the minimum amount of buffer memory in bytes required to execute a
-  /// sort with the current sorter.
-  int64_t ComputeMinReservation();
+  /// sort with the current sorter. Must be kept in sync with
+  /// SortNode.computeNodeResourceProfile() in fe.
+  int64_t ComputeMinReservation() const;
 
   /// Return true if the sorter has any spilled runs.
   bool HasSpilledRuns() const;
@@ -162,21 +163,19 @@ class Sorter {
   class TupleSorter;
 
   /// Create a SortedRunMerger from sorted runs in 'sorted_runs_' and assign it to
-  /// 'merger_'. Attempts to set up merger with 'max_num_runs' runs but may set it
-  /// up with fewer if it cannot pin the initial pages of all of the runs. Fails
-  /// if it cannot merge at least two runs. The runs to be merged are removed from
-  /// 'sorted_runs_'.  The Sorter sets the 'deep_copy_input' flag to true for the
-  /// merger, since the pages containing input run data will be deleted as input
-  /// runs are read.
-  Status CreateMerger(int max_num_runs) WARN_UNUSED_RESULT;
+  /// 'merger_'. 'num_runs' indicates how many runs should be covered by the current
+  /// merging attempt. Returns error if memory allocation fails during in
+  /// Run::PrepareRead(). The runs to be merged are removed from 'sorted_runs_'. The
+  /// Sorter sets the 'deep_copy_input' flag to true for the merger, since the pages
+  /// containing input run data will be deleted as input runs are read.
+  Status CreateMerger(int num_runs) WARN_UNUSED_RESULT;
 
   /// Repeatedly replaces multiple smaller runs in sorted_runs_ with a single larger
   /// merged run until there are few enough runs to be merged with a single merger.
-  /// Returns when 'merger_' is set up to merge the final runs.
-  /// At least 1 (2 if var-len slots) page from each sorted run must be pinned for
-  /// a merge. If the number of sorted runs is too large, merge sets of smaller runs
-  /// into large runs until a final merge can be performed. An intermediate row batch
-  /// containing deep copied rows is used for the output of each intermediate merge.
+  /// Returns when 'merger_' is set up to merge the final runs. If the number of sorted
+  /// runs is too large, merge sets of smaller runs into large runs until a final merge
+  /// can be performed. An intermediate row batch containing deep copied rows is used for
+  /// the output of each intermediate merge.
   Status MergeIntermediateRuns() WARN_UNUSED_RESULT;
 
   /// Execute a single step of the intermediate merge, pulling rows from 'merger_'
@@ -190,8 +189,26 @@ class Sorter {
   /// Helper that cleans up all runs in the sorter.
   void CleanupAllRuns();
 
-  /// ID of the ExecNode that owns the sorter, used for error reporting.
-  const int node_id_;
+  /// Based on the amount of unused buffers the Sorter has through the BufferPool this
+  /// function calculates the maximum number of runs that can be taken care of during the
+  /// next merge intermediate merge. Takes into account that a separate run is needed for
+  /// the output.
+  int MaxRunsInNextMerge() const;
+
+  /// Calculates the number of runs the 'merger_' should grab for merging in the current
+  /// round of merging. Returns at most MaxRunsInNextMerge(), so the Sorter will have
+  /// enough reservation to merge this number of runs.
+  int GetNumOfRunsForMerge() const;
+
+  /// If the number of available buffers is not enough to grab all the runs to merge in
+  /// one round then this functions starts allocating additional free buffers one by one
+  /// until it reaches the maximum limit the Sorter can have or until we have enough free
+  /// buffers for all the runs. This is possible if other operators have released memory
+  /// since the Sorter has started working on it's initial runs.
+  void TryToIncreaseMemAllocationForMerge();
+
+  /// Label of the ExecNode that owns the sorter, used for error reporting.
+  const std::string node_label_;
 
   /// Runtime state instance used to check for cancellation. Not owned.
   RuntimeState* const state_;

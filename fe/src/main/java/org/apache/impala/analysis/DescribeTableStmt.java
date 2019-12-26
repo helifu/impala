@@ -17,14 +17,13 @@
 
 package org.apache.impala.analysis;
 
-import java.util.ArrayList;
+import java.util.List;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.impala.analysis.Path.PathType;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TDescribeOutputStyle;
@@ -52,19 +51,19 @@ public class DescribeTableStmt extends StatementBase {
   private final TDescribeOutputStyle outputStyle_;
 
   /// "."-separated path from the describe statement.
-  private final ArrayList<String> rawPath_;
+  private final List<String> rawPath_;
 
   /// The resolved path to describe, set after analysis.
   private Path path_;
 
   /// The fully qualified name of the root table, set after analysis.
-  private Table table_;
+  private FeTable table_;
 
   /// Struct type with the fields to display for the described path.
   /// Only set when describing a path to a nested collection.
   private StructType resultStruct_;
 
-  public DescribeTableStmt(ArrayList<String> rawPath, TDescribeOutputStyle outputStyle) {
+  public DescribeTableStmt(List<String> rawPath, TDescribeOutputStyle outputStyle) {
     Preconditions.checkNotNull(rawPath);
     Preconditions.checkArgument(!rawPath.isEmpty());
     rawPath_ = rawPath;
@@ -74,7 +73,7 @@ public class DescribeTableStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("DESCRIBE ");
     if (outputStyle_ != TDescribeOutputStyle.MINIMAL) {
       sb.append(outputStyle_.toString() + " ");
@@ -82,22 +81,12 @@ public class DescribeTableStmt extends StatementBase {
     return sb.toString() + StringUtils.join(rawPath_, ".");
   }
 
-  public Table getTable() { return table_; }
+  public FeTable getTable() { return table_; }
   public TDescribeOutputStyle getOutputStyle() { return outputStyle_; }
 
-  /**
-   * Get the privilege requirement, which depends on the output style.
-   */
-  private Privilege getPrivilegeRequirement() {
-    switch (outputStyle_) {
-      case MINIMAL: return Privilege.ANY;
-      case FORMATTED:
-      case EXTENDED:
-        return Privilege.VIEW_METADATA;
-      default:
-        Preconditions.checkArgument(false);
-        return null;
-    }
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(rawPath_, null));
   }
 
   @Override
@@ -108,26 +97,43 @@ public class DescribeTableStmt extends StatementBase {
       // Register privilege requests to prefer reporting an authorization error over
       // an analysis error. We should not accidentally reveal the non-existence of a
       // table/database if the user is not authorized.
-      if (analyzer.hasMissingTbls()) throw ae;
       if (rawPath_.size() > 1) {
-        analyzer.registerPrivReq(new PrivilegeRequestBuilder()
-            .onTable(rawPath_.get(0), rawPath_.get(1))
-            .allOf(getPrivilegeRequirement()).toRequest());
+        analyzer.registerPrivReq(builder ->
+            builder.onTableUnknownOwner(rawPath_.get(0), rawPath_.get(1))
+                .any()
+                .build());
       }
-      analyzer.registerPrivReq(new PrivilegeRequestBuilder()
-          .onTable(analyzer.getDefaultDb(), rawPath_.get(0))
-          .allOf(getPrivilegeRequirement()).toRequest());
+      analyzer.registerPrivReq(builder ->
+          builder.onTableUnknownOwner(analyzer.getDefaultDb(), rawPath_.get(0))
+              .any()
+              .build());
       throw ae;
     } catch (TableLoadingException tle) {
       throw new AnalysisException(tle.getMessage(), tle);
     }
 
     table_ = path_.getRootTable();
+
     // Register authorization and audit events.
-    analyzer.getTable(table_.getTableName(), getPrivilegeRequirement());
+    // The ANY privilege here is used as a first-level check to see if there exists any
+    // privilege in the table or columns of the given table. A further check for
+    // column-level filtering will be done in Frontend.doDescribeTable() to filter out
+    // unauthorized columns against the actual required privileges.
+    // What this essentially means is if we have DROP a privilege on a particular table,
+    // this check will succeed, but the column-level filtering logic will filter out
+    // all columns returning an empty result due to insufficient VIEW_METADATA privilege.
+    analyzer.getTable(table_.getTableName(), /* add column-level privilege */ true,
+        Privilege.ANY);
 
     // Describing a table.
     if (path_.destTable() != null) return;
+
+    analyzer.registerPrivReq(builder ->
+        builder.onColumn(path_.getRootTable().getDb().getName(),
+            path_.getRootTable().getName(),
+            path_.getRawPath().get(0), path_.getRootTable().getOwnerUser())
+            .any()
+            .build());
 
     if (path_.destType().isComplexType()) {
       if (outputStyle_ == TDescribeOutputStyle.FORMATTED ||

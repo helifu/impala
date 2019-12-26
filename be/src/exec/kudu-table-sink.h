@@ -53,8 +53,8 @@ namespace impala {
 /// status. All reported errors (ignored or not) will be logged via the RuntimeState.
 class KuduTableSink : public DataSink {
  public:
-  KuduTableSink(const RowDescriptor* row_desc, const TDataSink& tsink,
-      RuntimeState* state);
+  KuduTableSink(TDataSinkId sink_id, const RowDescriptor* row_desc,
+      const TDataSink& tsink, RuntimeState* state);
 
   /// Prepares the expressions to be applied and creates a KuduSchema based on the
   /// expressions and KuduTableDescriptor.
@@ -94,6 +94,12 @@ class KuduTableSink : public DataSink {
   /// The Kudu table and session.
   kudu::client::sp::shared_ptr<kudu::client::KuduTable> table_;
   kudu::client::sp::shared_ptr<kudu::client::KuduSession> session_;
+
+  /// A cache of the nullability of each Kudu column. The Kudu schema accessor
+  /// is not inlined and actually creates a copy (see IMPALA-8284).
+  ///
+  /// Initialized in Open().
+  std::vector<bool> kudu_column_nullabilities_;
 
   /// Used to specify the type of write operation (INSERT/UPDATE/DELETE).
   TSinkAction::type sink_action_;

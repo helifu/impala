@@ -18,7 +18,7 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.View;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TAlterTableOrViewRenameParams;
@@ -69,13 +69,13 @@ public class AlterTableOrViewRenameStmt extends AlterTableStmt {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
-    newTableName_.analyze();
-    table_ = analyzer.getTable(tableName_, Privilege.ALTER);
-    if (table_ instanceof View && renameTable_) {
+    analyzer.getFqTableName(newTableName_).analyze();
+    table_ = analyzer.getTable(tableName_, Privilege.ALL);
+    if (table_ instanceof FeView && renameTable_) {
       throw new AnalysisException(String.format(
           "ALTER TABLE not allowed on a view: %s", table_.getFullName()));
     }
-    if (!(table_ instanceof View) && !renameTable_) {
+    if (!(table_ instanceof FeView) && !renameTable_) {
       throw new AnalysisException(String.format(
           "ALTER VIEW not allowed on a table: %s", table_.getFullName()));
     }

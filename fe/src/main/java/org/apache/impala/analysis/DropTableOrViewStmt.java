@@ -17,21 +17,28 @@
 
 package org.apache.impala.analysis;
 
+import java.util.List;
+
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.TableLoadingException;
-import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDropTableOrViewParams;
 import org.apache.impala.thrift.TTableName;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Preconditions;
 
 /**
  * Represents a DROP TABLE/VIEW [IF EXISTS] statement
  */
 public class DropTableOrViewStmt extends StatementBase {
+  private static final Logger LOG = LoggerFactory.getLogger(DropTableOrViewStmt.class);
+
   protected final TableName tableName_;
   protected final boolean ifExists_;
 
@@ -45,12 +52,15 @@ public class DropTableOrViewStmt extends StatementBase {
   // Set during analysis
   protected String dbName_;
 
+  // Server name needed for privileges. Set during analysis.
+  private String serverName_;
+
   /**
    * Constructor for building the DROP TABLE/VIEW statement
    */
   public DropTableOrViewStmt(TableName tableName, boolean ifExists,
       boolean dropTable, boolean purgeTable) {
-    tableName_ = tableName;
+    tableName_ = Preconditions.checkNotNull(tableName);
     ifExists_ = ifExists;
     dropTable_ = dropTable;
     purgeTable_ = purgeTable;
@@ -59,7 +69,7 @@ public class DropTableOrViewStmt extends StatementBase {
   }
 
   @Override
-  public String toSql() {
+  public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("DROP " + ((dropTable_) ? "TABLE " : "VIEW "));
     if (ifExists_) sb.append("IF EXISTS ");
     if (tableName_.getDb() != null) sb.append(tableName_.getDb() + ".");
@@ -74,7 +84,13 @@ public class DropTableOrViewStmt extends StatementBase {
     params.setIf_exists(ifExists_);
     params.setPurge(purgeTable_);
     params.setIs_table(dropTable_);
+    params.setServer_name(serverName_);
     return params;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
   }
 
   /**
@@ -87,16 +103,42 @@ public class DropTableOrViewStmt extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     dbName_ = analyzer.getTargetDbName(tableName_);
+    // Set the servername here if authorization is enabled because analyzer_ is not
+    // available in the toThrift() method.
+    serverName_ = analyzer.getServerName();
     try {
-      Table table = analyzer.getTable(tableName_, Privilege.DROP, true);
+      // Fetch the table owner information, without registering any privileges.
+      FeTable table = analyzer.getTableNoThrow(dbName_, tableName_.getTbl());
+      String tblOwnerUser = table == null ? null : table.getOwnerUser();
+      if (ifExists_) {
+        // Start with ANY privilege in case of IF EXISTS, and register DROP privilege
+        // later only if the table exists. See IMPALA-8851 for more explanation.
+        analyzer.registerPrivReq(builder ->
+            builder.allOf(Privilege.ANY)
+            .onTable(dbName_, getTbl(), tblOwnerUser)
+            .build());
+        if (table == null) return;
+      }
+      // Register the DROP privilege on the table.
+      table = analyzer.getTable(tableName_, /* add access event */ true,
+          /* add column-level privilege */ false, Privilege.DROP);
       Preconditions.checkNotNull(table);
-      if (table instanceof View && dropTable_) {
+      if (table instanceof FeView && dropTable_) {
+        // DROP VIEW IF EXISTS 'table' succeeds, similarly to Hive, but unlike postgres.
+        if (ifExists_) return;
         throw new AnalysisException(String.format(
             "DROP TABLE not allowed on a view: %s.%s", dbName_, getTbl()));
       }
-      if (!(table instanceof View) && !dropTable_) {
+      if (!(table instanceof FeView) && !dropTable_) {
+        // DROP TABLE IF EXISTS 'view' succeeds, similarly to Hive, but unlike postgres.
+        if (ifExists_) return;
         throw new AnalysisException(String.format(
             "DROP VIEW not allowed on a table: %s.%s", dbName_, getTbl()));
+      }
+      if (dropTable_) {
+        // To drop a view needs not write capabilities, only checks for tables.
+        analyzer.checkTableCapability(table, Analyzer.OperationType.WRITE);
+        analyzer.ensureTableNotFullAcid(table);
       }
     } catch (TableLoadingException e) {
       // We should still try to DROP tables that failed to load, so that tables that are
@@ -107,9 +149,7 @@ public class DropTableOrViewStmt extends StatementBase {
       analyzer.addAccessEvent(new TAccessEvent(
           analyzer.getFqTableName(tableName_).toString(), TCatalogObjectType.TABLE,
           Privilege.DROP.toString()));
-    } catch (AnalysisException e) {
-      if (ifExists_ && analyzer.getMissingTbls().isEmpty()) return;
-      throw e;
+      LOG.info("Ignoring TableLoadingException for {}", tableName_);
     }
   }
 

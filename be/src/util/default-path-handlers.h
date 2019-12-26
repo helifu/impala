@@ -19,9 +19,10 @@
 #define IMPALA_UTIL_DEFAULT_PATH_HANDLERS_H
 
 #include <stdio.h>
+#include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
 
 #include "util/webserver.h"
-#include "rapidjson/document.h"
 
 namespace impala {
 
@@ -30,12 +31,12 @@ class MetricGroup;
 
 /// Adds a set of default path handlers to the webserver to display
 /// logs and configuration flags
-void AddDefaultUrlCallbacks(Webserver* webserver, MemTracker* process_mem_tracker = NULL,
-    MetricGroup* metric_group = NULL);
+void AddDefaultUrlCallbacks(Webserver* webserver, MetricGroup* metric_group = NULL,
+    MemTracker* process_mem_tracker = NULL);
 
 /// Registered to handle "/"
 /// Populates document with various system-wide information.
-void RootHandler(const Webserver::ArgumentMap& args, rapidjson::Document* document);
+void RootHandler(const Webserver::WebRequest& req, rapidjson::Document* document);
 }
 
 #endif // IMPALA_UTIL_DEFAULT_PATH_HANDLERS_H

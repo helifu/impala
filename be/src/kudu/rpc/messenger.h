@@ -17,21 +17,20 @@
 #ifndef KUDU_RPC_MESSENGER_H
 #define KUDU_RPC_MESSENGER_H
 
-#include <stdint.h>
-
-#include <list>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <gtest/gtest_prod.h>
 
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/connection.h"
-#include "kudu/rpc/response_callback.h"
 #include "kudu/security/security_flags.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/util/locks.h"
@@ -39,6 +38,11 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
+
+namespace boost {
+template <typename Signature>
+class function;
+}
 
 namespace kudu {
 
@@ -56,20 +60,19 @@ using security::RpcAuthentication;
 using security::RpcEncryption;
 
 class AcceptorPool;
-class DumpRunningRpcsRequestPB;
-class DumpRunningRpcsResponsePB;
+class DumpConnectionsRequestPB;
+class DumpConnectionsResponsePB;
 class InboundCall;
 class Messenger;
 class OutboundCall;
 class Reactor;
-class ReactorThread;
 class RpcService;
 class RpczStore;
 
 struct AcceptorPoolInfo {
  public:
   explicit AcceptorPoolInfo(Sockaddr bind_address)
-      : bind_address_(std::move(bind_address)) {}
+      : bind_address_(bind_address) {}
 
   Sockaddr bind_address() const {
     return bind_address_;
@@ -160,6 +163,9 @@ class MessengerBuilder {
   // Configure the messenger to enable TLS encryption on inbound connections.
   MessengerBuilder& enable_inbound_tls();
 
+  // Configure the messenger to set the SO_REUSEPORT socket option.
+  MessengerBuilder& set_reuseport();
+
   Status Build(std::shared_ptr<Messenger> *msgr);
 
  private:
@@ -182,6 +188,7 @@ class MessengerBuilder {
   std::string rpc_private_key_password_cmd_;
   std::string keytab_file_;
   bool enable_inbound_tls_;
+  bool reuseport_;
 };
 
 // A Messenger is a container for the reactor threads which run event loops
@@ -199,6 +206,7 @@ class Messenger {
   friend class MessengerBuilder;
   friend class Proxy;
   friend class Reactor;
+  friend class ReactorThread;
   typedef std::vector<std::shared_ptr<AcceptorPool> > acceptor_vec_t;
   typedef std::unordered_map<std::string, scoped_refptr<RpcService> > RpcServicesMap;
 
@@ -206,7 +214,10 @@ class Messenger {
 
   ~Messenger();
 
-  // Stop all communication and prevent further use.
+  // Stops all communication and prevents further use. If called explicitly,
+  // also waits for outstanding tasks running on reactor threads to finish,
+  // which means it may  not be called from a reactor task.
+  //
   // It's not required to call this -- dropping the shared_ptr provided
   // from MessengerBuilder::Build will automatically call this method.
   void Shutdown();
@@ -228,13 +239,18 @@ class Messenger {
                          std::shared_ptr<AcceptorPool>* pool);
 
   // Register a new RpcService to handle inbound requests.
+  //
+  // Returns an error if a service with the same name is already registered.
   Status RegisterService(const std::string& service_name,
                          const scoped_refptr<RpcService>& service);
 
-  // Unregister currently-registered RpcService.
+  // Unregister an RpcService by name.
+  //
+  // Returns an error if no service with this name can be found.
   Status UnregisterService(const std::string& service_name);
 
-  Status UnregisterAllServices();
+  // Unregisters all RPC services.
+  void UnregisterAllServices();
 
   // Queue a call for transmission. This will pick the appropriate reactor,
   // and enqueue a task on that reactor to assign and send the call.
@@ -249,9 +265,9 @@ class Messenger {
   // Take ownership of the socket via Socket::Release
   void RegisterInboundSocket(Socket *new_socket, const Sockaddr &remote);
 
-  // Dump the current RPCs into the given protobuf.
-  Status DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
-                         DumpRunningRpcsResponsePB* resp);
+  // Dump info on related TCP connections into the given protobuf.
+  Status DumpConnections(const DumpConnectionsRequestPB& req,
+                         DumpConnectionsResponsePB* resp);
 
   // Run 'func' on a reactor thread after 'when' time elapses.
   //
@@ -296,7 +312,7 @@ class Messenger {
     return closing_;
   }
 
-  scoped_refptr<MetricEntity> metric_entity() const { return metric_entity_.get(); }
+  scoped_refptr<MetricEntity> metric_entity() const { return metric_entity_; }
 
   const int64_t rpc_negotiation_timeout_ms() const { return rpc_negotiation_timeout_ms_; }
 
@@ -311,7 +327,9 @@ class Messenger {
  private:
   FRIEND_TEST(TestRpc, TestConnectionKeepalive);
   FRIEND_TEST(TestRpc, TestConnectionAlwaysKeepalive);
+  FRIEND_TEST(TestRpc, TestClientConnectionsMetrics);
   FRIEND_TEST(TestRpc, TestCredentialsPolicy);
+  FRIEND_TEST(TestRpc, TestConnectionNetworkPlane);
   FRIEND_TEST(TestRpc, TestReopenOutboundConnections);
 
   explicit Messenger(const MessengerBuilder &bld);
@@ -320,6 +338,15 @@ class Messenger {
   Status Init();
   void RunTimeoutThread();
   void UpdateCurTime();
+
+  // Shuts down the messenger.
+  //
+  // Depending on 'mode', may or may not wait on any outstanding reactor tasks.
+  enum class ShutdownMode {
+    SYNC,
+    ASYNC,
+  };
+  void ShutdownInternal(ShutdownMode mode);
 
   // Called by external-facing shared_ptr when the user no longer holds
   // any references. See 'retain_self_' for more info.
@@ -377,6 +404,9 @@ class Messenger {
   // Path to the Kerberos Keytab file for this server.
   const std::string keytab_file_;
 
+  // Whether to set SO_REUSEPORT on the listening sockets.
+  bool reuseport_;
+
   // The ownership of the Messenger object is somewhat subtle. The pointer graph
   // looks like this:
   //
@@ -386,7 +416,7 @@ class Messenger {
   //         |                   |
   //         v
   //      Messenger    <------------ shared_ptr[2] --- Reactor
-  //       ^    |       ----------- bare pointer --> Reactor
+  //       ^    |      ------------- bare pointer  --> Reactor
   //        \__/
   //     shared_ptr[2]
   //     (retain_self_)
@@ -398,10 +428,11 @@ class Messenger {
   //
   // The teardown sequence is as follows:
   // Option 1): User calls "Shutdown()" explicitly:
-  //  - Messenger::Shutdown tells Reactors to shut down
-  //  - When each reactor thread finishes, it drops its shared_ptr[2]
+  //  - Messenger::Shutdown tells Reactors to shut down.
+  //  - When each reactor thread finishes, it drops its shared_ptr[2].
   //  - the Messenger::retain_self instance remains, keeping the Messenger
   //    alive.
+  //  - Before returning, Messenger::Shutdown waits for Reactors to shut down.
   //  - The user eventually drops its shared_ptr[1], which calls
   //    Messenger::AllExternalReferencesDropped. This drops retain_self_
   //    and results in object destruction.
@@ -413,11 +444,12 @@ class Messenger {
   //  - When the last Reactor thread dies, there will be no more shared_ptr[1] references
   //    and the Messenger will be destroyed.
   //
-  // The main goal of all of this confusion is that the reactor threads need to be able
-  // to shut down asynchronously, and we need to keep the Messenger alive until they
-  // do so. So, handing out a normal shared_ptr to users would force the Messenger
-  // destructor to Join() the reactor threads, which causes a problem if the user
-  // tries to destruct the Messenger from within a Reactor thread itself.
+  // The main goal of all of this confusion is that when using option 2, the
+  // reactor threads need to be able to shut down asynchronously, and we need
+  // to keep the Messenger alive until they do so. If normal shared_ptrs were
+  // handed out to users, the Messenger destructor may be forced to Join() the
+  // reactor threads, which deadlocks if the user destructs the Messenger from
+  // within a Reactor thread itself.
   std::shared_ptr<Messenger> retain_self_;
 
   DISALLOW_COPY_AND_ASSIGN(Messenger);

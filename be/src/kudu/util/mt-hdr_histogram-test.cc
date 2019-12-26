@@ -14,21 +14,26 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#include <gtest/gtest.h>
-#include <gflags/gflags.h>
+
+#include <cstdint>
 #include <vector>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/hdr_histogram.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
-DEFINE_int32_hidden(histogram_test_num_threads, 16,
+DEFINE_int32(histogram_test_num_threads, 16,
     "Number of threads to spawn for mt-hdr_histogram test");
-DEFINE_uint64_hidden(histogram_test_num_increments_per_thread, 100000LU,
+DEFINE_uint64(histogram_test_num_increments_per_thread, 100000LU,
     "Number of times to call Increment() per thread in mt-hdr_histogram test");
 
 using std::vector;

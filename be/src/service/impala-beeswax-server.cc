@@ -20,14 +20,15 @@
 #include "common/logging.h"
 #include "gen-cpp/Frontend_types.h"
 #include "rpc/thrift-util.h"
+#include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "service/client-request-state.h"
+#include "service/frontend.h"
 #include "service/query-options.h"
 #include "service/query-result-set.h"
 #include "util/auth-util.h"
-#include "util/impalad-metrics.h"
 #include "util/webserver.h"
 #include "util/runtime-profile.h"
 #include "util/runtime-profile-counters.h"
@@ -40,9 +41,9 @@ using namespace beeswax;
 
 #define RAISE_IF_ERROR(stmt, ex_type)                           \
   do {                                                          \
-    Status __status__ = (stmt);                                 \
-    if (UNLIKELY(!__status__.ok())) {                           \
-      RaiseBeeswaxException(__status__.GetDetail(), ex_type);   \
+    const Status& _status = (stmt);                          \
+    if (UNLIKELY(!_status.ok())) {                           \
+      RaiseBeeswaxException(_status.GetDetail(), ex_type);   \
     }                                                           \
   } while (false)
 
@@ -50,10 +51,12 @@ namespace impala {
 
 void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
   VLOG_QUERY << "query(): query=" << query.query;
+  RAISE_IF_ERROR(CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
+
   ScopedSessionState session_handle(this);
   shared_ptr<SessionState> session;
   RAISE_IF_ERROR(
-      session_handle.WithSession(ThriftServer::GetThreadConnectionId(), &session),
+      session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId(), &session),
       SQLSTATE_GENERAL_ERROR);
   TQueryCtx query_ctx;
   // raise general error for request conversion error;
@@ -65,7 +68,6 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
   RAISE_IF_ERROR(Execute(&query_ctx, session, &request_state),
       SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION);
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
   // start thread to wait for results to become available, which will allow
   // us to advance query state to FINISHED or EXCEPTION
   Status status = request_state->WaitAsync();
@@ -86,10 +88,11 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
 void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
     const LogContextId& client_ctx) {
   VLOG_QUERY << "executeAndWait(): query=" << query.query;
+  RAISE_IF_ERROR(CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
   ScopedSessionState session_handle(this);
   shared_ptr<SessionState> session;
   RAISE_IF_ERROR(
-      session_handle.WithSession(ThriftServer::GetThreadConnectionId(), &session),
+      session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId(), &session),
       SQLSTATE_GENERAL_ERROR);
   TQueryCtx query_ctx;
   // raise general error for request conversion error;
@@ -110,7 +113,6 @@ void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
   RAISE_IF_ERROR(Execute(&query_ctx, session, &request_state),
       SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION);
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
   // Once the query is running do a final check for session closure and add it to the
   // set of in-flight queries.
   Status status = SetQueryInflight(session, request_state);
@@ -140,8 +142,9 @@ void ImpalaServer::explain(QueryExplanation& query_explanation, const Query& que
   // Translate Beeswax Query to Impala's QueryRequest and then set the explain plan bool
   // before shipping to FE
   VLOG_QUERY << "explain(): query=" << query.query;
+  RAISE_IF_ERROR(CheckNotShuttingDown(), SQLSTATE_GENERAL_ERROR);
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
 
   TQueryCtx query_ctx;
@@ -158,8 +161,9 @@ void ImpalaServer::explain(QueryExplanation& query_explanation, const Query& que
 void ImpalaServer::fetch(Results& query_results, const QueryHandle& query_handle,
     const bool start_over, const int32_t fetch_size) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
-      SQLSTATE_GENERAL_ERROR);
+  shared_ptr<SessionState> session;
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(
+        ThriftServer::GetThreadConnectionId(), &session), SQLSTATE_GENERAL_ERROR);
 
   if (start_over) {
     // We can't start over. Raise "Optional feature not implemented"
@@ -171,7 +175,17 @@ void ImpalaServer::fetch(Results& query_results, const QueryHandle& query_handle
   QueryHandleToTUniqueId(query_handle, &query_id);
   VLOG_ROW << "fetch(): query_id=" << PrintId(query_id) << " fetch_size=" << fetch_size;
 
-  Status status = FetchInternal(query_id, start_over, fetch_size, &query_results);
+  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
+  if (UNLIKELY(request_state == nullptr)) {
+    string err_msg = Substitute("Invalid query handle: $0", PrintId(query_id));
+    VLOG(1) << err_msg;
+    RaiseBeeswaxException(err_msg, SQLSTATE_GENERAL_ERROR);
+  }
+  // Validate that query can be accessed by user.
+  RAISE_IF_ERROR(CheckClientRequestSession(session.get(), request_state->effective_user(),
+      query_id), SQLSTATE_GENERAL_ERROR);
+  Status status =
+      FetchInternal(request_state.get(), start_over, fetch_size, &query_results);
   VLOG_ROW << "fetch result: #results=" << query_results.data.size()
            << " has_more=" << (query_results.has_more ? "true" : "false");
   if (!status.ok()) {
@@ -184,8 +198,9 @@ void ImpalaServer::fetch(Results& query_results, const QueryHandle& query_handle
 void ImpalaServer::get_results_metadata(ResultsMetadata& results_metadata,
     const QueryHandle& handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
-      SQLSTATE_GENERAL_ERROR);
+  shared_ptr<SessionState> session;
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(
+      ThriftServer::GetThreadConnectionId(), &session), SQLSTATE_GENERAL_ERROR);
 
   // Convert QueryHandle to TUniqueId and get the query exec state.
   TUniqueId query_id;
@@ -196,6 +211,9 @@ void ImpalaServer::get_results_metadata(ResultsMetadata& results_metadata,
     RaiseBeeswaxException(Substitute("Invalid query handle: $0", PrintId(query_id)),
       SQLSTATE_GENERAL_ERROR);
   }
+  // Validate that query can be accessed by user.
+  RAISE_IF_ERROR(CheckClientRequestSession(session.get(), request_state->effective_user(),
+      query_id), SQLSTATE_GENERAL_ERROR);
 
   {
     lock_guard<mutex> l(*request_state->lock());
@@ -228,10 +246,17 @@ void ImpalaServer::get_results_metadata(ResultsMetadata& results_metadata,
 
 void ImpalaServer::close(const QueryHandle& handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
+
+  // Impala-shell and administrative tools can call this from a different connection,
+  // e.g. to allow an admin to force-terminate queries. We should allow the operation to
+  // proceed without validating the session/query relation so that workflows don't
+  // get broken. In future we could check that the users match OR that the user has
+  // admin priviliges on the server.
+
   VLOG_QUERY << "close(): query_id=" << PrintId(query_id);
   // TODO: do we need to raise an exception if the query state is EXCEPTION?
   // TODO: use timeout to get rid of unwanted request_state.
@@ -240,8 +265,9 @@ void ImpalaServer::close(const QueryHandle& handle) {
 
 beeswax::QueryState::type ImpalaServer::get_state(const QueryHandle& handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
-      SQLSTATE_GENERAL_ERROR);
+  shared_ptr<SessionState> session;
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(
+      ThriftServer::GetThreadConnectionId(), &session), SQLSTATE_GENERAL_ERROR);
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_ROW << "get_state(): query_id=" << PrintId(query_id);
@@ -252,17 +278,21 @@ beeswax::QueryState::type ImpalaServer::get_state(const QueryHandle& handle) {
     RaiseBeeswaxException(Substitute("Invalid query handle: $0", PrintId(query_id)),
       SQLSTATE_GENERAL_ERROR);
   }
+  // Validate that query can be accessed by user.
+  RAISE_IF_ERROR(CheckClientRequestSession(session.get(), request_state->effective_user(),
+      query_id), SQLSTATE_GENERAL_ERROR);
   // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
   // guaranteed to see the error query_status.
   lock_guard<mutex> l(*request_state->lock());
-  DCHECK_EQ(request_state->query_state() == beeswax::QueryState::EXCEPTION,
+  beeswax::QueryState::type query_state = request_state->BeeswaxQueryState();
+  DCHECK_EQ(query_state == beeswax::QueryState::EXCEPTION,
       !request_state->query_status().ok());
-  return request_state->query_state();
+  return query_state;
 }
 
 void ImpalaServer::echo(string& echo_string, const string& input_string) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
   echo_string = input_string;
 }
@@ -271,9 +301,10 @@ void ImpalaServer::clean(const LogContextId& log_context) {
 }
 
 void ImpalaServer::get_log(string& log, const LogContextId& context) {
+  shared_ptr<SessionState> session;
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
-      SQLSTATE_GENERAL_ERROR);
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(
+      ThriftServer::GetThreadConnectionId(), &session), SQLSTATE_GENERAL_ERROR);
   // LogContextId is the same as QueryHandle.id
   QueryHandle handle;
   handle.__set_id(context);
@@ -283,17 +314,20 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
   if (request_state.get() == nullptr) {
     stringstream str;
-    str << "unknown query id: " << query_id;
+    str << "unknown query id: " << PrintId(query_id);
     LOG(ERROR) << str.str();
     return;
   }
+  // Validate that query can be accessed by user.
+  RAISE_IF_ERROR(CheckClientRequestSession(session.get(), request_state->effective_user(),
+      query_id), SQLSTATE_GENERAL_ERROR);
   stringstream error_log_ss;
 
   {
-    // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
+    // Take the lock to ensure that if the client sees a exec_state == ERROR, it is
     // guaranteed to see the error query_status.
     lock_guard<mutex> l(*request_state->lock());
-    DCHECK_EQ(request_state->query_state() == beeswax::QueryState::EXCEPTION,
+    DCHECK_EQ(request_state->exec_state() == ClientRequestState::ExecState::ERROR,
         !request_state->query_status().ok());
     // If the query status is !ok, include the status error message at the top of the log.
     if (!request_state->query_status().ok()) {
@@ -307,17 +341,17 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
   }
 
   // Add warnings from execution
-  if (request_state->coord() != nullptr) {
-    const std::string coord_errors = request_state->coord()->GetErrorLog();
+  if (request_state->GetCoordinator() != nullptr) {
+    const std::string coord_errors = request_state->GetCoordinator()->GetErrorLog();
     if (!coord_errors.empty()) error_log_ss << coord_errors << "\n";
   }
   log = error_log_ss.str();
 }
 
-void ImpalaServer::get_default_configuration(vector<ConfigVariable> &configurations,
+void ImpalaServer::get_default_configuration(vector<ConfigVariable>& configurations,
     const bool include_hadoop) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
   configurations.insert(configurations.end(), default_configs_.begin(),
       default_configs_.end());
@@ -325,7 +359,7 @@ void ImpalaServer::get_default_configuration(vector<ConfigVariable> &configurati
 
 void ImpalaServer::dump_config(string& config) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
   config = "";
 }
@@ -333,25 +367,33 @@ void ImpalaServer::dump_config(string& config) {
 void ImpalaServer::Cancel(impala::TStatus& tstatus,
     const beeswax::QueryHandle& query_handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
   // Convert QueryHandle to TUniqueId and get the query exec state.
   TUniqueId query_id;
   QueryHandleToTUniqueId(query_handle, &query_id);
+
+  // Impala-shell and administrative tools can call this from a different connection,
+  // e.g. to allow an admin to force-terminate queries. We should allow the operation to
+  // proceed without validating the session/query relation so that workflows don't
+  // get broken. In future we could check that the users match OR that the user has
+  // admin priviliges on the server.
   RAISE_IF_ERROR(CancelInternal(query_id, true), SQLSTATE_GENERAL_ERROR);
   tstatus.status_code = TErrorCode::OK;
 }
 
-void ImpalaServer::CloseInsert(TInsertResult& insert_result,
+void ImpalaServer::CloseInsert(TDmlResult& dml_result,
     const QueryHandle& query_handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
-      SQLSTATE_GENERAL_ERROR);
+  shared_ptr<SessionState> session;
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(
+      ThriftServer::GetThreadConnectionId(), &session), SQLSTATE_GENERAL_ERROR);
   TUniqueId query_id;
   QueryHandleToTUniqueId(query_handle, &query_id);
   VLOG_QUERY << "CloseInsert(): query_id=" << PrintId(query_id);
 
-  Status status = CloseInsertInternal(query_id, &insert_result);
+  // CloseInsertInternal() will validates that 'session' has access to 'query_id'.
+  Status status = CloseInsertInternal(session.get(), query_id, &dml_result);
   if (!status.ok()) {
     RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
@@ -365,16 +407,19 @@ void ImpalaServer::GetRuntimeProfile(string& profile_output, const QueryHandle& 
   const TUniqueId& session_id = ThriftServer::GetThreadConnectionId();
   stringstream ss;
   shared_ptr<SessionState> session;
-  RAISE_IF_ERROR(session_handle.WithSession(session_id, &session),
-      SQLSTATE_GENERAL_ERROR);
+  RAISE_IF_ERROR(
+      session_handle.WithBeeswaxSession(session_id, &session), SQLSTATE_GENERAL_ERROR);
   if (session == NULL) {
     ss << Substitute("Invalid session id: $0", PrintId(session_id));
     RaiseBeeswaxException(ss.str(), SQLSTATE_GENERAL_ERROR);
   }
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
+  // GetRuntimeProfile() will validate that the user has access to 'query_id'.
   VLOG_RPC << "GetRuntimeProfile(): query_id=" << PrintId(query_id);
-  Status status = GetRuntimeProfileStr(query_id, GetEffectiveUser(*session), false, &ss);
+  Status status = GetRuntimeProfileOutput(
+      query_id, GetEffectiveUser(*session), TRuntimeProfileFormat::STRING,
+      &ss, nullptr, nullptr);
   if (!status.ok()) {
     ss << "GetRuntimeProfile error: " << status.GetDetail();
     RaiseBeeswaxException(ss.str(), SQLSTATE_GENERAL_ERROR);
@@ -387,8 +432,8 @@ void ImpalaServer::GetExecSummary(impala::TExecSummary& result,
   ScopedSessionState session_handle(this);
   const TUniqueId& session_id = ThriftServer::GetThreadConnectionId();
   shared_ptr<SessionState> session;
-  RAISE_IF_ERROR(session_handle.WithSession(session_id, &session),
-      SQLSTATE_GENERAL_ERROR);
+  RAISE_IF_ERROR(
+      session_handle.WithBeeswaxSession(session_id, &session), SQLSTATE_GENERAL_ERROR);
   if (session == NULL) {
     stringstream ss;
     ss << Substitute("Invalid session id: $0", PrintId(session_id));
@@ -397,18 +442,19 @@ void ImpalaServer::GetExecSummary(impala::TExecSummary& result,
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_RPC << "GetExecSummary(): query_id=" << PrintId(query_id);
+  // GetExecSummary() will validate that the user has access to 'query_id'.
   Status status = GetExecSummary(query_id, GetEffectiveUser(*session), &result);
   if (!status.ok()) RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
 }
 
 void ImpalaServer::PingImpalaService(TPingImpalaServiceResp& return_val) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  RAISE_IF_ERROR(session_handle.WithBeeswaxSession(ThriftServer::GetThreadConnectionId()),
       SQLSTATE_GENERAL_ERROR);
 
   VLOG_RPC << "PingImpalaService()";
   return_val.version = GetVersionString(true);
-  return_val.webserver_address = ExecEnv::GetInstance()->webserver()->Url();
+  return_val.webserver_address = ExecEnv::GetInstance()->webserver()->url();
   VLOG_RPC << "PingImpalaService(): return_val=" << ThriftDebugString(return_val);
 }
 
@@ -428,7 +474,10 @@ Status ImpalaServer::QueryToTQueryContext(const Query& query,
   {
     shared_ptr<SessionState> session;
     const TUniqueId& session_id = ThriftServer::GetThreadConnectionId();
-    RETURN_IF_ERROR(GetSessionState(session_id, &session));
+    // OK to skip secret validation since 'session_id' comes from connection
+    // and is trusted.
+    RETURN_IF_ERROR(GetSessionState(session_id, SecretArg::SkipSecretCheck(), &session,
+        /* mark_active= */ false));
     DCHECK(session != nullptr);
     {
       // The session is created when the client connects. Depending on the underlying
@@ -450,12 +499,13 @@ Status ImpalaServer::QueryToTQueryContext(const Query& query,
       RETURN_IF_ERROR(ParseQueryOptions(option, &overlay, &overlay_mask));
     }
     OverlayQueryOptions(overlay, overlay_mask, &query_ctx->client_request.query_options);
+    RETURN_IF_ERROR(ValidateQueryOptions(&overlay));
     set_query_options_mask |= overlay_mask;
   }
 
   // Only query options not set in the session or confOverlay can be overridden by the
   // pool options.
-  AddPoolQueryOptions(query_ctx, ~set_query_options_mask);
+  AddPoolConfiguration(query_ctx, ~set_query_options_mask);
   VLOG_QUERY << "TClientRequest.queryOptions: "
              << ThriftDebugString(query_ctx->client_request.query_options);
   return Status::OK();
@@ -481,24 +531,26 @@ inline void ImpalaServer::QueryHandleToTUniqueId(const QueryHandle& handle,
   throw exc;
 }
 
-Status ImpalaServer::FetchInternal(const TUniqueId& query_id,
+Status ImpalaServer::FetchInternal(ClientRequestState* request_state,
     const bool start_over, const int32_t fetch_size, beeswax::Results* query_results) {
-  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
-  if (UNLIKELY(request_state == nullptr)) {
-    return Status(Substitute("Invalid query handle: $0", PrintId(query_id)));
-  }
-
   // Make sure ClientRequestState::Wait() has completed before fetching rows. Wait()
   // ensures that rows are ready to be fetched (e.g., Wait() opens
   // ClientRequestState::output_exprs_, which are evaluated in
   // ClientRequestState::FetchRows() below).
-  request_state->BlockOnWait();
+  int64_t block_on_wait_time_us = 0;
+  if (!request_state->BlockOnWait(
+          request_state->fetch_rows_timeout_us(), &block_on_wait_time_us)) {
+    query_results->__set_ready(false);
+    query_results->__set_has_more(true);
+    query_results->__isset.columns = false;
+    query_results->__isset.data = false;
+    return Status::OK();
+  }
 
   lock_guard<mutex> frl(*request_state->fetch_rows_lock());
   lock_guard<mutex> l(*request_state->lock());
 
   if (request_state->num_rows_fetched() == 0) {
-    request_state->query_events()->MarkEvent("First row fetched");
     request_state->set_fetched_rows();
   }
 
@@ -534,7 +586,8 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id,
   if (!request_state->eos()) {
     scoped_ptr<QueryResultSet> result_set(QueryResultSet::CreateAsciiQueryResultSet(
         *request_state->result_metadata(), &query_results->data));
-    fetch_rows_status = request_state->FetchRows(fetch_size, result_set.get());
+    fetch_rows_status =
+        request_state->FetchRows(fetch_size, result_set.get(), block_on_wait_time_us);
   }
   query_results->__set_has_more(!request_state->eos());
   query_results->__isset.data = true;
@@ -542,41 +595,20 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id,
   return fetch_rows_status;
 }
 
-Status ImpalaServer::CloseInsertInternal(const TUniqueId& query_id,
-    TInsertResult* insert_result) {
+Status ImpalaServer::CloseInsertInternal(SessionState* session, const TUniqueId& query_id,
+    TDmlResult* dml_result) {
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
   if (UNLIKELY(request_state == nullptr)) {
-    return Status(Substitute("Invalid query handle: $0", PrintId(query_id)));
+    string err_msg = Substitute("Invalid query handle: $0", PrintId(query_id));
+    VLOG(1) << err_msg;
+    return Status::Expected(err_msg);
   }
+
+  RETURN_IF_ERROR(
+      CheckClientRequestSession(session, request_state->effective_user(), query_id));
 
   Status query_status;
-  {
-    lock_guard<mutex> l(*request_state->lock());
-    query_status = request_state->query_status();
-    if (query_status.ok()) {
-      // Coord may be NULL for a SELECT with LIMIT 0.
-      // Note that when IMPALA-87 is fixed (INSERT without FROM clause) we might
-      // need to revisit this, since that might lead us to insert a row without a
-      // coordinator, depending on how we choose to drive the table sink.
-      int64_t num_row_errors = 0;
-      bool has_kudu_stats = false;
-      if (request_state->coord() != nullptr) {
-        for (const PartitionStatusMap::value_type& v:
-             request_state->coord()->per_partition_status()) {
-          const pair<string, TInsertPartitionStatus> partition_status = v;
-          insert_result->rows_modified[partition_status.first] =
-              partition_status.second.num_modified_rows;
-
-          if (partition_status.second.__isset.stats &&
-              partition_status.second.stats.__isset.kudu_stats) {
-            has_kudu_stats = true;
-          }
-          num_row_errors += partition_status.second.stats.kudu_stats.num_row_errors;
-        }
-        if (has_kudu_stats) insert_result->__set_num_row_errors(num_row_errors);
-      }
-    }
-  }
+  request_state->GetDmlStats(dml_result, &query_status);
   RETURN_IF_ERROR(UnregisterQuery(query_id, true));
   return query_status;
 }

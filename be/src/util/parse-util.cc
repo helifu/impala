@@ -25,9 +25,9 @@ namespace impala {
 
 int64_t ParseUtil::ParseMemSpec(const string& mem_spec_str, bool* is_percent,
     int64_t relative_reference) {
+  *is_percent = false;
   if (mem_spec_str.empty()) return 0;
 
-  *is_percent = false;
   int64_t multiplier = -1;
   int32_t number_str_len = mem_spec_str.size();
 
@@ -40,6 +40,12 @@ int64_t ParseUtil::ParseMemSpec(const string& mem_spec_str, bool* is_percent,
     number_str_len--;
   }
   switch (*suffix_char) {
+    case 't':
+    case 'T':
+      // Terabytes.
+      number_str_len--;
+      multiplier = 1024L * 1024L * 1024L * 1024L;
+      break;
     case 'g':
     case 'G':
       // Gigabytes.

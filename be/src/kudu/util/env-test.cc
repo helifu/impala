@@ -15,28 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <fcntl.h>
-#include <sys/types.h>
-
-#include <memory>
-#include <string>
-
-#include <glog/logging.h>
-#include <glog/stl_logging.h>
-#include <gtest/gtest.h>
-
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/strings/human_readable.h"
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/strings/util.h"
-#include "kudu/util/env.h"
-#include "kudu/util/env_util.h"
-#include "kudu/util/malloc.h"
-#include "kudu/util/path_util.h"
-#include "kudu/util/status.h"
-#include "kudu/util/stopwatch.h"
-#include "kudu/util/test_util.h"
-
 #if !defined(__APPLE__)
 #include <linux/falloc.h>
 #endif  // !defined(__APPLE__)
@@ -49,15 +27,63 @@
 #define FALLOC_FL_PUNCH_HOLE  0x02 /* de-allocates range */
 #endif
 
+#include "kudu/util/env.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <glog/stl_logging.h> // IWYU pragma: keep
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/human_readable.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/strings/util.h"
+#include "kudu/util/array_view.h" // IWYU pragma: keep
+#include "kudu/util/env_util.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/path_util.h"
+#include "kudu/util/random.h"
+#include "kudu/util/random_util.h"
+#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+
 DECLARE_bool(never_fsync);
+DECLARE_bool(crash_on_eio);
+DECLARE_double(env_inject_eio);
 DECLARE_int32(env_inject_short_read_bytes);
 DECLARE_int32(env_inject_short_write_bytes);
+DECLARE_string(env_inject_eio_globs);
 
 namespace kudu {
 
+using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -81,16 +107,18 @@ class TestEnv : public KuduTest {
     if (checked) return;
 
 #if defined(__linux__)
-    int fd = creat(GetTestPath("check-fallocate").c_str(), S_IWUSR);
-    PCHECK(fd >= 0);
-    int err = fallocate(fd, 0, 0, 4096);
+    int fd;
+    RETRY_ON_EINTR(fd, creat(GetTestPath("check-fallocate").c_str(), S_IWUSR));
+    CHECK_ERR(fd);
+    int err;
+    RETRY_ON_EINTR(err, fallocate(fd, 0, 0, 4096));
     if (err != 0) {
       PCHECK(errno == ENOTSUP);
     } else {
       fallocate_supported_ = true;
 
-      err = fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-                      1024, 1024);
+      RETRY_ON_EINTR(err, fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+                                    1024, 1024));
       if (err != 0) {
         PCHECK(errno == ENOTSUP);
       } else {
@@ -98,7 +126,7 @@ class TestEnv : public KuduTest {
       }
     }
 
-    close(fd);
+    RETRY_ON_EINTR(err, close(fd));
 #endif
 
     checked = true;
@@ -138,8 +166,7 @@ class TestEnv : public KuduTest {
   void ReadAndVerifyTestData(RandomAccessFile* raf, size_t offset, size_t n) {
     unique_ptr<uint8_t[]> scratch(new uint8_t[n]);
     Slice s(scratch.get(), n);
-    ASSERT_OK(raf->Read(offset, &s));
-    ASSERT_EQ(n, s.size());
+    ASSERT_OK(raf->Read(offset, s));
     ASSERT_NO_FATAL_FAILURE(VerifyTestData(s, offset));
   }
 
@@ -344,6 +371,52 @@ TEST_F(TestEnv, TestHolePunch) {
   ASSERT_EQ(size_on_disk - punch_amount, new_size_on_disk);
 }
 
+TEST_F(TestEnv, TestHolePunchBenchmark) {
+  const int kFileSize = 1 * 1024 * 1024 * 1024;
+  const int kHoleSize = 10 * kOneMb;
+  const int kNumRuns = 1000;
+  if (!fallocate_punch_hole_supported_) {
+    LOG(INFO) << "hole punching not supported, skipping test";
+    return;
+  }
+  Random r(SeedRandom());
+
+  string test_path = GetTestPath("test");
+  unique_ptr<RWFile> file;
+  ASSERT_OK(env_->NewRWFile(test_path, &file));
+
+  // Initialize a scratch buffer with random data.
+  uint8_t scratch[kOneMb];
+  RandomString(&scratch, kOneMb, &r);
+
+  // Fill the file with sequences of the random data.
+  LOG_TIMING(INFO, Substitute("writing $0 bytes to file", kFileSize)) {
+    Slice slice(scratch, kOneMb);
+    for (int i = 0; i < kFileSize; i += kOneMb) {
+      ASSERT_OK(file->Write(i, slice));
+    }
+  }
+  LOG_TIMING(INFO, "syncing file") {
+    ASSERT_OK(file->Sync());
+  }
+
+  // Punch the first hole.
+  LOG_TIMING(INFO, Substitute("punching first hole of size $0", kHoleSize)) {
+    ASSERT_OK(file->PunchHole(0, kHoleSize));
+  }
+  LOG_TIMING(INFO, "syncing file") {
+    ASSERT_OK(file->Sync());
+  }
+
+  // Run the benchmark.
+  LOG_TIMING(INFO, Substitute("repunching $0 holes of size $1",
+                              kNumRuns, kHoleSize)) {
+    for (int i = 0; i < kNumRuns; i++) {
+      ASSERT_OK(file->PunchHole(0, kHoleSize));
+    }
+  }
+}
+
 TEST_F(TestEnv, TestTruncate) {
   LOG(INFO) << "Testing Truncate()";
   string test_path = GetTestPath("test_env_wf");
@@ -374,7 +447,7 @@ TEST_F(TestEnv, TestTruncate) {
   ASSERT_OK(env_->NewRandomAccessFile(test_path, &raf));
   unique_ptr<uint8_t[]> scratch(new uint8_t[size]);
   Slice s(scratch.get(), size);
-  ASSERT_OK(raf->Read(0, &s));
+  ASSERT_OK(raf->Read(0, s));
   const uint8_t* data = s.data();
   for (int i = 0; i < size; i++) {
     ASSERT_EQ(0, data[i]) << "Not null at position " << i;
@@ -415,21 +488,17 @@ TEST_F(TestEnv, TestReadFully) {
   FLAGS_env_inject_short_read_bytes = kReadLength / 2;
 
   // Verify that Read fully reads the whole requested data.
-  ASSERT_OK(raf->Read(0, &s));
-  ASSERT_EQ(s.data(), scratch.get()) << "Should have returned a contiguous copy";
-  ASSERT_EQ(kReadLength, s.size());
-
-  // Verify that the data read was correct.
+  ASSERT_OK(raf->Read(0, s));
   VerifyTestData(s, 0);
 
   // Turn short reads off again
   FLAGS_env_inject_short_read_bytes = 0;
 
-  // Verify that Read fails with an IOError at EOF.
+  // Verify that Read fails with an EndOfFile error EOF.
   Slice s2(scratch.get(), 200);
-  Status status = raf->Read(kFileSize - 100, &s2);
+  Status status = raf->Read(kFileSize - 100, s2);
   ASSERT_FALSE(status.ok());
-  ASSERT_TRUE(status.IsIOError());
+  ASSERT_TRUE(status.IsEndOfFile());
   ASSERT_STR_CONTAINS(status.ToString(), "EOF");
 }
 
@@ -455,17 +524,17 @@ TEST_F(TestEnv, TestReadVFully) {
   FLAGS_env_inject_short_read_bytes = 3;
 
   // Verify that Read fully reads the whole requested data.
-  ASSERT_OK(file->ReadV(0, &results));
+  ASSERT_OK(file->ReadV(0, results));
   ASSERT_EQ(result1, "abcde");
   ASSERT_EQ(result2, "12345");
 
   // Turn short reads off again
   FLAGS_env_inject_short_read_bytes = 0;
 
-  // Verify that Read fails with an IOError at EOF.
-  Status status = file->ReadV(5, &results);
+  // Verify that Read fails with an EndOfFile error at EOF.
+  Status status = file->ReadV(5, results);
   ASSERT_FALSE(status.ok());
-  ASSERT_TRUE(status.IsIOError());
+  ASSERT_TRUE(status.IsEndOfFile());
   ASSERT_STR_CONTAINS(status.ToString(), "EOF");
 }
 
@@ -495,7 +564,7 @@ TEST_F(TestEnv, TestIOVMax) {
   FLAGS_env_inject_short_read_bytes = 3;
 
   // Verify all the data is read
-  ASSERT_OK(file->ReadV(0, &results));
+  ASSERT_OK(file->ReadV(0, results));
   VerifyTestData(Slice(scratch, data_size), 0);
 }
 
@@ -581,7 +650,7 @@ TEST_F(TestEnv, TestReopen) {
   ASSERT_EQ(first.length() + second.length(), size);
   uint8_t scratch[size];
   Slice s(scratch, size);
-  ASSERT_OK(reader->Read(0, &s));
+  ASSERT_OK(reader->Read(0, s));
   ASSERT_EQ(first + second, s.ToString());
 }
 
@@ -599,32 +668,40 @@ TEST_F(TestEnv, TestIsDirectory) {
   ASSERT_FALSE(is_dir);
 }
 
-// Regression test for KUDU-1776.
-TEST_F(TestEnv, TestIncreaseOpenFileLimit) {
-  int64_t limit_before = env_->GetOpenFileLimit();
-  env_->IncreaseOpenFileLimit();
-  int64_t limit_after = env_->GetOpenFileLimit();
-  ASSERT_GE(limit_after, limit_before) << "Failed to retain/increase open file limit";
+class ResourceLimitTypeTest : public TestEnv,
+                              public ::testing::WithParamInterface<Env::ResourceLimitType> {};
+
+INSTANTIATE_TEST_CASE_P(ResourceLimitTypes,
+                        ResourceLimitTypeTest,
+                        ::testing::Values(Env::ResourceLimitType::OPEN_FILES_PER_PROCESS,
+                                          Env::ResourceLimitType::RUNNING_THREADS_PER_EUID));
+
+// Regression test for KUDU-1798.
+TEST_P(ResourceLimitTypeTest, TestIncreaseLimit) {
+  // Increase the resource limit. It should either increase or remain the same.
+  Env::ResourceLimitType t = GetParam();
+  int64_t limit_before = env_->GetResourceLimit(t);
+  env_->IncreaseResourceLimit(t);
+  int64_t limit_after = env_->GetResourceLimit(t);
+  ASSERT_GE(limit_after, limit_before);
+
+  // Try again. It should definitely be the same now.
+  env_->IncreaseResourceLimit(t);
+  int64_t limit_after_again = env_->GetResourceLimit(t);
+  ASSERT_EQ(limit_after, limit_after_again);
 }
 
-static Status TestWalkCb(vector<string>* actual,
+static Status TestWalkCb(unordered_set<string>* actual,
                          Env::FileType type,
                          const string& dirname, const string& basename) {
   VLOG(1) << type << ":" << dirname << ":" << basename;
-  actual->push_back(JoinPathSegments(dirname, basename));
+  InsertOrDie(actual, (JoinPathSegments(dirname, basename)));
   return Status::OK();
 }
 
-static Status CreateDir(Env* env, const string& name, vector<string>* created) {
-  RETURN_NOT_OK(env->CreateDir(name));
-  created->push_back(name);
-  return Status::OK();
-}
-
-static Status CreateFile(Env* env, const string& name, vector<string>* created) {
-  unique_ptr<WritableFile> writer;
-  RETURN_NOT_OK(env->NewWritableFile(name, &writer));
-  created->push_back(writer->filename());
+static Status NoopTestWalkCb(Env::FileType /*type*/,
+                             const string& /*dirname*/,
+                             const string& /*basename*/) {
   return Status::OK();
 }
 
@@ -640,40 +717,70 @@ TEST_F(TestEnv, TestWalk) {
   // /root/dir_b/file_2
   // /root/dir_b/dir_c/file_1
   // /root/dir_b/dir_c/file_2
+  unordered_set<string> expected;
+  auto create_dir = [&](const string& name) {
+    ASSERT_OK(env_->CreateDir(name));
+    InsertOrDie(&expected, name);
+  };
+  auto create_file = [&](const string& name) {
+    unique_ptr<WritableFile> writer;
+    ASSERT_OK(env_->NewWritableFile(name, &writer));
+    InsertOrDie(&expected, writer->filename());
+  };
   string root = GetTestPath("root");
   string subdir_a = JoinPathSegments(root, "dir_a");
   string subdir_b = JoinPathSegments(root, "dir_b");
   string subdir_c = JoinPathSegments(subdir_b, "dir_c");
   string file_one = "file_1";
   string file_two = "file_2";
-  vector<string> expected;
-  ASSERT_OK(CreateDir(env_, root, &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(root, file_one), &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(root, file_two), &expected));
-  ASSERT_OK(CreateDir(env_, subdir_a, &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_a, file_one), &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_a, file_two), &expected));
-  ASSERT_OK(CreateDir(env_, subdir_b, &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_b, file_one), &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_b, file_two), &expected));
-  ASSERT_OK(CreateDir(env_, subdir_c, &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_c, file_one), &expected));
-  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_c, file_two), &expected));
+  NO_FATALS(create_dir(root));
+  NO_FATALS(create_file(JoinPathSegments(root, file_one)));
+  NO_FATALS(create_file(JoinPathSegments(root, file_two)));
+  NO_FATALS(create_dir(subdir_a));
+  NO_FATALS(create_file(JoinPathSegments(subdir_a, file_one)));
+  NO_FATALS(create_file(JoinPathSegments(subdir_a, file_two)));
+  NO_FATALS(create_dir(subdir_b));
+  NO_FATALS(create_file(JoinPathSegments(subdir_b, file_one)));
+  NO_FATALS(create_file(JoinPathSegments(subdir_b, file_two)));
+  NO_FATALS(create_dir(subdir_c));
+  NO_FATALS(create_file(JoinPathSegments(subdir_c, file_one)));
+  NO_FATALS(create_file(JoinPathSegments(subdir_c, file_two)));
 
   // Do the walk.
-  //
-  // Sadly, tr1/unordered_set doesn't implement equality operators, so we
-  // compare sorted vectors instead.
-  vector<string> actual;
+  unordered_set<string> actual;
   ASSERT_OK(env_->Walk(root, Env::PRE_ORDER, Bind(&TestWalkCb, &actual)));
-  sort(expected.begin(), expected.end());
-  sort(actual.begin(), actual.end());
   ASSERT_EQ(expected, actual);
 }
 
+TEST_F(TestEnv, TestWalkNonExistentPath) {
+  // A walk on a non-existent path should fail.
+  Status s = env_->Walk("/not/a/real/path", Env::PRE_ORDER, Bind(&NoopTestWalkCb));
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "One or more errors occurred");
+}
+
+TEST_F(TestEnv, TestWalkBadPermissions) {
+  // Create a directory with mode of 0000.
+  const string kTestPath = GetTestPath("asdf");
+  ASSERT_OK(env_->CreateDir(kTestPath));
+  struct stat stat_buf;
+  PCHECK(stat(kTestPath.c_str(), &stat_buf) == 0);
+  PCHECK(chmod(kTestPath.c_str(), 0000) == 0);
+  SCOPED_CLEANUP({
+    // Restore the old permissions so the path can be successfully deleted.
+    PCHECK(chmod(kTestPath.c_str(), stat_buf.st_mode) == 0);
+  });
+
+  // A walk on a directory without execute permission should fail.
+  Status s = env_->Walk(kTestPath, Env::PRE_ORDER, Bind(&NoopTestWalkCb));
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "One or more errors occurred");
+}
+
 static Status TestWalkErrorCb(int* num_calls,
-                              Env::FileType type,
-                              const string& dirname, const string& basename) {
+                              Env::FileType /*type*/,
+                              const string& /*dirname*/,
+                              const string& /*basename*/) {
   (*num_calls)++;
   return Status::Aborted("Returning abort status");
 }
@@ -716,6 +823,20 @@ TEST_F(TestEnv, TestGlob) {
     ASSERT_OK(env_->Glob(JoinPathSegments(dir, matcher.first), &matches));
     ASSERT_EQ(matcher.second, matches.size());
   }
+}
+
+// Test that the status returned when 'glob' fails with a permission
+// error is reasonable.
+TEST_F(TestEnv, TestGlobPermissionDenied) {
+  string dir = GetTestPath("glob");
+  ASSERT_OK(env_->CreateDir(dir));
+  chmod(dir.c_str(), 0000);
+  SCOPED_CLEANUP({
+      chmod(dir.c_str(), 0700);
+    });
+  vector<string> matches;
+  Status s = env_->Glob(JoinPathSegments(dir, "*"), &matches);
+  ASSERT_STR_MATCHES(s.ToString(), "IO error: glob failed for /.*: Permission denied");
 }
 
 TEST_F(TestEnv, TestGetBlockSize) {
@@ -767,7 +888,7 @@ TEST_F(TestEnv, TestRWFile) {
   // Read from it.
   uint8_t scratch[kTestData.length()];
   Slice result(scratch, kTestData.length());
-  ASSERT_OK(file->Read(0, &result));
+  ASSERT_OK(file->Read(0, result));
   ASSERT_EQ(result, kTestData);
   uint64_t sz;
   ASSERT_OK(file->Size(&sz));
@@ -781,7 +902,7 @@ TEST_F(TestEnv, TestRWFile) {
   uint8_t scratch2[size2];
   Slice result2(scratch2, size2);
   vector<Slice> results = { result1, result2 };
-  ASSERT_OK(file->ReadV(0, &results));
+  ASSERT_OK(file->ReadV(0, results));
   ASSERT_EQ(result1, "abc");
   ASSERT_EQ(result2, "de");
 
@@ -792,7 +913,7 @@ TEST_F(TestEnv, TestRWFile) {
   string kNewTestData = "aabcdebcdeabcde";
   uint8_t scratch3[kNewTestData.length()];
   Slice result3(scratch3, kNewTestData.length());
-  ASSERT_OK(file->Read(0, &result3));
+  ASSERT_OK(file->Read(0, result3));
 
   // Retest.
   ASSERT_EQ(result3, kNewTestData);
@@ -809,8 +930,8 @@ TEST_F(TestEnv, TestRWFile) {
   ASSERT_OK(env_->NewRWFile(opts, GetTestPath("foo"), &file));
   uint8_t scratch4[kNewTestData.length()];
   Slice result4(scratch4, kNewTestData.length());
-  ASSERT_OK(file->Read(0, &result4));
-  ASSERT_EQ(result3, kNewTestData);
+  ASSERT_OK(file->Read(0, result4));
+  ASSERT_EQ(result4, kNewTestData);
 }
 
 TEST_F(TestEnv, TestCanonicalize) {
@@ -976,6 +1097,77 @@ TEST_F(TestEnv, TestGetExtentMap) {
   ASSERT_OK(f->GetExtentMap(&extents));
   ASSERT_EQ(num_extents + 1, extents.size()) <<
       "Punching a hole should have increased the number of extents by one";
+}
+
+TEST_F(TestEnv, TestInjectEIO) {
+  // Use two files to fail with.
+  FLAGS_crash_on_eio = false;
+  const string kTestRWPath1 = GetTestPath("test_env_rw_file1");
+  unique_ptr<RWFile> rw1;
+  ASSERT_OK(env_->NewRWFile(kTestRWPath1, &rw1));
+
+  const string kTestRWPath2 = GetTestPath("test_env_rw_file2");
+  unique_ptr<RWFile> rw2;
+  ASSERT_OK(env_->NewRWFile(kTestRWPath2, &rw2));
+
+  // Inject EIOs to all operations that might result in an EIO, without
+  // specifying a glob pattern (not specifying the glob pattern will inject
+  // EIOs wherever possible by default).
+  FLAGS_env_inject_eio = 1.0;
+  uint64_t size;
+  Status s = rw1->Size(&size);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+  s = rw2->Size(&size);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+
+  // Specify and verify that both files should fail by matching glob patterns
+  // to of each's literal paths.
+  FLAGS_env_inject_eio_globs = Substitute("$0,$1", kTestRWPath1, kTestRWPath2);
+  Slice result;
+  s = rw1->Read(0, result);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+  s = rw2->Size(&size);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+
+  // Inject EIOs to all operations that might result in an EIO across paths,
+  // specified with a glob pattern.
+  FLAGS_env_inject_eio_globs = "*";
+  Slice data("data");
+  s = rw1->Write(0, data);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+  s = rw2->Size(&size);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+
+  // Specify and verify that one of the files should fail by matching a glob
+  // pattern of one of the literal paths.
+  FLAGS_env_inject_eio_globs = kTestRWPath1;
+  s = rw1->Size(&size);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+  ASSERT_OK(rw2->Write(0, data));
+
+  // Specify the directory of one of the files and ensure that fails.
+  FLAGS_env_inject_eio_globs = JoinPathSegments(DirName(kTestRWPath2), "**");
+  s = rw2->Sync();
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+
+  // Specify a directory and check that failed directory operations are caught.
+  FLAGS_env_inject_eio_globs = DirName(kTestRWPath2);
+  s = env_->SyncDir(DirName(kTestRWPath2));
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+
+  // Specify that neither file fails.
+  FLAGS_env_inject_eio_globs = "neither_path";
+  ASSERT_OK(rw1->Close());
+  ASSERT_OK(rw2->Close());
 }
 
 }  // namespace kudu

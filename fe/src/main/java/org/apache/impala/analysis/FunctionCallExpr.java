@@ -21,8 +21,8 @@ import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.AggregateFunction;
-import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.BuiltinsDb;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
@@ -34,6 +34,7 @@ import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TQueryOptions;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
@@ -80,9 +81,10 @@ public class FunctionCallExpr extends Expr {
 
   /**
    * Returns an Expr that evaluates the function call <fnName>(<params>). The returned
-   * Expr is not necessarily a FunctionCallExpr (example: DECODE())
+   * Expr is not necessarily a FunctionCallExpr (example: DECODE()).
    */
-  public static Expr createExpr(FunctionName fnName, FunctionParams params) {
+  public static Expr createExpr(FunctionName fnName, FunctionParams params,
+      TQueryOptions options) {
     FunctionCallExpr functionCallExpr = new FunctionCallExpr(fnName, params);
     if (functionNameEqualsBuiltin(fnName, "decode")) {
       return new CaseExpr(functionCallExpr);
@@ -103,6 +105,14 @@ public class FunctionCallExpr extends Expr {
           new NullLiteral() // NULL
       ));
     }
+    // "mod" and "%" are equivalent in DECIMAL V2 mode.
+    Preconditions.checkArgument(options != null);
+    if (options.isDecimal_v2() && functionNameEqualsBuiltin(fnName, "mod")) {
+      List<Expr> plist = Lists.newArrayList(params.exprs());
+      Preconditions.checkArgument(plist.size() == 2);
+      return new ArithmeticExpr(ArithmeticExpr.Operator.MOD,
+          plist.get(0), plist.get(1));
+    }
     return functionCallExpr;
   }
 
@@ -111,7 +121,7 @@ public class FunctionCallExpr extends Expr {
     return fnName.getFnNamePath().size() == 1
            && fnName.getFnNamePath().get(0).equalsIgnoreCase(name)
         || fnName.getFnNamePath().size() == 2
-           && fnName.getFnNamePath().get(0).equals(Catalog.BUILTINS_DB)
+           && fnName.getFnNamePath().get(0).equals(BuiltinsDb.NAME)
            && fnName.getFnNamePath().get(1).equalsIgnoreCase(name);
   }
 
@@ -168,6 +178,14 @@ public class FunctionCallExpr extends Expr {
 
   public boolean isMergeAggFn() { return mergeAggInputFn_ != null; }
 
+  /**
+   *  Returns true if this is a call to an Impala builtin cast function.
+   */
+  private boolean isBuiltinCastFunction() {
+    return fnName_.isBuiltin() &&
+        fnName_.getFunction().startsWith(CastExpr.CAST_FUNCTION_PREFIX);
+  }
+
   @Override
   public void resetAnalysisState() {
     super.resetAnalysisState();
@@ -189,7 +207,7 @@ public class FunctionCallExpr extends Expr {
   }
 
   @Override
-  public String toSqlImpl() {
+  public String toSqlImpl(ToSqlOptions options) {
     if (label_ != null) return label_;
     // Merge agg fns should have an explicit label.
     Preconditions.checkState(!isMergeAggFn());
@@ -197,7 +215,7 @@ public class FunctionCallExpr extends Expr {
     sb.append(fnName_).append("(");
     if (params_.isStar()) sb.append("*");
     if (params_.isDistinct()) sb.append("DISTINCT ");
-    sb.append(Joiner.on(", ").join(childrenToSql()));
+    sb.append(Joiner.on(", ").join(childrenToSql(options)));
     if (params_.isIgnoreNulls()) sb.append(" IGNORE NULLS");
     sb.append(")");
     return sb.toString();
@@ -214,7 +232,6 @@ public class FunctionCallExpr extends Expr {
         .toString();
   }
 
-  public FunctionParams getParams() { return params_; }
   public boolean isScalarFunction() {
     Preconditions.checkNotNull(fn_);
     return fn_ instanceof ScalarFunction ;
@@ -253,16 +270,14 @@ public class FunctionCallExpr extends Expr {
     return ((AggregateFunction)fn_).ignoresDistinct();
   }
 
+  public FunctionParams getParams() { return params_; }
   public FunctionName getFnName() { return fnName_; }
   public void setIsAnalyticFnCall(boolean v) { isAnalyticFnCall_ = v; }
   public void setIsInternalFnCall(boolean v) { isInternalFnCall_ = v; }
 
   static boolean isNondeterministicBuiltinFnName(String fnName) {
-    if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
-        || fnName.equalsIgnoreCase("uuid")) {
-      return true;
-    }
-    return false;
+    return fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random") ||
+           fnName.equalsIgnoreCase("uuid");
   }
 
   /**
@@ -411,7 +426,7 @@ public class FunctionCallExpr extends Expr {
         // The second argument to these functions is the desired scale, otherwise
         // the default is 0.
         Preconditions.checkState(children_.size() == 2);
-        if (children_.get(1).isNullLiteral()) {
+        if (IS_NULL_VALUE.apply(children_.get(1))) {
           throw new AnalysisException(fnName_.getFunction() +
               "() cannot be called with a NULL second argument.");
         }
@@ -427,11 +442,10 @@ public class FunctionCallExpr extends Expr {
         }
         NumericLiteral scaleLiteral = (NumericLiteral) LiteralExpr.create(
             children_.get(1), analyzer.getQueryCtx());
-        digitsAfter = (int)scaleLiteral.getLongValue();
-        if (Math.abs(digitsAfter) > ScalarType.MAX_SCALE) {
-          throw new AnalysisException("Cannot round/truncate to scales greater than " +
-              ScalarType.MAX_SCALE + ".");
-        }
+        // If scale is greater than the scale of the decimal, this should be a no-op,
+        // so we do not need change the scale of the output decimal.
+        digitsAfter = Math.min(digitsAfter, (int)scaleLiteral.getLongValue());
+        Preconditions.checkState(digitsAfter <= ScalarType.MAX_SCALE);
         // Round/Truncate to a negative scale means to round to the digit before
         // the decimal e.g. round(1234.56, -2) would be 1200.
         // The resulting scale is always 0.
@@ -445,11 +459,15 @@ public class FunctionCallExpr extends Expr {
            fnName_.getFunction().equalsIgnoreCase("dround")) &&
           digitsAfter < childType.decimalScale()) {
         // If we are rounding to fewer decimal places, it's possible we need another
-        // digit before the decimal.
+        // digit before the decimal if the value gets rounded up.
         ++digitsBefore;
       }
     }
     Preconditions.checkState(returnType.isDecimal() && !returnType.isWildcardDecimal());
+    if (analyzer.isDecimalV2()) {
+      if (digitsBefore + digitsAfter > 38) return Type.INVALID;
+      return ScalarType.createDecimalType(digitsBefore + digitsAfter, digitsAfter);
+    }
     return ScalarType.createClippedDecimalType(digitsBefore + digitsAfter, digitsAfter);
   }
 
@@ -470,9 +488,14 @@ public class FunctionCallExpr extends Expr {
     }
 
     // User needs DB access.
-    Db db = analyzer.getDb(fnName_.getDb(), Privilege.VIEW_METADATA, true);
+    FeDb db = analyzer.getDb(fnName_.getDb(), Privilege.VIEW_METADATA, true);
     if (!db.containsFunction(fnName_.getFunction())) {
       throw new AnalysisException(fnName_ + "() unknown");
+    }
+
+    if (isBuiltinCastFunction()) {
+      throw new AnalysisException(toSql() +
+          " is reserved for internal use only. Use 'cast(expr AS type)' instead.");
     }
 
     if (fnName_.getFunction().equals("count") && params_.isDistinct()) {
@@ -533,7 +556,7 @@ public class FunctionCallExpr extends Expr {
 
     if (isAggregateFunction()) {
       // subexprs must not contain aggregates
-      if (TreeNode.contains(children_, Expr.isAggregatePredicate())) {
+      if (TreeNode.contains(children_, Expr.IS_AGGREGATE)) {
         throw new AnalysisException(
             "aggregate function must not contain aggregate parameters: " + this.toSql());
       }
@@ -586,7 +609,7 @@ public class FunctionCallExpr extends Expr {
           "Analytic function requires an OVER clause: " + toSql());
     }
 
-    castForFunctionCall(false);
+    castForFunctionCall(false, analyzer.isDecimalV2());
     type_ = fn_.getReturnType();
     if (type_.isDecimal() && type_.isWildcardDecimal()) {
       type_ = resolveDecimalReturnType(analyzer);

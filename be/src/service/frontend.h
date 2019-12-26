@@ -24,6 +24,7 @@
 #include "gen-cpp/ImpalaHiveServer2Service.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/Frontend_types.h"
+#include "gen-cpp/LineageGraph_types.h"
 #include "common/status.h"
 
 namespace impala {
@@ -38,21 +39,25 @@ class Frontend {
   /// or if there is any further exception, the constructor will terminate the process.
   Frontend();
 
-  /// Request to update the Impalad catalog cache. The req argument contains a vector of
-  /// updates that each contain objects that should be added/removed from the Catalog.
-  /// Returns a response that contains details such as the new max catalog version.
-  Status UpdateCatalogCache(const vector<TUpdateCatalogCacheRequest>& req,
+  /// Request to update the Impalad catalog cache. The 'req' argument contains a pointer
+  /// to a CatalogServer used for the FE to call NativeGetNextCatalogTopicItem() back to
+  /// get the catalog objects iteratively. Returns a response that contains details such
+  /// as the new max catalog version.
+  Status UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
       TUpdateCatalogCacheResponse *resp);
 
-  /// Request to update the Impalad frontend cluster membership snapshot.  The
-  /// TUpdateMembershipRequest contains the latest set of hosts.
-  Status UpdateMembership(const TUpdateMembershipRequest& req);
+  /// Request to update the Impalad frontend cluster membership snapshot of executors.
+  /// The TUpdateExecutorMembershipRequest contains the latest set of executor nodes.
+  Status UpdateExecutorMembership(const TUpdateExecutorMembershipRequest& req);
 
   /// Call FE to get explain plan
   Status GetExplainPlan(const TQueryCtx& query_ctx, std::string* explain_string);
 
   /// Call FE to get TExecRequest.
   Status GetExecRequest(const TQueryCtx& query_ctx, TExecRequest* result);
+
+  /// Get the metrics from the catalog used by this frontend.
+  Status GetCatalogMetrics(TGetCatalogMetricsResult* resp);
 
   /// Returns all matching table names, per Hive's "SHOW TABLES <pattern>". Each
   /// table name returned is unqualified.
@@ -88,8 +93,9 @@ class Frontend {
   /// Call FE to get the table/column stats.
   Status GetStats(const TShowStatsParams& params, TResultSet* result);
 
-  /// Call FE to get the privileges granted to a role.
-  Status GetRolePrivileges(const TShowGrantRoleParams& params, TResultSet* result);
+  /// Call FE to get the privileges granted to a principal.
+  Status GetPrincipalPrivileges(const TShowGrantPrincipalParams& params,
+      TResultSet* result);
 
   /// Return all functions of 'category' that match the optional argument 'pattern'.
   /// If pattern is NULL match all functions, otherwise match only those functions that
@@ -124,8 +130,9 @@ class Frontend {
   /// field is set to MINIMAL, only the column definitions are returned. If set to
   /// FORMATTED|EXTENDED, extended metadata is returned (in addition to the column defs).
   /// This includes info about the table properties, SerDe properties, StorageDescriptor
-  /// properties, and more.
-  Status DescribeTable(const TDescribeTableParams& params, TDescribeResult* response);
+  /// properties, and more.  The current user session is needed for privileges checks.
+  Status DescribeTable(const TDescribeTableParams& params, const TSessionState& session,
+      TDescribeResult* response);
 
   /// Returns (in the output parameter) a string containing the CREATE TABLE command that
   /// creates the table specified in the params.
@@ -151,10 +158,20 @@ class Frontend {
   Status GetHadoopConfig(const TGetHadoopConfigRequest& request,
       TGetHadoopConfigResponse* response);
 
+  /// Returns (in the output parameter) the list of groups for the given user.
+  Status GetHadoopGroups(const TGetHadoopGroupsRequest& request,
+      TGetHadoopGroupsResponse* response);
+
   /// Loads a single file or set of files into a table or partition. Saves the RPC
   /// response in the TLoadDataResp output parameter. Returns OK if the operation
   /// completed successfully.
   Status LoadData(const TLoadDataReq& load_data_request, TLoadDataResp* response);
+
+  /// Aborts transaction with the given transaction id.
+  Status AbortTransaction(int64_t transaction_id);
+
+  /// Unregisters an already committed transaction.
+  Status UnregisterTransaction(int64_t transaction_id);
 
   /// Returns true if the error returned by the FE was due to an AuthorizationException.
   static bool IsAuthorizationError(const Status& status);
@@ -175,18 +192,20 @@ class Frontend {
   Status BuildTestDescriptorTable(const TBuildTestDescriptorTableParams& params,
       TDescriptorTable* result);
 
- private:
-  /// Descriptor of Java Frontend class itself, used to create a new instance.
-  jclass fe_class_;
+  // Call FE post-query execution hook
+  Status CallQueryCompleteHooks(const TQueryCompleteContext& context);
 
+ private:
   jobject fe_;  // instance of org.apache.impala.service.JniFrontend
   jmethodID create_exec_request_id_;  // JniFrontend.createExecRequest()
   jmethodID get_explain_plan_id_;  // JniFrontend.getExplainPlan()
   jmethodID get_hadoop_config_id_;  // JniFrontend.getHadoopConfig(byte[])
   jmethodID get_hadoop_configs_id_;  // JniFrontend.getAllHadoopConfigs()
+  jmethodID get_hadoop_groups_id_;  // JniFrontend.getHadoopGroups()
   jmethodID check_config_id_; // JniFrontend.checkConfiguration()
   jmethodID update_catalog_cache_id_; // JniFrontend.updateCatalogCache(byte[][])
   jmethodID update_membership_id_; // JniFrontend.updateMembership()
+  jmethodID get_catalog_metrics_id_; // JniFrontend.getCatalogMetrics()
   jmethodID get_table_names_id_; // JniFrontend.getTableNames
   jmethodID describe_db_id_; // JniFrontend.describeDb
   jmethodID describe_table_id_; // JniFrontend.describeTable
@@ -197,13 +216,16 @@ class Frontend {
   jmethodID get_functions_id_; // JniFrontend.getFunctions
   jmethodID get_catalog_object_id_; // JniFrontend.getCatalogObject
   jmethodID show_roles_id_; // JniFrontend.getRoles
-  jmethodID get_role_privileges_id_; // JniFrontend.getRolePrivileges
+  jmethodID get_principal_privileges_id_; // JniFrontend.getPrincipalPrivileges
   jmethodID exec_hs2_metadata_op_id_; // JniFrontend.execHiveServer2MetadataOp
   jmethodID load_table_data_id_; // JniFrontend.loadTableData
   jmethodID set_catalog_is_ready_id_; // JniFrontend.setCatalogIsReady
   jmethodID wait_for_catalog_id_; // JniFrontend.waitForCatalog
   jmethodID get_table_files_id_; // JniFrontend.getTableFiles
   jmethodID show_create_function_id_; // JniFrontend.showCreateFunction
+  jmethodID call_query_complete_hooks_id_; // JniFrontend.callQueryCompleteHooks
+  jmethodID abort_txn_; // JniFrontend.abortTransaction()
+  jmethodID unregister_txn_; // JniFrontend.abortTransaction()
 
   // Only used for testing.
   jmethodID build_test_descriptor_table_id_; // JniFrontend.buildTestDescriptorTable()

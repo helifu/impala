@@ -18,8 +18,12 @@
 #include "kudu/util/env_util.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cerrno>
+#include <ctime>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,18 +31,17 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/bind.h"
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/strings/numbers.h"
-#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
-#include "kudu/util/debug-util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 
-DEFINE_int64_hidden(disk_reserved_bytes_free_for_testing, -1,
+DEFINE_int64(disk_reserved_bytes_free_for_testing, -1,
              "For testing only! Set to number of bytes free on each filesystem. "
              "Set to -1 to disable this test-specific override");
 TAG_FLAG(disk_reserved_bytes_free_for_testing, runtime);
@@ -46,18 +49,18 @@ TAG_FLAG(disk_reserved_bytes_free_for_testing, unsafe);
 
 // We define some flags for testing purposes: Two prefixes and their associated
 // "bytes free" overrides.
-DEFINE_string_hidden(disk_reserved_override_prefix_1_path_for_testing, "",
+DEFINE_string(disk_reserved_override_prefix_1_path_for_testing, "",
               "For testing only! Specifies a prefix to override the visible 'bytes free' on. "
               "Use --disk_reserved_override_prefix_1_bytes_free_for_testing to set the number of "
               "bytes free for this path prefix. Set to empty string to disable.");
-DEFINE_int64_hidden(disk_reserved_override_prefix_1_bytes_free_for_testing, -1,
+DEFINE_int64(disk_reserved_override_prefix_1_bytes_free_for_testing, -1,
              "For testing only! Set number of bytes free on the path prefix specified by "
              "--disk_reserved_override_prefix_1_path_for_testing. Set to -1 to disable.");
-DEFINE_string_hidden(disk_reserved_override_prefix_2_path_for_testing, "",
+DEFINE_string(disk_reserved_override_prefix_2_path_for_testing, "",
               "For testing only! Specifies a prefix to override the visible 'bytes free' on. "
               "Use --disk_reserved_override_prefix_2_bytes_free_for_testing to set the number of "
               "bytes free for this path prefix. Set to empty string to disable.");
-DEFINE_int64_hidden(disk_reserved_override_prefix_2_bytes_free_for_testing, -1,
+DEFINE_int64(disk_reserved_override_prefix_2_bytes_free_for_testing, -1,
              "For testing only! Set number of bytes free on the path prefix specified by "
              "--disk_reserved_override_prefix_2_path_for_testing. Set to -1 to disable.");
 TAG_FLAG(disk_reserved_override_prefix_1_path_for_testing, unsafe);
@@ -67,9 +70,11 @@ TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, unsafe);
 TAG_FLAG(disk_reserved_override_prefix_1_bytes_free_for_testing, runtime);
 TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, runtime);
 
+using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -264,26 +269,51 @@ Status DeleteTmpFilesRecursively(Env* env, const string& path) {
   return env->Walk(path, Env::PRE_ORDER, Bind(&DeleteTmpFilesRecursivelyCb, env));
 }
 
-ScopedFileDeleter::ScopedFileDeleter(Env* env, std::string path)
-    : env_(DCHECK_NOTNULL(env)), path_(std::move(path)), should_delete_(true) {}
-
-ScopedFileDeleter::~ScopedFileDeleter() {
-  if (should_delete_) {
-    bool is_dir;
-    Status s = env_->IsDirectory(path_, &is_dir);
-    WARN_NOT_OK(s, Substitute(
-        "Failed to determine if path is a directory: $0", path_));
-    if (!s.ok()) {
-      return;
+Status IsDirectoryEmpty(Env* env, const string& path, bool* is_empty) {
+  vector<string> children;
+  RETURN_NOT_OK(env->GetChildren(path, &children));
+  for (const auto& c : children) {
+    if (c == "." || c == "..") {
+      continue;
     }
-    if (is_dir) {
-      WARN_NOT_OK(env_->DeleteDir(path_),
-                  Substitute("Failed to remove directory: $0", path_));
-    } else {
-      WARN_NOT_OK(env_->DeleteFile(path_),
-          Substitute("Failed to remove file: $0", path_));
-    }
+    *is_empty = false;
+    return Status::OK();
   }
+  *is_empty = true;
+  return Status::OK();
+}
+
+Status SyncAllParentDirs(Env* env,
+                         const vector<string>& dirs,
+                         const vector<string>& files) {
+  // An unordered_set is used to deduplicate the set of directories.
+  unordered_set<string> to_sync;
+  for (const auto& d : dirs) {
+    to_sync.insert(DirName(d));
+  }
+  for (const auto& f : files) {
+    to_sync.insert(DirName(f));
+  }
+  for (const auto& d : to_sync) {
+    RETURN_NOT_OK_PREPEND(env->SyncDir(d),
+                          Substitute("unable to synchronize directory $0", d));
+  }
+  return Status::OK();
+}
+
+Status ListFilesInDir(Env* env,
+                      const string& path,
+                      vector<string>* entries) {
+  RETURN_NOT_OK(env->GetChildren(path, entries));
+  auto iter = entries->begin();
+  while (iter != entries->end()) {
+    if (*iter == "." || *iter == ".." || iter->find(kTmpInfix) != string::npos) {
+      iter = entries->erase(iter);
+      continue;
+    }
+    ++iter;
+  }
+  return Status::OK();
 }
 
 } // namespace env_util

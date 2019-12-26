@@ -15,16 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <algorithm>
-#include <gflags/gflags.h>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include <boost/function.hpp>
+#include <gflags/gflags.h>
+#include <google/protobuf/message.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/sysinfo.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/rpc/constants.h"
 #include "kudu/rpc/outbound_call.h"
@@ -35,11 +42,12 @@
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/kernel_stack_watchdog.h"
+#include "kudu/util/net/sockaddr.h"
 
 // 100M cycles should be about 50ms on a 2Ghz box. This should be high
 // enough that involuntary context switches don't trigger it, but low enough
 // that any serious blocking behavior on the reactor would.
-DEFINE_int64_hidden(rpc_callback_max_cycles, 100 * 1000 * 1000,
+DEFINE_int64(rpc_callback_max_cycles, 100 * 1000 * 1000,
              "The maximum number of cycles for which an RPC callback "
              "should be allowed to run without emitting a warning."
              " (Advanced debugging option)");
@@ -47,12 +55,14 @@ TAG_FLAG(rpc_callback_max_cycles, advanced);
 TAG_FLAG(rpc_callback_max_cycles, runtime);
 
 // Flag used in debug build for injecting cancellation at different code paths.
-DEFINE_int32_hidden(rpc_inject_cancellation_state, -1,
+DEFINE_int32(rpc_inject_cancellation_state, -1,
              "If this flag is not -1, it is the state in which a cancellation request "
              "will be injected. Should use values in OutboundCall::State only");
 TAG_FLAG(rpc_inject_cancellation_state, unsafe);
 
+using std::string;
 using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace rpc {
@@ -141,7 +151,9 @@ void OutboundCall::SetRequestPayload(const Message& req,
   sidecar_byte_size_ = 0;
   for (const unique_ptr<RpcSidecar>& car: sidecars_) {
     header_.add_sidecar_offsets(sidecar_byte_size_ + message_size);
-    sidecar_byte_size_ += car->AsSlice().size();
+    int32_t sidecar_bytes = car->AsSlice().size();
+    DCHECK_LE(sidecar_byte_size_, TransferLimits::kMaxTotalSidecarBytes - sidecar_bytes);
+    sidecar_byte_size_ += sidecar_bytes;
   }
 
   serialization::SerializeMessage(req, &request_buf_, sidecar_byte_size_, true);
@@ -294,14 +306,14 @@ void OutboundCall::SetResponse(gscoped_ptr<CallResponse> resp) {
     CallCallback();
   } else {
     // Error
-    gscoped_ptr<ErrorStatusPB> err(new ErrorStatusPB());
+    unique_ptr<ErrorStatusPB> err(new ErrorStatusPB());
     if (!err->ParseFromArray(r.data(), r.size())) {
       SetFailed(Status::IOError("Was an RPC error but could not parse error response",
                                 err->InitializationErrorString()));
       return;
     }
-    ErrorStatusPB* err_raw = err.release();
-    SetFailed(Status::RemoteError(err_raw->message()), Phase::REMOTE_CALL, err_raw);
+    Status s = Status::RemoteError(err->message());
+    SetFailed(std::move(s), Phase::REMOTE_CALL, std::move(err));
   }
 }
 
@@ -333,17 +345,15 @@ void OutboundCall::SetSent() {
   }
 }
 
-void OutboundCall::SetFailed(const Status &status,
+void OutboundCall::SetFailed(Status status,
                              Phase phase,
-                             ErrorStatusPB* err_pb) {
+                             unique_ptr<ErrorStatusPB> err_pb) {
   DCHECK(!status.ok());
   DCHECK(phase == Phase::CONNECTION_NEGOTIATION || phase == Phase::REMOTE_CALL);
   {
     std::lock_guard<simple_spinlock> l(lock_);
-    status_ = status;
-    if (err_pb) {
-      error_pb_.reset(err_pb);
-    }
+    status_ = std::move(status);
+    error_pb_ = std::move(err_pb);
     set_state_unlocked(phase == Phase::CONNECTION_NEGOTIATION
         ? FINISHED_NEGOTIATION_ERROR
         : FINISHED_ERROR);
@@ -439,7 +449,7 @@ string OutboundCall::ToString() const {
   return Substitute("RPC call $0 -> $1", remote_method_.ToString(), conn_id_.ToString());
 }
 
-void OutboundCall::DumpPB(const DumpRunningRpcsRequestPB& req,
+void OutboundCall::DumpPB(const DumpConnectionsRequestPB& req,
                           RpcCallInProgressPB* resp) {
   std::lock_guard<simple_spinlock> l(lock_);
   resp->mutable_header()->CopyFrom(header_);

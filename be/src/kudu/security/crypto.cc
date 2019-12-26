@@ -17,15 +17,21 @@
 
 #include "kudu/security/crypto.h"
 
-#include <cstdio>
-#include <cstdlib>
+#include <memory>
+#include <ostream>
 #include <string>
 
 #include <glog/logging.h>
 #include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/opensslv.h>
+#include <openssl/ossl_typ.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/openssl_util.h"
@@ -82,7 +88,11 @@ template<> struct SslTypeTraits<RSA> {
   static constexpr auto kFreeFunc = &RSA_free;
 };
 template<> struct SslTypeTraits<EVP_MD_CTX> {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   static constexpr auto kFreeFunc = &EVP_MD_CTX_destroy;
+#else
+  static constexpr auto kFreeFunc = &EVP_MD_CTX_free;
+#endif
 };
 
 namespace {

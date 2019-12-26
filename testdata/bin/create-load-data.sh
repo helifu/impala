@@ -29,7 +29,8 @@
 # bin/load-data.py
 
 set -euo pipefail
-trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+. $IMPALA_HOME/bin/report_build_error.sh
+setup_report_build_error
 
 . ${IMPALA_HOME}/bin/impala-config.sh > /dev/null 2>&1
 . ${IMPALA_HOME}/testdata/bin/run-step.sh
@@ -37,17 +38,22 @@ trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)
 # Environment variables used to direct the data loading process to an external cluster.
 # TODO: We need a better way of managing how these get set. See IMPALA-4346
 : ${HS2_HOST_PORT=localhost:11050}
-: ${HDFS_NN=localhost:20500}
-: ${IMPALAD=localhost:21000}
+: ${HDFS_NN=${INTERNAL_LISTEN_HOST}:20500}
+: ${IMPALAD=localhost}
 : ${REMOTE_LOAD=}
 : ${CM_HOST=}
+: ${IMPALA_SERIAL_DATALOAD=}
+# We don't expect dataload to take more than 2.5 hours.
+: ${TIMEOUT_FOR_CREATE_LOAD_DATA_MINS:= 150}
 
 SKIP_METADATA_LOAD=0
 SKIP_SNAPSHOT_LOAD=0
+SKIP_RANGER=0
 SNAPSHOT_FILE=""
 LOAD_DATA_ARGS=""
 EXPLORATION_STRATEGY="exhaustive"
 export JDBC_URL="jdbc:hive2://${HS2_HOST_PORT}/default;"
+HIVE_CMD="beeline -n $USER -u $JDBC_URL"
 
 # For logging when using run-step.
 LOG_DIR=${IMPALA_DATA_LOADING_LOGS_DIR}
@@ -83,23 +89,36 @@ do
       CM_HOST=${2-}
       shift;
       ;;
+    -skip_ranger)
+      SKIP_RANGER=1
+      ;;
+    -timeout)
+      TIMEOUT_FOR_CREATE_LOAD_DATA_MINS=${2-}
+      shift;
+      ;;
     -help|-h|*)
       echo "create-load-data.sh : Creates data and loads from scratch"
       echo "[-skip_metadata_load] : Skips loading of metadata"
       echo "[-skip_snapshot_load] : Assumes that the snapshot is already loaded"
       echo "[-snapshot_file] : Loads the test warehouse snapshot into hdfs"
       echo "[-cm_host] : Address of the Cloudera Manager host if loading to a remote cluster"
+      echo "[-skip_ranger] : Skip the set-up for Ranger."
+      echo "[-timeout] : The timeout in minutes for loading data."
       exit 1;
       ;;
     esac
   shift;
 done
 
+if [[ -n $REMOTE_LOAD ]]; then
+  SKIP_RANGER=1
+fi
+
+"${IMPALA_HOME}/bin/script-timeout-check.sh" -timeout $TIMEOUT_FOR_CREATE_LOAD_DATA_MINS \
+    -script_name "$(basename $0)" &
+TIMEOUT_PID=$!
+
 if [[ $SKIP_METADATA_LOAD -eq 0  && "$SNAPSHOT_FILE" = "" ]]; then
-  if [[ -z "$REMOTE_LOAD" ]]; then
-    run-step "Loading Hive Builtins" load-hive-builtins.log \
-      ${IMPALA_HOME}/testdata/bin/load-hive-builtins.sh
-  fi
   run-step "Generating HBase data" create-hbase.log \
       ${IMPALA_HOME}/testdata/bin/create-hbase.sh
   run-step "Creating /test-warehouse HDFS directory" create-test-warehouse-dir.log \
@@ -133,30 +152,70 @@ echo "SNAPSHOT_FILE=${SNAPSHOT_FILE:-}"
 echo "CM_HOST=${CM_HOST:-}"
 echo "REMOTE_LOAD=${REMOTE_LOAD:-}"
 
+function start-impala {
+  : ${START_CLUSTER_ARGS=""}
+  # Use a fast statestore update so that DDL operations run faster.
+  START_CLUSTER_ARGS_INT="--state_store_args=--statestore_update_frequency_ms=50"
+  if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
+    START_CLUSTER_ARGS_INT+=("--impalad_args=--abort_on_config_error=false -s 1")
+  else
+    START_CLUSTER_ARGS_INT+=("-s 3")
+  fi
+  if [[ "${ERASURE_CODING}" == true ]]; then
+    START_CLUSTER_ARGS="${START_CLUSTER_ARGS} \
+      --impalad_args=--default_query_options=allow_erasure_coded_files=true"
+  fi
+  START_CLUSTER_ARGS_INT+=("${START_CLUSTER_ARGS}")
+  ${IMPALA_HOME}/bin/start-impala-cluster.py --log_dir=${IMPALA_DATA_LOADING_LOGS_DIR} \
+    ${START_CLUSTER_ARGS_INT[@]}
+}
+
+function restart-cluster {
+  # Break out each individual step for clarity
+  echo "Shutting down Impala"
+  ${IMPALA_HOME}/bin/start-impala-cluster.py --kill
+  echo "Shutting down the minicluster"
+  ${IMPALA_HOME}/testdata/bin/kill-all.sh
+  echo "Starting the minicluster"
+  ${IMPALA_HOME}/testdata/bin/run-all.sh
+  echo "Starting Impala"
+  start-impala
+}
+
 function load-custom-schemas {
+  # HDFS commandline calls are slow, so consolidate the manipulation into
+  # as few calls as possible by populating a temporary directory with the
+  # appropriate structure and copying it in a single call.
+  TMP_DIR=$(mktemp -d)
+
+  # Cleanup old schemas dir
+  hadoop fs -rm -r -f /test-warehouse/schemas
   SCHEMA_SRC_DIR=${IMPALA_HOME}/testdata/data/schemas
-  SCHEMA_DEST_DIR=/test-warehouse/schemas
-  # clean the old schemas directory.
-  hadoop fs -rm -r -f ${SCHEMA_DEST_DIR}
-  hadoop fs -mkdir ${SCHEMA_DEST_DIR}
-  hadoop fs -put $SCHEMA_SRC_DIR/zipcode_incomes.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/alltypestiny.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/enum ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/malformed_decimal_tiny.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/decimal.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/nested/modern_nested.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/nested/legacy_nested.parquet ${SCHEMA_DEST_DIR}/
+  SCHEMA_TMP_DIR="${TMP_DIR}/schemas"
+  mkdir ${SCHEMA_TMP_DIR}
+  mkdir ${SCHEMA_TMP_DIR}/enum
+  ln -s ${SCHEMA_SRC_DIR}/zipcode_incomes.parquet ${SCHEMA_TMP_DIR}
+  ln -s ${SCHEMA_SRC_DIR}/alltypestiny.parquet ${SCHEMA_TMP_DIR}
+  ln -s ${SCHEMA_SRC_DIR}/enum/* ${SCHEMA_TMP_DIR}/enum
+  ln -s ${SCHEMA_SRC_DIR}/malformed_decimal_tiny.parquet ${SCHEMA_TMP_DIR}
+  ln -s ${SCHEMA_SRC_DIR}/decimal.parquet ${SCHEMA_TMP_DIR}
+  ln -s ${SCHEMA_SRC_DIR}/nested/modern_nested.parquet ${SCHEMA_TMP_DIR}
+  ln -s ${SCHEMA_SRC_DIR}/nested/legacy_nested.parquet ${SCHEMA_TMP_DIR}
 
   # CHAR and VARCHAR tables written by Hive
-  hadoop fs -mkdir -p /test-warehouse/chars_formats_avro_snap/
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/chars-formats.avro \
-    /test-warehouse/chars_formats_avro_snap
-  hadoop fs -mkdir -p /test-warehouse/chars_formats_parquet/
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/chars-formats.parquet \
-    /test-warehouse/chars_formats_parquet
-  hadoop fs -mkdir -p /test-warehouse/chars_formats_text/
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/chars-formats.txt \
-    /test-warehouse/chars_formats_text
+  mkdir -p ${TMP_DIR}/chars_formats_avro_snap \
+   ${TMP_DIR}/chars_formats_parquet \
+   ${TMP_DIR}/chars_formats_text \
+   ${TMP_DIR}/chars_formats_orc_def
+
+  ln -s ${IMPALA_HOME}/testdata/data/chars-formats.avro ${TMP_DIR}/chars_formats_avro_snap
+  ln -s ${IMPALA_HOME}/testdata/data/chars-formats.parquet ${TMP_DIR}/chars_formats_parquet
+  ln -s ${IMPALA_HOME}/testdata/data/chars-formats.orc ${TMP_DIR}/chars_formats_orc_def
+  ln -s ${IMPALA_HOME}/testdata/data/chars-formats.txt ${TMP_DIR}/chars_formats_text
+
+  hadoop fs -put -f ${TMP_DIR}/* /test-warehouse
+
+  rm -r ${TMP_DIR}
 }
 
 function load-data {
@@ -197,6 +256,11 @@ function load-data {
   ARGS+=("--impalad ${IMPALAD}")
   ARGS+=("--hive_hs2_hostport ${HS2_HOST_PORT}")
   ARGS+=("--hdfs_namenode ${HDFS_NN}")
+
+  # Disable parallelism for dataload if IMPALA_SERIAL_DATALOAD is set
+  if [[ "${IMPALA_SERIAL_DATALOAD}" -eq 1 ]]; then
+    ARGS+=("--num_processes 1")
+  fi
 
   if [[ -n ${TABLE_FORMATS} ]]; then
     # TBL_FMT_STR replaces slashes with underscores,
@@ -252,11 +316,65 @@ function load-aux-workloads {
   fi
 }
 
-function copy-auth-policy {
-  echo COPYING AUTHORIZATION POLICY FILE
-  hadoop fs -rm -f ${FILESYSTEM_PREFIX}/test-warehouse/authz-policy.ini
-  hadoop fs -put ${IMPALA_HOME}/fe/src/test/resources/authz-policy.ini \
-      ${FILESYSTEM_PREFIX}/test-warehouse/
+function setup-ranger {
+  echo "SETTING UP RANGER"
+
+  RANGER_SETUP_DIR="${IMPALA_HOME}/testdata/cluster/ranger/setup"
+
+  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
+    "${RANGER_SETUP_DIR}/impala_group_owner.json.template" > \
+    "${RANGER_SETUP_DIR}/impala_group_owner.json"
+
+  export GROUP_ID_OWNER=$(wget -qO - --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_group_owner.json" \
+    --header="accept:application/json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/xusers/secure/groups |
+    python -c "import sys, json; print json.load(sys.stdin)['id']")
+
+  export GROUP_ID_NON_OWNER=$(wget -qO - --auth-no-challenge --user=admin \
+    --password=admin --post-file="${RANGER_SETUP_DIR}/impala_group_non_owner.json" \
+    --header="accept:application/json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/xusers/secure/groups |
+    python -c "import sys, json; print json.load(sys.stdin)['id']")
+
+  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
+    "${RANGER_SETUP_DIR}/impala_user_owner.json.template" > \
+    "${RANGER_SETUP_DIR}/impala_user_owner.json"
+
+  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
+    "${RANGER_SETUP_DIR}/impala_user_non_owner.json.template" > \
+    "${RANGER_SETUP_DIR}/impala_user_non_owner.json"
+
+  if grep "\${[A-Z_]*}" "${RANGER_SETUP_DIR}/impala_user_owner.json"; then
+    echo "Found undefined variables in ${RANGER_SETUP_DIR}/impala_user_owner.json."
+    exit 1
+  fi
+
+  if grep "\${[A-Z_]*}" "${RANGER_SETUP_DIR}/impala_user_non_owner.json"; then
+    echo "Found undefined variables in ${RANGER_SETUP_DIR}/impala_user_non_owner.json."
+    exit 1
+  fi
+
+  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_user_owner.json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/xusers/secure/users
+
+  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_user_non_owner.json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/xusers/secure/users
+
+  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
+    --post-file="${RANGER_SETUP_DIR}/impala_service.json" \
+    --header="Content-Type:application/json" \
+    http://localhost:6080/service/public/v2/api/service
+
+  curl -u admin:admin -H "Accept: application/json" -H "Content-Type: application/json" \
+    -X PUT http://localhost:6080/service/public/v2/api/policy/4 \
+    -d @"${RANGER_SETUP_DIR}/policy_4_revised.json"
 }
 
 function copy-and-load-dependent-tables {
@@ -264,20 +382,27 @@ function copy-and-load-dependent-tables {
   # TODO: The multi-format table will move these files. So we need to copy them to a
   # temporary location for that table to use. Should find a better way to handle this.
   echo COPYING AND LOADING DATA FOR DEPENDENT TABLES
-  hadoop fs -rm -r -f /test-warehouse/alltypesmixedformat
-  hadoop fs -rm -r -f /tmp/alltypes_rc
-  hadoop fs -rm -r -f /tmp/alltypes_seq
-  hadoop fs -mkdir -p /tmp/alltypes_seq/year=2009
-  hadoop fs -mkdir -p /tmp/alltypes_rc/year=2009
+  hadoop fs -rm -r -f /test-warehouse/alltypesmixedformat \
+    /tmp/alltypes_rc /tmp/alltypes_seq /tmp/alltypes_parquet
+  hadoop fs -mkdir -p /tmp/alltypes_seq/year=2009 \
+    /tmp/alltypes_rc/year=2009 /tmp/alltypes_parquet/year=2009
+
+  # The file written by hive to /test-warehouse will be strangely replicated rather than
+  # erasure coded if EC is not set in /tmp
+  if [[ -n "${HDFS_ERASURECODE_POLICY:-}" ]]; then
+    hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" -path "/tmp/alltypes_rc"
+    hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" -path "/tmp/alltypes_seq"
+    hdfs ec -setPolicy -policy "${HDFS_ERASURECODE_POLICY}" -path "/tmp/alltypes_parquet"
+  fi
+
   hadoop fs -cp /test-warehouse/alltypes_seq/year=2009/month=2/ /tmp/alltypes_seq/year=2009
   hadoop fs -cp /test-warehouse/alltypes_rc/year=2009/month=3/ /tmp/alltypes_rc/year=2009
+  hadoop fs -cp /test-warehouse/alltypes_parquet/year=2009/month=4/ /tmp/alltypes_parquet/year=2009
 
   # Create a hidden file in AllTypesSmall
-  hadoop fs -rm -f /test-warehouse/alltypessmall/year=2009/month=1/_hidden
-  hadoop fs -rm -f /test-warehouse/alltypessmall/year=2009/month=1/.hidden
-  hadoop fs -cp /test-warehouse/zipcode_incomes/DEC_00_SF3_P077_with_ann_noheader.csv \
+  hadoop fs -cp -f /test-warehouse/zipcode_incomes/DEC_00_SF3_P077_with_ann_noheader.csv \
    /test-warehouse/alltypessmall/year=2009/month=1/_hidden
-  hadoop fs -cp /test-warehouse/zipcode_incomes/DEC_00_SF3_P077_with_ann_noheader.csv \
+  hadoop fs -cp -f /test-warehouse/zipcode_incomes/DEC_00_SF3_P077_with_ann_noheader.csv \
    /test-warehouse/alltypessmall/year=2009/month=1/.hidden
 
   # In case the data is updated by a non-super user, make sure the user can write
@@ -296,13 +421,17 @@ function copy-and-load-dependent-tables {
   #
   # See: logs/data_loading/copy-and-load-dependent-tables.log)
   # See also: IMPALA-4345
-  hadoop fs -chmod -R 777 /tmp/alltypes_rc
-  hadoop fs -chmod -R 777 /tmp/alltypes_seq
+  hadoop fs -chmod -R 777 /tmp/alltypes_rc /tmp/alltypes_seq /tmp/alltypes_parquet
 
   # For tables that rely on loading data from local fs test-wareload-house
   # TODO: Find a good way to integrate this with the normal data loading scripts
   beeline -n $USER -u "${JDBC_URL}" -f\
     ${IMPALA_HOME}/testdata/bin/load-dependent-tables.sql
+
+  if [[ "$IMPALA_HIVE_MAJOR_VERSION" == "2" ]]; then
+    beeline -n $USER -u "${JDBC_URL}" -f\
+      ${IMPALA_HOME}/testdata/bin/load-dependent-tables-hive2.sql
+  fi
 }
 
 function create-internal-hbase-table {
@@ -348,33 +477,31 @@ function load-custom-data {
 
   hadoop fs -mv /bad_text_lzo_text_lzo/ /test-warehouse/
 
-  # IMPALA-694: data file produced by parquet-mr version 1.2.5-cdh4.5.0
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/bad_parquet_data.parquet \
-                    /test-warehouse/bad_parquet_parquet
-
-  # Data file produced by parquet-mr with repeated values (produces 0 bit width dictionary)
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/repeated_values.parquet \
-                    /test-warehouse/bad_parquet_parquet
-
-  # IMPALA-720: data file produced by parquet-mr with multiple row groups
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/multiple_rowgroups.parquet \
-                    /test-warehouse/bad_parquet_parquet
-
-  # IMPALA-1401: data file produced by Hive 13 containing page statistics with long min/max
-  # string values
-  hadoop fs -put -f ${IMPALA_HOME}/testdata/data/long_page_header.parquet \
-                    /test-warehouse/bad_parquet_parquet
+  # Load specialized parquet files into functional_parquet.bad_parquet
+  # bad_parquet_data.parquet   - IMPALA-694: data file produced by
+  #                              parquet-mr version 1.2.5-cdh4.5.0
+  # repeated_values.parquet    - Data file produced by parquet-mr with repeated values
+  #                              (produces 0 bit width dictionary)
+  # multiple_rowgroups.parquet - IMPALA-720: data file produced by parquet-mr
+  #                              with multiple row groups
+  # long_page_header.parquet   - IMPALA-1401: data file produced by Hive 13 containing
+  #                              page statistics with long min/max string values
+  hadoop fs -put -f \
+    ${IMPALA_HOME}/testdata/data/bad_parquet_data.parquet \
+    ${IMPALA_HOME}/testdata/data/repeated_values.parquet \
+    ${IMPALA_HOME}/testdata/data/multiple_rowgroups.parquet \
+    ${IMPALA_HOME}/testdata/data/long_page_header.parquet \
+    /test-warehouse/bad_parquet_parquet
 
   # IMPALA-3732: parquet files with corrupt strings
-  local parq_file
-  for parq_file in dict-encoded-negative-len.parq plain-encoded-negative-len.parq; do
-    hadoop fs -put -f ${IMPALA_HOME}/testdata/bad_parquet_data/$parq_file \
-                    /test-warehouse/bad_parquet_strings_negative_len_parquet
-  done
-  for parq_file in dict-encoded-out-of-bounds.parq plain-encoded-out-of-bounds.parq; do
-    hadoop fs -put -f ${IMPALA_HOME}/testdata/bad_parquet_data/$parq_file \
-                    /test-warehouse/bad_parquet_strings_out_of_bounds_parquet
-  done
+  hadoop fs -put -f \
+    ${IMPALA_HOME}/testdata/bad_parquet_data/dict-encoded-negative-len.parq \
+    ${IMPALA_HOME}/testdata/bad_parquet_data/plain-encoded-negative-len.parq \
+    /test-warehouse/bad_parquet_strings_negative_len_parquet
+  hadoop fs -put -f \
+    ${IMPALA_HOME}/testdata/bad_parquet_data/dict-encoded-out-of-bounds.parq \
+    ${IMPALA_HOME}/testdata/bad_parquet_data/plain-encoded-out-of-bounds.parq \
+    /test-warehouse/bad_parquet_strings_out_of_bounds_parquet
 
   # Remove all index files in this partition.
   hadoop fs -rm -f /test-warehouse/alltypes_text_lzo/year=2009/month=1/*.lzo.index
@@ -418,27 +545,33 @@ function custom-post-load-steps {
     # Set both read and execute permissions because accessing the contents of a directory on
     # the local filesystem requires the x permission (while on HDFS it requires the r
     # permission).
-    hadoop fs -chmod -R 555 ${FILESYSTEM_PREFIX}/test-warehouse/alltypes_seq/year=2009/month=1
-    hadoop fs -chmod -R 555 ${FILESYSTEM_PREFIX}/test-warehouse/alltypes_seq/year=2009/month=3
+    hadoop fs -chmod -R 555 \
+      ${FILESYSTEM_PREFIX}/test-warehouse/alltypes_seq/year=2009/month=1 \
+      ${FILESYSTEM_PREFIX}/test-warehouse/alltypes_seq/year=2009/month=3
   fi
 
+  hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_parquet \
+    ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_sixblocks_parquet \
+    ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_one_row_group_parquet
+
   #IMPALA-1881: data file produced by hive with multiple blocks.
-  hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_parquet
   hadoop fs -Ddfs.block.size=1048576 -put -f \
     ${IMPALA_HOME}/testdata/LineItemMultiBlock/000000_0 \
     ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_parquet
 
   # IMPALA-2466: Add more tests to the HDFS Parquet scanner (Added after IMPALA-1881)
-  hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_sixblocks_parquet && \
   hadoop fs -Ddfs.block.size=1048576 -put -f \
     ${IMPALA_HOME}/testdata/LineItemMultiBlock/lineitem_sixblocks.parquet \
     ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_sixblocks_parquet
 
   # IMPALA-2466: Add more tests to the HDFS Parquet scanner (this has only one row group)
-  hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_one_row_group_parquet && \
   hadoop fs -Ddfs.block.size=1048576 -put -f \
     ${IMPALA_HOME}/testdata/LineItemMultiBlock/lineitem_one_row_group.parquet \
     ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_one_row_group_parquet
+
+  # IMPALA-3307: Upload test time-zone database
+  hadoop fs -Ddfs.block.size=1048576 -put -f ${IMPALA_HOME}/testdata/tzdb \
+    ${FILESYSTEM_PREFIX}/test-warehouse/
 }
 
 function copy-and-load-ext-data-source {
@@ -449,21 +582,56 @@ function copy-and-load-ext-data-source {
     ${IMPALA_HOME}/testdata/bin/create-data-source-table.sql
 }
 
-function wait-hdfs-replication {
-  FAIL_COUNT=0
-  while [[ "$FAIL_COUNT" -ne "6" ]] ; do
+function check-hdfs-health {
+  if [[ -n "${HDFS_ERASURECODE_POLICY:-}" ]]; then
+    if ! grep "Replicated Blocks:[[:space:]]*#[[:space:]]*Total size:[[:space:]]*0 B"\
+        <<< $(hdfs fsck /test-warehouse | tr '\n' '#'); then
+        echo "There are some replicated files despite that erasure coding is on"
+        echo "Failing the data loading job"
+        exit 1
+    fi
+    return
+  fi
+  MAX_FSCK=30
+  SLEEP_SEC=120
+  LAST_NUMBER_UNDER_REPLICATED=-1
+  for ((FSCK_COUNT = 0; FSCK_COUNT <= MAX_FSCK; FSCK_COUNT++)); do
     FSCK_OUTPUT="$(hdfs fsck /test-warehouse)"
     echo "$FSCK_OUTPUT"
-    if grep "Under-replicated blocks:[[:space:]]*0" <<< "$FSCK_OUTPUT"; then
+    NUMBER_UNDER_REPLICATED=$(
+        grep -oP "Under-replicated blocks:[[:space:]]*\K[[:digit:]]*" <<< "$FSCK_OUTPUT")
+    if [[ "$NUMBER_UNDER_REPLICATED" -eq 0 ]] ; then
+      # All the blocks are fully-replicated. The data loading can continue.
       return
     fi
-    let FAIL_COUNT="$FAIL_COUNT"+1
-    sleep 5
+    if [[ $(($FSCK_COUNT + 1)) -eq "$MAX_FSCK" ]] ; then
+      echo "Some HDFS blocks are still under-replicated after running HDFS fsck"\
+          "$MAX_FSCK times."
+      echo "Some tests cannot pass without fully-replicated blocks (IMPALA-3887)."
+      echo "Failing the data loading."
+      exit 1
+    fi
+    if [[ "$NUMBER_UNDER_REPLICATED" -eq "$LAST_NUMBER_UNDER_REPLICATED" ]] ; then
+      echo "There are under-replicated blocks in HDFS and HDFS is not making progress"\
+          "in $SLEEP_SEC seconds. Attempting to restart HDFS to resolve this issue."
+      # IMPALA-7119: Other minicluster components (like HBase) can fail if HDFS is
+      # restarted by itself, so restart the whole cluster, including Impala.
+      restart-cluster
+    fi
+    LAST_NUMBER_UNDER_REPLICATED="$NUMBER_UNDER_REPLICATED"
+    echo "$NUMBER_UNDER_REPLICATED under replicated blocks remaining."
+    echo "Sleeping for $SLEEP_SEC seconds before rechecking."
+    sleep "$SLEEP_SEC"
   done
-  echo "Some HDFS blocks are still under replicated after 30s."
-  echo "Some tests cannot pass without fully replicated blocks (IMPALA-3887)."
-  echo "Failing the data loading."
-  exit 1
+}
+
+function warm-up-hive {
+  echo "Running warm up Hive statements"
+  $HIVE_CMD -e "create database if not exists functional;"
+  $HIVE_CMD -e "create table if not exists hive_warm_up_tbl (i int);"
+  # The insert below starts a Tez session (if Hive uses Tez) and initializes
+  # .hiveJars directory in HDFS, see IMPALA-8841.
+  $HIVE_CMD -e "insert overwrite table hive_warm_up_tbl values (1);"
 }
 
 # For kerberized clusters, use kerberos
@@ -472,16 +640,8 @@ if ${CLUSTER_DIR}/admin is_kerberized; then
 fi
 
 # Start Impala
-: ${START_CLUSTER_ARGS=""}
-if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
-  START_CLUSTER_ARGS="--impalad_args=--abort_on_config_error=false -s 1 ${START_CLUSTER_ARGS}"
-else
-  START_CLUSTER_ARGS="-s 3 ${START_CLUSTER_ARGS}"
-fi
 if [[ -z "$REMOTE_LOAD" ]]; then
-  run-step "Starting Impala cluster" start-impala-cluster.log \
-    ${IMPALA_HOME}/bin/start-impala-cluster.py --log_dir=${IMPALA_DATA_LOADING_LOGS_DIR} \
-    ${START_CLUSTER_ARGS}
+  run-step "Starting Impala cluster" start-impala-cluster.log start-impala
 fi
 
 # The hdfs environment script sets up kms (encryption) and cache pools (hdfs caching).
@@ -493,6 +653,11 @@ if [[ "${TARGET_FILESYSTEM}" == "hdfs" ]]; then
 fi
 
 if [ $SKIP_METADATA_LOAD -eq 0 ]; then
+  # Using Hive in non-parallel mode before starting parallel execution may help with some
+  # flakiness during data load, see IMPALA-8841. The problem only occurs in Hive 3
+  # environment, but always doing the warm up shouldn't hurt much and may make it easier
+  # to investigate future issues where Hive doesn't work at all.
+  warm-up-hive
   run-step "Loading custom schemas" load-custom-schemas.log load-custom-schemas
   # Run some steps in parallel, with run-step-backgroundable / run-step-wait-all.
   # This is effective on steps that take a long time and don't depend on each
@@ -508,8 +673,12 @@ if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   if [[ -n "$CM_HOST" ]]; then
     LOAD_NESTED_ARGS="--cm-host $CM_HOST"
   fi
-  run-step "Loading nested data" load-nested.log \
-    ${IMPALA_HOME}/testdata/bin/load_nested.py ${LOAD_NESTED_ARGS:-}
+  run-step "Loading nested parquet data" load-nested.log \
+    ${IMPALA_HOME}/testdata/bin/load_nested.py \
+    -t tpch_nested_parquet -f parquet/none ${LOAD_NESTED_ARGS:-}
+  run-step "Loading nested orc data" load-nested.log \
+    ${IMPALA_HOME}/testdata/bin/load_nested.py \
+    -t tpch_nested_orc_def -f orc/def ${LOAD_NESTED_ARGS:-}
   run-step "Loading auxiliary workloads" load-aux-workloads.log load-aux-workloads
   run-step "Loading dependent tables" copy-and-load-dependent-tables.log \
       copy-and-load-dependent-tables
@@ -522,8 +691,10 @@ elif [ "${TARGET_FILESYSTEM}" = "hdfs" ];  then
       load-data "functional-query" "core" "hbase/none"
 fi
 
-if $KUDU_IS_SUPPORTED; then
+if [[ $SKIP_METADATA_LOAD -eq 1 && $KUDU_IS_SUPPORTED ]]; then
   # Tests depend on the kudu data being clean, so load the data from scratch.
+  # This is only necessary if this is not a full dataload, because a full dataload
+  # already loads Kudu functional and TPC-H tables from scratch.
   run-step-backgroundable "Loading Kudu functional" load-kudu.log \
         load-data "functional-query" "core" "kudu/none/none" force
   run-step-backgroundable "Loading Kudu TPCH" load-kudu-tpch.log \
@@ -544,15 +715,10 @@ if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
   run-step "Loading external data sources" load-ext-data-source.log \
       copy-and-load-ext-data-source
 
-  # HBase splitting is only relevant for FE tests
-  if [[ -z "$REMOTE_LOAD" ]]; then
-    run-step "Splitting HBase" create-hbase.log ${IMPALA_HOME}/testdata/bin/split-hbase.sh
-  fi
-
   run-step "Creating internal HBase table" create-internal-hbase-table.log \
       create-internal-hbase-table
 
-  run-step "Waiting for HDFS replication" wait-hdfs-replication.log wait-hdfs-replication
+  run-step "Checking HDFS health" check-hdfs-health.log check-hdfs-health
 fi
 
 # TODO: Investigate why all stats are not preserved. Theoretically, we only need to
@@ -560,4 +726,22 @@ fi
 run-step "Computing table stats" compute-table-stats.log \
     ${IMPALA_HOME}/testdata/bin/compute-table-stats.sh
 
-run-step "Copying auth policy file" copy-auth-policy.log copy-auth-policy
+# IMPALA-8346: this step only applies if the cluster is the local minicluster
+if [[ -z "$REMOTE_LOAD" ]]; then
+  run-step "Creating tpcds testcase data" create-tpcds-testcase-data.log \
+      ${IMPALA_HOME}/testdata/bin/create-tpcds-testcase-files.sh
+fi
+
+if [[ $SKIP_RANGER -eq 0 ]]; then
+  run-step "Setting up Ranger" setup-ranger.log setup-ranger
+fi
+
+# Restart the minicluster. This is strictly to provide a sanity check that
+# restarting the minicluster works and doesn't impact the tests. This is a common
+# operation for developers, so it is nice to test it.
+restart-cluster
+
+# Kill the spawned timeout process and its child sleep process.
+# There may not be a sleep process, so ignore failure.
+pkill -P $TIMEOUT_PID || true
+kill $TIMEOUT_PID

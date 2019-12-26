@@ -95,6 +95,20 @@ void StringToDecimalSymbolDummy() {
   StringToDecimal16(nullptr, 0, 0, 0, false, nullptr);
 }
 
+bool HdfsScanner::EvalRuntimeFilter(int i, TupleRow* row) {
+  LocalFilterStats* stats = &filter_stats_[i];
+  const FilterContext* ctx = filter_ctxs_[i];
+  ++stats->total_possible;
+  if (stats->enabled && ctx->filter->HasFilter()) {
+    ++stats->considered;
+    if (!ctx->Eval(row)) {
+      ++stats->rejected;
+      return false;
+    }
+  }
+  return true;
+}
+
 // Define the string parsing functions for llvm.  Stamp out the templated functions
 #ifdef IR_COMPILE
 using ParseResult = StringParser::ParseResult;
@@ -137,6 +151,11 @@ extern "C"
 void IrStringToTimestamp(TimestampValue* out, const char* s, int len,
     ParseResult* result) {
   *out = StringParser::StringToTimestamp(s, len, result);
+}
+
+extern "C"
+DateValue IrStringToDate(const char* s, int len, ParseResult* result) {
+  return StringParser::StringToDate(s, len, result);
 }
 
 extern "C"

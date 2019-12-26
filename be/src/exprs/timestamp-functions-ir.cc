@@ -24,9 +24,9 @@
 #include <gutil/strings/substitute.h>
 
 #include "exprs/anyval-util.h"
+#include "runtime/datetime-simple-date-format-parser.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.inline.h"
-#include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "udf/udf.h"
 #include "udf/udf-internal.h"
@@ -56,30 +56,31 @@ typedef boost::posix_time::seconds Seconds;
 
 namespace impala {
 
+using namespace datetime_parse_util;
+
 StringVal TimestampFunctions::StringValFromTimestamp(FunctionContext* context,
     const TimestampValue& tv, const StringVal& fmt) {
   void* state = context->GetFunctionState(FunctionContext::THREAD_LOCAL);
   DateTimeFormatContext* dt_ctx = reinterpret_cast<DateTimeFormatContext*>(state);
   if (!context->IsArgConstant(1)) {
     dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
-    if (!TimestampParser::ParseFormatTokens(dt_ctx)){
-      TimestampFunctions::ReportBadFormat(context, fmt, false);
+    if (!SimpleDateFormatTokenizer::Tokenize(dt_ctx)){
+      ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
       return StringVal::null();
     }
   }
 
-  int buff_len = dt_ctx->fmt_out_len + 1;
-  StringVal result(context, buff_len);
-  if (UNLIKELY(result.is_null)) return StringVal::null();
-  result.len = tv.Format(*dt_ctx, buff_len, reinterpret_cast<char*>(result.ptr));
-  if (result.len <= 0) return StringVal::null();
+  string formatted_timestamp = tv.Format(*dt_ctx);
+  if (formatted_timestamp.empty()) return StringVal::null();
+  StringVal result = AnyValUtil::FromString(context, formatted_timestamp);
   return result;
 }
 
 template <class TIME>
 StringVal TimestampFunctions::FromUnix(FunctionContext* context, const TIME& intp) {
   if (intp.is_null) return StringVal::null();
-  const TimestampValue tv = TimestampValue::FromUnixTime(intp.val);
+  const TimestampValue tv = TimestampValue::FromUnixTime(intp.val,
+      context->impl()->state()->local_time_zone());
   if (!tv.HasDateAndTime()) return StringVal::null();
   return AnyValUtil::FromString(context, tv.ToString());
 }
@@ -88,12 +89,13 @@ template <class TIME>
 StringVal TimestampFunctions::FromUnix(FunctionContext* context, const TIME& intp,
     const StringVal& fmt) {
   if (fmt.is_null || fmt.len == 0) {
-    TimestampFunctions::ReportBadFormat(context, fmt, false);
+    ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
     return StringVal::null();
   }
   if (intp.is_null) return StringVal::null();
 
-  const TimestampValue& t = TimestampValue::FromUnixTime(intp.val);
+  const TimestampValue& t = TimestampValue::FromUnixTime(intp.val,
+      context->impl()->state()->local_time_zone());
   return StringValFromTimestamp(context, t, fmt);
 }
 
@@ -103,19 +105,22 @@ BigIntVal TimestampFunctions::Unix(FunctionContext* context, const StringVal& st
   if (tv_val.is_null) return BigIntVal::null();
   const TimestampValue& tv = TimestampValue::FromTimestampVal(tv_val);
   time_t result;
-  return (tv.ToUnixTime(&result)) ? BigIntVal(result) : BigIntVal::null();
+  return (tv.ToUnixTime(context->impl()->state()->local_time_zone(), &result)) ?
+      BigIntVal(result) : BigIntVal::null();
 }
 
 BigIntVal TimestampFunctions::Unix(FunctionContext* context, const TimestampVal& ts_val) {
   if (ts_val.is_null) return BigIntVal::null();
   const TimestampValue& tv = TimestampValue::FromTimestampVal(ts_val);
   time_t result;
-  return (tv.ToUnixTime(&result)) ? BigIntVal(result) : BigIntVal::null();
+  return (tv.ToUnixTime(context->impl()->state()->local_time_zone(), &result)) ?
+      BigIntVal(result) : BigIntVal::null();
 }
 
 BigIntVal TimestampFunctions::Unix(FunctionContext* context) {
   time_t result;
-  if (context->impl()->state()->now()->ToUnixTime(&result)) {
+  if (context->impl()->state()->now()->ToUnixTime(
+      context->impl()->state()->local_time_zone(), &result)) {
     return BigIntVal(result);
   } else {
     return BigIntVal::null();
@@ -142,7 +147,8 @@ TimestampVal TimestampFunctions::UnixMicrosToUtcTimestamp(FunctionContext* conte
 TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
     const BigIntVal& bigint_val) {
   if (bigint_val.is_null) return TimestampVal::null();
-  const TimestampValue& tv = TimestampValue::FromUnixTime(bigint_val.val);
+  const TimestampValue& tv = TimestampValue::FromUnixTime(bigint_val.val,
+      context->impl()->state()->local_time_zone());
   TimestampVal tv_val;
   tv.ToTimestampVal(&tv_val);
   return tv_val;
@@ -151,7 +157,7 @@ TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
 TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
     const StringVal& date, const StringVal& fmt) {
   if (fmt.is_null || fmt.len == 0) {
-    TimestampFunctions::ReportBadFormat(context, fmt, false);
+    ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
     return TimestampVal::null();
   }
   if (date.is_null || date.len == 0) return TimestampVal::null();
@@ -159,12 +165,12 @@ TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
   DateTimeFormatContext* dt_ctx = reinterpret_cast<DateTimeFormatContext*>(state);
   if (!context->IsArgConstant(1)) {
      dt_ctx->Reset(reinterpret_cast<const char*>(fmt.ptr), fmt.len);
-     if (!TimestampParser::ParseFormatTokens(dt_ctx)) {
-       ReportBadFormat(context, fmt, false);
+     if (!SimpleDateFormatTokenizer::Tokenize(dt_ctx)) {
+       ReportBadFormat(context, datetime_parse_util::GENERAL_ERROR, fmt, false);
        return TimestampVal::null();
      }
   }
-  const TimestampValue& tv = TimestampValue::Parse(
+  const TimestampValue& tv = TimestampValue::ParseSimpleDateFormat(
       reinterpret_cast<const char*>(date.ptr), date.len, *dt_ctx);
   TimestampVal tv_val;
   tv.ToTimestampVal(&tv_val);
@@ -182,41 +188,11 @@ StringVal TimestampFunctions::FromTimestamp(FunctionContext* context,
 BigIntVal TimestampFunctions::UnixFromString(FunctionContext* context,
     const StringVal& sv) {
   if (sv.is_null) return BigIntVal::null();
-  const TimestampValue& tv = TimestampValue::Parse(
+  const TimestampValue& tv = TimestampValue::ParseSimpleDateFormat(
       reinterpret_cast<const char *>(sv.ptr), sv.len);
   time_t result;
-  return (tv.ToUnixTime(&result)) ? BigIntVal(result) : BigIntVal::null();
-}
-
-void TimestampFunctions::ReportBadFormat(FunctionContext* context,
-    const StringVal& format, bool is_error) {
-  stringstream ss;
-  const StringValue& fmt = StringValue::FromStringVal(format);
-  if (format.is_null || format.len == 0) {
-    ss << "Bad date/time conversion format: format string is NULL or has 0 length";
-  } else {
-    ss << "Bad date/time conversion format: " << fmt.DebugString();
-  }
-  if (is_error) {
-    context->SetError(ss.str().c_str());
-  } else {
-    context->AddWarning(ss.str().c_str());
-  }
-}
-
-StringVal TimestampFunctions::DayName(FunctionContext* context, const TimestampVal& ts) {
-  if (ts.is_null) return StringVal::null();
-  IntVal dow = DayOfWeek(context, ts);
-  switch(dow.val) {
-    case 1: return StringVal(SUNDAY);
-    case 2: return StringVal(MONDAY);
-    case 3: return StringVal(TUESDAY);
-    case 4: return StringVal(WEDNESDAY);
-    case 5: return StringVal(THURSDAY);
-    case 6: return StringVal(FRIDAY);
-    case 7: return StringVal(SATURDAY);
-    default: return StringVal::null();
-   }
+  return (tv.ToUnixTime(context->impl()->state()->local_time_zone(), &result)) ?
+      BigIntVal(result) : BigIntVal::null();
 }
 
 IntVal TimestampFunctions::Year(FunctionContext* context, const TimestampVal& ts_val) {
@@ -226,7 +202,6 @@ IntVal TimestampFunctions::Year(FunctionContext* context, const TimestampVal& ts
   return IntVal(ts_value.date().year());
 }
 
-
 IntVal TimestampFunctions::Month(FunctionContext* context, const TimestampVal& ts_val) {
   if (ts_val.is_null) return IntVal::null();
   const TimestampValue& ts_value = TimestampValue::FromTimestampVal(ts_val);
@@ -234,6 +209,13 @@ IntVal TimestampFunctions::Month(FunctionContext* context, const TimestampVal& t
   return IntVal(ts_value.date().month());
 }
 
+IntVal TimestampFunctions::Quarter(FunctionContext* context, const TimestampVal& ts_val) {
+  if (ts_val.is_null) return IntVal::null();
+  const TimestampValue& ts_value = TimestampValue::FromTimestampVal(ts_val);
+  if (!ts_value.HasDate()) return IntVal::null();
+  int m = ts_value.date().month();
+  return IntVal((m - 1) / 3 + 1);
+}
 
 IntVal TimestampFunctions::DayOfWeek(FunctionContext* context,
     const TimestampVal& ts_val) {
@@ -331,6 +313,8 @@ StringVal TimestampFunctions::ToDate(FunctionContext* context,
   // our built-in functions might incorrectly return such a malformed timestamp.
   if (!ts_value.HasDate()) return StringVal::null();
   StringVal result(context, 10);
+  // Return NULL if 'result' allocation fails inside of the StringVal constructor.
+  if (UNLIKELY(result.is_null)) return StringVal::null();
   result.len = 10;
   // Fill in year, month, and day.
   IntToChar(result.ptr, ts_value.date().year(), 4);
@@ -340,10 +324,6 @@ StringVal TimestampFunctions::ToDate(FunctionContext* context,
   result.ptr[7] = '-';
   result.ptr[4] = '-';
   return result;
-}
-
-inline bool IsLeapYear(int year) {
-  return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
 }
 
 inline unsigned short GetLastDayOfMonth(int month, int year) {
@@ -470,7 +450,18 @@ string TimestampFunctions::ShortDayName(FunctionContext* context,
   IntVal dow = DayOfWeek(context, ts);
   DCHECK_GT(dow.val, 0);
   DCHECK_LT(dow.val, 8);
-  return DAY_ARRAY[dow.val - 1];
+  return SHORT_DAY_NAMES[CAPITALIZED][dow.val - 1];
+}
+
+StringVal TimestampFunctions::LongDayName(FunctionContext* context,
+    const TimestampVal& ts) {
+  if (ts.is_null) return StringVal::null();
+  IntVal dow = DayOfWeek(context, ts);
+  DCHECK_GT(dow.val, 0);
+  DCHECK_LT(dow.val, 8);
+  const string& day_name = DAY_NAMES[CAPITALIZED][dow.val - 1];
+  return StringVal(reinterpret_cast<uint8_t*>(const_cast<char*>(day_name.data())),
+      day_name.size());
 }
 
 string TimestampFunctions::ShortMonthName(FunctionContext* context,
@@ -479,7 +470,25 @@ string TimestampFunctions::ShortMonthName(FunctionContext* context,
   IntVal mth = Month(context, ts);
   DCHECK_GT(mth.val, 0);
   DCHECK_LT(mth.val, 13);
-  return MONTH_ARRAY[mth.val - 1];
+  return SHORT_MONTH_NAMES[CAPITALIZED][mth.val - 1];
+}
+
+StringVal TimestampFunctions::LongMonthName(FunctionContext* context,
+    const TimestampVal& ts) {
+  if (ts.is_null) return StringVal::null();
+  IntVal mth = Month(context, ts);
+  DCHECK_GT(mth.val, 0);
+  DCHECK_LT(mth.val, 13);
+  const string& mn = MONTH_NAMES[CAPITALIZED][mth.val - 1];
+  return StringVal(reinterpret_cast<uint8_t*>(const_cast<char*>(mn.data())), mn.size());
+}
+
+namespace {
+inline cctz::time_point<cctz::sys_seconds> UnixTimeToTimePoint(time_t t) {
+  return std::chrono::time_point_cast<cctz::sys_seconds>(
+      std::chrono::system_clock::from_time_t(0)) + cctz::sys_seconds(t);
+}
+
 }
 
 StringVal TimestampFunctions::TimeOfDay(FunctionContext* context) {
@@ -492,16 +501,23 @@ StringVal TimestampFunctions::TimeOfDay(FunctionContext* context) {
   IntVal min = Minute(context, curr);
   IntVal sec = Second(context, curr);
   IntVal year = Year(context, curr);
-  time_t rawtime;
-  time(&rawtime);
-  struct tm tzone;
-  localtime_r(&rawtime, &tzone);
+
+  // Calculate 'start' time point at which query execution started.
+  cctz::time_point<cctz::sys_seconds> start = UnixTimeToTimePoint(
+      context->impl()->state()->query_ctx().start_unix_millis / MILLIS_PER_SEC);
+  // Find 'tz_name' time-zone abbreviation that corresponds to 'local_time_zone' at
+  // 'start' time point.
+  cctz::time_zone::absolute_lookup start_lookup =
+      context->impl()->state()->local_time_zone().lookup(start);
+  const string& tz_name = (start_lookup.abbr != nullptr) ? start_lookup.abbr :
+      context->impl()->state()->local_time_zone().name();
+
   stringstream result;
   result << day << " " << month << " " << setw(2) << setfill('0')
          << dayofmonth.val << " " << setw(2) << setfill('0') << hour.val << ":"
          << setw(2) << setfill('0') << min.val << ":"
          << setw(2) << setfill('0') << sec.val << " " << year.val << " "
-         << tzone.tm_zone;
+         << tz_name;
   return AnyValUtil::FromString(context, result.str());
 }
 
@@ -542,28 +558,23 @@ DoubleVal TimestampFunctions::MonthsBetween(FunctionContext* context,
 
 TimestampVal TimestampFunctions::NextDay(FunctionContext* context,
     const TimestampVal& date, const StringVal& weekday) {
+  if (weekday.is_null) {
+    context->SetError("Invalid Day: NULL");
+    return TimestampVal::null();
+  }
+
   string weekday_str = string(reinterpret_cast<const char*>(weekday.ptr), weekday.len);
   transform(weekday_str.begin(), weekday_str.end(), weekday_str.begin(), tolower);
-  int day_idx = 0;
-  if (weekday_str == "sunday" || weekday_str == "sun") {
-    day_idx = 1;
-  } else if (weekday_str == "monday" || weekday_str == "mon") {
-    day_idx = 2;
-  } else if (weekday_str == "tuesday" || weekday_str == "tue") {
-    day_idx = 3;
-  } else if (weekday_str == "wednesday" || weekday_str == "wed") {
-    day_idx = 4;
-  } else if (weekday_str == "thursday" || weekday_str == "thu") {
-    day_idx = 5;
-  } else if (weekday_str == "friday" || weekday_str == "fri") {
-    day_idx = 6;
-  } else if (weekday_str == "saturday" || weekday_str == "sat") {
-    day_idx = 7;
-  }
-  DCHECK_GE(day_idx, 1);
-  DCHECK_LE(day_idx, 7);
 
-  int delta_days = day_idx - DayOfWeek(context, date).val;
+  const auto it = DAYNAME_MAP.find(weekday_str);
+  if (it == DAYNAME_MAP.end()) {
+    context->SetError(Substitute("Invalid Day: $0", weekday_str).c_str());
+    return TimestampVal::null();
+  }
+  DCHECK_GE(it->second, 0);
+  DCHECK_LE(it->second, 6);
+
+  int delta_days = it->second + 1 - DayOfWeek(context, date).val;
   delta_days = delta_days <= 0 ? delta_days + 7 : delta_days;
   DCHECK_GE(delta_days, 1);
   DCHECK_LE(delta_days, 7);
@@ -671,6 +682,16 @@ inline void AddInterval<Seconds>(FunctionContext* context, int64_t interval,
   int64_t seconds = interval % (60 * 60 * 24);
   AddInterval<Days>(context, days, datetime);
   *datetime += Seconds(seconds);
+}
+
+/// Workaround a boost bug in adding large millisecond intervals.
+template <>
+inline void AddInterval<Milliseconds>(FunctionContext* context, int64_t interval,
+    ptime* datetime) {
+  int64_t seconds = interval / 1000;
+  int64_t milliseconds = interval % 1000;
+  AddInterval<Seconds>(context, seconds, datetime);
+  *datetime += Milliseconds(milliseconds);
 }
 
 /// Workaround a boost bug in adding large microsecond intervals.

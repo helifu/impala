@@ -22,6 +22,7 @@ import java.util.Set;
 import org.apache.hadoop.hive.metastore.api.BinaryColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.BooleanColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
+import org.apache.hadoop.hive.metastore.api.DateColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.DecimalColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.DoubleColumnStatsData;
 import org.apache.hadoop.hive.metastore.api.LongColumnStatsData;
@@ -33,6 +34,7 @@ import org.apache.impala.thrift.TColumnStats;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Sets;
+import com.google.common.math.LongMath;
 
 /**
  * Statistics for a single column.
@@ -41,10 +43,10 @@ public class ColumnStats {
   // Set of the currently supported column stats column types.
   private final static Set<PrimitiveType> SUPPORTED_COL_TYPES = Sets.newHashSet(
       PrimitiveType.BIGINT, PrimitiveType.BINARY, PrimitiveType.BOOLEAN,
-      PrimitiveType.DOUBLE, PrimitiveType.FLOAT, PrimitiveType.INT,
-      PrimitiveType.SMALLINT, PrimitiveType.CHAR, PrimitiveType.VARCHAR,
-      PrimitiveType.STRING, PrimitiveType.TIMESTAMP, PrimitiveType.TINYINT,
-      PrimitiveType.DECIMAL);
+      PrimitiveType.DATE, PrimitiveType.DOUBLE, PrimitiveType.FLOAT,
+      PrimitiveType.INT, PrimitiveType.SMALLINT, PrimitiveType.CHAR,
+      PrimitiveType.VARCHAR, PrimitiveType.STRING, PrimitiveType.TIMESTAMP,
+      PrimitiveType.TINYINT, PrimitiveType.DECIMAL);
 
   public enum StatsKey {
     NUM_DISTINCT_VALUES("numDVs"),
@@ -71,9 +73,12 @@ public class ColumnStats {
     public String toString() { return name_; }
   }
 
-  // in bytes: excludes serialization overhead
+  // in bytes: excludes serialization overhead.
+  // -1 if unknown. Always has a valid value for fixed-length types.
   private double avgSize_;
   // in bytes; includes serialization overhead.
+  // -1 if unknown. Always has a valid value for fixed-length types.
+  // avgSerializedSize_ is valid iff avgSize_ is valid.
   private double avgSerializedSize_;
   private long maxSize_;  // in bytes
   private long numDistinctValues_;
@@ -81,6 +86,7 @@ public class ColumnStats {
 
   public ColumnStats(Type colType) {
     initColStats(colType);
+    validate(colType);
   }
 
   /**
@@ -92,6 +98,7 @@ public class ColumnStats {
     maxSize_ = other.maxSize_;
     numDistinctValues_ = other.numDistinctValues_;
     numNulls_ = other.numNulls_;
+    validate(null);
   }
 
   /**
@@ -118,17 +125,21 @@ public class ColumnStats {
    */
   public static ColumnStats fromExpr(Expr expr) {
     Preconditions.checkNotNull(expr);
-    Preconditions.checkState(expr.getType().isValid());
-    ColumnStats stats = new ColumnStats(expr.getType());
+    Preconditions.checkState(expr.getType().isValid(), expr);
+    Type colType = expr.getType();
+    ColumnStats stats = new ColumnStats(colType);
     stats.setNumDistinctValues(expr.getNumDistinctValues());
     SlotRef slotRef = expr.unwrapSlotRef(false);
     if (slotRef == null) return stats;
     ColumnStats slotStats = slotRef.getDesc().getStats();
     if (slotStats == null) return stats;
     stats.numNulls_ = slotStats.getNumNulls();
-    stats.avgSerializedSize_ = slotStats.getAvgSerializedSize();
-    stats.avgSize_ = slotStats.getAvgSize();
-    stats.maxSize_ = slotStats.getMaxSize();
+    if (!colType.isFixedLengthType()) {
+      stats.avgSerializedSize_ = slotStats.getAvgSerializedSize();
+      stats.avgSize_ = slotStats.getAvgSize();
+      stats.maxSize_ = slotStats.getMaxSize();
+    }
+    stats.validate(colType);
     return stats;
   }
 
@@ -150,6 +161,7 @@ public class ColumnStats {
     } else {
       numNulls_ += other.numNulls_;
     }
+    validate(null);
     return this;
   }
 
@@ -163,7 +175,8 @@ public class ColumnStats {
   public long getMaxSize() { return maxSize_; }
   public boolean hasNulls() { return numNulls_ > 0; }
   public long getNumNulls() { return numNulls_; }
-  public boolean hasAvgSerializedSize() { return avgSerializedSize_ >= 0; }
+  // True iff getAvgSize() and getAvgSerializedSize() will return valid values.
+  public boolean hasAvgSize() { return avgSize_ >= 0; }
   public boolean hasNumDistinctValues() { return numDistinctValues_ >= 0; }
   public boolean hasStats() { return numNulls_ != -1 || numDistinctValues_ != -1; }
 
@@ -184,7 +197,14 @@ public class ColumnStats {
         if (isCompatible) {
           BooleanColumnStatsData boolStats = statsData.getBooleanStats();
           numNulls_ = boolStats.getNumNulls();
-          numDistinctValues_ = (numNulls_ > 0) ? 3 : 2;
+          // If we have numNulls, we can infer NDV from that.
+          if (numNulls_ > 0) {
+            numDistinctValues_ = 3;
+          } else if (numNulls_ == 0) {
+            numDistinctValues_ = 2;
+          } else {
+            numDistinctValues_ = -1;
+          }
         }
         break;
       case TINYINT:
@@ -199,6 +219,14 @@ public class ColumnStats {
           numNulls_ = longStats.getNumNulls();
         }
         break;
+      case DATE:
+        isCompatible = statsData.isSetDateStats();
+        if (isCompatible) {
+          DateColumnStatsData dateStats = statsData.getDateStats();
+          numDistinctValues_ = dateStats.getNumDVs();
+          numNulls_ = dateStats.getNumNulls();
+        }
+        break;
       case FLOAT:
       case DOUBLE:
         isCompatible = statsData.isSetDoubleStats();
@@ -209,6 +237,14 @@ public class ColumnStats {
         }
         break;
       case CHAR:
+        // Ignore CHAR length stats, since it is fixed length internally.
+        isCompatible = statsData.isSetStringStats();
+        if (isCompatible) {
+          StringColumnStatsData stringStats = statsData.getStringStats();
+          numDistinctValues_ = stringStats.getNumDVs();
+          numNulls_ = stringStats.getNumNulls();
+        }
+        break;
       case VARCHAR:
       case STRING:
         isCompatible = statsData.isSetStringStats();
@@ -218,7 +254,11 @@ public class ColumnStats {
           numNulls_ = stringStats.getNumNulls();
           maxSize_ = stringStats.getMaxColLen();
           avgSize_ = Double.valueOf(stringStats.getAvgColLen()).floatValue();
-          avgSerializedSize_ = avgSize_ + PrimitiveType.STRING.getSlotSize();
+          if (avgSize_ >= 0) {
+            avgSerializedSize_ = avgSize_ + PrimitiveType.STRING.getSlotSize();
+          } else {
+            avgSerializedSize_ = -1;
+          }
         }
         break;
       case BINARY:
@@ -244,7 +284,79 @@ public class ColumnStats {
             "Unexpected column type: " + colType.toString());
         break;
     }
+    validate(colType);
     return isCompatible;
+  }
+
+  /**
+   * Convert the statistics back into an HMS-compatible ColumnStatisticsData object.
+   * This is essentially the inverse of {@link #update(Type, ColumnStatisticsData)
+   * above.
+   *
+   * Returns null if statistics for the specified type are not supported.
+   */
+  public static ColumnStatisticsData createHiveColStatsData(
+      long capNdv, TColumnStats colStats, Type colType) {
+    ColumnStatisticsData colStatsData = new ColumnStatisticsData();
+    long ndv = colStats.getNum_distinct_values();
+    // Cap NDV at row count if available.
+    if (capNdv >= 0) ndv = Math.min(ndv, capNdv);
+
+    long numNulls = colStats.getNum_nulls();
+    switch(colType.getPrimitiveType()) {
+      case BOOLEAN:
+        // TODO(IMPALA-8205): actually compute the count of true/false
+        // values.
+        colStatsData.setBooleanStats(new BooleanColumnStatsData(
+            /*numTrues=*/-1, /*numFalse=*/-1, numNulls));
+        break;
+      case TINYINT:
+        ndv = Math.min(ndv, LongMath.pow(2, Byte.SIZE));
+        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
+        break;
+      case SMALLINT:
+        ndv = Math.min(ndv, LongMath.pow(2, Short.SIZE));
+        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
+        break;
+      case INT:
+        ndv = Math.min(ndv, LongMath.pow(2, Integer.SIZE));
+        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
+        break;
+      case DATE:
+        // Number of distinct dates in the 0001-01-01..9999-12-31 inclusive range is
+        // 3652059.
+        ndv = Math.min(ndv, 3652059);
+        colStatsData.setDateStats(new DateColumnStatsData(numNulls, ndv));
+        break;
+      case BIGINT:
+      case TIMESTAMP: // Hive and Impala use LongColumnStatsData for timestamps.
+        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndv));
+        break;
+      case FLOAT:
+      case DOUBLE:
+        colStatsData.setDoubleStats(new DoubleColumnStatsData(numNulls, ndv));
+        break;
+      case CHAR:
+      case VARCHAR:
+      case STRING:
+        long maxStrLen = colStats.getMax_size();
+        double avgStrLen = colStats.getAvg_size();
+        colStatsData.setStringStats(
+            new StringColumnStatsData(maxStrLen, avgStrLen, numNulls, ndv));
+        break;
+      case DECIMAL:
+        double decMaxNdv = Math.pow(10, colType.getPrecision());
+        ndv = (long) Math.min(ndv, decMaxNdv);
+        colStatsData.setDecimalStats(new DecimalColumnStatsData(numNulls, ndv));
+        break;
+      default:
+        return null;
+    }
+    return colStatsData;
+  }
+
+  public ColumnStatisticsData toHmsCompatibleThrift(Type colType) {
+    return createHiveColStatsData(-1, toThrift(), colType);
   }
 
   /**
@@ -252,13 +364,17 @@ public class ColumnStats {
    * Requires that the given value is of a type appropriate for the
    * member being set. Throws if that is not the case.
    */
-  public void update(StatsKey key, Number value) {
+  public void update(Type colType, StatsKey key, Number value) {
     Preconditions.checkNotNull(key);
     Preconditions.checkNotNull(value);
     if (key == StatsKey.AVG_SIZE) {
       Preconditions.checkArgument(value instanceof Float);
+      Float floatValue = (Float) value;
+      Preconditions.checkArgument(floatValue >= 0 || floatValue == -1, floatValue);
     } else {
       Preconditions.checkArgument(value instanceof Long);
+      Long longValue = (Long) value;
+      Preconditions.checkArgument(longValue >= 0 || longValue == -1, longValue);
     }
     switch (key) {
       case NUM_DISTINCT_VALUES: {
@@ -270,15 +386,24 @@ public class ColumnStats {
         break;
       }
       case AVG_SIZE: {
+        Preconditions.checkArgument(!colType.isFixedLengthType(), colType);
         avgSize_ = (Float) value;
+        // Ensure avgSerializedSize_ stays in sync with avgSize_.
+        if (avgSize_ >= 0) {
+          avgSerializedSize_ = colType.getSlotSize() + avgSize_;
+        } else {
+          avgSerializedSize_ = -1;
+        }
         break;
       }
       case MAX_SIZE: {
+        Preconditions.checkArgument(!colType.isFixedLengthType(), colType);
         maxSize_ = (Long) value;
         break;
       }
       default: Preconditions.checkState(false);
     }
+    validate(colType);
   }
 
   /**
@@ -292,14 +417,16 @@ public class ColumnStats {
 
   public void update(Type colType, TColumnStats stats) {
     initColStats(colType);
-    avgSize_ = Double.valueOf(stats.getAvg_size()).floatValue();
-    if (colType.getPrimitiveType() == PrimitiveType.STRING ||
-        colType.getPrimitiveType() == PrimitiveType.BINARY) {
+    if (!colType.isFixedLengthType() && stats.getAvg_size() >= 0) {
+      // Update size estimates based on average size. Fixed length types already include
+      // size estimates.
+      avgSize_ = Double.valueOf(stats.getAvg_size()).floatValue();
       avgSerializedSize_ = colType.getSlotSize() + avgSize_;
     }
     maxSize_ = stats.getMax_size();
     numDistinctValues_ = stats.getNum_distinct_values();
     numNulls_ = stats.getNum_nulls();
+    validate(colType);
   }
 
   public TColumnStats toThrift() {
@@ -311,9 +438,31 @@ public class ColumnStats {
     return colStats;
   }
 
+  /**
+   * Check that the stats obey expected invariants.
+   * 'colType' is optional, but should be passed in if it is available in the caller.
+   */
+  public void validate(Type colType) {
+    // avgSize_ and avgSerializedSize_ must be set together.
+    Preconditions.checkState(avgSize_ >= 0 == avgSerializedSize_ >= 0, this);
+
+    // Values must be either valid or -1.
+    Preconditions.checkState(avgSize_ == -1 || avgSize_ >= 0, this);
+    Preconditions.checkState(avgSerializedSize_ == -1 || avgSerializedSize_ >= 0, this);
+    Preconditions.checkState(maxSize_ == -1 || maxSize_ >= 0, this);
+    Preconditions.checkState(numDistinctValues_ == -1 || numDistinctValues_ >= 0, this);
+    Preconditions.checkState(numNulls_ == -1 || numNulls_ >= 0, this);
+    if (colType != null && colType.isFixedLengthType()) {
+      Preconditions.checkState(avgSize_ == colType.getSlotSize(), this);
+      Preconditions.checkState(avgSerializedSize_ == colType.getSlotSize(), this);
+      Preconditions.checkState(maxSize_ == colType.getSlotSize(), this);
+    }
+  }
+
   @Override
   public String toString() {
     return Objects.toStringHelper(this.getClass())
+        .add("avgSize_", avgSize_)
         .add("avgSerializedSize_", avgSerializedSize_)
         .add("maxSize_", maxSize_)
         .add("numDistinct_", numDistinctValues_)

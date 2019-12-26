@@ -18,6 +18,11 @@
 namespace cpp impala
 namespace java org.apache.impala.thrift
 
+enum TReservedWordsVersion {
+  IMPALA_2_11 = 0
+  IMPALA_3_0 = 1
+}
+
 // Used to pass gflags from backend to frontend, JniCatalog and JniFrontend
 // Attributes without comments correspond to gflags
 struct TBackendGflags {
@@ -39,7 +44,7 @@ struct TBackendGflags {
 
   9: required string principal
 
-  10: required string authorization_policy_file
+  // REMOVED: 10: required string authorization_policy_file
 
   11: required string server_name
 
@@ -62,4 +67,84 @@ struct TBackendGflags {
   20: required i32 max_hdfs_partitions_parallel_load
 
   21: required i32 max_nonhdfs_partitions_parallel_load
+
+  22: required TReservedWordsVersion reserved_words_version
+
+  23: required double max_filter_error_rate
+
+  24: required i64 min_buffer_size
+
+  25: required bool enable_orc_scanner
+
+  26: required string authorized_proxy_group_config
+
+  27: required bool use_local_catalog
+
+  28: required bool disable_catalog_data_ops_debug_only
+
+  29: required i32 local_catalog_cache_mb
+
+  30: required i32 local_catalog_cache_expiration_s
+
+  32: required string catalog_topic_mode
+
+  33: required i32 invalidate_tables_timeout_s
+
+  34: required bool invalidate_tables_on_memory_pressure
+
+  35: required double invalidate_tables_gc_old_gen_full_threshold
+
+  36: required double invalidate_tables_fraction_on_memory_pressure
+
+  37: required i32 local_catalog_max_fetch_retries
+
+  38: required i64 kudu_scanner_thread_estimated_bytes_per_column
+
+  39: required i64 kudu_scanner_thread_max_estimated_bytes
+
+  40: required i32 catalog_max_parallel_partial_fetch_rpc
+
+  41: required i64 catalog_partial_fetch_rpc_queue_timeout_s
+
+  42: required i64 exchg_node_buffer_size_bytes
+
+  43: required i32 kudu_mutation_buffer_size
+
+  44: required i32 kudu_error_buffer_size
+
+  45: required i32 hms_event_polling_interval_s
+
+  46: required string impala_build_version
+
+  47: required string authorization_factory_class
+
+  48: required bool unlock_mt_dop
+
+  49: required string ranger_service_type
+
+  50: required string ranger_app_id
+
+  51: required string authorization_provider
+
+  52: required bool recursively_list_partitions
+
+  53: required string query_event_hook_classes
+
+  54: required i32 query_event_hook_nthreads
+
+  55: required bool is_executor
+
+  56: required bool use_dedicated_coordinator_estimates
+
+  57: required string blacklisted_dbs
+
+  58: required string blacklisted_tables
+
+  59: required bool unlock_zorder_sort
+
+  60: required string min_privilege_set_for_show_stmts
+
+  61: required bool mt_dop_auto_fallback
+
+  62: required i32 num_expected_executors
 }

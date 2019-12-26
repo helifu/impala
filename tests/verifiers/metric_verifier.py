@@ -17,23 +17,25 @@
 #
 # Verifier for common impalad metrics
 
+import logging
+from time import time, sleep
+
+LOG = logging.getLogger('test_verify_metrics')
+LOG.setLevel(level=logging.DEBUG)
+
 # List of metrics that should be equal to zero when there are no outstanding queries.
 METRIC_LIST = [
                "impala-server.num-queries-registered",
-               # TODO (IMPALA-3377): Re-enable
-               # "impala-server.backends.client-cache.clients-in-use", disabled as a
-               # work-around due to IMPALA-3327.
-               #"impala-server.backends.client-cache.clients-in-use",
-               "impala-server.hash-table.total-bytes",
+               "impala-server.num-fragments-in-flight",
                "impala-server.io-mgr.num-open-files",
-               "impala-server.mem-pool.total-bytes",
                "impala-server.num-files-open-for-insert",
                "impala-server.scan-ranges.num-missing-volume-id",
                # Buffer pool pages belong to specific queries. Therefore there should be
                # no clean pages if there are no queries running.
                "buffer-pool.clean-pages",
-               "buffer-pool.clean-page-bytes"
-               ]
+               "buffer-pool.clean-page-bytes",
+               "impala-server.num-open-beeswax-sessions",
+               "impala-server.num-open-hiveserver2-sessions"]
 
 class MetricVerifier(object):
   """Reuseable class that can verify common metrics"""
@@ -60,3 +62,21 @@ class MetricVerifier(object):
 
   def wait_for_metric(self, metric_name, expected_value, timeout=60):
     self.impalad_service.wait_for_metric_value(metric_name, expected_value, timeout)
+
+  def wait_for_backend_admission_control_state(self, timeout=60):
+    """Wait for the admission-control-related values on the /backends page to go to
+    zero (i.e. consistent with an idle cluster)."""
+    start_time = time()
+    while time() - start_time < timeout:
+      try:
+        self.__assert_backend_ac_value_are_zero()
+        break  # Success!
+      except AssertionError as e:
+        LOG.info("Not yet quiesced: %s", str(e))
+        sleep(0.1)
+
+  def __assert_backend_ac_value_are_zero(self):
+    response = self.impalad_service.get_debug_webpage_json("/backends")
+    for backend in response['backends']:
+      for key in ['num_admitted', 'admission_slots_in_use', 'mem_admitted']:
+        assert str(backend[key]) == '0'

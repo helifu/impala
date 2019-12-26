@@ -20,40 +20,43 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <stdio.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
-#include <sstream>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ev++.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 
-#include "kudu/gutil/once.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/debug-util.h"
+#include "kudu/util/env.h"
 #include "kudu/util/errno.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/signal.h"
-#include "kudu/util/stopwatch.h"
 #include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
 
-#include "common/config.h"
-
+using std::map;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -83,11 +86,6 @@ static const char* kProcSelfFd =
 #else
 #define READDIR readdir
 #define DIRENT dirent
-#endif
-
-// Disable O_CLOEXEC if not available on very old kernels.
-#if !defined(O_CLOEXEC)
-#define O_CLOEXEC 0
 #endif
 
 // Since opendir() calls malloc(), this must be called before fork().
@@ -147,29 +145,40 @@ void CloseNonStandardFDs(DIR* fd_dir) {
           fd == STDOUT_FILENO ||
           fd == STDERR_FILENO ||
           fd == dir_fd))  {
-      close(fd);
+      int ret;
+      RETRY_ON_EINTR(ret, close(fd));
     }
   }
 }
 
 void RedirectToDevNull(int fd) {
-  // We must not close stderr or stdout, because then when a new file descriptor
-  // gets opened, it might get that fd number.  (We always allocate the lowest
-  // available file descriptor number.)  Instead, we reopen that fd as
-  // /dev/null.
-  int dev_null = open("/dev/null", O_WRONLY);
+  // We must not close stderr or stdout, because then when a new file
+  // descriptor is opened, it might reuse the closed file descriptor's number
+  // (we always allocate the lowest available file descriptor number).
+  //
+  // Instead, we open /dev/null as a new file descriptor, then use dup2() to
+  // atomically close 'fd' and reuse its file descriptor number as an open file
+  // handle to /dev/null.
+  //
+  // It is expected that the file descriptor allocated when opening /dev/null
+  // will be closed when the child process closes all of its "non-standard"
+  // file descriptors later on.
+  int dev_null;
+  RETRY_ON_EINTR(dev_null, open("/dev/null", O_WRONLY));
   if (dev_null < 0) {
     PLOG(WARNING) << "failed to open /dev/null";
   } else {
-    PCHECK(dup2(dev_null, fd));
+    int ret;
+    RETRY_ON_EINTR(ret, dup2(dev_null, fd));
+    PCHECK(ret);
   }
 }
 
 // Stateful libev watcher to help ReadFdsFully().
 class ReadFdsFullyHelper {
  public:
-  ReadFdsFullyHelper(const string& progname, ev::dynamic_loop* loop, int fd)
-      : progname_(progname) {
+  ReadFdsFullyHelper(string progname, ev::dynamic_loop* loop, int fd)
+      : progname_(std::move(progname)) {
     // Bind the watcher to the provided loop, to this functor, and to the
     // readable fd.
     watcher_.set(*loop);
@@ -184,14 +193,12 @@ class ReadFdsFullyHelper {
     DCHECK_EQ(ev::READ, revents);
 
     char buf[1024];
-    ssize_t n = read(w.fd, buf, arraysize(buf));
+    ssize_t n;
+    RETRY_ON_EINTR(n, read(w.fd, buf, arraysize(buf)));
     if (n == 0) {
       // EOF, stop watching.
       w.stop();
     } else if (n < 0) {
-      // Interrupted by a signal, do nothing.
-      if (errno == EINTR) return;
-
       // A fatal error. Store it and stop watching.
       status_ = Status::IOError("IO error reading from " + progname_,
                                 ErrnoToString(errno), errno);
@@ -277,22 +284,13 @@ Subprocess::~Subprocess() {
 
   for (int i = 0; i < 3; ++i) {
     if (fd_state_[i] == PIPED && child_fds_[i] >= 0) {
-      close(child_fds_[i]);
+      int ret;
+      RETRY_ON_EINTR(ret, close(child_fds_[i]));
     }
   }
 }
 
-void Subprocess::DisableStderr() {
-  CHECK_EQ(state_, kNotStarted);
-  fd_state_[STDERR_FILENO] = DISABLED;
-}
-
-void Subprocess::DisableStdout() {
-  CHECK_EQ(state_, kNotStarted);
-  fd_state_[STDOUT_FILENO] = DISABLED;
-}
-
-#if defined(__APPLE__) || !defined(HAVE_PIPE2)
+#if defined(__APPLE__)
 static int pipe2(int pipefd[2], int flags) {
   DCHECK_EQ(O_CLOEXEC, flags);
 
@@ -301,13 +299,15 @@ static int pipe2(int pipefd[2], int flags) {
     return -1;
   }
   if (fcntl(new_fds[0], F_SETFD, O_CLOEXEC) == -1) {
-    close(new_fds[0]);
-    close(new_fds[1]);
+    int ret;
+    RETRY_ON_EINTR(ret, close(new_fds[0]));
+    RETRY_ON_EINTR(ret, close(new_fds[1]));
     return -1;
   }
   if (fcntl(new_fds[1], F_SETFD, O_CLOEXEC) == -1) {
-    close(new_fds[0]);
-    close(new_fds[1]);
+    int ret;
+    RETRY_ON_EINTR(ret, close(new_fds[0]));
+    RETRY_ON_EINTR(ret, close(new_fds[1]));
     return -1;
   }
   pipefd[0] = new_fds[0];
@@ -363,7 +363,8 @@ Status Subprocess::Start() {
   RETURN_NOT_OK_PREPEND(OpenProcFdDir(&fd_dir), "Unable to open fd dir");
   unique_ptr<DIR, std::function<void(DIR*)>> fd_dir_closer(fd_dir,
                                                            CloseProcFdDir);
-  int ret = fork();
+  int ret;
+  RETRY_ON_EINTR(ret, fork());
   if (ret == -1) {
     return Status::RuntimeError("Unable to fork", ErrnoToString(errno), errno);
   }
@@ -379,13 +380,19 @@ Status Subprocess::Start() {
 
     // stdin
     if (fd_state_[STDIN_FILENO] == PIPED) {
-      PCHECK(dup2(child_stdin[0], STDIN_FILENO) == STDIN_FILENO);
+      int dup2_ret;
+      RETRY_ON_EINTR(dup2_ret, dup2(child_stdin[0], STDIN_FILENO));
+      PCHECK(dup2_ret == STDIN_FILENO);
+    } else {
+      DCHECK_EQ(SHARED, fd_state_[STDIN_FILENO]);
     }
 
     // stdout
     switch (fd_state_[STDOUT_FILENO]) {
       case PIPED: {
-        PCHECK(dup2(child_stdout[1], STDOUT_FILENO) == STDOUT_FILENO);
+        int dup2_ret;
+        RETRY_ON_EINTR(dup2_ret, dup2(child_stdout[1], STDOUT_FILENO));
+        PCHECK(dup2_ret == STDOUT_FILENO);
         break;
       }
       case DISABLED: {
@@ -393,13 +400,16 @@ Status Subprocess::Start() {
         break;
       }
       default:
+        DCHECK_EQ(SHARED, fd_state_[STDOUT_FILENO]);
         break;
     }
 
     // stderr
     switch (fd_state_[STDERR_FILENO]) {
       case PIPED: {
-        PCHECK(dup2(child_stderr[1], STDERR_FILENO) == STDERR_FILENO);
+        int dup2_ret;
+        RETRY_ON_EINTR(dup2_ret, dup2(child_stderr[1], STDERR_FILENO));
+        PCHECK(dup2_ret == STDERR_FILENO);
         break;
       }
       case DISABLED: {
@@ -407,12 +417,15 @@ Status Subprocess::Start() {
         break;
       }
       default:
+        DCHECK_EQ(SHARED, fd_state_[STDERR_FILENO]);
         break;
     }
 
     // Close the read side of the sync pipe;
     // the write side should be closed upon execvp().
-    PCHECK(close(sync_pipe[0]) == 0);
+    int close_ret;
+    RETRY_ON_EINTR(close_ret, close(sync_pipe[0]));
+    PCHECK(close_ret == 0);
 
     CloseNonStandardFDs(fd_dir);
 
@@ -423,6 +436,11 @@ Status Subprocess::Start() {
     // disposition to SIG_IGN via IgnoreSigPipe(). At the time of writing, we
     // don't explicitly ignore any other signals in Kudu.
     ResetSigPipeHandlerToDefault();
+
+    // Set the current working directory of the subprocess.
+    if (!cwd_.empty()) {
+      PCHECK(chdir(cwd_.c_str()) == 0);
+    }
 
     // Set the environment for the subprocess. This is more portable than
     // using execvpe(), which doesn't exist on OS X. We rely on the 'p'
@@ -440,9 +458,10 @@ Status Subprocess::Start() {
     // We are the parent
     child_pid_ = ret;
     // Close child's side of the pipes
-    if (fd_state_[STDIN_FILENO]  == PIPED) close(child_stdin[0]);
-    if (fd_state_[STDOUT_FILENO] == PIPED) close(child_stdout[1]);
-    if (fd_state_[STDERR_FILENO] == PIPED) close(child_stderr[1]);
+    int close_ret;
+    if (fd_state_[STDIN_FILENO]  == PIPED) RETRY_ON_EINTR(close_ret, close(child_stdin[0]));
+    if (fd_state_[STDOUT_FILENO] == PIPED) RETRY_ON_EINTR(close_ret, close(child_stdout[1]));
+    if (fd_state_[STDERR_FILENO] == PIPED) RETRY_ON_EINTR(close_ret, close(child_stderr[1]));
     // Keep parent's side of the pipes
     child_fds_[STDIN_FILENO]  = child_stdin[1];
     child_fds_[STDOUT_FILENO] = child_stdout[0];
@@ -458,19 +477,18 @@ Status Subprocess::Start() {
       // Close the write side of the sync pipe. It's crucial to make sure
       // it succeeds otherwise the blocking read() below might wait forever
       // even if the child process has closed the pipe.
-      PCHECK(close(sync_pipe[1]) == 0);
+      RETRY_ON_EINTR(close_ret, close(sync_pipe[1]));
+      PCHECK(close_ret == 0);
       while (true) {
         uint8_t buf;
         int err = 0;
-        const int rc = read(sync_pipe[0], &buf, 1);
+        int rc;
+        RETRY_ON_EINTR(rc, read(sync_pipe[0], &buf, 1));
         if (rc == -1) {
           err = errno;
-          if (err == EINTR) {
-            // Retry in case of a signal.
-            continue;
-          }
         }
-        PCHECK(close(sync_pipe[0]) == 0);
+        RETRY_ON_EINTR(close_ret, close(sync_pipe[0]));
+        PCHECK(close_ret == 0);
         if (rc == 0) {
           // That's OK -- expecting EOF from the other side of the pipe.
           break;
@@ -497,6 +515,39 @@ Status Subprocess::WaitNoBlock(int* wait_status) {
   return DoWait(wait_status, NON_BLOCKING);
 }
 
+Status Subprocess::GetProcfsState(int pid, ProcfsState* state) {
+  faststring data;
+  string filename = Substitute("/proc/$0/stat", pid);
+  RETURN_NOT_OK(ReadFileToString(Env::Default(), filename, &data));
+
+  // The part of /proc/<pid>/stat that's relevant for us looks like this:
+  //
+  //   "16009 (subprocess-test) R ..."
+  //
+  // The first number is the PID, the string in the parens in the command, and
+  // the single letter afterwards is the process' state.
+  //
+  // To extract the state, we scan backwards looking for the last ')', then
+  // increment past it and the separating space. This is safer than scanning
+  // forward as it properly handles commands containing parens.
+  string data_str = data.ToString();
+  const char* end_parens = strrchr(data_str.c_str(), ')');
+  if (end_parens == nullptr) {
+    return Status::RuntimeError(Substitute("unexpected layout in $0", filename));
+  }
+  char proc_state = end_parens[2];
+
+  switch (proc_state) {
+    case 'T':
+      *state = ProcfsState::PAUSED;
+      break;
+    default:
+      *state = ProcfsState::RUNNING;
+      break;
+  }
+  return Status::OK();
+}
+
 Status Subprocess::Kill(int signal) {
   if (state_ != kRunning) {
     const string err_str = "Sub-process is not running";
@@ -508,6 +559,35 @@ Status Subprocess::Kill(int signal) {
                                 ErrnoToString(errno),
                                 errno);
   }
+
+  // Signal delivery is often asynchronous. For some signals, we try to wait
+  // for the process to actually change state, using /proc/<pid>/stat as a
+  // guide. This is best-effort.
+  ProcfsState desired_state;
+  switch (signal) {
+    case SIGSTOP:
+      desired_state = ProcfsState::PAUSED;
+      break;
+    case SIGCONT:
+      desired_state = ProcfsState::RUNNING;
+      break;
+    default:
+      return Status::OK();
+  }
+  Stopwatch sw;
+  sw.start();
+  do {
+    ProcfsState current_state;
+    if (!GetProcfsState(child_pid_, &current_state).ok()) {
+      // There was some error parsing /proc/<pid>/stat (or perhaps it doesn't
+      // exist on this platform).
+      return Status::OK();
+    }
+    if (current_state == desired_state) {
+      return Status::OK();
+    }
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  } while (sw.elapsed().wall_seconds() < kProcessWaitTimeoutSeconds);
   return Status::OK();
 }
 
@@ -605,12 +685,17 @@ Status Subprocess::Call(const vector<string>& argv,
   RETURN_NOT_OK_PREPEND(p.Start(),
                         "Unable to fork " + argv[0]);
 
-  if (!stdin_in.empty() &&
-      write(p.to_child_stdin_fd(), stdin_in.data(), stdin_in.size()) < stdin_in.size()) {
-    return Status::IOError("Unable to write to child process stdin", ErrnoToString(errno), errno);
+  if (!stdin_in.empty()) {
+    ssize_t written;
+    RETRY_ON_EINTR(written, write(p.to_child_stdin_fd(), stdin_in.data(), stdin_in.size()));
+    if (written < stdin_in.size()) {
+      return Status::IOError("Unable to write to child process stdin",
+                             ErrnoToString(errno), errno);
+    }
   }
 
-  int err = close(p.ReleaseChildStdinFd());
+  int err;
+  RETRY_ON_EINTR(err, close(p.ReleaseChildStdinFd()));
   if (PREDICT_FALSE(err != 0)) {
     return Status::IOError("Unable to close child process stdin", ErrnoToString(errno), errno);
   }
@@ -666,7 +751,8 @@ Status Subprocess::DoWait(int* wait_status, WaitMode mode) {
 
   const int options = (mode == NON_BLOCKING) ? WNOHANG : 0;
   int status;
-  const int rc = waitpid(child_pid_, &status, options);
+  int rc;
+  RETRY_ON_EINTR(rc, waitpid(child_pid_, &status, options));
   if (rc == -1) {
     return Status::RuntimeError("Unable to wait on child",
                                 ErrnoToString(errno), errno);
@@ -686,14 +772,29 @@ Status Subprocess::DoWait(int* wait_status, WaitMode mode) {
   return Status::OK();
 }
 
-void Subprocess::SetEnvVars(std::map<std::string, std::string> env) {
+void Subprocess::SetEnvVars(map<string, string> env) {
+  CHECK_EQ(state_, kNotStarted);
   env_ = std::move(env);
+}
+
+void Subprocess::SetCurrentDir(string cwd) {
+  CHECK_EQ(state_, kNotStarted);
+  cwd_ = std::move(cwd);
 }
 
 void Subprocess::SetFdShared(int stdfd, bool share) {
   CHECK_EQ(state_, kNotStarted);
-  CHECK_NE(fd_state_[stdfd], DISABLED);
-  fd_state_[stdfd] = share? SHARED : PIPED;
+  fd_state_[stdfd] = share ? SHARED : PIPED;
+}
+
+void Subprocess::DisableStderr() {
+  CHECK_EQ(state_, kNotStarted);
+  fd_state_[STDERR_FILENO] = DISABLED;
+}
+
+void Subprocess::DisableStdout() {
+  CHECK_EQ(state_, kNotStarted);
+  fd_state_[STDOUT_FILENO] = DISABLED;
 }
 
 int Subprocess::CheckAndOffer(int stdfd) const {

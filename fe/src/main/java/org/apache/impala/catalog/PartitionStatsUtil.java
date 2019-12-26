@@ -17,24 +17,25 @@
 
 package org.apache.impala.catalog;
 
-import org.apache.impala.thrift.TPartitionStats;
-import org.apache.impala.common.JniUtil;
-import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.util.MetaStoreUtil;
-
-import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import org.apache.commons.codec.binary.Base64;
-import org.apache.thrift.protocol.TCompactProtocol;
-import org.apache.thrift.TSerializer;
+
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.JniUtil;
+import org.apache.impala.common.Reference;
+import org.apache.impala.thrift.TPartitionStats;
+import org.apache.impala.util.CompressionUtil;
+import org.apache.impala.util.MetaStoreUtil;
 import org.apache.thrift.TException;
-import com.google.common.base.Preconditions;
+import org.apache.thrift.TSerializer;
+import org.apache.thrift.protocol.TCompactProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.collect.Lists;
+import com.google.common.base.Preconditions;
 
 /**
  * Handles serialising and deserialising intermediate statistics from the Hive MetaStore
@@ -50,12 +51,49 @@ public class PartitionStatsUtil {
   private final static Logger LOG = LoggerFactory.getLogger(PartitionStatsUtil.class);
 
   /**
-   * Reconstructs a TPartitionStats object from its serialised form in the given parameter
-   * map. Returns null if no stats are serialised, and throws an exception if there was an
-   * error during deserialisation.
+   * Deflate-decompresses 'compressedStats' and deserializes it into TPartitionStats.
+   * Returns null if either 'compressedStats' is null or deserialization/decompression
+   * returns a null value. The partition, 'part', provides debugging context.
+   * Throws an exception if there is an error with deserialization/decompression.
    */
-  public static TPartitionStats partStatsFromParameters(
-      Map<String, String> hmsParameters) throws ImpalaException {
+  public static TPartitionStats partStatsFromCompressedBytes(
+      byte[] compressedStats, FeFsPartition part) throws ImpalaException {
+    if (compressedStats == null) return null;
+    TCompactProtocol.Factory protocolFactory = new TCompactProtocol.Factory();
+    TPartitionStats ret = new TPartitionStats();
+    byte[] decompressed = CompressionUtil.deflateDecompress(compressedStats);
+    if (decompressed == null) {
+      String partitionName = (part == null ? "N/A" : part.getPartitionName());
+      LOG.warn("Error decompressing partition stats for partition: " + partitionName);
+      return null;
+    }
+    JniUtil.deserializeThrift(protocolFactory, ret, decompressed);
+    return ret;
+  }
+
+  /**
+   * Get the partition stats from the given partition, or null if no stats
+   * are available. If stats are present but cannot be parsed, logs a warning
+   * and returns null.
+   */
+  public static TPartitionStats getPartStatsOrWarn(FeFsPartition part) {
+    try {
+      byte[] compressedStats = part.getPartitionStatsCompressed();
+      return partStatsFromCompressedBytes(compressedStats, part);
+    } catch (ImpalaException e) {
+      LOG.warn("Bad partition stats for " + part.getPartitionName(), e);
+      return null;
+    }
+  }
+
+  /**
+   * Reconstructs the intermediate stats from chunks and returns the corresponding
+   * byte array. The output byte array is deflate-compressed. Sets hasIncrStats to
+   * 'true' if the partition stats contain intermediate col stats.
+   */
+  public static byte[] partStatsBytesFromParameters(
+      Map<String, String> hmsParameters, Reference<Boolean> hasIncrStats) throws
+      ImpalaException {
     if (hmsParameters == null) return null;
     String numChunksStr = hmsParameters.get(INCREMENTAL_STATS_NUM_CHUNKS);
     if (numChunksStr == null) return null;
@@ -71,25 +109,59 @@ public class PartitionStatsUtil {
       }
       encodedStats.append(chunk);
     }
-
-    byte[] decodedStats = Base64.decodeBase64(encodedStats.toString());
-    TCompactProtocol.Factory protocolFactory = new TCompactProtocol.Factory();
-    TPartitionStats ret = new TPartitionStats();
-    JniUtil.deserializeThrift(protocolFactory, ret, decodedStats);
-    return ret;
+    byte[] decodedBytes = Base64.getDecoder().decode(encodedStats.toString());
+    TPartitionStats stats = new TPartitionStats();
+    JniUtil.deserializeThrift(new TCompactProtocol.Factory(), stats, decodedBytes);
+    hasIncrStats.setRef(stats.isSetIntermediate_col_stats());
+    return CompressionUtil.deflateCompress(decodedBytes);
   }
 
   /**
-   * Serialises a TPartitionStats object to a partition.
+   * Serializes 'stats' and deflate-compresses it to bytes. Returns null if 'stats' is
+   * null. Throws an exception if there is an error with serialization/compression.
    */
-  public static void partStatsToParameters(TPartitionStats partStats,
-      HdfsPartition partition) {
-    // null stats means logically delete the stats from this partition
+  public static byte[] partStatsToCompressedBytes(TPartitionStats stats)
+      throws TException {
+    if (stats == null) return null;
+    TCompactProtocol.Factory protocolFactory = new TCompactProtocol.Factory();
+    TSerializer serializer = new TSerializer(protocolFactory);
+    byte[] serialized = CompressionUtil.deflateCompress(serializer.serialize(stats));
+    return serialized;
+  }
+
+  /**
+   * Serialises a TPartitionStats object to a partition. If 'partStats' is null, the
+   * partition's stats are removed.
+   */
+  public static void partStatsToPartition(TPartitionStats partStats,
+      HdfsPartition partition) throws ImpalaException {
     if (partStats == null) {
-      deletePartStats(partition);
+      partition.setPartitionStatsBytes(null, false);
       return;
     }
 
+    try {
+      partition.setPartitionStatsBytes(
+          partStatsToCompressedBytes(partStats), partStats.isSetIntermediate_col_stats());
+    } catch (TException e) {
+      String debugString =
+          String.format("Error saving partition stats: table %s, partition %s",
+          partition.getTable().getFullName(), partition.getPartitionName());
+      LOG.error(debugString, e);
+      throw new ImpalaRuntimeException(debugString, e);
+    }
+  }
+
+  /**
+   * Converts byte[] representation of partition's stats into a chunked string form
+   * appropriate to store in the HMS parameters map. Inserts these chunks into the
+   * given input 'params' map. If we run into any errors deserializing partition stats,
+   * 'params' map is not altered.
+   */
+  public static void partStatsToParams(
+      HdfsPartition partition, Map<String, String> params) {
+    byte[] compressedStats = partition.getPartitionStatsCompressed();
+    if (compressedStats == null) return;
     // The HMS has a 4k (as of Hive 0.13, Impala 2.0) limit on the length of any parameter
     // string.  The serialised version of the partition stats is often larger than this.
     // Therefore, we naively 'chunk' the byte string into 4k pieces, and store the number
@@ -99,37 +171,24 @@ public class PartitionStatsUtil {
     // valid string. This inflates its length somewhat; we may want to consider a
     // different scheme or at least understand why this scheme doesn't seem much more
     // effective than an ASCII representation.
-    try {
-      TCompactProtocol.Factory protocolFactory = new TCompactProtocol.Factory();
-      TSerializer serializer = new TSerializer(protocolFactory);
-      byte[] serialized = serializer.serialize(partStats);
-      String base64 = new String(Base64.encodeBase64(serialized));
-      List<String> chunks =
-          chunkStringForHms(base64, MetaStoreUtil.MAX_PROPERTY_VALUE_LENGTH);
-      partition.putToParameters(
-          INCREMENTAL_STATS_NUM_CHUNKS, Integer.toString(chunks.size()));
-      for (int i = 0; i < chunks.size(); ++i) {
-        partition.putToParameters(INCREMENTAL_STATS_CHUNK_PREFIX + i, chunks.get(i));
-      }
-    } catch (TException e) {
-      LOG.error("Error saving partition stats: ", e);
-      // TODO: What to throw here?
+    byte[] decompressed = CompressionUtil.deflateDecompress(compressedStats);
+    if (decompressed  == null)  {
+      LOG.error(
+          "Error decompressing partition stats for " + partition.getPartitionName());
+      return;
     }
-  }
-
-  public static void deletePartStats(HdfsPartition partition) {
-    partition.putToParameters(INCREMENTAL_STATS_NUM_CHUNKS, "0");
-    for (Iterator<String> it = partition.getParameters().keySet().iterator();
-         it.hasNext(); ) {
-      if (it.next().startsWith(INCREMENTAL_STATS_CHUNK_PREFIX)) {
-        it.remove();
-      }
+    String base64 = new String(Base64.getEncoder().encode(decompressed));
+    List<String> chunks =
+      chunkStringForHms(base64, MetaStoreUtil.MAX_PROPERTY_VALUE_LENGTH);
+    params.put(INCREMENTAL_STATS_NUM_CHUNKS, Integer.toString(chunks.size()));
+    for (int i = 0; i < chunks.size(); ++i) {
+      params.put(INCREMENTAL_STATS_CHUNK_PREFIX + i, chunks.get(i));
     }
   }
 
   static private List<String> chunkStringForHms(String data, int chunkLen) {
     int idx = 0;
-    List<String> ret = Lists.newArrayList();
+    List<String> ret = new ArrayList<>();
     while (idx < data.length()) {
       int remaining = data.length() - idx;
       int chunkSize = (chunkLen > remaining) ? remaining : chunkLen;

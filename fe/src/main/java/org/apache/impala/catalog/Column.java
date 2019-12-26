@@ -17,21 +17,21 @@
 
 package org.apache.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.thrift.TColumn;
+import org.apache.impala.thrift.TColumnStats;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.impala.thrift.TColumn;
-import org.apache.impala.thrift.TColumnStats;
 import com.google.common.base.Function;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-
-import org.apache.impala.common.ImpalaRuntimeException;
 
 /**
  * Internal representation of column-related metadata.
@@ -123,6 +123,7 @@ public class Column {
 
   public static List<FieldSchema> toFieldSchemas(List<Column> columns) {
     return Lists.transform(columns, new Function<Column, FieldSchema>() {
+      @Override
       public FieldSchema apply(Column column) {
         Preconditions.checkNotNull(column.getType());
         return new FieldSchema(column.getName(), column.getType().toSql().toLowerCase(),
@@ -132,8 +133,19 @@ public class Column {
   }
 
   public static List<String> toColumnNames(List<Column> columns) {
-    List<String> colNames = Lists.newArrayList();
+    List<String> colNames = new ArrayList<>();
     for (Column col: columns) colNames.add(col.getName());
     return colNames;
   }
+  /**
+   * Returns a struct type from the table columns passed in as a parameter.
+   */
+  public static StructType columnsToStruct(List<Column> columns) {
+    List<StructField> fields = Lists.newArrayListWithCapacity(columns.size());
+    for (Column col: columns) {
+      fields.add(new StructField(col.getName(), col.getType(), col.getComment()));
+    }
+    return new StructType(fields);
+  }
+
 }

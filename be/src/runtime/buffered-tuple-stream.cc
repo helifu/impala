@@ -31,6 +31,7 @@
 #include "runtime/tuple-row.h"
 #include "util/bit-util.h"
 #include "util/debug-util.h"
+#include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
@@ -47,36 +48,20 @@ using namespace impala;
 using namespace strings;
 
 using BufferHandle = BufferPool::BufferHandle;
+using FlushMode = RowBatch::FlushMode;
 
 BufferedTupleStream::BufferedTupleStream(RuntimeState* state,
     const RowDescriptor* row_desc, BufferPool::ClientHandle* buffer_pool_client,
     int64_t default_page_len, int64_t max_page_len, const set<SlotId>& ext_varlen_slots)
   : state_(state),
     desc_(row_desc),
-    node_id_(-1),
-    buffer_pool_(state->exec_env()->buffer_pool()),
+    buffer_pool_(ExecEnv::GetInstance()->buffer_pool()),
     buffer_pool_client_(buffer_pool_client),
-    num_pages_(0),
-    total_byte_size_(0),
-    has_read_iterator_(false),
     read_page_reservation_(buffer_pool_client_),
-    read_page_rows_returned_(-1),
-    read_ptr_(nullptr),
-    read_end_ptr_(nullptr),
-    write_ptr_(nullptr),
-    write_end_ptr_(nullptr),
-    rows_returned_(0),
-    has_write_iterator_(false),
-    write_page_(nullptr),
     write_page_reservation_(buffer_pool_client_),
-    bytes_pinned_(0),
-    num_rows_(0),
     default_page_len_(default_page_len),
     max_page_len_(max_page_len),
-    has_nullable_tuple_(row_desc->IsAnyTupleNullable()),
-    delete_on_read_(false),
-    closed_(false),
-    pinned_(true) {
+    has_nullable_tuple_(row_desc->IsAnyTupleNullable()) {
   DCHECK_GE(max_page_len, default_page_len);
   DCHECK(BitUtil::IsPowerOf2(default_page_len)) << default_page_len;
   DCHECK(BitUtil::IsPowerOf2(max_page_len)) << max_page_len;
@@ -110,10 +95,6 @@ BufferedTupleStream::BufferedTupleStream(RuntimeState* state,
   }
 }
 
-BufferedTupleStream::~BufferedTupleStream() {
-  DCHECK(closed_);
-}
-
 void BufferedTupleStream::CheckConsistencyFull() const {
   CheckConsistencyFast();
   // The below checks require iterating over all the pages in the stream.
@@ -139,11 +120,13 @@ void BufferedTupleStream::CheckConsistencyFast() const {
   DCHECK(has_read_iterator() || read_page_ == pages_.end());
   if (read_page_ != pages_.end()) {
     CheckPageConsistency(&*read_page_);
-    DCHECK(read_page_->is_pinned());
-    DCHECK(read_page_->retrieved_buffer);
-    // Can't check read buffer without affecting behaviour, because a read may be in
-    // flight and this would required blocking on that write.
-    DCHECK_GE(read_end_ptr_, read_ptr_);
+    if (!read_page_->attached_to_output_batch) {
+      DCHECK(read_page_->is_pinned());
+      DCHECK(read_page_->retrieved_buffer);
+      // Can't check read buffer without affecting behaviour, because a read may be in
+      // flight and this would required blocking on that write.
+      DCHECK_GE(read_end_ptr_, read_ptr_);
+    }
   }
   if (NeedReadReservation()) {
     DCHECK_EQ(default_page_len_, read_page_reservation_.GetReservation())
@@ -159,6 +142,12 @@ void BufferedTupleStream::CheckConsistencyFast() const {
 }
 
 void BufferedTupleStream::CheckPageConsistency(const Page* page) const {
+  if (page->attached_to_output_batch) {
+    /// Read page was just attached to output batch.
+    DCHECK(is_read_page(page)) << page->DebugString();
+    DCHECK(!page->handle.is_open());
+    return;
+  }
   DCHECK_EQ(ExpectedPinCount(pinned_, page), page->pin_count()) << DebugString();
   // Only one large row per page.
   if (page->len() > default_page_len_) DCHECK_LE(page->num_rows, 1);
@@ -170,7 +159,7 @@ string BufferedTupleStream::DebugString() const {
   stringstream ss;
   ss << "BufferedTupleStream num_rows=" << num_rows_
      << " rows_returned=" << rows_returned_ << " pinned=" << pinned_
-     << " delete_on_read=" << delete_on_read_ << " closed=" << closed_ << "\n"
+     << " attach_on_read=" << attach_on_read_ << " closed=" << closed_ << "\n"
      << " bytes_pinned=" << bytes_pinned_ << " has_write_iterator=" << has_write_iterator_
      << " write_page=" << write_page_ << " has_read_iterator=" << has_read_iterator_
      << " read_page=";
@@ -201,20 +190,35 @@ string BufferedTupleStream::DebugString() const {
   return ss.str();
 }
 
-string BufferedTupleStream::Page::DebugString() const {
-  return Substitute("$0 num_rows=$1", handle.DebugString(), num_rows);
+void BufferedTupleStream::Page::AttachBufferToBatch(
+    BufferedTupleStream* parent, RowBatch* batch, FlushMode flush) {
+  DCHECK(is_pinned());
+  DCHECK(retrieved_buffer);
+  parent->bytes_pinned_ -= len();
+  // ExtractBuffer() cannot fail because the buffer is already in memory.
+  BufferPool::BufferHandle buffer;
+  Status status =
+      parent->buffer_pool_->ExtractBuffer(parent->buffer_pool_client_, &handle, &buffer);
+  DCHECK(status.ok());
+  batch->AddBuffer(parent->buffer_pool_client_, move(buffer), flush);
+  attached_to_output_batch = true;
 }
 
-Status BufferedTupleStream::Init(int node_id, bool pinned) {
-  if (!pinned) UnpinStream(UNPIN_ALL_EXCEPT_CURRENT);
-  node_id_ = node_id;
+string BufferedTupleStream::Page::DebugString() const {
+  return Substitute("$0 num_rows=$1 retrived_buffer=$2 attached_to_output_batch=$3",
+      handle.DebugString(), num_rows, retrieved_buffer, attached_to_output_batch);
+}
+
+Status BufferedTupleStream::Init(const string& caller_label, bool pinned) {
+  if (!pinned) RETURN_IF_ERROR(UnpinStream(UNPIN_ALL_EXCEPT_CURRENT));
+  caller_label_ = caller_label;
   return Status::OK();
 }
 
 Status BufferedTupleStream::PrepareForWrite(bool* got_reservation) {
   // This must be the first iterator created.
   DCHECK(pages_.empty());
-  DCHECK(!delete_on_read_);
+  DCHECK(!attach_on_read_);
   DCHECK(!has_write_iterator());
   DCHECK(!has_read_iterator());
   CHECK_CONSISTENCY_FULL();
@@ -229,10 +233,10 @@ Status BufferedTupleStream::PrepareForWrite(bool* got_reservation) {
 }
 
 Status BufferedTupleStream::PrepareForReadWrite(
-    bool delete_on_read, bool* got_reservation) {
+    bool attach_on_read, bool* got_reservation) {
   // This must be the first iterator created.
   DCHECK(pages_.empty());
-  DCHECK(!delete_on_read_);
+  DCHECK(!attach_on_read_);
   DCHECK(!has_write_iterator());
   DCHECK(!has_read_iterator());
   CHECK_CONSISTENCY_FULL();
@@ -243,20 +247,17 @@ Status BufferedTupleStream::PrepareForReadWrite(
   // Save reservation for both the read and write iterators.
   buffer_pool_client_->SaveReservation(&read_page_reservation_, default_page_len_);
   buffer_pool_client_->SaveReservation(&write_page_reservation_, default_page_len_);
-  RETURN_IF_ERROR(PrepareForReadInternal(delete_on_read));
+  RETURN_IF_ERROR(PrepareForReadInternal(attach_on_read));
   return Status::OK();
 }
 
-void BufferedTupleStream::Close(RowBatch* batch, RowBatch::FlushMode flush) {
+void BufferedTupleStream::Close(RowBatch* batch, FlushMode flush) {
   for (Page& page : pages_) {
+    if (page.attached_to_output_batch) continue; // Already returned.
     if (batch != nullptr && page.retrieved_buffer) {
       // Subtle: We only need to attach buffers from pages that we may have returned
-      // references to. ExtractBuffer() cannot fail for these pages because the data
-      // is guaranteed to already be in -memory.
-      BufferPool::BufferHandle buffer;
-      Status status = buffer_pool_->ExtractBuffer(buffer_pool_client_, &page.handle, &buffer);
-      DCHECK(status.ok());
-      batch->AddBuffer(buffer_pool_client_, move(buffer), flush);
+      // references to.
+      page.AttachBufferToBatch(this, batch, flush);
     } else {
       buffer_pool_->DestroyPage(buffer_pool_client_, &page.handle);
     }
@@ -266,22 +267,28 @@ void BufferedTupleStream::Close(RowBatch* batch, RowBatch::FlushMode flush) {
   pages_.clear();
   num_pages_ = 0;
   bytes_pinned_ = 0;
+  bytes_unpinned_ = 0;
   closed_ = true;
 }
 
 int64_t BufferedTupleStream::CalcBytesPinned() const {
   int64_t result = 0;
-  for (const Page& page : pages_) result += page.pin_count() * page.len();
+  for (const Page& page : pages_) {
+    if (!page.attached_to_output_batch) result += page.pin_count() * page.len();
+  }
   return result;
 }
 
 Status BufferedTupleStream::PinPage(Page* page) {
   RETURN_IF_ERROR(buffer_pool_->Pin(buffer_pool_client_, &page->handle));
   bytes_pinned_ += page->len();
+  bytes_unpinned_ -= page->len();
+  DCHECK_GE(bytes_unpinned_, 0);
   return Status::OK();
 }
 
 int BufferedTupleStream::ExpectedPinCount(bool stream_pinned, const Page* page) const {
+  DCHECK(!page->attached_to_output_batch);
   return (stream_pinned || is_read_page(page) || is_write_page(page)) ? 1 : 0;
 }
 
@@ -300,6 +307,8 @@ void BufferedTupleStream::UnpinPageIfNeeded(Page* page, bool stream_pinned) {
     DCHECK_EQ(new_pin_count, page->pin_count() - 1);
     buffer_pool_->Unpin(buffer_pool_client_, &page->handle);
     bytes_pinned_ -= page->len();
+    DCHECK_GE(bytes_pinned_, 0);
+    bytes_unpinned_ += page->len();
     if (page->pin_count() == 0) page->retrieved_buffer = false;
   }
 }
@@ -382,7 +391,7 @@ Status BufferedTupleStream::NewWritePage(int64_t page_len) noexcept {
 Status BufferedTupleStream::CalcPageLenForRow(int64_t row_size, int64_t* page_len) {
   if (UNLIKELY(row_size > max_page_len_)) {
     return Status(TErrorCode::MAX_ROW_SIZE,
-        PrettyPrinter::Print(row_size, TUnit::BYTES), node_id_,
+        PrettyPrinter::Print(row_size, TUnit::BYTES), caller_label_,
         PrettyPrinter::Print(state_->query_options().max_row_size, TUnit::BYTES));
   }
   *page_len = max(default_page_len_, BitUtil::RoundUpToPowerOfTwo(row_size));
@@ -483,12 +492,11 @@ Status BufferedTupleStream::NextReadPage() {
         && !NeedReadReservation(pinned_, num_pages_, true, true)) {
       buffer_pool_client_->RestoreReservation(&read_page_reservation_, default_page_len_);
     }
-  } else if (delete_on_read_) {
+  } else if (attach_on_read_) {
     DCHECK(read_page_ == pages_.begin()) << read_page_->DebugString() << " "
                                          << DebugString();
     DCHECK_NE(&*read_page_, write_page_);
-    bytes_pinned_ -= pages_.front().len();
-    buffer_pool_->DestroyPage(buffer_pool_client_, &pages_.front().handle);
+    DCHECK(read_page_->attached_to_output_batch);
     pages_.pop_front();
     --num_pages_;
     read_page_ = pages_.begin();
@@ -557,12 +565,13 @@ void BufferedTupleStream::InvalidateReadIterator() {
   if (read_page_reservation_.GetReservation() > 0) {
     buffer_pool_client_->RestoreReservation(&read_page_reservation_, default_page_len_);
   }
-  // It is safe to re-read a delete-on-read stream if no rows were read and no pages
+  // It is safe to re-read an attach-on-read stream if no rows were read and no pages
   // were therefore deleted.
-  if (rows_returned_ == 0) delete_on_read_ = false;
+  DCHECK(attach_on_read_ == false || rows_returned_ == 0);
+  if (rows_returned_ == 0) attach_on_read_ = false;
 }
 
-Status BufferedTupleStream::PrepareForRead(bool delete_on_read, bool* got_reservation) {
+Status BufferedTupleStream::PrepareForRead(bool attach_on_read, bool* got_reservation) {
   CHECK_CONSISTENCY_FULL();
   InvalidateWriteIterator();
   InvalidateReadIterator();
@@ -570,12 +579,12 @@ Status BufferedTupleStream::PrepareForRead(bool delete_on_read, bool* got_reserv
   *got_reservation = pinned_ || pages_.empty()
       || buffer_pool_client_->IncreaseReservationToFit(default_page_len_);
   if (!*got_reservation) return Status::OK();
-  return PrepareForReadInternal(delete_on_read);
+  return PrepareForReadInternal(attach_on_read);
 }
 
-Status BufferedTupleStream::PrepareForReadInternal(bool delete_on_read) {
+Status BufferedTupleStream::PrepareForReadInternal(bool attach_on_read) {
   DCHECK(!closed_);
-  DCHECK(!delete_on_read_);
+  DCHECK(!attach_on_read_);
   DCHECK(!has_read_iterator());
 
   has_read_iterator_ = true;
@@ -599,7 +608,7 @@ Status BufferedTupleStream::PrepareForReadInternal(bool delete_on_read) {
   }
   read_page_rows_returned_ = 0;
   rows_returned_ = 0;
-  delete_on_read_ = delete_on_read;
+  attach_on_read_ = attach_on_read;
   CHECK_CONSISTENCY_FULL();
   return Status::OK();
 }
@@ -650,7 +659,7 @@ Status BufferedTupleStream::PinStream(bool* pinned) {
   return Status::OK();
 }
 
-void BufferedTupleStream::UnpinStream(UnpinMode mode) {
+Status BufferedTupleStream::UnpinStream(UnpinMode mode) {
   CHECK_CONSISTENCY_FULL();
   DCHECK(!closed_);
   if (mode == UNPIN_ALL) {
@@ -661,6 +670,11 @@ void BufferedTupleStream::UnpinStream(UnpinMode mode) {
 
   if (pinned_) {
     CHECK_CONSISTENCY_FULL();
+    if (&*read_page_ != write_page_ && read_page_ != pages_.end()
+        && read_page_rows_returned_ == read_page_->num_rows) {
+      RETURN_IF_ERROR(NextReadPage());
+    }
+
     // If the stream was pinned, there may be some remaining pinned pages that should
     // be unpinned at this point.
     for (Page& page : pages_) UnpinPageIfNeeded(&page, false);
@@ -675,6 +689,7 @@ void BufferedTupleStream::UnpinStream(UnpinMode mode) {
     pinned_ = false;
   }
   CHECK_CONSISTENCY_FULL();
+  return Status::OK();
 }
 
 Status BufferedTupleStream::GetNext(RowBatch* batch, bool* eos) {
@@ -708,6 +723,15 @@ Status BufferedTupleStream::GetNextInternal(
 
   if (UNLIKELY(read_page_ == pages_.end()
           || read_page_rows_returned_ == read_page_->num_rows)) {
+    if (read_page_ != pages_.end() && attach_on_read_
+        && !read_page_->attached_to_output_batch) {
+      DCHECK(has_write_iterator());
+      // We're in a read-write stream in the case where we're at the end of the read page
+      // but the buffer was not attached on the last GetNext() call because the write
+      // iterator had not yet advanced.
+      read_page_->AttachBufferToBatch(this, batch, FlushMode::FLUSH_RESOURCES);
+      return Status::OK();
+    }
     // Get the next page in the stream (or the first page if read_page_ was not yet
     // initialized.) We need to do this at the beginning of the GetNext() call to ensure
     // the buffer management semantics. NextReadPage() may unpin or delete the buffer
@@ -729,7 +753,7 @@ Status BufferedTupleStream::GetNextInternal(
   // null tuple indicator.
   if (FILL_FLAT_ROWS) {
     DCHECK(flat_rows != nullptr);
-    DCHECK(!delete_on_read_);
+    DCHECK(!attach_on_read_);
     DCHECK_EQ(batch->num_rows(), 0);
     flat_rows->clear();
     flat_rows->reserve(rows_to_fill);
@@ -768,11 +792,28 @@ Status BufferedTupleStream::GetNextInternal(
   rows_returned_ += rows_to_fill;
   read_page_rows_returned_ += rows_to_fill;
   *eos = (rows_returned_ == num_rows_);
-  if (read_page_rows_returned_ == read_page_->num_rows && (!pinned_ || delete_on_read_)) {
-    // No more data in this page. The batch must be immediately returned up the operator
-    // tree and deep copied so that NextReadPage() can reuse the read page's buffer.
-    // TODO: IMPALA-4179 - instead attach the buffer and flush the resources.
-    batch->MarkNeedsDeepCopy();
+  if (read_page_rows_returned_ == read_page_->num_rows) {
+    // No more data in this page. NextReadPage() may need to reuse the reservation
+    // currently used for 'read_page_' so we may need to flush resources. When
+    // 'attach_on_read_' is true, we're returning the buffer. Otherwise the buffer will
+    // be unpinned later but we're returning a reference to the memory so we need to
+    // signal to the caller that the resources are going away. Note that if there is a
+    // read-write page it is not safe to attach the buffer yet because more rows may be
+    // appended to the page.
+    if (attach_on_read_) {
+      if (!has_read_write_page()) {
+        // Safe to attach because we already called GetBuffer() in NextReadPage().
+        // TODO: always flushing for pinned streams is overkill since we may not need
+        // to reuse the reservation immediately. Changing this may require modifying
+        // callers of this class.
+        read_page_->AttachBufferToBatch(this, batch, FlushMode::FLUSH_RESOURCES);
+      }
+    } else if (!pinned_) {
+      // Flush resources so that we can safely unpin the page on the next GetNext() call.
+      // Note that if this is a read/write page we might not actually do the advance on
+      // the next call to GetNext(). In that case the flush is still safe to do.
+      batch->MarkFlushResources();
+    }
   }
   if (FILL_FLAT_ROWS) DCHECK_EQ(flat_rows->size(), rows_to_fill);
   DCHECK_LE(read_ptr_, read_end_ptr_);
@@ -1028,7 +1069,7 @@ void BufferedTupleStream::GetTupleRow(FlatRowPtr flat_row, TupleRow* row) const 
   DCHECK(row != nullptr);
   DCHECK(!closed_);
   DCHECK(is_pinned());
-  DCHECK(!delete_on_read_);
+  DCHECK(!attach_on_read_);
   uint8_t* data = flat_row;
   return has_nullable_tuple_ ? UnflattenTupleRow<true>(&data, row) :
                                UnflattenTupleRow<false>(&data, row);
@@ -1038,7 +1079,7 @@ template <bool HAS_NULLABLE_TUPLE>
 void BufferedTupleStream::UnflattenTupleRow(uint8_t** data, TupleRow* row) const {
   const int tuples_per_row = desc_->tuple_descriptors().size();
   uint8_t* ptr = *data;
-  if (has_nullable_tuple_) {
+  if (HAS_NULLABLE_TUPLE) {
     // Stitch together the tuples from the page and the NULL ones.
     const uint8_t* null_indicators = ptr;
     ptr += NullIndicatorBytesPerRow();

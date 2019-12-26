@@ -6,7 +6,7 @@ select count(*), sum(int_col) from functional.alltypesmixedformat
 ---- TYPES
 bigint, bigint
 ---- RESULTS
-900,4050
+1200,5400
 ====
 ---- QUERY
 # Restrict set of partitions (still multi-format)
@@ -23,4 +23,18 @@ select count(*), sum(int_col) from functional.alltypesmixedformat where month = 
 bigint, bigint
 ---- RESULTS
 280,1260
+====
+---- QUERY
+# IMPALA-5861: RowsRead counter should be accurate for table scan that returns
+# zero slots. This test is run with various batch_size values, which helps
+# reproduce the bug. Scanning multiple file formats triggers the bug because
+# the Parquet count(*) rewrite is disabled when non-Parquet file formats are
+# present.
+select count(*) from functional.alltypesmixedformat
+---- TYPES
+bigint
+---- RESULTS
+1200
+---- RUNTIME_PROFILE
+aggregation(SUM, RowsRead): 1200
 ====

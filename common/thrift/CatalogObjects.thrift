@@ -29,80 +29,93 @@ include "hive_metastore.thrift"
 enum TCatalogObjectType {
   // UNKNOWN is used to indicate an error condition when converting
   // strings to their matching TCatalogObjectType.
-  UNKNOWN,
-  CATALOG,
-  DATABASE,
-  TABLE,
-  VIEW,
-  FUNCTION,
-  DATA_SOURCE,
-  ROLE,
-  PRIVILEGE,
-  HDFS_CACHE_POOL,
+  UNKNOWN = 0
+  CATALOG = 1
+  DATABASE = 2
+  TABLE = 3
+  VIEW = 4
+  FUNCTION = 5
+  DATA_SOURCE = 6
+  PRINCIPAL = 7
+  PRIVILEGE = 8
+  HDFS_CACHE_POOL = 9
+  // A catalog object type as a marker for authorization cache invalidation.
+  AUTHZ_CACHE_INVALIDATION = 10
 }
 
 enum TTableType {
-  HDFS_TABLE,
-  HBASE_TABLE,
-  VIEW,
-  DATA_SOURCE_TABLE,
-  KUDU_TABLE,
+  HDFS_TABLE = 0
+  HBASE_TABLE = 1
+  VIEW = 2
+  DATA_SOURCE_TABLE = 3
+  KUDU_TABLE = 4
 }
 
 // TODO: Separate the storage engines (e.g. Kudu) from the file formats.
 // TODO: Make the names consistent with the file format keywords specified in
 // the parser.
 enum THdfsFileFormat {
-  TEXT,
-  RC_FILE,
-  SEQUENCE_FILE,
-  AVRO,
-  PARQUET,
-  KUDU
+  TEXT = 0
+  RC_FILE = 1
+  SEQUENCE_FILE = 2
+  AVRO = 3
+  PARQUET = 4
+  KUDU = 5
+  ORC = 6
 }
 
 // TODO: Since compression is also enabled for Kudu columns, we should
 // rename this enum to not be Hdfs specific.
 enum THdfsCompression {
-  NONE,
-  DEFAULT,
-  GZIP,
-  DEFLATE,
-  BZIP2,
-  SNAPPY,
-  SNAPPY_BLOCKED,
-  LZO,
-  LZ4,
-  ZLIB
+  NONE = 0
+  DEFAULT = 1
+  GZIP = 2
+  DEFLATE = 3
+  BZIP2 = 4
+  SNAPPY = 5
+  SNAPPY_BLOCKED = 6
+  LZO = 7
+  LZ4 = 8
+  ZLIB = 9
+  ZSTD = 10
+  BROTLI = 11
+  LZ4_BLOCKED = 12
 }
 
 enum TColumnEncoding {
-  AUTO,
-  PLAIN,
-  PREFIX,
-  GROUP_VARINT,
-  RLE,
-  DICTIONARY,
-  BIT_SHUFFLE
+  AUTO = 0
+  PLAIN = 1
+  PREFIX = 2
+  GROUP_VARINT = 3
+  RLE = 4
+  DICTIONARY = 5
+  BIT_SHUFFLE = 6
 }
 
 enum THdfsSeqCompressionMode {
-  RECORD,
-  BLOCK
+  RECORD = 0
+  BLOCK = 1
 }
 
 // The table property type.
 enum TTablePropertyType {
-  TBL_PROPERTY,
-  SERDE_PROPERTY
+  TBL_PROPERTY = 0
+  SERDE_PROPERTY = 1
 }
 
 // The access level that is available to Impala on the Catalog object.
 enum TAccessLevel {
-  NONE,
-  READ_WRITE,
-  READ_ONLY,
-  WRITE_ONLY,
+  NONE = 0
+  READ_WRITE = 1
+  READ_ONLY = 2
+  WRITE_ONLY = 3
+}
+
+struct TCompressionCodec {
+  // Compression codec
+  1: required THdfsCompression codec
+  // Compression level
+  2: optional i32 compression_level
 }
 
 // Mapping from names defined by Avro to values in the THdfsCompression enum.
@@ -237,18 +250,39 @@ struct THdfsPartitionLocation {
 }
 
 // Represents an HDFS partition
+// TODO(vercegovac): rename to TFsPartition
 struct THdfsPartition {
+
+  // ============================================================
+  // Fields included in the "Descriptor" format sent to the backend
+  // as part of query plans and fragments.
+  // ============================================================
+
   1: required byte lineDelim
   2: required byte fieldDelim
   3: required byte collectionDelim
   4: required byte mapKeyDelim
   5: required byte escapeChar
   6: required THdfsFileFormat fileFormat
+
   // These are Literal expressions
   7: list<Exprs.TExpr> partitionKeyExprs
   8: required i32 blockSize
-  9: optional list<THdfsFileDesc> file_desc
+
   10: optional THdfsPartitionLocation location
+
+  // Unique (in this table) id of this partition. May be set to
+  // PROTOTYPE_PARTITION_ID when this object is used to describe
+  // a partition which will be created as part of a query.
+  14: optional i64 id
+
+
+  // ============================================================
+  // Fields only included when the catalogd serializes a table to be
+  // sent to the impalad as part of a catalog update.
+  // ============================================================
+
+  9: optional list<THdfsFileDesc> file_desc
 
   // The access level Impala has on this partition (READ_WRITE, READ_ONLY, etc).
   11: optional TAccessLevel access_level
@@ -259,10 +293,6 @@ struct THdfsPartition {
   // True if this partition has been marked as cached (does not necessarily mean the
   // underlying data is cached).
   13: optional bool is_marked_cached
-
-  // Unique (in this table) id of this partition. If -1, the partition does not currently
-  // exist.
-  14: optional i64 id
 
   // (key,value) pairs stored in the Hive Metastore.
   15: optional map<string, string> hms_parameters
@@ -275,11 +305,29 @@ struct THdfsPartition {
   // Total file size in bytes of this partition.
   17: optional i64 total_file_size_bytes
 
-  // True, if this partition has incremental stats
-  18: optional bool has_incremental_stats
+  // byte[] representation of TPartitionStats for this partition that is compressed using
+  // 'deflate-compression'.
+  18: optional binary partition_stats
+
+  // Set to true if partition_stats contain intermediate column stats computed via
+  // incremental statistics, false otherwise.
+  19: optional bool has_incremental_stats
+
+  // For acid table, store last committed write id.
+  20: optional i64 write_id
 }
 
+// Constant partition ID used for THdfsPartition.prototype_partition below.
+// Must be < 0 to avoid collisions
+const i64 PROTOTYPE_PARTITION_ID = -1;
+
+
 struct THdfsTable {
+  // ============================================================
+  // Fields included in the "Descriptor" format sent to the backend
+  // as part of query plans and fragments.
+  // ============================================================
+
   1: required string hdfsBaseDir
 
   // Deprecated. Use TTableDescriptor.colNames.
@@ -294,21 +342,35 @@ struct THdfsTable {
   // Set to the table's Avro schema if this is an Avro table
   6: optional string avroSchema
 
-  // map from partition id to partition metadata
+  // Map from partition id to partition metadata.
+  // Does not include the special prototype partition with id=PROTOTYPE_PARTITION_ID --
+  // that partition is separately included below.
   4: required map<i64, THdfsPartition> partitions
 
-  // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
-  // Used so that each THdfsFileBlock can just reference an index in this list rather
-  // than duplicate the list of network address, which helps reduce memory usage.
-  7: optional list<Types.TNetworkAddress> network_addresses
+  // Prototype partition, used when creating new partitions during insert.
+  10: required THdfsPartition prototype_partition
 
-  // Indicates that this table's partitions reside on more than one filesystem.
-  // TODO: remove once INSERT across filesystems is supported.
-  8: optional bool multiple_filesystems
+  // REMOVED: 8: optional bool multiple_filesystems
 
   // The prefixes of locations of partitions in this table. See THdfsPartitionLocation for
   // the description of how a prefix is computed.
   9: optional list<string> partition_prefixes
+
+  // ============================================================
+  // Fields only included when the catalogd serializes a table to be
+  // sent to the impalad as part of a catalog update.
+  // ============================================================
+
+  // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
+  // Used so that each THdfsFileBlock can just reference an index in this list rather
+  // than duplicate the list of network address, which helps reduce memory usage.
+  7: optional list<Types.TNetworkAddress> network_addresses,
+
+  // Primary Keys information for HDFS Tables
+  11: optional list<hive_metastore.SQLPrimaryKey> primary_keys,
+
+  // Foreign Keys information for HDFS Tables
+  12: optional list<hive_metastore.SQLForeignKey> foreign_keys
 }
 
 struct THBaseTable {
@@ -428,6 +490,16 @@ struct TTable {
 
   // Set iff this a kudu table
   13: optional TKuduTable kudu_table
+
+  // Set iff this is an acid table. The valid write ids list.
+  // The string is assumed to be created by ValidWriteIdList.writeToString
+  // For example ValidReaderWriteIdList object's format is:
+  // <table_name>:<highwatermark>:<minOpenWriteId>:<open_writeids>:<abort_writeids>
+  14: optional string valid_write_ids
+
+  // Set if this table needs storage access during metadata load.
+  // Time used for storage loading in nanoseconds.
+  15: optional i64 storage_metadata_load_time_ns
 }
 
 // Represents a database.
@@ -440,46 +512,62 @@ struct TDatabase {
   2: optional hive_metastore.Database metastore_db
 }
 
-// Represents a role in an authorization policy.
-struct TRole {
-  // Case-insensitive role name
-  1: required string role_name
+// Represents a type of principal.
+enum TPrincipalType {
+  ROLE = 0
+  USER = 1
+  GROUP = 2
+}
 
-  // Unique ID of this role, generated by the Catalog Server.
-  2: required i32 role_id
+// Represents a principal in an authorization policy.
+struct TPrincipal {
+  // Case-insensitive principal name
+  1: required string principal_name
 
-  // List of groups this role has been granted to (group names are case sensitive).
+  // Unique ID of this principal, generated by the Catalog Server.
+  2: required i32 principal_id
+
+  // Type of this principal.
+  3: required TPrincipalType principal_type
+
+  // List of groups this principal has been granted to (group names are case sensitive).
   // TODO: Keep a list of grant groups globally (in TCatalog?) and reference by ID since
-  // the same groups will likely be shared across multiple roles.
-  3: required list<string> grant_groups
+  // the same groups will likely be shared across multiple principals.
+  4: required list<string> grant_groups
 }
 
 // The scope a TPrivilege applies to.
 enum TPrivilegeScope {
-  SERVER,
-  URI,
-  DATABASE,
-  TABLE,
-  COLUMN,
+  SERVER = 0
+  URI = 1
+  DATABASE = 2
+  TABLE = 3
+  COLUMN = 4
 }
 
 // The privilege level allowed.
 enum TPrivilegeLevel {
-  ALL,
-  INSERT,
-  SELECT
+  ALL = 0
+  INSERT = 1
+  SELECT = 2
+  REFRESH = 3
+  CREATE = 4
+  ALTER = 5
+  DROP = 6
+  OWNER = 7
 }
 
 // Represents a privilege in an authorization policy. Privileges contain the level
-// of access, the scope and role the privilege applies to, and details on what
+// of access, the scope and principal the privilege applies to, and details on what
 // catalog object the privilege is securing. Objects are hierarchical, so a privilege
 // corresponding to a table must also specify all the parent objects (database name
 // and server name).
 struct TPrivilege {
-  // A human readable name for this privilege. The combination of role_id +
+  // NOTE: This field is no longer needed. Keeping it here to keep the field numbers.
+  // A human readable name for this privilege. The combination of principal_id +
   // privilege_name is guaranteed to be unique. Stored in a form that can be passed
   // to Sentry: [ServerName]->[DbName]->[TableName]->[ColumnName]->[Action Granted].
-  1: required string privilege_name
+  // 1: required string privilege_name
 
   // The level of access this privilege provides.
   2: required TPrivilegeLevel privilege_level
@@ -488,32 +576,35 @@ struct TPrivilege {
   3: required TPrivilegeScope scope
 
   // If true, GRANT OPTION was specified. For a GRANT privilege statement, everyone
-  // granted this role should be able to issue GRANT/REVOKE privilege statements even if
-  // they are not an admin. For REVOKE privilege statements, the privilege should be
+  // granted this principal should be able to issue GRANT/REVOKE privilege statements even
+  // if they are not an admin. For REVOKE privilege statements, the privilege should be
   // retainined and the existing GRANT OPTION (if it was set) on the privilege should be
   // removed.
   4: required bool has_grant_opt
 
-  // The ID of the role this privilege belongs to.
-  5: optional i32 role_id
+  // The ID of the principal this privilege belongs to.
+  5: optional i32 principal_id
+
+  // The type of the principal this privilege belongs to.
+  6: optional TPrincipalType principal_type
 
   // Set if scope is SERVER, URI, DATABASE, or TABLE
-  6: optional string server_name
+  7: optional string server_name
 
   // Set if scope is DATABASE or TABLE
-  7: optional string db_name
+  8: optional string db_name
 
   // Unqualified table name. Set if scope is TABLE.
-  8: optional string table_name
+  9: optional string table_name
 
   // Set if scope is URI
-  9: optional string uri
+  10: optional string uri
 
   // Time this privilege was created (in milliseconds since epoch).
-  10: optional i64 create_time_ms
+  11: optional i64 create_time_ms
 
   // Set if scope is COLUMN
-  11: optional string column_name
+  12: optional string column_name
 }
 
 // Thrift representation of an HdfsCachePool.
@@ -525,10 +616,21 @@ struct THdfsCachePool {
   // the pool limits, pool owner, etc.
 }
 
+// Thrift representation of an TAuthzCacheInvalidation. This catalog object does not
+// contain any authorization data and it's used as marker to perform an authorization
+// cache invalidation.
+struct TAuthzCacheInvalidation {
+  // Name of the authorization cache marker.
+  1: required string marker_name
+}
+
 // Represents state associated with the overall catalog.
 struct TCatalog {
   // The CatalogService service ID.
   1: required Types.TUniqueId catalog_service_id
+
+  // The catalog version last time when we reset the entire catalog
+  2: required i64 last_reset_catalog_version
 }
 
 // Union of all Thrift Catalog objects
@@ -554,12 +656,15 @@ struct TCatalogObject {
   // Set iff object type is DATA SOURCE
   7: optional TDataSource data_source
 
-  // Set iff object type is ROLE
-  8: optional TRole role
+  // Set iff object type is PRINCIPAL
+  8: optional TPrincipal principal
 
   // Set iff object type is PRIVILEGE
   9: optional TPrivilege privilege
 
   // Set iff object type is HDFS_CACHE_POOL
   10: optional THdfsCachePool cache_pool
+
+  // Set iff object type is AUTHZ_CACHE_INVALIDATION
+  11: optional TAuthzCacheInvalidation authz_cache_invalidation
 }

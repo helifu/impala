@@ -37,8 +37,8 @@ public class CreateDropRoleStmt extends AuthorizationStmt {
   }
 
   @Override
-  public String toSql() {
-    return String.format("%s ROLE %s", roleName_, isDropRole_ ? "DROP" : "CREATE");
+  public String toSql(ToSqlOptions options) {
+    return String.format("%s ROLE %s", isDropRole_ ? "DROP" : "CREATE", roleName_);
   }
 
   public TCreateDropRoleParams toThrift() {
@@ -51,11 +51,5 @@ public class CreateDropRoleStmt extends AuthorizationStmt {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
-    Role existingRole = analyzer.getCatalog().getAuthPolicy().getRole(roleName_);
-    if (isDropRole_ && existingRole == null) {
-      throw new AnalysisException(String.format("Role '%s' does not exist.", roleName_));
-    } else if (!isDropRole_ && existingRole != null) {
-      throw new AnalysisException(String.format("Role '%s' already exists.", roleName_));
-    }
   }
 }

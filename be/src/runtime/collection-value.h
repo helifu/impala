@@ -27,7 +27,7 @@ namespace impala {
 /// arrays and maps are effectively indistinguishable; a map can be thought of as an array
 /// of key/value structs (and neither of these fields are necessarily materialized in the
 /// item tuples).
-struct CollectionValue {
+struct __attribute__((__packed__)) CollectionValue {
   /// Pointer to buffer containing item tuples.
   uint8_t* ptr;
 
@@ -41,6 +41,9 @@ struct CollectionValue {
   inline int64_t ByteSize(const TupleDescriptor& item_tuple_desc) const {
     return static_cast<int64_t>(num_tuples) * item_tuple_desc.byte_size();
   }
+
+  /// For C++/IR interop, we need to be able to look up types by name.
+  static const char* LLVM_CLASS_NAME;
 };
 
 }

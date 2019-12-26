@@ -26,6 +26,7 @@
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
 #include "util/dummy-runtime-profile.h"
+#include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
@@ -57,7 +58,8 @@ void ReservationTracker::InitRootTracker(
 }
 
 void ReservationTracker::InitChildTracker(RuntimeProfile* profile,
-    ReservationTracker* parent, MemTracker* mem_tracker, int64_t reservation_limit) {
+    ReservationTracker* parent, MemTracker* mem_tracker, int64_t reservation_limit,
+    MemLimit mem_limit_mode) {
   DCHECK(parent != nullptr);
   DCHECK_GE(reservation_limit, 0);
 
@@ -65,6 +67,7 @@ void ReservationTracker::InitChildTracker(RuntimeProfile* profile,
   DCHECK(!initialized_);
   parent_ = parent;
   mem_tracker_ = mem_tracker;
+  mem_limit_mode_ = mem_limit_mode;
 
   reservation_limit_ = reservation_limit;
   reservation_ = 0;
@@ -79,7 +82,8 @@ void ReservationTracker::InitChildTracker(RuntimeProfile* profile,
       DCHECK_EQ(parent_mem_tracker, mem_tracker_->parent());
       // Make sure we don't have a lower limit than the ancestor, since we don't enforce
       // limits at lower links.
-      DCHECK_EQ(mem_tracker_->lowest_limit(), parent_mem_tracker->lowest_limit());
+      DCHECK_EQ(mem_tracker_->GetLowestLimit(mem_limit_mode_),
+          parent_mem_tracker->GetLowestLimit(mem_limit_mode_));
     } else {
       // Make sure we didn't leave a gap in the links. E.g. this tracker's grandparent
       // shouldn't have a MemTracker.
@@ -141,6 +145,14 @@ bool ReservationTracker::IncreaseReservationToFit(int64_t bytes, Status* error_s
   return IncreaseReservationInternalLocked(bytes, true, false, error_status);
 }
 
+bool ReservationTracker::IncreaseReservationToFitAndAllocate(
+    int64_t bytes, Status* error_status) {
+  lock_guard<SpinLock> l(lock_);
+  if (!IncreaseReservationInternalLocked(bytes, true, false, error_status)) return false;
+  AllocateFromLocked(bytes);
+  return true;
+}
+
 bool ReservationTracker::IncreaseReservationInternalLocked(int64_t bytes,
     bool use_existing_reservation, bool is_child_reservation, Status* error_status) {
   DCHECK(initialized_);
@@ -200,7 +212,8 @@ bool ReservationTracker::IncreaseReservationInternalLocked(int64_t bytes,
       granted = parent_->IncreaseReservationInternalLocked(
           reservation_increase, true, true, error_status);
     }
-    if (granted && !TryConsumeFromMemTracker(reservation_increase)) {
+    if (granted
+        && !TryConsumeFromMemTracker(reservation_increase, mem_limit_mode_)) {
       granted = false;
       if (error_status != nullptr) {
         *error_status = mem_tracker_->MemLimitExceeded(nullptr,
@@ -222,13 +235,14 @@ bool ReservationTracker::IncreaseReservationInternalLocked(int64_t bytes,
   return granted;
 }
 
-bool ReservationTracker::TryConsumeFromMemTracker(int64_t reservation_increase) {
+bool ReservationTracker::TryConsumeFromMemTracker(
+    int64_t reservation_increase, MemLimit mem_limit_mode) {
   DCHECK_GE(reservation_increase, 0);
   if (mem_tracker_ == nullptr) return true;
   if (GetParentMemTracker() == nullptr) {
     // At the topmost link, which may be a MemTracker with a limit, we need to use
     // TryConsume() to check the limit.
-    return mem_tracker_->TryConsume(reservation_increase);
+    return mem_tracker_->TryConsume(reservation_increase, mem_limit_mode);
   } else {
     // For lower links, there shouldn't be a limit to enforce, so we just need to
     // update the consumption of the linked MemTracker since the reservation is
@@ -321,7 +335,7 @@ bool ReservationTracker::TransferReservationTo(ReservationTracker* other, int64_
     // We don't handle MemTrackers with limit in this function - this should always
     // succeed.
     DCHECK(tracker->mem_tracker_ == nullptr || !tracker->mem_tracker_->has_limit());
-    bool success = tracker->TryConsumeFromMemTracker(bytes);
+    bool success = tracker->TryConsumeFromMemTracker(bytes, MemLimit::HARD);
     DCHECK(success);
     if (tracker != other_path_to_common[0]) tracker->child_reservations_ += bytes;
   }
@@ -359,6 +373,10 @@ vector<ReservationTracker*> ReservationTracker::FindPathToRoot() {
 
 void ReservationTracker::AllocateFrom(int64_t bytes) {
   lock_guard<SpinLock> l(lock_);
+  AllocateFromLocked(bytes);
+}
+
+void ReservationTracker::AllocateFromLocked(int64_t bytes) {
   DCHECK(initialized_);
   DCHECK_GE(bytes, 0);
   DCHECK_LE(bytes, unused_reservation());

@@ -17,6 +17,7 @@
 
 package org.apache.impala.service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -24,14 +25,13 @@ import java.util.Objects;
 import org.apache.hadoop.hive.metastore.api.PrincipalPrivilegeSet;
 import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.PrivilegeGrantInfo;
-import org.apache.hadoop.hive.ql.metadata.formatting.MetaDataFormatUtils;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.KuduColumn;
-import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
@@ -51,7 +51,7 @@ public class DescribeResultFactory {
   // Empty column used to format description output table.
   private final static TColumnValue EMPTY = new TColumnValue().setString_val("");
 
-  public static TDescribeResult buildDescribeDbResult(Db db,
+  public static TDescribeResult buildDescribeDbResult(FeDb db,
     TDescribeOutputStyle outputFormat) {
     switch (outputFormat) {
       case MINIMAL: return describeDbMinimal(db);
@@ -67,7 +67,7 @@ public class DescribeResultFactory {
    * Builds results for a DESCRIBE DATABASE <db> command. This consists of the database
    * location and comment.
    */
-  private static TDescribeResult describeDbMinimal(Db db) {
+  private static TDescribeResult describeDbMinimal(FeDb db) {
     TDescribeResult descResult = new TDescribeResult();
 
     org.apache.hadoop.hive.metastore.api.Database msDb = db.getMetaStoreDb();
@@ -122,7 +122,7 @@ public class DescribeResultFactory {
    * Builds a TDescribeResult that contains the result of a DESCRIBE FORMATTED|EXTENDED
    * DATABASE <db> command. Output all the database's properties.
    */
-  private static TDescribeResult describeDbExtended(Db db) {
+  private static TDescribeResult describeDbExtended(FeDb db) {
     TDescribeResult descResult = describeDbMinimal(db);
     org.apache.hadoop.hive.metastore.api.Database msDb = db.getMetaStoreDb();
     String ownerName = null;
@@ -181,9 +181,11 @@ public class DescribeResultFactory {
    * Builds a TDescribeResult that contains the result of a DESCRIBE FORMATTED|EXTENDED
    * <table> command. For the formatted describe output the goal is to be exactly the
    * same as what Hive (via HiveServer2) outputs, for compatibility reasons. To do this,
-   * Hive's MetadataFormatUtils class is used to build the results.
+   * Hive's MetadataFormatUtils class is used to build the results.  filteredColumns is a
+   * list of columns the user is authorized to view.
    */
-  public static TDescribeResult buildDescribeFormattedResult(Table table) {
+  public static TDescribeResult buildDescribeFormattedResult(FeTable table,
+      List<Column> filteredColumns) {
     TDescribeResult result = new TDescribeResult();
     result.results = Lists.newArrayList();
 
@@ -192,8 +194,19 @@ public class DescribeResultFactory {
     // For some table formats (e.g. Avro) the column list in the table can differ from the
     // one returned by the Hive metastore. To handle this we use the column list from the
     // table which has already reconciled those differences.
-    msTable.getSd().setCols(Column.toFieldSchemas(table.getNonClusteringColumns()));
-    msTable.setPartitionKeys(Column.toFieldSchemas(table.getClusteringColumns()));
+    // Need to create a new list since if the columns are filtered, this will
+    // affect the original list.
+    List<Column> nonClustered = new ArrayList<Column>();
+    List<Column> clustered = new ArrayList<Column>();
+    for (Column col: filteredColumns) {
+      if (table.isClusteringColumn(col)) {
+        clustered.add(col);
+      } else {
+        nonClustered.add(col);
+      }
+    }
+    msTable.getSd().setCols(Column.toFieldSchemas(nonClustered));
+    msTable.setPartitionKeys(Column.toFieldSchemas(clustered));
 
     // To avoid initializing any of the SerDe classes in the metastore table Thrift
     // struct, create the ql.metadata.Table object by calling the empty c'tor and
@@ -203,15 +216,15 @@ public class DescribeResultFactory {
     hiveTable.setTTable(msTable);
     StringBuilder sb = new StringBuilder();
     // First add all the columns (includes partition columns).
-    sb.append(MetaDataFormatUtils.getAllColumnsInformation(msTable.getSd().getCols(),
+    sb.append(MetastoreShim.getAllColumnsInformation(msTable.getSd().getCols(),
         msTable.getPartitionKeys(), true, false, true));
     // Add the extended table metadata information.
-    sb.append(MetaDataFormatUtils.getTableInformation(hiveTable));
+    sb.append(MetastoreShim.getTableInformation(hiveTable));
 
     for (String line: sb.toString().split("\n")) {
       // To match Hive's HiveServer2 output, split each line into multiple column
       // values based on the field delimiter.
-      String[] columns = line.split(MetaDataFormatUtils.FIELD_DELIM);
+      String[] columns = line.split("\t");
       TResultRow resultRow = new TResultRow();
       for (int i = 0; i < NUM_DESC_FORMATTED_RESULT_COLS; ++i) {
         TColumnValue colVal = new TColumnValue();
@@ -248,16 +261,12 @@ public class DescribeResultFactory {
   }
 
   /**
-   * Builds a TDescribeResult for a table.
+   * Builds a TDescribeResult for a kudu table from a list of columns.
    */
-  public static TDescribeResult buildDescribeMinimalResult(Table table) {
-    if (!(table instanceof KuduTable)) {
-      return buildDescribeMinimalResult(table.getHiveColumnsAsStruct());
-    }
-
+  public static TDescribeResult buildKuduDescribeMinimalResult(List<Column> columns) {
     TDescribeResult descResult = new TDescribeResult();
     descResult.results = Lists.newArrayList();
-    for (Column c: table.getColumnsInHiveOrder()) {
+    for (Column c: columns) {
       Preconditions.checkState(c instanceof KuduColumn);
       KuduColumn kuduColumn = (KuduColumn) c;
       // General describe info.

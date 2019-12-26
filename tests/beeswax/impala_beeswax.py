@@ -25,6 +25,7 @@
 #   client.connect()
 #   result = client.execute(query_string)
 #   where result is an object of the class ImpalaBeeswaxResult.
+import logging
 import time
 import shlex
 import getpass
@@ -44,6 +45,8 @@ from thrift.transport.TTransport import TTransportException
 from thrift.protocol import TBinaryProtocol
 from thrift.Thrift import TApplicationException
 
+LOG = logging.getLogger('impala_beeswax')
+
 # Custom exception wrapper.
 # All exceptions coming from thrift/beeswax etc. go through this wrapper.
 # __str__ preserves the exception type.
@@ -60,6 +63,7 @@ class ImpalaBeeswaxException(Exception):
 class ImpalaBeeswaxResult(object):
   def __init__(self, **kwargs):
     self.query = kwargs.get('query', None)
+    self.query_id = kwargs['query_id']
     self.success = kwargs.get('success', False)
     # Insert returns an int, convert into list to have a uniform data type.
     # TODO: We should revisit this if we have more datatypes to deal with.
@@ -71,6 +75,12 @@ class ImpalaBeeswaxResult(object):
     self.time_taken = kwargs.get('time_taken', 0)
     self.summary = kwargs.get('summary', str())
     self.schema = kwargs.get('schema', None)
+    self.column_types = None
+    self.column_labels = None
+    if self.schema is not None:
+      # Extract labels and types so there is a shared interface with HS2ResultSet.
+      self.column_types = [fs.type.upper() for fs in self.schema.fieldSchemas]
+      self.column_labels = [fs.name.upper() for fs in self.schema.fieldSchemas]
     self.runtime_profile = kwargs.get('runtime_profile', str())
     self.exec_summary = kwargs.get('exec_summary', None)
 
@@ -100,7 +110,12 @@ class ImpalaBeeswaxClient(object):
   def __init__(self, impalad, use_kerberos=False, user=None, password=None,
                use_ssl=False):
     self.connected = False
-    self.impalad = impalad
+    split_impalad = impalad.split(":")
+    assert len(split_impalad) in [1, 2]
+    self.impalad_host = split_impalad[0]
+    self.impalad_port = 21000  # Default beeswax port
+    if len(split_impalad) == 2:
+      self.impalad_port = int(split_impalad[1])
     self.imp_service = None
     self.transport = None
     self.use_kerberos = use_kerberos
@@ -138,7 +153,6 @@ class ImpalaBeeswaxClient(object):
     Raises an exception if the connection is unsuccesful.
     """
     try:
-      self.impalad = self.impalad.split(':')
       self.transport = self.__get_transport()
       self.transport.open()
       protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
@@ -160,7 +174,7 @@ class ImpalaBeeswaxClient(object):
       trans_type = 'kerberos'
     elif self.use_ldap:
       trans_type = 'plain_sasl'
-    return create_transport(host=self.impalad[0], port=int(self.impalad[1]),
+    return create_transport(host=self.impalad_host, port=self.impalad_port,
                             service='impala', transport_type=trans_type, user=self.user,
                             password=self.password, use_ssl=self.use_ssl)
 
@@ -178,7 +192,7 @@ class ImpalaBeeswaxClient(object):
       # fetch_results() will close the query after which there is no guarantee that
       # profile and log will be available so fetch them first.
       runtime_profile = self.get_runtime_profile(handle)
-      exec_summary = self.get_exec_summary(handle)
+      exec_summary = self.get_exec_summary_and_parse(handle)
       log = self.get_log(handle.log_context)
 
       result = self.fetch_results(query_string, handle)
@@ -191,16 +205,20 @@ class ImpalaBeeswaxClient(object):
       result = self.fetch_results(query_string, handle)
       result.time_taken = time.time() - start
       result.start_time = start_time
-      result.exec_summary = self.get_exec_summary(handle)
+      result.exec_summary = self.get_exec_summary_and_parse(handle)
       result.log = self.get_log(handle.log_context)
       result.runtime_profile = self.get_runtime_profile(handle)
       self.close_query(handle)
     return result
 
   def get_exec_summary(self, handle):
-    """Calls GetExecSummary() for the last query handle"""
+    return self.__do_rpc(lambda: self.imp_service.GetExecSummary(handle))
+
+  def get_exec_summary_and_parse(self, handle):
+    """Calls GetExecSummary() for the last query handle, parses it and returns a summary
+    table. Returns None in case of an error or an empty result"""
     try:
-      summary = self.__do_rpc(lambda: self.imp_service.GetExecSummary(handle))
+      summary = self.get_exec_summary(handle)
     except ImpalaBeeswaxException:
       summary = None
 
@@ -266,14 +284,18 @@ class ImpalaBeeswaxClient(object):
       else:
         avg_time = 0
 
-      row["num_hosts"] = len(node.exec_stats)
+      row["num_instances"] = len(node.exec_stats)
+      row["num_hosts"] = node.num_hosts
       row["avg_time"] = avg_time
 
+    is_sink = node.node_id == -1
     # If the node is a broadcast-receiving exchange node, the cardinality of rows produced
     # is the max over all instances (which should all have received the same number of
     # rows). Otherwise, the cardinality is the sum over all instances which process
     # disjoint partitions.
-    if node.is_broadcast:
+    if is_sink:
+      cardinality = -1
+    elif node.is_broadcast:
       cardinality = max_stats.cardinality
     else:
       cardinality = agg_stats.cardinality
@@ -332,13 +354,15 @@ class ImpalaBeeswaxClient(object):
     query.query = query_string
     query.hadoop_user = user if user is not None else getpass.getuser()
     query.configuration = self.__options_to_string_list()
-    return self.__do_rpc(lambda: self.imp_service.query(query,))
+    handle = self.__do_rpc(lambda: self.imp_service.query(query,))
+    LOG.info("Started query {0}".format(handle.id))
+    return handle
 
   def __execute_query(self, query_string, user=None):
     """Executes a query and waits for completion"""
     handle = self.execute_query_async(query_string, user=user)
     # Wait for the query to finish execution.
-    self.wait_for_completion(handle)
+    self.wait_for_finished(handle)
     return handle
 
   def cancel_query(self, query_id):
@@ -347,8 +371,9 @@ class ImpalaBeeswaxClient(object):
   def close_query(self, handle):
     self.__do_rpc(lambda: self.imp_service.close(handle))
 
-  def wait_for_completion(self, query_handle):
-    """Given a query handle, polls the coordinator waiting for the query to complete"""
+  def wait_for_finished(self, query_handle):
+    """Given a query handle, polls the coordinator waiting for the query to transition to
+       'FINISHED' state"""
     while True:
       query_state = self.get_state(query_handle)
       # if the rpc succeeded, the output is the query state
@@ -363,6 +388,44 @@ class ImpalaBeeswaxClient(object):
           self.close_query(query_handle)
       time.sleep(0.05)
 
+  def wait_for_finished_timeout(self, query_handle, timeout=10):
+    """Given a query handle and a timeout, polls the coordinator waiting for the query to
+       transition to 'FINISHED' state till 'timeout' seconds"""
+    start_time = time.time()
+    while (time.time() - start_time < timeout):
+      query_state = self.get_state(query_handle)
+      # if the rpc succeeded, the output is the query state
+      if query_state == self.query_states["FINISHED"]:
+        return True
+      elif query_state == self.query_states["EXCEPTION"]:
+        try:
+          error_log = self.__do_rpc(
+            lambda: self.imp_service.get_log(query_handle.log_context))
+          raise ImpalaBeeswaxException("Query aborted:" + error_log, None)
+        finally:
+          self.close_query(query_handle)
+      time.sleep(0.05)
+    return False
+
+  def wait_for_admission_control(self, query_handle):
+    """Given a query handle, polls the coordinator waiting for it to complete
+      admission control processing of the query"""
+    while True:
+      query_state = self.get_state(query_handle)
+      if query_state > self.query_states["COMPILED"]:
+        break
+      time.sleep(0.05)
+
+  def get_admission_result(self, query_handle):
+    """Given a query handle, returns the admission result from the query profile"""
+    query_state = self.get_state(query_handle)
+    if query_state > self.query_states["COMPILED"]:
+      query_profile = self.get_runtime_profile(query_handle)
+      admit_result = re.search(r"Admission result: (.*)", query_profile)
+      if admit_result:
+        return admit_result.group(1)
+    return ""
+
   def get_default_configuration(self):
     return self.__do_rpc(lambda: self.imp_service.get_default_configuration(False))
 
@@ -372,21 +435,14 @@ class ImpalaBeeswaxClient(object):
   def get_log(self, query_handle):
     return self.__do_rpc(lambda: self.imp_service.get_log(query_handle))
 
-  def refresh(self):
-    """Invalidate the Impalad catalog"""
-    return self.execute("invalidate metadata")
-
-  def refresh_table(self, db_name, table_name):
-    """Refresh a specific table from the catalog"""
-    return self.execute("refresh %s.%s" % (db_name, table_name))
-
   def fetch_results(self, query_string, query_handle, max_rows = -1):
     """Fetches query results given a handle and query type (insert, use, other)"""
     query_type = self.__get_query_type(query_string)
     if query_type == 'use':
       # TODO: "use <database>" does not currently throw an error. Need to update this
       # to handle the error case once that behavior has been changed.
-      return ImpalaBeeswaxResult(query=query_string, success=True, data=[])
+      return ImpalaBeeswaxResult(query=query_string, query_id=query_handle.id,
+                                 success=True, data=[])
 
     # Result fetching for insert is different from other queries.
     exec_result = None
@@ -410,17 +466,21 @@ class ImpalaBeeswaxClient(object):
         break
 
     # The query executed successfully and all the data was fetched.
-    exec_result = ImpalaBeeswaxResult(success=True, data=result_rows, schema=schema)
+    exec_result = ImpalaBeeswaxResult(query_id=handle.id, success=True, data=result_rows,
+                                      schema=schema)
     exec_result.summary = 'Returned %d rows' % (len(result_rows))
     return exec_result
 
+  def close_dml(self, handle):
+    return self.__do_rpc(lambda: self.imp_service.CloseInsert(handle))
+
   def __fetch_insert_results(self, handle):
     """Executes an insert query"""
-    result = self.__do_rpc(lambda: self.imp_service.CloseInsert(handle))
+    result = self.close_dml(handle)
     # The insert was successful
     num_rows = sum(map(int, result.rows_modified.values()))
     data = ["%s: %s" % row for row in result.rows_modified.iteritems()]
-    exec_result = ImpalaBeeswaxResult(success=True, data=data)
+    exec_result = ImpalaBeeswaxResult(query_id=handle.id, success=True, data=data)
     exec_result.summary = "Inserted %d rows" % (num_rows,)
     return exec_result
 

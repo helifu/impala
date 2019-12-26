@@ -25,7 +25,11 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/scheduling")
 # TODO: Move other scheduling-related classes here
 add_library(Scheduling STATIC
   admission-controller.cc
-  backend-config.cc
+  executor-blacklist.cc
+  cluster-membership-mgr.cc
+  cluster-membership-test-util.cc
+  executor-group.cc
+  hash-ring.cc
   query-schedule.cc
   request-pool-service.cc
   scheduler-test-util.cc
@@ -33,7 +37,17 @@ add_library(Scheduling STATIC
 )
 add_dependencies(Scheduling gen-deps)
 
-ADD_BE_TEST(scheduler-test)
-ADD_BE_TEST(backend-config-test)
-# TODO: Add BE test
-# ADD_BE_TEST(admission-controller-test)
+add_library(SchedulingTests STATIC
+  admission-controller-test.cc
+  cluster-membership-mgr-test.cc
+  executor-group-test.cc
+  hash-ring-test.cc
+  scheduler-test.cc
+)
+add_dependencies(SchedulingTests gen-deps)
+
+ADD_UNIFIED_BE_LSAN_TEST(admission-controller-test AdmissionControllerTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(cluster-membership-mgr-test ClusterMembershipMgrTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(executor-group-test ExecutorGroupTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(hash-ring-test HashRingTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(scheduler-test SchedulerTest.*)

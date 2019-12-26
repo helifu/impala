@@ -23,23 +23,21 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.KuduTable;
-import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.planner.DataSink;
 import org.apache.impala.rewrite.ExprRewriter;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
 /**
  * Abstract super class for statements that modify existing data like
@@ -80,7 +78,7 @@ public abstract class ModifyStmt extends StatementBase {
 
   // Target Kudu table. Since currently only Kudu tables are supported, we use a
   // concrete table class. Result of analysis.
-  protected KuduTable table_;
+  protected FeKuduTable table_;
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
@@ -88,7 +86,10 @@ public abstract class ModifyStmt extends StatementBase {
   // Position mapping of output expressions of the sourceStmt_ to column indices in the
   // target table. The i'th position in this list maps to the referencedColumns_[i]'th
   // position in the target table. Set in createSourceStmt() during analysis.
-  protected ArrayList<Integer> referencedColumns_;
+  protected List<Integer> referencedColumns_;
+
+  // SQL string of the ModifyStmt. Set in analyze().
+  protected String sqlString_;
 
   public ModifyStmt(List<String> targetTablePath, FromClause fromClause,
       List<Pair<SlotRef, Expr>> assignmentExprs, Expr wherePredicate) {
@@ -96,6 +97,20 @@ public abstract class ModifyStmt extends StatementBase {
     fromClause_ = Preconditions.checkNotNull(fromClause);
     assignments_ = Preconditions.checkNotNull(assignmentExprs);
     wherePredicate_ = wherePredicate;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(targetTablePath_, null));
+    fromClause_.collectTableRefs(tblRefs);
+    if (wherePredicate_ != null) {
+      // Collect TableRefs in WHERE-clause subqueries.
+      List<Subquery> subqueries = new ArrayList<>();
+      wherePredicate_.collect(Subquery.class, subqueries);
+      for (Subquery sq : subqueries) {
+        sq.getStatement().collectTableRefs(tblRefs);
+      }
+    }
   }
 
   /**
@@ -135,14 +150,14 @@ public abstract class ModifyStmt extends StatementBase {
     }
 
     Preconditions.checkNotNull(targetTableRef_);
-    Table dstTbl = targetTableRef_.getTable();
+    FeTable dstTbl = targetTableRef_.getTable();
     // Only Kudu tables can be updated
-    if (!(dstTbl instanceof KuduTable)) {
+    if (!(dstTbl instanceof FeKuduTable)) {
       throw new AnalysisException(
           format("Impala does not support modifying a non-Kudu table: %s",
               dstTbl.getFullName()));
     }
-    table_ = (KuduTable) dstTbl;
+    table_ = (FeKuduTable) dstTbl;
 
     // Make sure that the user is allowed to modify the target table. Use ALL because no
     // UPDATE / DELETE privilege exists yet (IMPALA-3840).
@@ -153,6 +168,8 @@ public abstract class ModifyStmt extends StatementBase {
     sourceStmt_.analyze(analyzer);
     // Add target table to descriptor table.
     analyzer.getDescTbl().setTargetTable(table_);
+
+    sqlString_ = toSql();
   }
 
   @Override
@@ -175,8 +192,8 @@ public abstract class ModifyStmt extends StatementBase {
   private void createSourceStmt(Analyzer analyzer)
       throws AnalysisException {
     // Builds the select list and column position mapping for the target table.
-    ArrayList<SelectListItem> selectList = Lists.newArrayList();
-    referencedColumns_ = Lists.newArrayList();
+    ArrayList<SelectListItem> selectList = new ArrayList<>();
+    referencedColumns_ = new ArrayList<>();
     buildAndValidateAssignmentExprs(analyzer, selectList, referencedColumns_);
 
     // Analyze the generated select statement.
@@ -206,22 +223,22 @@ public abstract class ModifyStmt extends StatementBase {
    * are always prepended to the list of expression representing the assignments.
    */
   private void buildAndValidateAssignmentExprs(Analyzer analyzer,
-      ArrayList<SelectListItem> selectList, ArrayList<Integer> referencedColumns)
+      List<SelectListItem> selectList, List<Integer> referencedColumns)
       throws AnalysisException {
     // The order of the referenced columns equals the order of the result expressions
-    HashSet<SlotId> uniqueSlots = Sets.newHashSet();
-    HashSet<SlotId> keySlots = Sets.newHashSet();
+    Set<SlotId> uniqueSlots = new HashSet<>();
+    Set<SlotId> keySlots = new HashSet<>();
 
     // Mapping from column name to index
-    ArrayList<Column> cols = table_.getColumnsInHiveOrder();
-    HashMap<String, Integer> colIndexMap = Maps.newHashMap();
+    List<Column> cols = table_.getColumnsInHiveOrder();
+    Map<String, Integer> colIndexMap = new HashMap<>();
     for (int i = 0; i < cols.size(); i++) {
       colIndexMap.put(cols.get(i).getName(), i);
     }
 
     // Add the key columns as slot refs
     for (String k : table_.getPrimaryKeyColumnNames()) {
-      ArrayList<String> path = Path.createRawPath(targetTableRef_.getUniqueAlias(), k);
+      List<String> path = Path.createRawPath(targetTableRef_.getUniqueAlias(), k);
       SlotRef ref = new SlotRef(path);
       ref.analyze(analyzer);
       selectList.add(new SelectListItem(ref, null));
@@ -232,11 +249,17 @@ public abstract class ModifyStmt extends StatementBase {
 
     // Assignments are only used in the context of updates.
     for (Pair<SlotRef, Expr> valueAssignment : assignments_) {
-      Expr rhsExpr = valueAssignment.second;
-      rhsExpr.analyze(analyzer);
-
       SlotRef lhsSlotRef = valueAssignment.first;
       lhsSlotRef.analyze(analyzer);
+
+      Expr rhsExpr = valueAssignment.second;
+      // No subqueries for rhs expression
+      if (rhsExpr.contains(Subquery.class)) {
+        throw new AnalysisException(
+            format("Subqueries are not supported as update expressions for column '%s'",
+                lhsSlotRef.toSql()));
+      }
+      rhsExpr.analyze(analyzer);
 
       // Correct target table
       if (!lhsSlotRef.isBoundByTupleIds(targetTableRef_.getId().asList())) {
@@ -244,13 +267,6 @@ public abstract class ModifyStmt extends StatementBase {
             format("Left-hand side column '%s' in assignment expression '%s=%s' does not "
                 + "belong to target table '%s'", lhsSlotRef.toSql(), lhsSlotRef.toSql(),
                 rhsExpr.toSql(), targetTableRef_.getDesc().getTable().getFullName()));
-      }
-
-      // No subqueries for rhs expression
-      if (rhsExpr.contains(Subquery.class)) {
-        throw new AnalysisException(
-            format("Subqueries are not supported as update expressions for column '%s'",
-                lhsSlotRef.toSql()));
       }
 
       Column c = lhsSlotRef.getResolvedPath().destColumn();
@@ -271,8 +287,8 @@ public abstract class ModifyStmt extends StatementBase {
             format("Duplicate value assignment to column: '%s'", lhsSlotRef.toSql()));
       }
 
-      rhsExpr = checkTypeCompatibility(
-          targetTableRef_.getDesc().getTable().getFullName(), c, rhsExpr);
+      rhsExpr = checkTypeCompatibility(targetTableRef_.getDesc().getTable().getFullName(),
+          c, rhsExpr, analyzer.isDecimalV2(), null /*widestTypeSrcExpr*/);
       uniqueSlots.add(lhsSlotRef.getSlotId());
       selectList.add(new SelectListItem(rhsExpr, null));
       referencedColumns.add(colIndexMap.get(c.getName()));
@@ -297,9 +313,7 @@ public abstract class ModifyStmt extends StatementBase {
   }
 
   public QueryStmt getQueryStmt() { return sourceStmt_; }
-  public abstract DataSink createDataSink();
+  public abstract DataSink createDataSink(List<Expr> resultExprs);
   @Override
-  public abstract String toSql();
-
-
+  public abstract String toSql(ToSqlOptions options);
 }

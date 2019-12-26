@@ -21,11 +21,14 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 #include <sasl/sasl.h>
 
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/negotiation.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
@@ -35,19 +38,19 @@
 #include "kudu/security/token.pb.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class Slice;
+class faststring;
 
 namespace security {
 class TlsContext;
 }
 
 namespace rpc {
-
-class NegotiatePB;
-class NegotiatePB_SaslAuth;
-class ResponseHeader;
 
 // Class for doing KRPC negotiation with a remote server over a bidirectional socket.
 // Operations on this class are NOT thread-safe.
@@ -61,8 +64,8 @@ class ClientNegotiation {
   // The provided TlsContext must outlive this negotiation instance.
   ClientNegotiation(std::unique_ptr<Socket> socket,
                     const security::TlsContext* tls_context,
-                    const boost::optional<security::SignedTokenPB>& authn_token,
-                    security::RpcEncryption encryption,
+                    boost::optional<security::SignedTokenPB> authn_token,
+                    RpcEncryption encryption,
                     std::string sasl_proto_name);
 
   // Enable PLAIN authentication.
@@ -136,6 +139,9 @@ class ClientNegotiation {
 
   // SASL callback for SASL_CB_PASS
   int SecretCb(sasl_conn_t* conn, int id, sasl_secret_t** psecret);
+
+  // Check that GSSAPI/Kerberos credentials are available.
+  static Status CheckGSSAPI() WARN_UNUSED_RESULT;
 
  private:
 
@@ -221,7 +227,7 @@ class ClientNegotiation {
   // TLS state.
   const security::TlsContext* tls_context_;
   security::TlsHandshake tls_handshake_;
-  const security::RpcEncryption encryption_;
+  const RpcEncryption encryption_;
   bool tls_negotiated_;
 
   // TSK state.

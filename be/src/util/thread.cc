@@ -78,10 +78,10 @@ namespace {
 //   },
 //   { ... }
 // ]
-void JvmThreadsUrlCallback(const Webserver::ArgumentMap& args, Document* doc);
+void JvmThreadsUrlCallback(const Webserver::WebRequest& req, Document* doc);
 
 void ThreadOverviewUrlCallback(bool include_jvm_threads,
-    const Webserver::ArgumentMap& args, Document* document);
+    const Webserver::WebRequest& req, Document* document);
 
 }
 
@@ -141,7 +141,7 @@ class ThreadMgr {
   //             "iowait_ns": 0
   //             }
   //        ]
-  void ThreadGroupUrlCallback(const Webserver::ArgumentMap& args, Document* output);
+  void ThreadGroupUrlCallback(const Webserver::WebRequest& req, Document* output);
 
  private:
   // Container class for any details we want to capture about a thread
@@ -228,7 +228,8 @@ void ThreadMgr::GetThreadOverview(Document* document) {
   Value lst(kArrayType);
   for (const ThreadCategoryMap::value_type& category: thread_categories_) {
     Value val(kObjectType);
-    val.AddMember("name", category.first.c_str(), document->GetAllocator());
+    Value name(category.first.c_str(), document->GetAllocator());
+    val.AddMember("name", name, document->GetAllocator());
     val.AddMember("size", static_cast<uint64_t>(category.second.threads_by_id.size()),
         document->GetAllocator());
     val.AddMember("num_created",
@@ -240,10 +241,11 @@ void ThreadMgr::GetThreadOverview(Document* document) {
   document->AddMember("thread-groups", lst, document->GetAllocator());
 }
 
-void ThreadMgr::ThreadGroupUrlCallback(const Webserver::ArgumentMap& args,
+void ThreadMgr::ThreadGroupUrlCallback(const Webserver::WebRequest& req,
     Document* document) {
   lock_guard<mutex> l(lock_);
   vector<const ThreadCategory*> categories_to_print;
+  const auto& args = req.parsed_args;
   Webserver::ArgumentMap::const_iterator category_it = args.find("group");
   string category_name = (category_it == args.end()) ? "all" : category_it->second;
   if (category_name != "all") {
@@ -254,7 +256,8 @@ void ThreadMgr::ThreadGroupUrlCallback(const Webserver::ArgumentMap& args,
     }
     categories_to_print.push_back(&category->second);
     Value val(kObjectType);
-    val.AddMember("category", category->first.c_str(), document->GetAllocator());
+    Value name(category->first.c_str(), document->GetAllocator());
+    val.AddMember("category", name, document->GetAllocator());
     val.AddMember("size", static_cast<uint64_t>(category->second.threads_by_id.size()),
         document->GetAllocator());
     document->AddMember("thread-group", val, document->GetAllocator());
@@ -268,7 +271,8 @@ void ThreadMgr::ThreadGroupUrlCallback(const Webserver::ArgumentMap& args,
   for (const ThreadCategory* category: categories_to_print) {
     for (const auto& thread : category->threads_by_id) {
       Value val(kObjectType);
-      val.AddMember("name", thread.second.name().c_str(), document->GetAllocator());
+      Value name(thread.second.name().c_str(), document->GetAllocator());
+      val.AddMember("name", name, document->GetAllocator());
       val.AddMember("id", thread.second.thread_id(), document->GetAllocator());
       ThreadStats stats;
       Status status = GetThreadStats(thread.second.thread_id(), &stats);
@@ -311,7 +315,7 @@ Status Thread::StartThread(const std::string& category, const std::string& name,
   try {
     t->thread_.reset(
         new boost::thread(&Thread::SuperviseThread, t->name_, t->category_, functor,
-            &thread_started));
+            GetThreadDebugInfo(), &thread_started));
   } catch (boost::thread_resource_error& e) {
     return Status(TErrorCode::THREAD_CREATION_FAILED, name, category, e.what());
   }
@@ -327,7 +331,8 @@ Status Thread::StartThread(const std::string& category, const std::string& name,
 }
 
 void Thread::SuperviseThread(const string& name, const string& category,
-    Thread::ThreadFunctor functor, Promise<int64_t>* thread_started) {
+    Thread::ThreadFunctor functor, const ThreadDebugInfo* parent_thread_info,
+    Promise<int64_t>* thread_started) {
   int64_t system_tid = syscall(SYS_gettid);
   if (system_tid == -1) {
     string error_msg = GetStrErrMsg();
@@ -340,12 +345,13 @@ void Thread::SuperviseThread(const string& name, const string& category,
 
   // Use boost's get_id rather than the system thread ID as the unique key for this thread
   // since the latter is more prone to being recycled.
-
   thread_mgr_ref->AddThread(this_thread::get_id(), name_copy, category_copy, system_tid);
-  thread_started->Set(system_tid);
 
   ThreadDebugInfo thread_debug_info;
   thread_debug_info.SetThreadName(name_copy);
+  thread_debug_info.SetParentInfo(parent_thread_info);
+
+  thread_started->Set(system_tid);
 
   // Any reference to any parameter not copied in by value may no longer be valid after
   // this point, since the caller that is waiting on *tid != 0 may wake, take the lock and
@@ -372,20 +378,21 @@ namespace {
 void RegisterUrlCallbacks(bool include_jvm_threads, Webserver* webserver) {
   DCHECK(webserver != nullptr);
   auto overview_callback = [include_jvm_threads]
-      (const Webserver::ArgumentMap& args, Document* doc) {
-    ThreadOverviewUrlCallback(include_jvm_threads, args, doc);
+      (const Webserver::WebRequest& req, Document* doc) {
+    ThreadOverviewUrlCallback(include_jvm_threads, req, doc);
   };
-  webserver->RegisterUrlCallback(THREADS_WEB_PAGE, THREADS_TEMPLATE, overview_callback);
+  webserver->RegisterUrlCallback(
+      THREADS_WEB_PAGE, THREADS_TEMPLATE, overview_callback, true);
 
-  auto group_callback = [] (const Webserver::ArgumentMap& args, Document* doc) {
-    thread_manager->ThreadGroupUrlCallback(args, doc);
+  auto group_callback = [] (const Webserver::WebRequest& req, Document* doc) {
+    thread_manager->ThreadGroupUrlCallback(req, doc);
   };
   webserver->RegisterUrlCallback(THREAD_GROUP_WEB_PAGE, THREAD_GROUP_TEMPLATE,
       group_callback, false);
 
   if (include_jvm_threads) {
-    auto jvm_threads_callback = [] (const Webserver::ArgumentMap& args, Document* doc) {
-      JvmThreadsUrlCallback(args, doc);
+    auto jvm_threads_callback = [] (const Webserver::WebRequest& req, Document* doc) {
+      JvmThreadsUrlCallback(req, doc);
     };
     webserver->RegisterUrlCallback(JVM_THREADS_WEB_PAGE, JVM_THREADS_TEMPLATE,
         jvm_threads_callback, false);
@@ -393,7 +400,7 @@ void RegisterUrlCallbacks(bool include_jvm_threads, Webserver* webserver) {
 }
 
 void ThreadOverviewUrlCallback(bool include_jvm_threads,
-    const Webserver::ArgumentMap& args, Document* document) {
+    const Webserver::WebRequest& req, Document* document) {
   thread_manager->GetThreadOverview(document);
   if (!include_jvm_threads) return;
 
@@ -417,7 +424,7 @@ void ThreadOverviewUrlCallback(bool include_jvm_threads,
   document->AddMember("jvm-threads", jvm_threads_val, document->GetAllocator());
 }
 
-void JvmThreadsUrlCallback(const Webserver::ArgumentMap& args, Document* doc) {
+void JvmThreadsUrlCallback(const Webserver::WebRequest& req, Document* doc) {
   DCHECK(doc != NULL);
   TGetJvmThreadsInfoRequest request;
   request.get_complete_info = true;

@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// This file is generated during Kudu's build. Instead of recreating the necessary steps
+// in Impala's build process, we copy it into our repository. See
+// kudu/client/CMakeLists.txt in Kudu's repository for details.
+
 #ifndef KUDU_EXPORT_H
 #define KUDU_EXPORT_H
 

@@ -26,12 +26,16 @@ from time import sleep
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import SkipIf, SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, \
+    SkipIfLocal
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 
 FAILPOINT_ACTIONS = ['FAIL', 'CANCEL', 'MEM_LIMIT_EXCEEDED']
-FAILPOINT_LOCATIONS = ['PREPARE', 'PREPARE_SCANNER', 'OPEN', 'GETNEXT', 'GETNEXT_SCANNER', 'CLOSE']
+# Not included:
+# - SCANNER_ERROR, because it only fires if the query already hit an error.
+FAILPOINT_LOCATIONS = ['PREPARE', 'PREPARE_SCANNER', 'OPEN', 'GETNEXT', 'GETNEXT_SCANNER',
+                       'CLOSE']
 # Map debug actions to their corresponding query options' values.
 FAILPOINT_ACTION_MAP = {'FAIL': 'FAIL', 'CANCEL': 'WAIT',
                         'MEM_LIMIT_EXCEEDED': 'MEM_LIMIT_EXCEEDED'}
@@ -53,6 +57,7 @@ QUERIES = [
 
 @SkipIf.skip_hbase # -skip_hbase argument specified
 @SkipIfS3.hbase # S3: missing coverage: failures
+@SkipIfABFS.hbase
 @SkipIfADLS.hbase
 @SkipIfIsilon.hbase # ISILON: missing coverage: failures.
 @SkipIfLocal.hbase
@@ -75,6 +80,11 @@ class TestFailpoints(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         create_exec_option_dimension([0], [False], [0]))
 
+    # Don't create PREPARE:WAIT debug actions because cancellation is not checked until
+    # after the prepare phase once execution is started.
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: not (v.get_value('action') == 'CANCEL'
+                     and v.get_value('location') == 'PREPARE'))
     # Don't create CLOSE:WAIT debug actions to avoid leaking plan fragments (there's no
     # way to cancel a plan fragment once Close() has been called)
     cls.ImpalaTestMatrix.add_constraint(
@@ -90,9 +100,6 @@ class TestFailpoints(ImpalaTestSuite):
     location = vector.get_value('location')
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
 
-    if action == "CANCEL" and location == "PREPARE":
-      pytest.xfail(reason="IMPALA-5202 leads to a hang.")
-
     try:
       plan_node_ids = self.__parse_plan_nodes_from_explain(query, vector)
     except ImpalaBeeswaxException as e:
@@ -103,6 +110,9 @@ class TestFailpoints(ImpalaTestSuite):
 
     for node_id in plan_node_ids:
       debug_action = '%d:%s:%s' % (node_id, location, FAILPOINT_ACTION_MAP[action])
+      # IMPALA-7046: add jitter to backend startup to exercise various failure paths.
+      debug_action += '|COORD_BEFORE_EXEC_RPC:JITTER@100@0.3'
+
       LOG.info('Current debug action: SET DEBUG_ACTION=%s' % debug_action)
       vector.get_value('exec_option')['debug_action'] = debug_action
 
@@ -130,6 +140,48 @@ class TestFailpoints(ImpalaTestSuite):
       if match is not None:
         node_ids.append(int(match.group('node_id')))
     return node_ids
+
+  def test_lifecycle_failures(self):
+    """Test that targeted failure injections in the query lifecycle do not cause crashes
+    or hangs"""
+    query = "select * from tpch.lineitem limit 10000"
+
+    # Test that the admission controller handles scheduler errors correctly.
+    debug_action = "SCHEDULER_SCHEDULE:FAIL"
+    result = self.execute_query_expect_failure(self.client, query,
+        query_options={'debug_action': debug_action})
+    assert "Error during scheduling" in str(result)
+
+    # Fail the Prepare() phase of all fragment instances.
+    debug_action = 'FIS_IN_PREPARE:FAIL@1.0'
+    self.execute_query_expect_failure(self.client, query,
+        query_options={'debug_action': debug_action})
+
+    # Fail the Open() phase of all fragment instances.
+    debug_action = 'FIS_IN_OPEN:FAIL@1.0'
+    self.execute_query_expect_failure(self.client, query,
+        query_options={'debug_action': debug_action})
+
+    # Fail the ExecInternal() phase of all fragment instances.
+    debug_action = 'FIS_IN_EXEC_INTERNAL:FAIL@1.0'
+    self.execute_query_expect_failure(self.client, query,
+        query_options={'debug_action': debug_action})
+
+    # Fail the fragment instance thread creation with a 0.5 probability.
+    debug_action = 'FIS_FAIL_THREAD_CREATION:FAIL@0.5'
+
+    # We want to test the behavior when only some fragment instance threads fail to be
+    # created, so we set the probability of fragment instance thread creation failure to
+    # 0.5. Since there's only a 50% chance of fragment instance thread creation failure,
+    # we attempt to catch a query failure up to a very conservative maximum of 50 tries.
+    for i in range(50):
+      try:
+        self.execute_query(query,
+            query_options={'debug_action': debug_action})
+      except ImpalaBeeswaxException as e:
+        assert 'Debug Action: FIS_FAIL_THREAD_CREATION:FAIL@0.5' \
+            in str(e), str(e)
+        break
 
   def __execute_fail_action(self, query, vector):
     try:

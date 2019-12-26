@@ -26,6 +26,7 @@
 #include "runtime/bufferpool/buffer-allocator.h"
 #include "util/bit-util.h"
 #include "util/cpu-info.h"
+#include "util/metrics.h"
 #include "util/runtime-profile-counters.h"
 #include "util/time.h"
 #include "util/uid-util.h"
@@ -104,10 +105,10 @@ Status BufferPool::PageHandle::GetBuffer(const BufferHandle** buffer) const {
   return Status::OK();
 }
 
-BufferPool::BufferPool(int64_t min_buffer_len, int64_t buffer_bytes_limit,
-      int64_t clean_page_bytes_limit)
+BufferPool::BufferPool(MetricGroup* metrics, int64_t min_buffer_len,
+    int64_t buffer_bytes_limit, int64_t clean_page_bytes_limit)
   : allocator_(new BufferAllocator(
-        this, min_buffer_len, buffer_bytes_limit, clean_page_bytes_limit)),
+        this, metrics, min_buffer_len, buffer_bytes_limit, clean_page_bytes_limit)),
     min_buffer_len_(min_buffer_len) {
   DCHECK_GT(min_buffer_len, 0);
   DCHECK_EQ(min_buffer_len, BitUtil::RoundUpToPowerOfTwo(min_buffer_len));
@@ -117,11 +118,12 @@ BufferPool::~BufferPool() {}
 
 Status BufferPool::RegisterClient(const string& name, TmpFileMgr::FileGroup* file_group,
     ReservationTracker* parent_reservation, MemTracker* mem_tracker,
-    int64_t reservation_limit, RuntimeProfile* profile, ClientHandle* client) {
+    int64_t reservation_limit, RuntimeProfile* profile, ClientHandle* client,
+    MemLimit mem_limit_mode) {
   DCHECK(!client->is_registered());
   DCHECK(parent_reservation != NULL);
   client->impl_ = new Client(this, file_group, name, parent_reservation, mem_tracker,
-      reservation_limit, profile);
+      mem_limit_mode, reservation_limit, profile);
   return Status::OK();
 }
 
@@ -226,12 +228,23 @@ Status BufferPool::ExtractBuffer(
 
 Status BufferPool::AllocateBuffer(
     ClientHandle* client, int64_t len, BufferHandle* handle) {
-  RETURN_IF_ERROR(client->impl_->PrepareToAllocateBuffer(len));
+  RETURN_IF_ERROR(client->impl_->PrepareToAllocateBuffer(len, true, nullptr));
   Status status = allocator_->Allocate(client, len, handle);
-  if (!status.ok()) {
-    // Allocation failed - update client's accounting to reflect the failure.
-    client->impl_->FreedBuffer(len);
-  }
+  // If the allocation failed, update client's accounting to reflect the failure.
+  if (!status.ok()) client->impl_->FreedBuffer(len);
+  return status;
+}
+
+Status BufferPool::AllocateUnreservedBuffer(
+    ClientHandle* client, int64_t len, BufferHandle* handle) {
+  DCHECK(!handle->is_open());
+  bool success;
+  RETURN_IF_ERROR(client->impl_->PrepareToAllocateBuffer(len, false, &success));
+  if (!success) return Status::OK(); // Leave 'handle' closed to indicate failure.
+
+  Status status = allocator_->Allocate(client, len, handle);
+  // If the allocation failed, update client's accounting to reflect the failure.
+  if (!status.ok()) client->impl_->FreedBuffer(len);
   return status;
 }
 
@@ -302,8 +315,9 @@ bool BufferPool::ClientHandle::IncreaseReservationToFit(int64_t bytes) {
   return impl_->reservation()->IncreaseReservationToFit(bytes);
 }
 
-Status BufferPool::ClientHandle::DecreaseReservationTo(int64_t target_bytes) {
-  return impl_->DecreaseReservationTo(target_bytes);
+Status BufferPool::ClientHandle::DecreaseReservationTo(
+    int64_t max_decrease, int64_t target_bytes) {
+  return impl_->DecreaseReservationTo(max_decrease, target_bytes);
 }
 
 int64_t BufferPool::ClientHandle::GetReservation() const {
@@ -320,6 +334,7 @@ int64_t BufferPool::ClientHandle::GetUnusedReservation() const {
 
 bool BufferPool::ClientHandle::TransferReservationFrom(
     ReservationTracker* src, int64_t bytes) {
+  DCHECK(!impl_->has_unpinned_pages());
   return src->TransferReservationTo(impl_->reservation(), bytes);
 }
 
@@ -329,12 +344,14 @@ bool BufferPool::ClientHandle::TransferReservationTo(
 }
 
 void BufferPool::ClientHandle::SaveReservation(SubReservation* dst, int64_t bytes) {
+  DCHECK(!dst->is_closed());
   DCHECK_EQ(dst->tracker_->parent(), impl_->reservation());
   bool success = impl_->reservation()->TransferReservationTo(dst->tracker_.get(), bytes);
   DCHECK(success); // SubReservation should not have a limit, so this shouldn't fail.
 }
 
 void BufferPool::ClientHandle::RestoreReservation(SubReservation* src, int64_t bytes) {
+  DCHECK(!src->is_closed());
   DCHECK_EQ(src->tracker_->parent(), impl_->reservation());
   bool success = src->tracker_->TransferReservationTo(impl_->reservation(), bytes);
   DCHECK(success); // Transferring reservation to parent shouldn't fail.
@@ -348,7 +365,18 @@ bool BufferPool::ClientHandle::has_unpinned_pages() const {
   return impl_->has_unpinned_pages();
 }
 
+BufferPool::SubReservation::SubReservation() {
+  DCHECK(is_closed()) << "subreservation must be closed.";
+}
+
 BufferPool::SubReservation::SubReservation(ClientHandle* client) {
+  DCHECK(client->is_registered());
+  Init(client);
+}
+
+void BufferPool::SubReservation::Init(ClientHandle* client) {
+  DCHECK(tracker_ == nullptr);
+  DCHECK(client->is_registered());
   tracker_.reset(new ReservationTracker);
   tracker_->InitChildTracker(
       nullptr, client->impl_->reservation(), nullptr, numeric_limits<int64_t>::max());
@@ -372,7 +400,7 @@ void BufferPool::SubReservation::Close() {
 
 BufferPool::Client::Client(BufferPool* pool, TmpFileMgr::FileGroup* file_group,
     const string& name, ReservationTracker* parent_reservation, MemTracker* mem_tracker,
-    int64_t reservation_limit, RuntimeProfile* profile)
+    MemLimit mem_limit_mode, int64_t reservation_limit, RuntimeProfile* profile)
   : pool_(pool),
     file_group_(file_group),
     name_(name),
@@ -382,8 +410,9 @@ BufferPool::Client::Client(BufferPool* pool, TmpFileMgr::FileGroup* file_group,
   // Set up a child profile with buffer pool info.
   RuntimeProfile* child_profile = profile->CreateChild("Buffer pool", true, true);
   reservation_.InitChildTracker(
-      child_profile, parent_reservation, mem_tracker, reservation_limit);
+      child_profile, parent_reservation, mem_tracker, reservation_limit, mem_limit_mode);
   counters_.alloc_time = ADD_TIMER(child_profile, "AllocTime");
+  counters_.sys_alloc_time = ADD_TIMER(child_profile, "SystemAllocTime");
   counters_.cumulative_allocations =
       ADD_COUNTER(child_profile, "CumulativeAllocations", TUnit::UNIT);
   counters_.cumulative_bytes_alloced =
@@ -546,23 +575,50 @@ Status BufferPool::Client::FinishMoveEvictedToPinned(Page* page) {
   return Status::OK();
 }
 
-Status BufferPool::Client::PrepareToAllocateBuffer(int64_t len) {
-  unique_lock<mutex> lock(lock_);
-  // Clean enough pages to allow allocation to proceed without violating our eviction
-  // policy. This can fail, so only update the accounting once success is ensured.
-  RETURN_IF_ERROR(CleanPages(&lock, len));
-  reservation_.AllocateFrom(len);
-  buffers_allocated_bytes_ += len;
-  DCHECK_CONSISTENCY();
+Status BufferPool::Client::PrepareToAllocateBuffer(
+    int64_t len, bool reserved, bool* success) {
+  if (success != nullptr) *success = false;
+  // Don't need to hold the client's 'lock_' yet because 'reservation_' operations are
+  // threadsafe.
+  if (reserved) {
+    // The client must have already reserved the memory.
+    reservation_.AllocateFrom(len);
+  } else {
+    DCHECK(success != nullptr);
+    // The client may not have reserved the memory.
+    if (!reservation_.IncreaseReservationToFitAndAllocate(len)) return Status::OK();
+  }
+
+  {
+    unique_lock<mutex> lock(lock_);
+    // Clean enough pages to allow allocation to proceed without violating our eviction
+    // policy.
+    Status status = CleanPages(&lock, len);
+    if (!status.ok()) {
+      // Reverse the allocation.
+      reservation_.ReleaseTo(len);
+      return status;
+    }
+    buffers_allocated_bytes_ += len;
+    DCHECK_CONSISTENCY();
+  }
+  if (success != nullptr) *success = true;
   return Status::OK();
 }
 
-Status BufferPool::Client::DecreaseReservationTo(int64_t target_bytes) {
+Status BufferPool::Client::DecreaseReservationTo(
+    int64_t max_decrease, int64_t target_bytes) {
   unique_lock<mutex> lock(lock_);
+  // Get a snapshot of the current reservation. Reservation may be increased concurrently
+  // without holding 'lock_' but cannot be decreased, so the end result may be higher
+  // than 'target_bytes' if another thread concurrently increases reservation. This
+  // interleaving of threads gives the same result as IncreaseReservation() running
+  // after DecreaseReservationTo(). Similarly, running IncreaseReservationToFit() and
+  // DecreaseReservationTo() concurrently can lead to a range of outcomes, but that
+  // is unavoidable by the nature of the methods.
   int64_t current_reservation = reservation_.GetReservation();
   DCHECK_GE(current_reservation, target_bytes);
-  int64_t amount_to_free =
-      min(reservation_.GetUnusedReservation(), current_reservation - target_bytes);
+  int64_t amount_to_free = min(max_decrease, current_reservation - target_bytes);
   if (amount_to_free == 0) return Status::OK();
   // Clean enough pages to allow us to safely release reservation.
   RETURN_IF_ERROR(CleanPages(&lock, amount_to_free));
@@ -589,7 +645,7 @@ Status BufferPool::Client::CleanPages(unique_lock<mutex>* client_lock, int64_t l
   // Wait until enough writes have finished so that we can make the allocation without
   // violating the eviction policy. I.e. so that other clients can immediately get the
   // memory they're entitled to without waiting for this client's write to complete.
-  DCHECK_GE(in_flight_write_pages_.bytes(), min_bytes_to_write);
+  DCHECK_GE(in_flight_write_pages_.bytes(), min_bytes_to_write) << DebugStringLocked();
   while (dirty_unpinned_pages_.bytes() + in_flight_write_pages_.bytes()
       > target_dirty_bytes) {
     SCOPED_TIMER(counters().write_wait_time);
@@ -600,8 +656,8 @@ Status BufferPool::Client::CleanPages(unique_lock<mutex>* client_lock, int64_t l
 }
 
 void BufferPool::Client::WriteDirtyPagesAsync(int64_t min_bytes_to_write) {
-  DCHECK_GE(min_bytes_to_write, 0);
-  DCHECK_LE(min_bytes_to_write, dirty_unpinned_pages_.bytes());
+  DCHECK_GE(min_bytes_to_write, 0) << DebugStringLocked();
+  DCHECK_LE(min_bytes_to_write, dirty_unpinned_pages_.bytes()) << DebugStringLocked();
   if (file_group_ == NULL) {
     // Spilling disabled - there should be no unpinned pages to write.
     DCHECK_EQ(0, min_bytes_to_write);
@@ -657,7 +713,7 @@ void BufferPool::Client::WriteCompleteCallback(Page* page, const Status& write_s
 #endif
   {
     unique_lock<mutex> cl(lock_);
-    DCHECK(in_flight_write_pages_.Contains(page));
+    DCHECK(in_flight_write_pages_.Contains(page)) << DebugStringLocked();
     // The status should always be propagated.
     // TODO: if we add cancellation support to TmpFileMgr, consider cancellation path.
     if (!write_status.ok()) write_status_.MergeStatus(write_status);
@@ -691,6 +747,10 @@ void BufferPool::Client::WaitForAllWrites() {
 
 string BufferPool::Client::DebugString() {
   lock_guard<mutex> lock(lock_);
+  return DebugStringLocked();
+}
+
+string BufferPool::Client::DebugStringLocked() {
   stringstream ss;
   ss << Substitute("<BufferPool::Client> $0 name: $1 write_status: $2 "
                    "buffers allocated $3 num_pages: $4 pinned_bytes: $5 "

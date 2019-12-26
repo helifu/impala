@@ -24,15 +24,45 @@ import logging
 import os
 
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from tests.common.environ import HIVE_MAJOR_VERSION
 import tests.comparison.cli_options as cli_options
 
 
 LOG = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
 
+# We use Hive to transform nested text tables into parquet/orc tables. To control the
+# compression, the property keys differ from file formats (see COMPRESSION_KEYS_MAP).
+# The property values also differ from short names used in Impala (e.g. snap, def).
+# So we define COMPRESSION_VALUES_MAP for the mapping.
+COMPRESSION_KEYS_MAP = {
+  "parquet": "parquet.compression",
+  "orc": "orc.compress"
+}
+COMPRESSION_VALUES_MAP = {
+  # Currently, only three codecs are supported in Hive for Parquet. See codes in
+  # org.apache.parquet.hadoop.metadata.CompressionCodecName (parquet-hadoop-bundle)
+  "parquet": {
+    "none": "SNAPPY",
+    "snap": "SNAPPY",
+    "gzip": "GZIP",
+    "lzo": "LZO"
+  },
+  # Currently, only three codecs are supported in Hive for ORC. See Hive codes in
+  # org.apache.orc.impl.WriterImpl#createCodec (in module hive-orc)
+  "orc": {
+    "none": "NONE",
+    "def": "ZLIB",
+    "snap": "SNAPPY"
+  }
+}
+
 # These vars are set after arg parsing.
 cluster = None
 source_db = None
 target_db = None
+file_format = None
+compression_key = None
+compression_value = None
 chunks = None
 
 def is_loaded():
@@ -58,6 +88,9 @@ def load():
     sql_params = {
         "source_db": source_db,
         "target_db": target_db,
+        "file_format": file_format,
+        "compression_key": compression_key,
+        "compression_value": compression_value,
         "chunks": chunks,
         "warehouse_dir": cluster.hive.warehouse_dir}
 
@@ -104,7 +137,7 @@ def load():
     for chunk_idx in xrange(chunks):
       sql_params["chunk_idx"] = chunk_idx
       tmp_customer_sql = r"""
-          SELECT
+          SELECT STRAIGHT_JOIN
             c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment,
             c_comment,
             GROUP_CONCAT(
@@ -120,8 +153,8 @@ def load():
                 CAST(lineitems_string AS STRING)
               ), '\002'
             ) orders_string
-          FROM {source_db}.customer
-          LEFT JOIN tmp_orders_string ON c_custkey = o_custkey
+          FROM tmp_orders_string
+          RIGHT JOIN [SHUFFLE] {source_db}.customer ON c_custkey = o_custkey
           WHERE c_custkey % {chunks} = {chunk_idx}
           GROUP BY 1, 2, 3, 4, 5, 6, 7, 8""".format(**sql_params)
       LOG.info("Creating temp customers (chunk {chunk} of {chunks})".format(
@@ -240,55 +273,96 @@ def load():
       LOCATION '{warehouse_dir}/{target_db}.db/tmp_supplier_string'"""\
           .format(**sql_params))
 
-    # The part table doesn't have nesting.
+    # The part table doesn't have nesting. If it's a parquet table, we create it in Impala
     LOG.info("Creating parts")
-    impala.execute("""
-      CREATE EXTERNAL TABLE part
-      STORED AS PARQUET
-      AS SELECT * FROM {source_db}.part""".format(**sql_params))
+    if file_format == "parquet":
+      impala.execute("""
+        CREATE EXTERNAL TABLE part
+        STORED AS PARQUET
+        AS SELECT * FROM {source_db}.part""".format(**sql_params))
+  cluster.hdfs.ensure_home_dir()
+  if file_format == "orc":
+    # For ORC format, we create the 'part' table by Hive
+    with cluster.hive.cursor(db_name=target_db) as hive:
+      hive.execute("""
+        CREATE TABLE part
+        STORED AS ORC
+        TBLPROPERTIES('{compression_key}'='{compression_value}')
+        AS SELECT * FROM {source_db}.part""".format(**sql_params))
 
-  # Hive is used to convert the data into parquet and drop all the temp tables.
+  # Hive is used to convert the data into parquet/orc and drop all the temp tables.
   # The Hive SET values are necessary to prevent Impala remote reads of parquet files.
   # These values are taken from http://blog.cloudera.com/blog/2014/12/the-impala-cookbook.
-  cluster.hdfs.ensure_home_dir()
+  create_final_tables_sql = """
+      SET mapred.min.split.size=1073741824;
+      SET parquet.block.size=10737418240;
+      SET dfs.block.size=1073741824;
+
+      CREATE TABLE region
+      STORED AS {file_format}
+      TBLPROPERTIES('{compression_key}'='{compression_value}')
+      AS SELECT * FROM tmp_region;
+
+      CREATE TABLE supplier
+      STORED AS {file_format}
+      TBLPROPERTIES('{compression_key}'='{compression_value}')
+      AS SELECT * FROM tmp_supplier;"""
+
+  # A simple CTAS for tpch_nested_parquet.customer would create 3 files with Hive3 vs
+  # 4 files with Hive2. This difference would break several tests, and it seemed
+  # easier to hack the loading of the table than to add Hive version specific behavior
+  # for each affected test. A small part of the table is inserted in a separate statement
+  # to generate the +1 file (needs hive.merge.tezfiles to avoid creating +3 files).
+  # TODO: find a less hacky way to ensure a fix number of files
+  if HIVE_MAJOR_VERSION >= 3 and file_format == "parquet":
+    create_final_tables_sql += """
+        CREATE TABLE customer
+        STORED AS {file_format}
+        TBLPROPERTIES('{compression_key}'='{compression_value}')
+        AS SELECT * FROM tmp_customer
+        WHERE c_custkey >= 10;
+
+        INSERT INTO customer
+        SELECT * FROM tmp_customer
+        WHERE c_custkey < 10;"""
+  else:
+    create_final_tables_sql += """
+        CREATE TABLE customer
+        STORED AS {file_format}
+        TBLPROPERTIES('{compression_key}'='{compression_value}')
+        AS SELECT * FROM tmp_customer;"""
+
   with cluster.hive.cursor(db_name=target_db) as hive:
     LOG.info("Converting temp tables")
-    for stmt in """
-        SET mapred.min.split.size=1073741824;
-        SET parquet.block.size=10737418240;
-        SET dfs.block.size=1073741824;
-
-        CREATE TABLE customer
-        STORED AS PARQUET
-        TBLPROPERTIES('parquet.compression'='SNAPPY')
-        AS SELECT * FROM tmp_customer;
-
-        DROP TABLE tmp_orders_string;
-        DROP TABLE tmp_customer_string;
-        DROP TABLE tmp_customer;
-
-        CREATE TABLE region
-        STORED AS PARQUET
-        TBLPROPERTIES('parquet.compression'='SNAPPY')
-        AS SELECT * FROM tmp_region;
-
-        DROP TABLE tmp_region_string;
-        DROP TABLE tmp_region;
-
-        CREATE TABLE supplier
-        STORED AS PARQUET
-        TBLPROPERTIES('parquet.compression'='SNAPPY')
-        AS SELECT * FROM tmp_supplier;
-
-        DROP TABLE tmp_supplier;
-        DROP TABLE tmp_supplier_string;""".split(";"):
+    for stmt in create_final_tables_sql.format(**sql_params).split(";"):
       if not stmt.strip():
         continue
       LOG.info("Executing: {0}".format(stmt))
       hive.execute(stmt)
 
   with cluster.impala.cursor(db_name=target_db) as impala:
-    impala.invalidate_metadata()
+    # Drop the temporary tables. These temporary tables were created
+    # in Impala, so they exist in Impala's metadata. This drop is executed by
+    # Impala so that the metadata is automatically updated.
+    for stmt in """
+        DROP TABLE tmp_orders_string;
+        DROP TABLE tmp_customer_string;
+        DROP TABLE tmp_customer;
+
+        DROP TABLE tmp_region_string;
+        DROP TABLE tmp_region;
+
+        DROP TABLE tmp_supplier;
+        DROP TABLE tmp_supplier_string;""".split(";"):
+      if not stmt.strip():
+        continue
+      LOG.info("Executing: {0}".format(stmt))
+      impala.execute(stmt)
+
+    impala.invalidate_metadata(table_name="customer")
+    impala.invalidate_metadata(table_name="part")
+    impala.invalidate_metadata(table_name="region")
+    impala.invalidate_metadata(table_name="supplier")
     impala.compute_stats()
 
   LOG.info("Done loading nested TPCH data")
@@ -303,6 +377,7 @@ if __name__ == "__main__":
 
   parser.add_argument("-s", "--source-db", default="tpch_parquet")
   parser.add_argument("-t", "--target-db", default="tpch_nested_parquet")
+  parser.add_argument("-f", "--table-format", default="parquet/none")  # can be "orc/def"
   parser.add_argument("-c", "-p", "--chunks", type=int, default=1)
 
   args = parser.parse_args()
@@ -312,6 +387,18 @@ if __name__ == "__main__":
   cluster = cli_options.create_cluster(args)
   source_db = args.source_db
   target_db = args.target_db
+  file_format, compression_value = args.table_format.split("/")
+  # 'compression_value' is one of [none,def,gzip,bzip,snap,lzo]. We should translate it
+  # into values that can be set to Hive.
+  if file_format not in COMPRESSION_KEYS_MAP:
+    raise Exception("Nested types in file format %s are not supported" % file_format)
+  compression_key = COMPRESSION_KEYS_MAP[file_format]
+  if compression_value not in COMPRESSION_VALUES_MAP[file_format]:
+    raise Exception("Loading %s tables in %s compression is not supported by Hive. "
+                    "Supported compressions: %s"
+                    % (file_format, compression_value,
+                       str(COMPRESSION_VALUES_MAP[file_format].keys())))
+  compression_value = COMPRESSION_VALUES_MAP[file_format][compression_value]
   chunks = args.chunks
 
   if is_loaded():

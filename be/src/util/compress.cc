@@ -22,8 +22,10 @@
 #include <boost/crc.hpp>
 #include <gutil/strings/substitute.h>
 #undef DISALLOW_COPY_AND_ASSIGN // Snappy redefines this.
-#include <snappy.h>
 #include <lz4.h>
+#include <snappy.h>
+#include <zstd.h>
+#include <zstd_errors.h>
 
 #include "exec/read-write-util.h"
 #include "runtime/mem-pool.h"
@@ -316,5 +318,70 @@ Status Lz4Compressor::ProcessBlock(bool output_preallocated, int64_t input_lengt
   }
   *output_length = LZ4_compress_default(reinterpret_cast<const char*>(input),
       reinterpret_cast<char*>(*output), input_length, *output_length);
+  return Status::OK();
+}
+
+ZstandardCompressor::ZstandardCompressor(MemPool* mem_pool, bool reuse_buffer, int clevel)
+  : Codec(mem_pool, reuse_buffer), clevel_(clevel) {}
+
+int64_t ZstandardCompressor::MaxOutputLen(int64_t input_len, const uint8_t* input) {
+  return ZSTD_compressBound(input_len);
+}
+
+Status ZstandardCompressor::ProcessBlock(bool output_preallocated, int64_t input_length,
+    const uint8_t* input, int64_t* output_length, uint8_t** output) {
+  DCHECK_GE(input_length, 0);
+  DCHECK(output_preallocated) << "Output was not allocated for Zstd Codec";
+  if (input_length == 0) return Status::OK();
+  *output_length = ZSTD_compress(*output, *output_length, input, input_length, clevel_);
+  if (ZSTD_isError(*output_length)) {
+    return Status(TErrorCode::ZSTD_ERROR, "ZSTD_compress",
+        ZSTD_getErrorString(ZSTD_getErrorCode(*output_length)));
+  }
+  return Status::OK();
+}
+
+Lz4BlockCompressor::Lz4BlockCompressor(MemPool* mem_pool, bool reuse_buffer)
+  : Codec(mem_pool, reuse_buffer) {
+}
+
+int64_t Lz4BlockCompressor::MaxOutputLen(int64_t input_length, const uint8_t* input) {
+  // Hadoop uses a block compression scheme. For more details look at the comments for
+  // the SnappyBlockCompressor implementation above.
+  // If input_length == 0 then only the input_length will be stored in the compressed
+  // block.
+  if (input_length == 0) { return sizeof(int32_t); }
+
+  // The length estimation includes upper bound on LZ4 compressed data for the given
+  // input_length and two int storage for uncompressed length and compressed
+  // length.
+  return LZ4_compressBound(input_length) + 2 * sizeof(int32_t);
+}
+
+Status Lz4BlockCompressor::ProcessBlock(bool output_preallocated, int64_t input_length,
+    const uint8_t* input, int64_t* output_length, uint8_t** output) {
+  DCHECK_GE(input_length, 0);
+  size_t length = MaxOutputLen(input_length, input);
+
+  CHECK(output_preallocated && length <= *output_length)
+    << " Output was not allocated for Lz4 Codec or is not sufficient."
+    << " output_preallocated " << output_preallocated << " length: " << length
+    << " output_length " << *output_length;
+
+  uint8_t* outp = *output;
+  ReadWriteUtil::PutInt(outp, static_cast<uint32_t>(input_length));
+  outp += sizeof(int32_t);
+  if (input_length > 0) {
+    uint8_t* sizep = outp;
+    outp += sizeof(int32_t);
+    const int64_t size = LZ4_compress_default(reinterpret_cast<const char*>(input),
+        reinterpret_cast<char*>(outp), input_length, *output_length - (outp - *output));
+    if (size == 0) { return Status(TErrorCode::LZ4_COMPRESS_DEFAULT_FAILED); }
+    ReadWriteUtil::PutInt(sizep, static_cast<uint32_t>(size));
+    outp += size;
+    DCHECK_LE(outp - *output, length);
+  }
+
+  *output_length = outp - *output;
   return Status::OK();
 }

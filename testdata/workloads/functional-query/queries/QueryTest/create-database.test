@@ -2,6 +2,7 @@
 ---- QUERY
 create database $DATABASE_2 comment "For testing"
 ---- RESULTS
+'Database has been created.'
 ====
 ---- QUERY
 show databases like "$DATABASE_2"
@@ -11,15 +12,36 @@ show databases like "$DATABASE_2"
 STRING, STRING
 ====
 ---- QUERY
+# Test that DESCRIBE shows the proper database location
+# for a newly created database (regression test for IMPALA-7439)
+describe database $DATABASE_2
+---- RESULTS
+'$DATABASE_2','$NAMENODE/test-warehouse/$DATABASE_2.db','For testing'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Test that DESCRIBE EXTENDED also has all of the necessary info.
+describe database extended $DATABASE_2
+---- RESULTS
+'$DATABASE_2','$NAMENODE/test-warehouse/$DATABASE_2.db','For testing'
+'Owner: ','',''
+'','$USER','USER'
+---- TYPES
+string, string, string
+====
+---- QUERY
 # Make sure creating a database with the same name doesn't throw an error when
 # IF NOT EXISTS is specified.
 create database if not exists $DATABASE_2
 ---- RESULTS
+'Database already exists.'
 ====
 ---- QUERY
 # Test dropping the database.
 drop database $DATABASE_2
 ---- RESULTS
+'Database has been dropped.'
 ====
 ---- QUERY
 show databases like "$DATABASE_2"
@@ -31,6 +53,7 @@ STRING, STRING
 # Dropping a non-existent databases is ok with IF EXISTS
 drop database if exists $DATABASE_2
 ---- RESULTS
+'Database does not exist.'
 ====
 ---- QUERY
 # Test DROP DATABASE ... CASCADE
@@ -50,6 +73,7 @@ create function if not exists $DATABASE_cascade.f1() returns string
 create aggregate function if not exists $DATABASE_cascade.f2(int, string) RETURNS int
   location '$FILESYSTEM_PREFIX/test-warehouse/libTestUdas.so' UPDATE_FN='TwoArgUpdate'
 ---- RESULTS
+'Function has been created.'
 ====
 ---- QUERY
 show tables in $DATABASE_cascade
@@ -80,6 +104,7 @@ STRING, STRING, STRING, STRING
 # as the database itself.
 drop database $DATABASE_cascade cascade
 ---- RESULTS
+'Database has been dropped.'
 ====
 ---- QUERY
 show databases like '$DATABASE_cascade'
@@ -99,6 +124,7 @@ STRING,STRING
 ---- QUERY
 drop database $DATABASE_restrict restrict
 ---- RESULTS
+'Database has been dropped.'
 ====
 ---- QUERY
 show databases like '$DATABASE_restrict'

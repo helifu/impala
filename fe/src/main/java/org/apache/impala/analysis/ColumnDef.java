@@ -18,27 +18,29 @@
 package org.apache.impala.analysis;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.List;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
-
-import com.google.common.base.Function;
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.kudu.ColumnSchema.CompressionAlgorithm;
 import org.apache.kudu.ColumnSchema.Encoding;
+
+import com.google.common.base.Function;
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 
 /**
  * Represents a column definition in a CREATE/ALTER TABLE/VIEW/COLUMN statement.
@@ -250,14 +252,14 @@ public class ColumnDef {
         throw new AnalysisException(String.format("Only constant values are allowed " +
             "for default values: %s", defaultValue_.toSql()));
       }
-      LiteralExpr defaultValLiteral = LiteralExpr.create(defaultValue_,
-          analyzer.getQueryCtx());
+      LiteralExpr defaultValLiteral = LiteralExpr.createBounded(defaultValue_,
+          analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
       if (defaultValLiteral == null) {
         throw new AnalysisException(String.format("Only constant values are allowed " +
             "for default values: %s", defaultValue_.toSql()));
       }
-      if (defaultValLiteral.getType().isNull() && ((isNullable_ != null && !isNullable_)
-          || isPrimaryKey_)) {
+      if (Expr.IS_NULL_VALUE.apply(defaultValLiteral) &&
+          ((isNullable_ != null && !isNullable_) || isPrimaryKey_)) {
         throw new AnalysisException(String.format("Default value of NULL not allowed " +
             "on non-nullable column: '%s'", getColName()));
       }
@@ -269,13 +271,14 @@ public class ColumnDef {
         e.analyze(analyzer);
         defaultValLiteral = LiteralExpr.create(e, analyzer.getQueryCtx());
         Preconditions.checkNotNull(defaultValLiteral);
-        if (defaultValLiteral.isNullLiteral()) {
+        if (Expr.IS_NULL_VALUE.apply(defaultValLiteral)) {
           throw new AnalysisException(String.format("String %s cannot be cast " +
               "to a TIMESTAMP literal.", defaultValue_.toSql()));
         }
       }
 
-      if (!Type.isImplicitlyCastable(defaultValLiteral.getType(), type_, true)) {
+      if (!Type.isImplicitlyCastable(defaultValLiteral.getType(), type_,
+          true, analyzer.isDecimalV2())) {
         throw new AnalysisException(String.format("Default value %s (type: %s) " +
             "is not compatible with column '%s' (type: %s).", defaultValue_.toSql(),
             defaultValue_.getType().toSql(), colName_, type_.toSql()));
@@ -283,7 +286,8 @@ public class ColumnDef {
       if (!defaultValLiteral.getType().equals(type_)) {
         Expr castLiteral = defaultValLiteral.uncheckedCastTo(type_);
         Preconditions.checkNotNull(castLiteral);
-        defaultValLiteral = LiteralExpr.create(castLiteral, analyzer.getQueryCtx());
+        defaultValLiteral = LiteralExpr.createBounded(castLiteral,
+            analyzer.getQueryCtx(), StringLiteral.MAX_STRING_LEN);
       }
       Preconditions.checkNotNull(defaultValLiteral);
       outputDefaultValue_ = defaultValLiteral;
@@ -369,6 +373,7 @@ public class ColumnDef {
 
   public static List<FieldSchema> toFieldSchemas(List<ColumnDef> colDefs) {
     return Lists.transform(colDefs, new Function<ColumnDef, FieldSchema>() {
+      @Override
       public FieldSchema apply(ColumnDef colDef) {
         Preconditions.checkNotNull(colDef.getType());
         return new FieldSchema(colDef.getColName(), colDef.getType().toSql(),
@@ -378,7 +383,7 @@ public class ColumnDef {
   }
 
   static List<String> toColumnNames(Collection<ColumnDef> colDefs) {
-    List<String> colNames = Lists.newArrayList();
+    List<String> colNames = new ArrayList<>();
     for (ColumnDef colDef: colDefs) {
       colNames.add(colDef.getColName());
     }
@@ -391,7 +396,7 @@ public class ColumnDef {
    * is the same as the iteration order of 'colDefs'.
    */
   static Map<String, ColumnDef> mapByColumnNames(Collection<ColumnDef> colDefs) {
-    Map<String, ColumnDef> colDefsByColName = new LinkedHashMap<String, ColumnDef>();
+    Map<String, ColumnDef> colDefsByColName = new LinkedHashMap<>();
     for (ColumnDef colDef: colDefs) {
       ColumnDef def = colDefsByColName.put(colDef.getColName(), colDef);
       Preconditions.checkState(def == null);

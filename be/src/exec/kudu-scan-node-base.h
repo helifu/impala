@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef IMPALA_EXEC_KUDU_SCAN_NODE_BASE_H_
-#define IMPALA_EXEC_KUDU_SCAN_NODE_BASE_H_
+#pragma once
 
 #include <gtest/gtest.h>
 #include <kudu/client/client.h>
@@ -36,15 +35,20 @@ class KuduScanner;
 /// removed.
 class KuduScanNodeBase : public ScanNode {
  public:
-  KuduScanNodeBase(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  KuduScanNodeBase(
+      ObjectPool* pool, const ScanPlanNode& pnode, const DescriptorTbl& descs);
   ~KuduScanNodeBase();
 
-  virtual Status Prepare(RuntimeState* state);
-  virtual Status Open(RuntimeState* state);
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
+  virtual Status Prepare(RuntimeState* state) override;
+  virtual Status Open(RuntimeState* state) override;
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos)
+      override = 0;
+
+  bool optimize_count_star() const { return count_star_slot_offset_ != -1; }
+  int count_star_slot_offset() const { return count_star_slot_offset_; }
 
  protected:
-  virtual void DebugString(int indentation_level, std::stringstream* out) const;
+  virtual void DebugString(int indentation_level, std::stringstream* out) const override;
 
   /// Returns the total number of scan tokens
   int NumScanTokens() { return scan_tokens_.size(); }
@@ -56,6 +60,8 @@ class KuduScanNodeBase : public ScanNode {
   /// Not thread safe, access must be synchronized.
   const std::string* GetNextScanToken();
 
+  const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
+
  private:
   friend class KuduScanner;
 
@@ -63,11 +69,11 @@ class KuduScanNodeBase : public ScanNode {
   const TupleId tuple_id_;
 
   /// Descriptor of tuples read from Kudu table.
-  const TupleDescriptor* tuple_desc_;
+  const TupleDescriptor* tuple_desc_ = nullptr;
 
   /// Pointer to the KuduClient, which is stored on the QueryState and shared between
   /// scanners and fragment instances.
-  kudu::client::KuduClient* client_;
+  kudu::client::KuduClient* client_ = nullptr;
 
   /// Kudu table reference. Shared between scanner threads for KuduScanNode.
   kudu::client::sp::shared_ptr<kudu::client::KuduTable> table_;
@@ -76,18 +82,23 @@ class KuduScanNodeBase : public ScanNode {
   std::vector<std::string> scan_tokens_;
 
   /// The next index in 'scan_tokens_' to be assigned.
-  int next_scan_token_idx_;
+  int next_scan_token_idx_ = 0;
 
-  RuntimeProfile::Counter* kudu_round_trips_;
-  RuntimeProfile::Counter* kudu_remote_tokens_;
+  /// The byte offset of the slot for Kudu metadata if count star optimization is enabled.
+  /// When set, this scan node can optimize a count(*) query by populating the
+  /// tuple with data from the num rows statistic.
+  /// See applyCountStartOptimization() in KuduScanNode.java.
+  const int count_star_slot_offset_;
+
+  RuntimeProfile::Counter* kudu_round_trips_ = nullptr;
+  RuntimeProfile::Counter* kudu_remote_tokens_ = nullptr;
+  RuntimeProfile::Counter* kudu_client_time_ = nullptr;
   static const std::string KUDU_ROUND_TRIPS;
   static const std::string KUDU_REMOTE_TOKENS;
+  static const std::string KUDU_CLIENT_TIME;
 
-  const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
   kudu::client::KuduClient* kudu_client() { return client_; }
   RuntimeProfile::Counter* kudu_round_trips() const { return kudu_round_trips_; }
+  RuntimeProfile::Counter* kudu_client_time() const { return kudu_client_time_; }
 };
-
-}
-
-#endif
+} // namespace impala

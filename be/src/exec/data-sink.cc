@@ -26,19 +26,19 @@
 #include "exec/hdfs-table-sink.h"
 #include "exec/kudu-table-sink.h"
 #include "exec/kudu-util.h"
+#include "exec/blocking-plan-root-sink.h"
+#include "exec/buffered-plan-root-sink.h"
 #include "exec/plan-root-sink.h"
 #include "exprs/scalar-expr.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gutil/strings/substitute.h"
-#include "runtime/data-stream-sender.h"
 #include "runtime/krpc-data-stream-sender.h"
 #include "runtime/mem-tracker.h"
 #include "util/container-util.h"
 
 #include "common/names.h"
 
-DECLARE_bool(use_krpc);
 DEFINE_int64(data_stream_sender_buffer_size, 16 * 1024,
     "(Advanced) Max size in bytes which a row batch in a data stream sender's channel "
     "can accumulate before the row batch is sent over the wire.");
@@ -47,9 +47,18 @@ using strings::Substitute;
 
 namespace impala {
 
-DataSink::DataSink(const RowDescriptor* row_desc, const string& name, RuntimeState* state)
+// Empty string
+const char* const DataSink::ROOT_PARTITION_KEY = "";
+
+DataSink::DataSink(TDataSinkId sink_id, const RowDescriptor* row_desc, const string& name,
+    RuntimeState* state)
   : closed_(false), row_desc_(row_desc), name_(name) {
   profile_ = RuntimeProfile::Create(state->obj_pool(), name);
+  if (sink_id != -1) {
+    // There is one sink per fragment so we can use the fragment index as a unique
+    // identifier.
+    profile_->SetDataSinkId(sink_id);
+  }
 }
 
 DataSink::~DataSink() {
@@ -60,35 +69,33 @@ Status DataSink::Create(const TPlanFragmentCtx& fragment_ctx,
     const TPlanFragmentInstanceCtx& fragment_instance_ctx, const RowDescriptor* row_desc,
     RuntimeState* state, DataSink** sink) {
   const TDataSink& thrift_sink = fragment_ctx.fragment.output_sink;
-  const vector<TExpr>& thrift_output_exprs = fragment_ctx.fragment.output_exprs;
+  const vector<TExpr>& thrift_output_exprs = thrift_sink.output_exprs;
   ObjectPool* pool = state->obj_pool();
+  // We have one fragment per sink, so we can use the fragment index as the sink ID.
+  TDataSinkId sink_id = fragment_ctx.fragment.idx;
   switch (thrift_sink.type) {
     case TDataSinkType::DATA_STREAM_SINK:
       if (!thrift_sink.__isset.stream_sink) return Status("Missing data stream sink.");
-
-      if (FLAGS_use_krpc) {
-        *sink = pool->Add(new KrpcDataStreamSender(fragment_instance_ctx.sender_id,
-            row_desc, thrift_sink.stream_sink, fragment_ctx.destinations,
-            FLAGS_data_stream_sender_buffer_size, state));
-      } else {
-        // TODO: figure out good buffer size based on size of output row
-        *sink = pool->Add(new DataStreamSender(fragment_instance_ctx.sender_id, row_desc,
-            thrift_sink.stream_sink, fragment_ctx.destinations,
-            FLAGS_data_stream_sender_buffer_size, state));
-      }
+      // TODO: figure out good buffer size based on size of output row
+      *sink = pool->Add(new KrpcDataStreamSender(sink_id,
+          fragment_instance_ctx.sender_id, row_desc, thrift_sink.stream_sink,
+          fragment_ctx.destinations, FLAGS_data_stream_sender_buffer_size, state));
       break;
     case TDataSinkType::TABLE_SINK:
       if (!thrift_sink.__isset.table_sink) return Status("Missing table sink.");
       switch (thrift_sink.table_sink.type) {
         case TTableSinkType::HDFS:
-          *sink = pool->Add(new HdfsTableSink(row_desc, thrift_sink, state));
+          *sink =
+              pool->Add(new HdfsTableSink(sink_id, row_desc, thrift_sink, state));
           break;
         case TTableSinkType::HBASE:
-          *sink = pool->Add(new HBaseTableSink(row_desc, thrift_sink, state));
+          *sink =
+              pool->Add(new HBaseTableSink(sink_id, row_desc, thrift_sink, state));
           break;
         case TTableSinkType::KUDU:
           RETURN_IF_ERROR(CheckKuduAvailability());
-          *sink = pool->Add(new KuduTableSink(row_desc, thrift_sink, state));
+          *sink =
+              pool->Add(new KuduTableSink(sink_id, row_desc, thrift_sink, state));
           break;
         default:
           stringstream error_msg;
@@ -101,8 +108,16 @@ Status DataSink::Create(const TPlanFragmentCtx& fragment_ctx,
       }
       break;
     case TDataSinkType::PLAN_ROOT_SINK:
-      *sink = pool->Add(new PlanRootSink(row_desc, state));
+      if (state->query_options().spool_query_results) {
+        *sink = pool->Add(new BufferedPlanRootSink(sink_id, row_desc, state,
+            fragment_ctx.fragment.output_sink.plan_root_sink.resource_profile,
+            fragment_instance_ctx.debug_options));
+      } else {
+        *sink = pool->Add(new BlockingPlanRootSink(sink_id, row_desc, state));
+      }
       break;
+    case TDataSinkType::JOIN_BUILD_SINK:
+      // IMPALA-4224 - join build sink not supported in backend execution.
     default:
       stringstream error_msg;
       map<int, const char*>::const_iterator i =
@@ -121,69 +136,6 @@ Status DataSink::Init(const vector<TExpr>& thrift_output_exprs,
   return ScalarExpr::Create(thrift_output_exprs, *row_desc_, state, &output_exprs_);
 }
 
-void DataSink::MergeDmlStats(const TInsertStats& src_stats,
-    TInsertStats* dst_stats) {
-  dst_stats->bytes_written += src_stats.bytes_written;
-  if (src_stats.__isset.kudu_stats) {
-    if (!dst_stats->__isset.kudu_stats) dst_stats->__set_kudu_stats(TKuduDmlStats());
-    if (!dst_stats->kudu_stats.__isset.num_row_errors) {
-      dst_stats->kudu_stats.__set_num_row_errors(0);
-    }
-    dst_stats->kudu_stats.__set_num_row_errors(
-        dst_stats->kudu_stats.num_row_errors + src_stats.kudu_stats.num_row_errors);
-  }
-  if (src_stats.__isset.parquet_stats) {
-    if (dst_stats->__isset.parquet_stats) {
-      MergeMapValues<string, int64_t>(src_stats.parquet_stats.per_column_size,
-          &dst_stats->parquet_stats.per_column_size);
-    } else {
-      dst_stats->__set_parquet_stats(src_stats.parquet_stats);
-    }
-  }
-}
-
-string DataSink::OutputDmlStats(const PartitionStatusMap& stats,
-    const string& prefix) {
-  const char* indent = "  ";
-  stringstream ss;
-  ss << prefix;
-  bool first = true;
-  for (const PartitionStatusMap::value_type& val: stats) {
-    if (!first) ss << endl;
-    first = false;
-    ss << "Partition: ";
-
-    const string& partition_key = val.first;
-    if (partition_key == g_ImpalaInternalService_constants.ROOT_PARTITION_KEY) {
-      ss << "Default" << endl;
-    } else {
-      ss << partition_key << endl;
-    }
-    if (val.second.__isset.num_modified_rows) {
-      ss << "NumModifiedRows: " << val.second.num_modified_rows << endl;
-    }
-
-    if (!val.second.__isset.stats) continue;
-    const TInsertStats& stats = val.second.stats;
-    if (stats.__isset.kudu_stats) {
-      ss << "NumRowErrors: " << stats.kudu_stats.num_row_errors << endl;
-    }
-
-    ss << indent << "BytesWritten: "
-       << PrettyPrinter::Print(stats.bytes_written, TUnit::BYTES);
-    if (stats.__isset.parquet_stats) {
-      const TParquetInsertStats& parquet_stats = stats.parquet_stats;
-      ss << endl << indent << "Per Column Sizes:";
-      for (map<string, int64_t>::const_iterator i = parquet_stats.per_column_size.begin();
-           i != parquet_stats.per_column_size.end(); ++i) {
-        ss << endl << indent << indent << i->first << ": "
-           << PrettyPrinter::Print(i->second, TUnit::BYTES);
-      }
-    }
-  }
-  return ss.str();
-}
-
 Status DataSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
   DCHECK(parent_mem_tracker != nullptr);
   DCHECK(profile_ != nullptr);
@@ -195,6 +147,10 @@ Status DataSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
   RETURN_IF_ERROR(ScalarExprEvaluator::Create(output_exprs_, state, state->obj_pool(),
       expr_perm_pool_.get(), expr_results_pool_.get(), &output_expr_evals_));
   return Status::OK();
+}
+
+void DataSink::Codegen(LlvmCodeGen* codegen) {
+  return;
 }
 
 Status DataSink::Open(RuntimeState* state) {

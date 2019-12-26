@@ -19,36 +19,41 @@
 
 #include <algorithm>
 
+#include "exec/exec-node-util.h"
+#include "exec/text-converter.inline.h"
+#include "gen-cpp/PlanNodes_types.h"
+#include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
+#include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
 #include "runtime/tuple.h"
 #include "util/jni-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/runtime-profile-counters.h"
-#include "gen-cpp/PlanNodes_types.h"
-#include "exec/text-converter.inline.h"
 
 #include "common/names.h"
 using namespace impala;
 
-HBaseScanNode::HBaseScanNode(ObjectPool* pool, const TPlanNode& tnode,
+PROFILE_DEFINE_TIMER(TotalRawHBaseReadTime, STABLE_HIGH,
+    "Aggregate wall clock time spent reading from HBase.");
+
+HBaseScanNode::HBaseScanNode(ObjectPool* pool, const ScanPlanNode& pnode,
                              const DescriptorTbl& descs)
-    : ScanNode(pool, tnode, descs),
-      table_name_(tnode.hbase_scan_node.table_name),
-      tuple_id_(tnode.hbase_scan_node.tuple_id),
+    : ScanNode(pool, pnode, descs),
+      table_name_(pnode.tnode_->hbase_scan_node.table_name),
+      tuple_id_(pnode.tnode_->hbase_scan_node.tuple_id),
       tuple_desc_(NULL),
       tuple_idx_(0),
-      filters_(tnode.hbase_scan_node.filters),
+      filters_(pnode.tnode_->hbase_scan_node.filters),
       hbase_scanner_(NULL),
       row_key_slot_(NULL),
       row_key_binary_encoded_(false),
       text_converter_(new TextConverter('\\', "", false)),
       suggested_max_caching_(0) {
-  if (tnode.hbase_scan_node.__isset.suggested_max_caching) {
-    suggested_max_caching_ = tnode.hbase_scan_node.suggested_max_caching;
+  if (pnode.tnode_->hbase_scan_node.__isset.suggested_max_caching) {
+    suggested_max_caching_ = pnode.tnode_->hbase_scan_node.suggested_max_caching;
   }
 }
 
@@ -57,9 +62,11 @@ HBaseScanNode::~HBaseScanNode() {
 
 Status HBaseScanNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ScanNode::Prepare(state));
-  read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HBASE_READ_TIMER);
+  hbase_read_timer_ = PROFILE_TotalRawHBaseReadTime.Instantiate(runtime_profile());
+  AddBytesReadCounters();
 
-  hbase_scanner_.reset(new HBaseTableScanner(this, state->htable_factory(), state));
+  hbase_scanner_.reset(
+      new HBaseTableScanner(this, ExecEnv::GetInstance()->htable_factory(), state));
 
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
   if (tuple_desc_ == NULL) {
@@ -111,15 +118,17 @@ Status HBaseScanNode::Prepare(RuntimeState* state) {
       sr.set_stop_key(key_range.stopKey);
     }
   }
+  runtime_profile_->AddInfoString("Table Name", hbase_table->fully_qualified_name());
   return Status::OK();
 }
 
 Status HBaseScanNode::Open(RuntimeState* state) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedOpenEventAdder ea(this);
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
 
   // No need to initialize hbase_scanner_ if there are no scan ranges.
   if (scan_range_vector_.size() == 0) return Status::OK();
@@ -145,14 +154,11 @@ void HBaseScanNode::WriteTextSlot(
 }
 
 Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  ScopedGetNextEventAdder ea(this, eos);
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
-  // For GetNext, most of the time is spent in HBaseTableScanner::ResultScanner_next,
-  // but there's still some considerable time inside here.
-  // TODO: need to understand how the time is spent inside this function.
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
-  SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
 
   if (scan_range_vector_.empty() || ReachedLimit()) {
     *eos = true;
@@ -172,12 +178,12 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
   bool error_in_row = false;
 
   // Indicates whether there are more rows to process. Set in hbase_scanner_.Next().
-  JNIEnv* env = getJNIEnv();
+  JNIEnv* env = JniUtil::GetJNIEnv();
   bool has_next = false;
   while (true) {
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(QueryMaintenance(state));
-    if (ReachedLimit() || row_batch->AtCapacity()) {
+    if (row_batch->AtCapacity() || ReachedLimit()) {
       // hang on to last allocated chunk in pool, we'll keep writing into it in the
       // next GetNext() call
       *eos = ReachedLimit();
@@ -249,8 +255,8 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
     DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
     if (EvalConjuncts(conjunct_evals_.data(), conjuncts_.size(), row)) {
       row_batch->CommitLastRow();
-      ++num_rows_returned_;
-      COUNTER_SET(rows_returned_counter_, num_rows_returned_);
+      IncrementNumRowsReturned(1);
+      COUNTER_SET(rows_returned_counter_, rows_returned());
       tuple = reinterpret_cast<Tuple*>(
           reinterpret_cast<uint8_t*>(tuple) + tuple_desc_->byte_size());
     } else {
@@ -264,7 +270,7 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
   return Status::OK();
 }
 
-Status HBaseScanNode::Reset(RuntimeState* state) {
+Status HBaseScanNode::Reset(RuntimeState* state, RowBatch* row_batch) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }
@@ -272,11 +278,10 @@ Status HBaseScanNode::Reset(RuntimeState* state) {
 void HBaseScanNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  PeriodicCounterUpdater::StopRateCounter(total_throughput_counter());
-  PeriodicCounterUpdater::StopTimeSeriesCounter(bytes_read_timeseries_counter_);
+  runtime_profile_->StopPeriodicCounters();
 
   if (hbase_scanner_.get() != NULL) {
-    JNIEnv* env = getJNIEnv();
+    JNIEnv* env = JniUtil::GetJNIEnv();
     hbase_scanner_->Close(env);
   }
   ScanNode::Close(state);

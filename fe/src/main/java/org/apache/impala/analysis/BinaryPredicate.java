@@ -36,8 +36,6 @@ import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Most predicates with two operands.
@@ -137,9 +135,14 @@ public class BinaryPredicate extends Predicate {
   public boolean isInferred() { return isInferred_; }
   public void setIsInferred() { isInferred_ = true; }
 
+  public boolean hasIdenticalOperands() {
+    return getChild(0) != null && getChild(0).equals(getChild(1));
+  }
+
   @Override
-  public String toSqlImpl() {
-    return getChild(0).toSql() + " " + op_.toString() + " " + getChild(1).toSql();
+  public String toSqlImpl(ToSqlOptions options) {
+    return getChild(0).toSql(options) + " " + op_.toString() + " "
+        + getChild(1).toSql(options);
   }
 
   @Override
@@ -159,10 +162,11 @@ public class BinaryPredicate extends Predicate {
 
   @Override
   public String debugString() {
-    return Objects.toStringHelper(this)
-        .add("op", op_)
-        .addValue(super.debugString())
-        .toString();
+    Objects.ToStringHelper toStrHelper = Objects.toStringHelper(this);
+    toStrHelper.add("op", op_).addValue(super.debugString());
+    if (isAuxExpr()) toStrHelper.add("isAux", true);
+    if (isInferred_) toStrHelper.add("isInferred", true);
+    return toStrHelper.toString();
   }
 
   @Override
@@ -173,24 +177,12 @@ public class BinaryPredicate extends Predicate {
     fn_ = getBuiltinFunction(analyzer, opName, collectChildReturnTypes(),
         CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     if (fn_ == null) {
-      // Construct an appropriate error message and throw an AnalysisException.
-      String errMsg = "operands of type " + getChild(0).getType().toSql() + " and " +
-            getChild(1).getType().toSql()  + " are not comparable: " + toSql();
-
-      // Check if any of the children is a Subquery that does not return a
-      // scalar.
-      for (Expr expr: children_) {
-        if (expr instanceof Subquery && !expr.getType().isScalarType()) {
-          errMsg = "Subquery must return a single row: " + expr.toSql();
-          break;
-        }
-      }
-
-      throw new AnalysisException(errMsg);
+      throw new AnalysisException("operands of type " + getChild(0).getType().toSql() +
+          " and " + getChild(1).getType().toSql()  + " are not comparable: " + toSql());
     }
     Preconditions.checkState(fn_.getReturnType().isBoolean());
 
-    ArrayList<Expr> subqueries = Lists.newArrayList();
+    List<Expr> subqueries = new ArrayList<>();
     collectAll(Predicates.instanceOf(Subquery.class), subqueries);
     if (subqueries.size() > 1) {
       // TODO Remove that restriction when we add support for independent subquery
@@ -203,7 +195,7 @@ public class BinaryPredicate extends Predicate {
           "supported in binary predicates: " + toSql());
     }
 
-    List<InPredicate> inPredicates = Lists.newArrayList();
+    List<InPredicate> inPredicates = new ArrayList<>();
     collect(InPredicate.class, inPredicates);
     for (InPredicate inPredicate: inPredicates) {
       if (inPredicate.contains(Subquery.class)) {
@@ -212,9 +204,11 @@ public class BinaryPredicate extends Predicate {
       }
     }
 
-    // Don't perform any casting for predicates with subqueries here. Any casting
-    // required will be performed when the subquery is unnested.
-    if (!contains(Subquery.class)) castForFunctionCall(true);
+    if (!contains(Subquery.class)) {
+      // Don't perform any casting for predicates with subqueries here. Any casting
+      // required will be performed when the subquery is unnested.
+      castForFunctionCall(true, analyzer.isDecimalV2());
+    }
 
     // Determine selectivity
     // TODO: Compute selectivity for nested predicates.

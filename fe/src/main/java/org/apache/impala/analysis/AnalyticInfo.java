@@ -26,7 +26,6 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 
 /**
  * Encapsulates the analytic functions found in a single select block plus
@@ -38,7 +37,7 @@ public class AnalyticInfo extends AggregateInfoBase {
   // All unique analytic exprs of a select block. Used to populate
   // super.aggregateExprs_ based on AnalyticExpr.getFnCall() for each analytic expr
   // in this list.
-  private final ArrayList<Expr> analyticExprs_;
+  private final List<AnalyticExpr> analyticExprs_;
 
   // Intersection of the partition exps of all the analytic functions.
   private final List<Expr> commonPartitionExprs_;
@@ -46,8 +45,8 @@ public class AnalyticInfo extends AggregateInfoBase {
   // map from analyticExprs_ to their corresponding analytic tuple slotrefs
   private final ExprSubstitutionMap analyticTupleSmap_;
 
-  private AnalyticInfo(ArrayList<Expr> analyticExprs) {
-    super(new ArrayList<Expr>(), new ArrayList<FunctionCallExpr>());
+  private AnalyticInfo(List<AnalyticExpr> analyticExprs) {
+    super(new ArrayList<>(), new ArrayList<>());
     analyticExprs_ = Expr.cloneList(analyticExprs);
     // Extract the analytic function calls for each analytic expr.
     for (Expr analyticExpr: analyticExprs) {
@@ -68,7 +67,7 @@ public class AnalyticInfo extends AggregateInfoBase {
     commonPartitionExprs_ = Expr.cloneList(other.commonPartitionExprs_);
   }
 
-  public ArrayList<Expr> getAnalyticExprs() { return analyticExprs_; }
+  public List<AnalyticExpr> getAnalyticExprs() { return analyticExprs_; }
   public ExprSubstitutionMap getSmap() { return analyticTupleSmap_; }
   public List<Expr> getCommonPartitionExprs() { return commonPartitionExprs_; }
 
@@ -77,7 +76,7 @@ public class AnalyticInfo extends AggregateInfoBase {
    * smaps.
    */
   static public AnalyticInfo create(
-      ArrayList<Expr> analyticExprs, Analyzer analyzer) {
+      List<AnalyticExpr> analyticExprs, Analyzer analyzer) {
     Preconditions.checkState(analyticExprs != null && !analyticExprs.isEmpty());
     Expr.removeDuplicates(analyticExprs);
     AnalyticInfo result = new AnalyticInfo(analyticExprs);
@@ -110,7 +109,7 @@ public class AnalyticInfo extends AggregateInfoBase {
    * analytic functions.
    */
   private List<Expr> computeCommonPartitionExprs() {
-    List<Expr> result = Lists.newArrayList();
+    List<Expr> result = new ArrayList<>();
     for (Expr analyticExpr: analyticExprs_) {
       Preconditions.checkState(analyticExpr.isAnalyzed());
       List<Expr> partitionExprs = ((AnalyticExpr) analyticExpr).getPartitionExprs();
@@ -128,7 +127,7 @@ public class AnalyticInfo extends AggregateInfoBase {
   @Override
   public void materializeRequiredSlots(Analyzer analyzer, ExprSubstitutionMap smap) {
     materializedSlots_.clear();
-    List<Expr> exprs = Lists.newArrayList();
+    List<Expr> exprs = new ArrayList<>();
     for (int i = 0; i < analyticExprs_.size(); ++i) {
       SlotDescriptor outputSlotDesc = outputTupleDesc_.getSlots().get(i);
       if (!outputSlotDesc.isMaterialized()) continue;
@@ -147,7 +146,7 @@ public class AnalyticInfo extends AggregateInfoBase {
    * analytic tuple.
    */
   public void checkConsistency() {
-    ArrayList<SlotDescriptor> slots = intermediateTupleDesc_.getSlots();
+    List<SlotDescriptor> slots = intermediateTupleDesc_.getSlots();
 
     // Check materialized slots.
     int numMaterializedSlots = 0;

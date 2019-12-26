@@ -143,24 +143,40 @@ under the License.
           </li>
 
           <li>
-            <p>
-              Data is physically divided based on units of storage called <term>tablets</term>. Tablets are
-              stored by <term>tablet servers</term>. Each tablet server can store multiple tablets,
-              and each tablet is replicated across multiple tablet servers, managed automatically by Kudu.
-              Where practical, colocate the tablet servers on the same hosts as the DataNodes, although that is not required.
-            </p>
+            <p> Data is physically divided based on units of storage called
+                <term>tablets</term>. Tablets are stored by <term>tablet
+                servers</term>. Each tablet server can store multiple tablets,
+              and each tablet is replicated across multiple tablet servers,
+              managed automatically by Kudu. Where practical, co-locate the
+              tablet servers on the same hosts as the Impala daemons, although
+              that is not required. </p>
           </li>
         </ul>
-
-        <p>
-          One consideration for the cluster topology is that the number of replicas for a Kudu table
-          must be odd.
-        </p>
 
       </conbody>
 
     </concept>
 
+  </concept>
+
+  <concept id="kudu_replication_factor">
+    <title>Kudu Replication Factor</title>
+    <conbody>
+      <p>
+        By default, Kudu tables created through Impala use a tablet
+        replication factor of 3. To change the replication factor for a Kudu
+        table, specify the replication factor using <codeph>TBLPROPERTIES
+          ('kudu.num_tablet_replicas' = '<i>n</i>')</codeph> in the <keyword
+          keyref="create_table"/> statement.
+      </p>
+
+      <p>
+        The number of replicas for a Kudu table must be odd.
+      </p>
+
+      <p> Altering the <codeph>kudu.num_tablet_replicas</codeph> property after
+        table creation currently has no effect. </p>
+    </conbody>
   </concept>
 
   <concept id="kudu_ddl">
@@ -507,8 +523,7 @@ CREATE TABLE default_vals
             Each column in a Kudu table can optionally use an encoding, a low-overhead form of
             compression that reduces the size on disk, then requires additional CPU cycles to
             reconstruct the original values during queries. Typically, highly compressible data
-            benefits from the reduced I/O to read the data back from disk. By default, each
-            column uses the <q>plain</q> encoding where the data is stored unchanged.
+            benefits from the reduced I/O to read the data back from disk.
           </p>
 
           <p>
@@ -517,9 +532,9 @@ CREATE TABLE default_vals
             <ul>
               <li>
                 <p>
-                  <codeph>AUTO_ENCODING</codeph>: use the default encoding based on the column
-                  type; currently always the same as <codeph>PLAIN_ENCODING</codeph>, but subject to
-                  change in the future.
+                  <codeph>AUTO_ENCODING</codeph>: use the default encoding based
+                  on the column type, which are bitshuffle for the numeric type
+                  columns and dictionary for the string type columns.
                 </p>
               </li>
               <li>
@@ -1094,24 +1109,19 @@ select microseconds,
       <title>How Impala Handles Kudu Metadata</title>
 
       <conbody>
-
+        <note>This section only applies the Kudu services that are not
+          integrated with the Hive Metastore (HMS).</note>
         <p conref="../shared/impala_common.xml#common/kudu_metadata_intro"/>
         <p conref="../shared/impala_common.xml#common/kudu_metadata_details"/>
-
-        <p>
-          Because Kudu manages the metadata for its own tables separately from the metastore
-          database, there is a table name stored in the metastore database for Impala to use,
-          and a table name on the Kudu side, and these names can be modified independently
-          through <codeph>ALTER TABLE</codeph> statements.
-        </p>
-
-        <p>
-          To avoid potential name conflicts, the prefix <codeph>impala::</codeph>
-          and the Impala database name are encoded into the underlying Kudu
-          table name:
-        </p>
-
-<codeblock><![CDATA[
+        <p> Because Kudu manages the metadata for its own tables separately from
+          the metastore database, there is a table name stored in the metastore
+          database for Impala to use, and a table name on the Kudu side, and
+          these names can be modified independently through <codeph>ALTER
+            TABLE</codeph> statements. </p>
+        <p> To avoid potential name conflicts, the prefix
+            <codeph>impala::</codeph> and the Impala database name are encoded
+          into the underlying Kudu table name: </p>
+        <codeblock><![CDATA[
 create database some_database;
 use some_database;
 
@@ -1123,17 +1133,39 @@ describe formatted table_name_demo;
 kudu.table_name  | impala::some_database.table_name_demo
 ]]>
 </codeblock>
-
-        <p>
-          See <xref keyref="kudu_tables"/> for examples of how to change the name of
-          the Impala table in the metastore database, the name of the underlying Kudu
-          table, or both.
-        </p>
-
+        <p> See <xref keyref="kudu_tables"/> for examples of how to change the
+          name of the Impala table in the metastore database, the name of the
+          underlying Kudu table, or both. </p>
       </conbody>
 
     </concept>
 
+  </concept>
+  <concept id="kudu_hms">
+    <title>Working with Kudu Integrated with Hive Metastore</title>
+    <conbody>
+      <p>Starting from Kudu 1.10 and Impala 3.3, Impala supports Kudu services
+        integrated with the Hive Metastore (HMS). See <xref
+          href="https://kudu.apache.org/docs/hive_metastore.html#hive_metastore"
+          format="html" scope="external">the HMS integration
+          documentation</xref> for more details on Kudu’s Hive Metastore
+        integration.</p>
+      <p>The following are some of the changes you need to consider when working
+        with Kudu services integrated with the HMS.<ul>
+          <li> When Kudu is integrated with the Hive Metastore, Impala must be
+            configured to use the same HMS as Kudu.</li>
+          <li> Since there may be no one-to-one mapping between Kudu tables and
+            external tables, only internal tables are automatically
+            synchronized. </li>
+          <li>When you create a table in Kudu, Kudu will create an HMS entry for
+            that table with the internal table type.</li>
+          <li>When the Kudu service is integrated with the HMS, internal table
+            entries will be created automatically in the HMS when tables are
+            created in Kudu without Impala. To access these tables through
+            Impala, run <codeph>INVALIDATE METADATA</codeph> statement so Impala
+            picks up the latest metadata.</li>
+        </ul></p>
+    </conbody>
   </concept>
 
   <concept id="kudu_etl">
@@ -1242,6 +1274,8 @@ kudu.table_name  | impala::some_database.table_name_demo
           does not apply to Kudu tables.
         </p>
       </note>
+
+      <p conref="../shared/impala_common.xml#common/kudu_hints"/>
 
     </conbody>
 

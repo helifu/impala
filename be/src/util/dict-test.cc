@@ -25,15 +25,38 @@
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "testutil/gtest-util.h"
+#include "testutil/rand-util.h"
+#include "util/bit-packing.inline.h"
 #include "util/dict-encoding.h"
+#include "util/encoding-test-util.h"
 
 #include "common/names.h"
 
 namespace impala {
 
+// Helper function to validate that 'decoder' decodes the expected values.
+// If 'skip_at' and 'skip_count' aren't zero, then the value skipping logic
+// is also exercised.
+template<typename InternalType>
+void ValidateValues(DictDecoder<InternalType>& decoder,
+const vector<InternalType>& values, int skip_at, int skip_count, bool skip_success) {
+  for (int i = 0; i < skip_at; ++i) {
+    InternalType j;
+    ASSERT_TRUE(decoder.GetNextValue(&j));
+    EXPECT_EQ(values[i], j) << i;
+  }
+  EXPECT_EQ(decoder.SkipValues(skip_count), skip_success);
+  for (int i = skip_at + skip_count; i < values.size(); ++i) {
+    InternalType j;
+    ASSERT_TRUE(decoder.GetNextValue(&j));
+    EXPECT_EQ(values[i], j) << i;
+  }
+}
+
 template<typename InternalType, parquet::Type::type PARQUET_TYPE>
 void ValidateDict(const vector<InternalType>& values,
-    const vector<InternalType>& dict_values, int fixed_buffer_byte_size) {
+    const vector<InternalType>& dict_values, int fixed_buffer_byte_size,
+    int skip_at = 0, int skip_count = 0, bool skip_success = true) {
   set<InternalType> values_set(values.begin(), values.end());
 
   int bytes_alloc = 0;
@@ -50,7 +73,7 @@ void ValidateDict(const vector<InternalType>& values,
   uint8_t dict_buffer[encoder.dict_encoded_size()];
   encoder.WriteDict(dict_buffer);
 
-  int data_buffer_len = encoder.EstimatedDataEncodedSize();
+  int data_buffer_len = encoder.EstimatedDataEncodedSize() * 2;
   uint8_t data_buffer[data_buffer_len];
   int data_len = encoder.WriteData(data_buffer, data_buffer_len);
   EXPECT_GT(data_len, 0);
@@ -73,11 +96,7 @@ void ValidateDict(const vector<InternalType>& values,
   }
   // Test access to dictionary via internal stream
   ASSERT_OK(decoder.SetData(data_buffer, data_len));
-  for (InternalType i: values) {
-    InternalType j;
-    ASSERT_TRUE(decoder.GetNextValue(&j));
-    EXPECT_EQ(i, j);
-  }
+  ValidateValues(decoder, values, skip_at, skip_count, skip_success);
   pool.FreeAll();
 }
 
@@ -110,9 +129,9 @@ TEST(DictTest, TestStrings) {
 }
 
 TEST(DictTest, TestTimestamps) {
-  TimestampValue tv1 = TimestampValue::Parse("2011-01-01 09:01:01");
-  TimestampValue tv2 = TimestampValue::Parse("2012-01-01 09:01:01");
-  TimestampValue tv3 = TimestampValue::Parse("2011-01-01 09:01:02");
+  TimestampValue tv1 = TimestampValue::ParseSimpleDateFormat("2011-01-01 09:01:01");
+  TimestampValue tv2 = TimestampValue::ParseSimpleDateFormat("2012-01-01 09:01:01");
+  TimestampValue tv3 = TimestampValue::ParseSimpleDateFormat("2011-01-01 09:01:02");
 
   vector<TimestampValue> dict_values;
   dict_values.push_back(tv1);
@@ -251,6 +270,31 @@ TEST(DictTest, SetDataAfterPartialRead) {
   EXPECT_EQ(track_decoder.consumption(), bytes_alloc);
 }
 
+// Make sure the decoder detects if the bit width is too high.
+TEST(DictTest, SetDataInvalidBitwidthFails) {
+  // The maximum bit width that bit packing can handle is higher but DictDecoder uses 32
+  // bit integers to store the indices.
+  const int high_bit_width = 33;
+  uint8_t buffer[5] = {}; // Initialise the buffer.
+
+  MemTracker tracker;
+  DictDecoder<int> decoder(&tracker);
+
+  // Accept valid bit widths.
+  for (int i = 0; i < high_bit_width; i++) {
+    buffer[0] = i;
+    Status status = decoder.SetData(buffer, 5);
+    EXPECT_OK(status);
+  }
+
+  // Reject too high bit widths.
+  for (int i = high_bit_width; i < BatchedBitReader::MAX_BITWIDTH; i++) {
+    buffer[0] = i;
+    Status status = decoder.SetData(buffer, 5);
+    EXPECT_FALSE(status.ok());
+  }
+}
+
 // Test handling of decode errors from out-of-range values.
 TEST(DictTest, DecodeErrors) {
   int bytes_alloc = 0;
@@ -319,6 +363,124 @@ TEST(DictTest, DecodeErrors) {
   }
 }
 
+TEST(DictTest, TestGetNextValuesAndSkippingFuzzy) {
+  const int values_size = 8192;
+  const int rounds = 100;
+  MemTracker tracker;
+  MemTracker track_encoder;
+  MemTracker track_decoder;
+  MemPool pool(&tracker);
+  DictEncoder<int> large_dict_encoder(&pool, sizeof(int), &track_encoder);
+
+  std::default_random_engine random_eng;
+  RandTestUtil::SeedRng("DICT_TEST_SEED", &random_eng);
+
+  // Generates random number between 'bottom' and 'top' (inclusive intervals).
+  auto GetRandom = [&random_eng](int bottom, int top) {
+    std::uniform_int_distribution<int> uni_dist(bottom, top);
+    return uni_dist(random_eng);
+  };
+
+  vector<int> values = MakeRandomSequence(random_eng, values_size, 200, 10);
+  for (int val : values) {
+    large_dict_encoder.Put(val);
+  }
+
+  vector<uint8_t> data_buffer(large_dict_encoder.EstimatedDataEncodedSize() * 2);
+  int data_len = large_dict_encoder.WriteData(data_buffer.data(), data_buffer.size());
+  ASSERT_GT(data_len, 0);
+
+  vector<uint8_t> dict_buffer(large_dict_encoder.dict_encoded_size());
+  large_dict_encoder.WriteDict(dict_buffer.data());
+  large_dict_encoder.Close();
+
+  vector<int32_t> decoded_values(values.size());
+  DictDecoder<int> decoder(&track_decoder);
+  ASSERT_TRUE(decoder.template Reset<parquet::Type::INT32>(
+      dict_buffer.data(), dict_buffer.size(), sizeof(int)));
+
+  for (int round = 0; round < rounds; ++round) {
+    ASSERT_OK(decoder.SetData(data_buffer.data(), data_buffer.size()));
+    int i = 0;
+    while (i < values.size()) {
+      int length = GetRandom(1, 200);
+      if (i + length > values.size()) length = values.size() - i;
+      int skip_or_get = GetRandom(0, 1);
+      if (skip_or_get == 0) {
+        // skip values
+        ASSERT_TRUE(decoder.SkipValues(length));
+      } else {
+        // decode values
+        ASSERT_TRUE(decoder.GetNextValues(&decoded_values[i],
+                sizeof(int32_t), length));
+        for (int j = 0; j < length; ++j) {
+          EXPECT_EQ(values[i+j], decoded_values[i+j]);
+        }
+      }
+      i += length;
+    }
+  }
 }
 
-IMPALA_TEST_MAIN();
+TEST(DictTest, TestSkippingValues) {
+  auto ValidateSkipping = [](const vector<int32_t>& values,
+      const vector<int32_t>& dict_values, int skip_at, int skip_count,
+      bool skip_success = true) {
+    const int value_byte_size = ParquetPlainEncoder::EncodedByteSize(
+        ColumnType(TYPE_INT));
+    ValidateDict<int32_t, parquet::Type::INT32>(values, dict_values, value_byte_size,
+        skip_at, skip_count, skip_success);
+  };
+
+  vector<int32_t> literal_values;
+  for (int i = 0; i < 200; ++i) literal_values.push_back(i);
+  ValidateSkipping(literal_values, literal_values, 0, 4);
+  ValidateSkipping(literal_values, literal_values, 0, 130);
+  ValidateSkipping(literal_values, literal_values, 2, 4);
+  ValidateSkipping(literal_values, literal_values, 4, 48);
+  ValidateSkipping(literal_values, literal_values, 7, 130);
+  // Skipping too many values should fail
+  ValidateSkipping(literal_values, literal_values, 4, 300, false);
+
+  vector<int32_t> repeated_values(200, 1000);
+  ValidateSkipping(repeated_values, {1000}, 0, 4);
+  ValidateSkipping(repeated_values, {1000}, 0, 49);
+  ValidateSkipping(repeated_values, {1000}, 0, 145);
+  ValidateSkipping(repeated_values, {1000}, 3, 4);
+  ValidateSkipping(repeated_values, {1000}, 4, 49);
+  ValidateSkipping(repeated_values, {1000}, 4, 150);
+  // Skipping too many values should fail
+  ValidateSkipping(repeated_values, {1000}, 4, 300, false);
+
+  auto Concat = [](const vector<int32_t>& a, const vector<int32_t>& b) {
+    vector<int32_t> ab(a);
+    ab.insert(ab.end(), b.begin(), b.end());
+    return ab;
+  };
+  vector<int32_t> literal_then_repeated = Concat(literal_values, repeated_values);
+  vector<int32_t> literal_then_repeated_dict = Concat(literal_values, {1000});
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 0, 4);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 0, 87);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 0, 200);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 0, 222);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 4, 19);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 4, 200);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 200, 47);
+  ValidateSkipping(literal_then_repeated, literal_then_repeated_dict, 234, 166);
+
+  vector<int32_t> repeated_then_literal = Concat(repeated_values, literal_values);
+  vector<int32_t> repeated_then_literal_dict = Concat({1000}, literal_values);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 0, 4);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 0, 89);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 0, 200);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 0, 232);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 4, 8);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 4, 88);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 4, 288);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 230, 11);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 230, 79);
+  ValidateSkipping(repeated_then_literal, repeated_then_literal_dict, 230, 170);
+}
+
+}
+

@@ -23,7 +23,6 @@
 
 #include "exec/hdfs-scanner.h"
 #include "exec/hdfs-scan-node-base.h"
-#include "exec/scanner-context.h"
 
 namespace impala {
 
@@ -31,24 +30,33 @@ class DescriptorTbl;
 class ObjectPool;
 class RuntimeState;
 class RowBatch;
+class ScannerContext;
 class TPlanNode;
 
 /// Scan node that materializes tuples, evaluates conjuncts and runtime filters
 /// in the thread calling GetNext(). Uses the HdfsScanner::GetNext() interface.
 class HdfsScanNodeMt : public HdfsScanNodeBase {
  public:
-  HdfsScanNodeMt(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+  HdfsScanNodeMt(
+      ObjectPool* pool, const HdfsScanPlanNode& pnode, const DescriptorTbl& descs);
   ~HdfsScanNodeMt();
 
-  virtual Status Prepare(RuntimeState* state) WARN_UNUSED_RESULT;
-  virtual Status Open(RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status Prepare(RuntimeState* state) override WARN_UNUSED_RESULT;
+  virtual Status Open(RuntimeState* state) override WARN_UNUSED_RESULT;
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos)
-      WARN_UNUSED_RESULT;
-  virtual void Close(RuntimeState* state);
+      override WARN_UNUSED_RESULT;
+  virtual void Close(RuntimeState* state) override;
 
-  virtual bool HasRowBatchQueue() const { return false; }
+  virtual bool HasRowBatchQueue() const override { return false; }
+  virtual ExecutionModel getExecutionModel() const override { return TASK_BASED; }
 
  private:
+  /// Create and open new scanner for this partition type.
+  /// If the scanner is successfully created and opened, it is returned in 'scanner'.
+  Status CreateAndOpenScanner(HdfsPartitionDescriptor* partition,
+      ScannerContext* context, boost::scoped_ptr<HdfsScanner>* scanner)
+      WARN_UNUSED_RESULT;
+
   /// Current scan range and corresponding scanner.
   io::ScanRange* scan_range_;
   boost::scoped_ptr<ScannerContext> scanner_ctx_;

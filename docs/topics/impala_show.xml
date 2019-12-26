@@ -33,20 +33,15 @@ under the License.
   </prolog>
 
   <conbody>
-
-    <p>
-      <indexterm audience="hidden">SHOW statement</indexterm>
-      The <codeph>SHOW</codeph> statement is a flexible way to get information about different types of Impala
-      objects.
-    </p>
-
+    <p> The <codeph>SHOW</codeph> statement is a flexible way to get information
+      about different types of Impala objects. </p>
     <p conref="../shared/impala_common.xml#common/syntax_blurb"/>
-
-<codeblock>SHOW DATABASES [[LIKE] '<varname>pattern</varname>']
+    <codeblock>SHOW DATABASES [[LIKE] '<varname>pattern</varname>']
 SHOW SCHEMAS [[LIKE] '<varname>pattern</varname>'] - an alias for SHOW DATABASES
 SHOW TABLES [IN <varname>database_name</varname>] [[LIKE] '<varname>pattern</varname>']
 <ph rev="1.2.0">SHOW [AGGREGATE | ANALYTIC] FUNCTIONS [IN <varname>database_name</varname>] [[LIKE] '<varname>pattern</varname>']</ph>
 <ph rev="1.2.1">SHOW CREATE TABLE [<varname>database_name</varname>].<varname>table_name</varname></ph>
+<ph rev="1.2.1">SHOW CREATE VIEW [<varname>database_name</varname>].<varname>view_name</varname></ph>
 <ph rev="1.2.1">SHOW TABLE STATS [<varname>database_name</varname>.]<varname>table_name</varname></ph>
 <ph rev="1.2.1">SHOW COLUMN STATS [<varname>database_name</varname>.]<varname>table_name</varname></ph>
 <ph rev="1.4.0">SHOW PARTITIONS [<varname>database_name</varname>.]<varname>table_name</varname></ph>
@@ -55,44 +50,47 @@ SHOW FILES IN [<varname>database_name</varname>.]<varname>table_name</varname> <
 
 <ph rev="2.0.0">SHOW ROLES
 SHOW CURRENT ROLES
-SHOW ROLE GRANT GROUP <varname>group_name</varname>
-SHOW GRANT ROLE <varname>role_name</varname></ph>
-</codeblock>
+SHOW ROLE GRANT GROUP <varname>group_name</varname></ph>
 
-<!-- SHOW ROLE GRANT { USER <varname>user_name</varname> | GROUP <varname>group_name</varname> | ROLE <varname>role_name</varname> } -->
+<ph rev="3.1.0">SHOW GRANT USER <varname>user_name</varname> ON SERVER
+SHOW GRANT USER <varname>user_name</varname> ON DATABASE <varname>database_name</varname>
+SHOW GRANT USER <varname>user_name</varname> ON TABLE <varname>database_name.table_name</varname>
+SHOW GRANT USER <varname>user_name</varname> ON URI <varname>uri</varname></ph>
+SHOW GRANT USER <varname>user_name</varname> ON COLUMN <varname>database_name.table_name.column_name</varname></codeblock>
+    <p>The following statements are supported only when Impala uses Sentry to
+      manage authorization.</p>
+    <codeblock>SHOW GRANT USER <varname>user_name</varname>
 
-<!-- Extracted from the previous codeblock because even hidden content produces blank lines.
-<ph audience="hidden" rev="1.4.0">SHOW DATA SOURCES [LIKE '<varname>source_name</varname>]</ph>
--->
-
-<!-- Some suggestion there would be this syntax for 1.4, but it's not in the builds:
-<ph rev="1.4.0">SHOW [CACHED] TABLES [IN <varname>database_name</varname>] [[LIKE] '<varname>pattern</varname>']</ph>
-<ph rev="1.4.0">SHOW [CACHED] PARTITIONS [<varname>database_name</varname>.]<varname>table_name</varname></ph>
--->
-
-    <p>
-      Issue a <codeph>SHOW <varname>object_type</varname></codeph> statement to see the appropriate objects in the
-      current database, or <codeph>SHOW <varname>object_type</varname> IN <varname>database_name</varname></codeph>
-      to see objects in a specific database.
-    </p>
-
-    <p>
-      The optional <varname>pattern</varname> argument is a quoted string literal, using Unix-style
-      <codeph>*</codeph> wildcards and allowing <codeph>|</codeph> for alternation. The preceding
-      <codeph>LIKE</codeph> keyword is also optional. All object names are stored in lowercase, so use all
-      lowercase letters in the pattern string. For example:
-    </p>
-
-<codeblock>show databases 'a*';
-show databases like 'a*';
-show tables in some_db like '*fact*';
-use some_db;
-show tables '*dim*|*fact*';</codeblock>
-
+SHOW GRANT ROLE <varname>role_name</varname>
+SHOW GRANT ROLE <varname>role_name</varname> ON SERVER
+SHOW GRANT ROLE <varname>role_name</varname> ON DATABASE <varname>database_name</varname>
+SHOW GRANT ROLE <varname>role_name</varname> ON TABLE <varname>database_name.table_name</varname>
+SHOW GRANT ROLE <varname>role_name</varname> ON URI <varname>uri</varname>
+SHOW GRANT ROLE <varname>role_name</varname> ON COLUMN <varname>database_name.table_name.column_name</varname></codeblock>
+    <p rev="3.3">The following statements are supported only when Impala uses
+      Ranger to manage authorization.</p>
+    <codeblock>SHOW GRANT GROUP <varname>group_name</varname> ON SERVER
+SHOW GRANT GROUP <varname>group_name</varname> ON DATABASE <varname>database_name</varname>
+SHOW GRANT GROUP <varname>group_name</varname> ON TABLE <varname>database_name.table_name</varname>
+SHOW GRANT GROUP <varname>group_name</varname> ON URI <varname>uri</varname>
+SHOW GRANT GROUP <varname>group_name</varname> ON COLUMN <varname>database_name.table_name.column_name</varname></codeblock>
+    <p> Issue a <codeph>SHOW <varname>object_type</varname></codeph> statement
+      to see the appropriate objects in the current database, or <codeph>SHOW
+          <varname>object_type</varname> IN
+        <varname>database_name</varname></codeph> to see objects in a specific
+      database. </p>
+    <p> The optional <varname>pattern</varname> argument is a quoted string
+      literal, using Unix-style <codeph>*</codeph> wildcards and allowing
+        <codeph>|</codeph> for alternation. The preceding <codeph>LIKE</codeph>
+      keyword is also optional. All object names are stored in lowercase, so use
+      all lowercase letters in the pattern string. For example: </p>
+    <codeblock>SHOW DATABASES 'a*';
+SHOW DATABASES LIKE 'a*';
+SHOW TABLES IN some_db LIKE '*fact*';
+USE some_db;
+SHOW TABLES '*dim*|*fact*';</codeblock>
     <p conref="../shared/impala_common.xml#common/cancel_blurb_no"/>
-
     <p outputclass="toc inpage"/>
-
   </conbody>
 
   <concept rev="2.2.0" id="show_files">
@@ -336,10 +334,11 @@ where id between 1 and 1000000;
     <conbody>
 
       <p>
-        The <codeph>SHOW ROLES</codeph> statement displays roles. This syntax is available in <keyword keyref="impala20_full"/> and later
-        only, when you are using the Sentry authorization framework along with the Sentry service, as described in
-        <xref href="impala_authorization.xml#sentry_service"/>. It does not apply when you use the Sentry framework
-        with privileges defined in a policy file.
+        The <codeph>SHOW ROLES</codeph> statement displays roles. This syntax
+        is available in <keyword keyref="impala20_full"/> and later only, when
+        you are using the Sentry authorization framework along with the Sentry
+        service, as described in <xref
+          href="impala_authorization.xml#sentry_service"/>.
       </p>
 
       <p conref="../shared/impala_common.xml#common/security_blurb"/>
@@ -377,7 +376,7 @@ where id between 1 and 1000000;
 
   <concept rev="2.0.0" id="show_current_role">
 
-    <title>SHOW CURRENT ROLE</title>
+    <title>SHOW CURRENT ROLES</title>
   <prolog>
     <metadata>
       <data name="Category" value="Sentry"/>
@@ -388,10 +387,11 @@ where id between 1 and 1000000;
     <conbody>
 
       <p rev="2.0.0">
-        The <codeph>SHOW CURRENT ROLE</codeph> statement displays roles assigned to the current user. This syntax
-        is available in <keyword keyref="impala20_full"/> and later only, when you are using the Sentry authorization framework along with
-        the Sentry service, as described in <xref href="impala_authorization.xml#sentry_service"/>. It does not
-        apply when you use the Sentry framework with privileges defined in a policy file.
+        The <codeph>SHOW CURRENT ROLES</codeph> statement displays
+        roles assigned to the current user. This syntax is available in <keyword
+          keyref="impala20_full"/> and later only, when you are using the Sentry
+        authorization framework along with the Sentry service, as described in
+          <xref href="impala_authorization.xml#sentry_service"/>.
       </p>
 
       <p conref="../shared/impala_common.xml#common/security_blurb"/>
@@ -426,7 +426,7 @@ where id between 1 and 1000000;
 
   <concept id="show_role_grant">
 
-    <title>SHOW ROLE GRANT Statement</title>
+    <title>SHOW ROLE GRANT GROUP Statement</title>
   <prolog>
     <metadata>
       <data name="Category" value="Sentry"/>
@@ -438,23 +438,18 @@ where id between 1 and 1000000;
     <conbody>
 
       <p rev="2.0.0">
-<!-- Copied from Sentry docs. Turn into conref. I did some rewording for clarity. -->
-        The <codeph>SHOW ROLE GRANT</codeph> statement lists all the roles assigned to the specified group. This
-        statement is only allowed for Sentry administrative users and others users that are part of the specified
-        group. This syntax is available in <keyword keyref="impala20_full"/> and later only, when you are using the Sentry authorization
-        framework along with the Sentry service, as described in
-        <xref href="impala_authorization.xml#sentry_service"/>. It does not apply when you use the Sentry framework
-        with privileges defined in a policy file.
+        The <codeph>SHOW ROLE GRANT GROUP</codeph> statement lists
+        all the roles assigned to the specified group. This statement is only
+        allowed for Sentry administrative users and others users that are part
+        of the specified group. This syntax is available in <keyword
+          keyref="impala20_full"/> and later only, when you are using the Sentry
+        authorization framework along with the Sentry service, as described in
+          <xref href="impala_authorization.xml#sentry_service"/>.
       </p>
 
       <p conref="../shared/impala_common.xml#common/security_blurb"/>
 
       <p conref="../shared/impala_common.xml#common/show_security"/>
-
-<!--
-<p conref="../shared/impala_common.xml#common/example_blurb"/>
-<codeblock>To do: construct example for SHOW ROLE GRANT</codeblock>
--->
 
       <p conref="../shared/impala_common.xml#common/permissions_blurb_no"/>
 
@@ -480,12 +475,14 @@ where id between 1 and 1000000;
     <conbody>
 
       <p>
-<!-- Copied from Sentry docs. Turn into conref. I did some rewording for clarity. -->
-        The <codeph>SHOW GRANT ROLE</codeph> statement list all the grants for the given role name. This statement
-        is only allowed for Sentry administrative users and other users that have been granted the specified role.
-        This syntax is available in <keyword keyref="impala20_full"/> and later only, when you are using the Sentry authorization framework
-        along with the Sentry service, as described in <xref href="impala_authorization.xml#sentry_service"/>. It
-        does not apply when you use the Sentry framework with privileges defined in a policy file.
+        <!-- Copied from Sentry docs. Turn into conref. I did some rewording for clarity. -->
+        The <codeph>SHOW GRANT ROLE</codeph> statement list all the grants for
+        the given role name. This statement is only allowed for Sentry
+        administrative users and other users that have been granted the
+        specified role. This syntax is available in <keyword
+          keyref="impala20_full"/> and later only, when you are using the Sentry
+        authorization framework along with the Sentry service, as described in
+          <xref href="impala_authorization.xml#sentry_service"/>.
       </p>
 
       <p conref="../shared/impala_common.xml#common/security_blurb"/>
@@ -501,6 +498,36 @@ where id between 1 and 1000000;
 
       <p conref="../shared/impala_common.xml#common/related_info"/>
 
+      <p>
+        <xref href="impala_authorization.xml#authorization"/>
+      </p>
+    </conbody>
+  </concept>
+  <concept rev="3.1.0" id="show_grant_user">
+    <title>SHOW GRANT USER Statement</title>
+    <prolog>
+      <metadata>
+        <data name="Category" value="Sentry"/>
+        <data name="Category" value="Users"/>
+      </metadata>
+    </prolog>
+    <conbody>
+      <p>
+        The <codeph>SHOW GRANT USER</codeph> statement shows the list of
+        privileges for a given user. This statement is only allowed for Sentry
+        administrative users. However, the current user can run <codeph>SHOW
+          GRANT USER</codeph> for themselves.
+      </p>
+      <p>
+        This syntax is available in <keyword keyref="impala31_full"/> and later
+        only, when you are using the Sentry authorization framework along with
+        the Sentry service, as described in <xref
+          href="impala_authorization.xml#sentry_service"/>.
+      </p>
+      <p conref="../shared/impala_common.xml#common/security_blurb"/>
+      <p conref="../shared/impala_common.xml#common/show_security"/>
+      <p conref="../shared/impala_common.xml#common/permissions_blurb_no"/>
+      <p conref="../shared/impala_common.xml#common/related_info"/>
       <p>
         <xref href="impala_authorization.xml#authorization"/>
       </p>
@@ -738,6 +765,16 @@ show tables like '*dim*|t*';
         to change things such as the database name, <codeph>LOCATION</codeph> field, and so on that might be
         different on the destination system.
       </p>
+      <p>
+        If you specify a view name in the <codeph>SHOW CREATE TABLE</codeph>,
+        it returns a <codeph>CREATE VIEW</codeph> statement with column names
+        and the original SQL statement to reproduce the view. You need the
+          <codeph>VIEW_METADATA</codeph> privilege on the view and
+          <codeph>SELECT</codeph> privilege on all underlying views and tables to
+        successfully run the <codeph>SHOW CREATE VIEW</codeph> statement for a
+        view. The <codeph>SHOW CREATE VIEW</codeph> is available as an alias for
+          <codeph>SHOW CREATE TABLE</codeph>.
+      </p>
 
       <p conref="../shared/impala_common.xml#common/security_blurb"/>
 
@@ -783,10 +820,9 @@ show CREATE TABLE numeric_grades_default_letter;
 |   student STRING NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,                  |
 |   PRIMARY KEY (score)                                                                          |
 | )                                                                                              |
-| PARTITION BY <b>RANGE (score) (...)</b>                                                               |
+| PARTITION BY <b>RANGE (score) (...)</b>                                                          |
 | STORED AS KUDU                                                                                 |
-| TBLPROPERTIES ('kudu.master_addresses'='vd0342.example.com:7051',                              |
-|   'kudu.table_name'='impala::USER.numeric_grades_default_letter')                              |
+| TBLPROPERTIES ('kudu.master_addresses'='vd0342.example.com:7051')                              |
 +------------------------------------------------------------------------------------------------+
 
 show range partitions numeric_grades_default_letter;
@@ -861,6 +897,22 @@ show create table show_create_table_demo;
       <p>
         <xref href="impala_create_table.xml#create_table"/>, <xref href="impala_describe.xml#describe"/>,
         <xref href="impala_show.xml#show_tables"/>
+      </p>
+    </conbody>
+  </concept>
+  <concept id="show_create_view">
+    <title>SHOW CREATE VIEW Statement</title>
+    <conbody>
+      <p> The <codeph>SHOW CREATE VIEW</codeph>, it returns a <codeph>CREATE
+          VIEW</codeph> statement with column names and the original SQL
+        statement to reproduce the view. You need the
+          <codeph>VIEW_METADATA</codeph> privilege on the view and
+          <codeph>SELECT</codeph> privilege on all underlying views and tables to
+        successfully run the <codeph>SHOW CREATE VIEW</codeph> statement for a
+        view. </p>
+      <p>
+        The <codeph>SHOW CREATE VIEW</codeph> is an alias for <codeph>SHOW
+          CREATE TABLE</codeph>.
       </p>
     </conbody>
   </concept>

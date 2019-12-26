@@ -25,21 +25,29 @@
 
 #include "exec/kudu-util.h"
 #include "kudu/rpc/rpc_context.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/trace.h"
+#include "runtime/fragment-instance-state.h"
 #include "runtime/krpc-data-stream-recvr.h"
 #include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/sorted-run-merger.h"
+#include "service/data-stream-service.h"
+#include "util/debug-util.h"
 #include "util/runtime-profile-counters.h"
 #include "util/periodic-counter-updater.h"
+#include "util/test-info.h"
+#include "util/time.h"
 
 #include "gen-cpp/data_stream_service.pb.h"
 
 #include "common/names.h"
 
-DECLARE_bool(use_krpc);
 DECLARE_int32(datastream_service_num_deserialization_threads);
 
+using kudu::MonoDelta;
+using kudu::MonoTime;
 using kudu::rpc::RpcContext;
 using std::condition_variable_any;
 
@@ -79,7 +87,7 @@ class KrpcDataStreamRecvr::SenderQueue {
   // On success, the first entry of 'deferred_rpcs_' is removed and the sender of the RPC
   // will be responded to. If the serialized row batch fails to be extracted from the
   // entry, the error status will be sent as reply.
-  void DequeueDeferredRpc();
+  void ProcessDeferredRpc();
 
   // Takes over the RPC state 'ctx' of an early sender for deferred processing and
   // kicks off a deserialization task to process it asynchronously. The ownership of
@@ -104,15 +112,34 @@ class KrpcDataStreamRecvr::SenderQueue {
  private:
   // Returns true if either (1) 'batch_queue' is empty and there is no pending insertion
   // or (2) inserting a row batch of 'batch_size' into 'batch_queue' will not cause the
-  // soft limit of the receiver to be exceeded. Expected to be called with lock_ held.
-  bool CanEnqueue(int64_t batch_size) const;
+  // soft limit of the receiver to be exceeded. Expected to be called with 'lock_' held.
+  bool CanEnqueue(int64_t batch_size, const unique_lock<SpinLock>& lock) const;
+
+  // Helper function for inserting 'payload' into 'deferred_rpcs_'. Also does some
+  // accounting for various counters. 'lock_' must be held when calling this function.
+  void EnqueueDeferredRpc(unique_ptr<TransmitDataCtx> payload,
+      const unique_lock<SpinLock>& lock);
+
+  // Helper function for removing the first item from 'deferred_rpcs_'. Also does some
+  // accounting for various counters. 'lock_' must be held when calling this function.
+  void DequeueDeferredRpc(const unique_lock<SpinLock>& lock);
+
+  // Mark an error 'status' into the overall status. 'lock_' must be held when calling
+  // this function. Will notify all threads waiting on 'data_arrival_cv_'.
+  void MarkErrorStatus(const Status& status, const unique_lock<SpinLock>& lock);
 
   // Unpacks a serialized row batch from 'request' and 'rpc_context' and populates
-  // 'tuple_offsets' and 'tuple_data'. On success, the deserialized row batch size will
-  // be stored in 'batch_size'. On failure, the error status is returned.
-  static Status UnpackRequest(const TransmitDataRequestPB* request,
+  // 'tuple_offsets' and 'tuple_data'. On success, the deserialized row batch sizes is
+  // stored in 'deserialized_size'. If 'serialized_size' is not NULL, also stores the
+  // serialized row batch size in it. On failure, the error status is returned.
+  Status UnpackRequest(const TransmitDataRequestPB* request,
       RpcContext* rpc_context, kudu::Slice* tuple_offsets, kudu::Slice* tuple_data,
-      int64_t* batch_size);
+      int64_t* deserialized_size, int64_t* serialized_size = nullptr);
+
+  // Helper function to compute the serialized row batch size from 'request'
+  // and 'rpc_context'. Returns 0 on failure to unpack the serialized row batch.
+  int64_t GetSerializedBatchSize(const TransmitDataRequestPB* request,
+      RpcContext* rpc_context);
 
   // The workhorse function for deserializing a row batch represented by ('header',
   // 'tuple_offsets' and 'tuple_data') and inserting it into 'batch_queue'. Expects to be
@@ -121,10 +148,11 @@ class KrpcDataStreamRecvr::SenderQueue {
   // the row batch is deserialized. 'batch_size' is the size in bytes of the deserialized
   // row batch. The caller is expected to have called CanEnqueue() to make sure the row
   // batch can be inserted without exceeding the soft limit of the receiver. Also notify
-  // a thread waiting on 'data_arrival_cv_'.
-  void AddBatchWork(int64_t batch_size, const RowBatchHeaderPB& header,
+  // a thread waiting on 'data_arrival_cv_'. Return error status if the row batch creation
+  // failed. Returns OK otherwise.
+  Status AddBatchWork(int64_t batch_size, const RowBatchHeaderPB& header,
       const kudu::Slice& tuple_offsets, const kudu::Slice& tuple_data,
-      unique_lock<SpinLock>* lock);
+      unique_lock<SpinLock>* lock, RpcContext* rpc_context) WARN_UNUSED_RESULT;
 
   // Receiver of which this queue is a member.
   KrpcDataStreamRecvr* recvr_;
@@ -132,7 +160,11 @@ class KrpcDataStreamRecvr::SenderQueue {
   // Protects all subsequent fields.
   SpinLock lock_;
 
-  // If true, the receiver fragment for this stream got cancelled.
+  // Record any error status within KrpcDataStreamRecvr when inserting row batch.
+  Status status_;
+
+  // If true, the receiver fragment for this stream got cancelled. This is usually
+  // triggered by closing the owning exchange node or cancelling the query.
   bool is_cancelled_ = false;
 
   // Number of deserialization requests sent to deserialization threads to drain
@@ -179,6 +211,11 @@ class KrpcDataStreamRecvr::SenderQueue {
   // full when they last tried to do so. The senders wait here until there is a space for
   // their batches, allowing the receiver-side to implement basic flow-control.
   std::queue<std::unique_ptr<TransmitDataCtx>> deferred_rpcs_;
+
+  // Monotonic time in nanoseconds of when 'deferred_rpcs_' goes from being empty to
+  // non-empty. Set to 0 when 'deferred_rpcs_' becomes empty again. Used for computing
+  // 'total_has_deferred_rpcs_timer_'.
+  int64_t has_deferred_rpcs_start_time_ns_ = 0;
 };
 
 KrpcDataStreamRecvr::SenderQueue::SenderQueue(
@@ -186,7 +223,9 @@ KrpcDataStreamRecvr::SenderQueue::SenderQueue(
   : recvr_(parent_recvr), num_remaining_senders_(num_senders) { }
 
 Status KrpcDataStreamRecvr::SenderQueue::GetBatch(RowBatch** next_batch) {
-  SCOPED_TIMER(recvr_->queue_get_batch_time_);
+  SCOPED_TIMER(recvr_->queue_get_batch_timer_);
+  DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
+  DCHECK(!recvr_->closed_);
   int num_to_dequeue = 0;
   // The sender id is set below when we decide to dequeue entries from 'deferred_rpcs_'.
   int sender_id = -1;
@@ -197,17 +236,25 @@ Status KrpcDataStreamRecvr::SenderQueue::GetBatch(RowBatch** next_batch) {
     *next_batch = nullptr;
 
     // Wait until something shows up or we know we're done
-    while (batch_queue_.empty() && !is_cancelled_ && num_remaining_senders_ > 0) {
-      VLOG_ROW << "wait arrival fragment_instance_id=" << recvr_->fragment_instance_id()
+    while (batch_queue_.empty() && status_.ok() && !is_cancelled_ &&
+        num_remaining_senders_ > 0) {
+      // Verify before waiting on 'data_arrival_cv_' that if there are any deferred
+      // batches, either there is outstanding deserialization request queued or there
+      // is pending insertion so this thread is guaranteed to wake up at some point.
+      DCHECK(deferred_rpcs_.empty() ||
+          (num_deserialize_tasks_pending_ + num_pending_enqueue_) > 0);
+      VLOG_ROW << "wait arrival fragment_instance_id="
+               << PrintId(recvr_->fragment_instance_id())
                << " node=" << recvr_->dest_node_id();
       // Don't count time spent waiting on the sender as active time.
-      CANCEL_SAFE_SCOPED_TIMER(recvr_->data_arrival_timer_, &is_cancelled_);
-      CANCEL_SAFE_SCOPED_TIMER(recvr_->inactive_timer_, &is_cancelled_);
-      CANCEL_SAFE_SCOPED_TIMER(
+      CANCEL_SAFE_SCOPED_TIMER3(recvr_->data_wait_timer_, recvr_->inactive_timer_,
           received_first_batch_ ? nullptr : recvr_->first_batch_wait_total_timer_,
           &is_cancelled_);
       data_arrival_cv_.wait(l);
     }
+
+    // Return early if there is any error when inserting row batches.
+    RETURN_IF_ERROR(status_);
 
     if (UNLIKELY(is_cancelled_)) {
       // Cancellation should have drained the entire 'deferred_rpcs_' queue.
@@ -242,7 +289,9 @@ Status KrpcDataStreamRecvr::SenderQueue::GetBatch(RowBatch** next_batch) {
     DCHECK(!batch_queue_.empty());
     received_first_batch_ = true;
     RowBatch* result = batch_queue_.front().second.release();
-    recvr_->num_buffered_bytes_.Add(-batch_queue_.front().first);
+    int64_t batch_size = batch_queue_.front().first;
+    COUNTER_ADD(recvr_->bytes_dequeued_counter_, batch_size);
+    recvr_->num_buffered_bytes_.Add(-batch_size);
     batch_queue_.pop_front();
     VLOG_ROW << "fetched #rows=" << result->num_rows();
     current_batch_.reset(result);
@@ -260,7 +309,9 @@ Status KrpcDataStreamRecvr::SenderQueue::GetBatch(RowBatch** next_batch) {
   return Status::OK();
 }
 
-inline bool KrpcDataStreamRecvr::SenderQueue::CanEnqueue(int64_t batch_size) const {
+inline bool KrpcDataStreamRecvr::SenderQueue::CanEnqueue(int64_t batch_size,
+    const unique_lock<SpinLock>& lock) const {
+  DCHECK(lock.owns_lock());
   // The queue is truly empty iff there is no pending insert. It's important that we
   // enqueue the new batch regardless of buffer limit if the queue is currently empty.
   // In the case of a merging receiver, batches are received from a specific queue
@@ -270,9 +321,46 @@ inline bool KrpcDataStreamRecvr::SenderQueue::CanEnqueue(int64_t batch_size) con
   return queue_empty || !recvr_->ExceedsLimit(batch_size);
 }
 
+void KrpcDataStreamRecvr::SenderQueue::EnqueueDeferredRpc(
+    unique_ptr<TransmitDataCtx> payload, const unique_lock<SpinLock>& lock) {
+  DCHECK(lock.owns_lock());
+  TRACE_TO(payload->rpc_context->trace(), "Enqueuing deferred RPC");
+  if (deferred_rpcs_.empty()) has_deferred_rpcs_start_time_ns_ = MonotonicNanos();
+  deferred_rpcs_.push(move(payload));
+  recvr_->num_deferred_rpcs_.Add(1);
+  COUNTER_ADD(recvr_->total_deferred_rpcs_counter_, 1);
+}
+
+void KrpcDataStreamRecvr::SenderQueue::DequeueDeferredRpc(
+    const unique_lock<SpinLock>& lock) {
+  DCHECK(lock.owns_lock());
+  deferred_rpcs_.pop();
+  if (deferred_rpcs_.empty()) {
+    DCHECK_NE(has_deferred_rpcs_start_time_ns_, 0);
+    int64_t duration = MonotonicNanos() - has_deferred_rpcs_start_time_ns_;
+    COUNTER_ADD(recvr_->total_has_deferred_rpcs_timer_, duration);
+    has_deferred_rpcs_start_time_ns_ = 0;
+  }
+  recvr_->num_deferred_rpcs_.Add(-1);
+}
+
+inline void KrpcDataStreamRecvr::SenderQueue::MarkErrorStatus(const Status& status,
+    const unique_lock<SpinLock>& lock) {
+  DCHECK(lock.owns_lock());
+  DCHECK(!status.ok());
+  status_.MergeStatus(status);
+  // Notify all threads which are waiting for row batches that an error has occurred.
+  data_arrival_cv_.notify_all();
+}
+
 Status KrpcDataStreamRecvr::SenderQueue::UnpackRequest(
     const TransmitDataRequestPB* request, RpcContext* rpc_context,
-    kudu::Slice* tuple_offsets, kudu::Slice* tuple_data, int64_t* batch_size) {
+    kudu::Slice* tuple_offsets, kudu::Slice* tuple_data, int64_t* deserialized_size,
+    int64_t* serialized_size) {
+
+  RETURN_IF_ERROR(DebugAction(recvr_->runtime_state_.query_options(),
+      "RECVR_UNPACK_PAYLOAD"));
+
   // Unpack the tuple offsets.
   KUDU_RETURN_IF_ERROR(rpc_context->GetInboundSidecar(
       request->tuple_offsets_sidecar_idx(), tuple_offsets),
@@ -282,43 +370,64 @@ Status KrpcDataStreamRecvr::SenderQueue::UnpackRequest(
       request->tuple_data_sidecar_idx(), tuple_data),
       "Failed to get the tuple data sidecar");
   // Compute the size of the deserialized row batch.
-  *batch_size =
+  *deserialized_size =
       RowBatch::GetDeserializedSize(request->row_batch_header(), *tuple_offsets);
+  // Compute the size of the serialized row batch.
+  if (serialized_size != nullptr) {
+    *serialized_size = tuple_offsets->size() + tuple_data->size();
+  }
   return Status::OK();
 }
 
-void KrpcDataStreamRecvr::SenderQueue::AddBatchWork(int64_t batch_size,
+Status KrpcDataStreamRecvr::SenderQueue::AddBatchWork(int64_t batch_size,
     const RowBatchHeaderPB& header, const kudu::Slice& tuple_offsets,
-    const kudu::Slice& tuple_data, unique_lock<SpinLock>* lock) {
+    const kudu::Slice& tuple_data, unique_lock<SpinLock>* lock,
+    RpcContext* rpc_context) {
   DCHECK(lock != nullptr);
   DCHECK(lock->owns_lock());
+  DCHECK(!is_cancelled_);
 
-  COUNTER_ADD(recvr_->num_accepted_batches_, 1);
-  COUNTER_ADD(recvr_->bytes_received_counter_, batch_size);
   // Reserve queue space before dropping the lock below.
   recvr_->num_buffered_bytes_.Add(batch_size);
+  // Bump 'num_pending_enqueue_' to avoid race with Close() when lock is dropped below.
   DCHECK_GE(num_pending_enqueue_, 0);
   ++num_pending_enqueue_;
 
   // Deserialization may take some time due to compression and memory allocation.
   // Drop the lock so we can deserialize multiple batches in parallel.
   lock->unlock();
+  TRACE_TO(rpc_context->trace(), "Deserializing batch");
   unique_ptr<RowBatch> batch;
+  Status status;
   {
     SCOPED_TIMER(recvr_->deserialize_row_batch_timer_);
-    // At this point, the row batch will be inserted into batch_queue_. Close() will
-    // handle deleting any unconsumed batches from batch_queue_. Close() cannot proceed
-    // until there are no pending insertion to batch_queue_.
-    batch.reset(new RowBatch(recvr_->row_desc(), header, tuple_offsets, tuple_data,
-        recvr_->mem_tracker()));
+    status = DebugAction(recvr_->runtime_state_.query_options(), "RECVR_ADD_BATCH");
+    if (LIKELY(status.ok())) {
+      // At this point, a row batch will be inserted into batch_queue_.
+      // Close() will handle deleting any unconsumed batches from batch_queue_.
+      // Close() cannot proceed until there are no pending insertion to batch_queue_.
+      status = RowBatch::FromProtobuf(recvr_->row_desc(), header, tuple_offsets,
+          tuple_data, recvr_->parent_tracker(), recvr_->buffer_pool_client(), &batch);
+    }
   }
   lock->lock();
 
   DCHECK_GT(num_pending_enqueue_, 0);
   --num_pending_enqueue_;
+  if (UNLIKELY(!status.ok())) {
+    recvr_->num_buffered_bytes_.Add(-batch_size);
+    VLOG_QUERY << "Failed to deserialize batch for "
+               << PrintId(recvr_->fragment_instance_id());
+    TRACE_TO(rpc_context->trace(), "Failed to deserialize batch: $0", status.GetDetail());
+    MarkErrorStatus(status, *lock);
+    return status;
+  }
   VLOG_ROW << "added #rows=" << batch->num_rows() << " batch_size=" << batch_size;
+  TRACE_TO(rpc_context->trace(), "Enqueuing deserialized batch");
+  COUNTER_ADD(recvr_->total_enqueued_batches_counter_, 1);
   batch_queue_.emplace_back(batch_size, move(batch));
   data_arrival_cv_.notify_one();
+  return Status::OK();
 }
 
 void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* request,
@@ -331,10 +440,17 @@ void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* req
   Status status = UnpackRequest(request, rpc_context, &tuple_offsets, &tuple_data,
       &batch_size);
   if (UNLIKELY(!status.ok())) {
-    status.ToProto(response->mutable_status());
-    rpc_context->RespondSuccess();
+    {
+      unique_lock<SpinLock> l(lock_);
+      MarkErrorStatus(status, l);
+    }
+    TRACE_TO(rpc_context->trace(), "Error unpacking request: $0", status.GetDetail());
+    DataStreamService::RespondRpc(status, response, rpc_context);
     return;
   }
+  COUNTER_ADD(recvr_->total_received_batches_counter_, 1);
+  // To be consistent with the senders, only count the sidecars size.
+  COUNTER_ADD(recvr_->bytes_received_counter_, tuple_data.size() + tuple_offsets.size());
 
   {
     unique_lock<SpinLock> l(lock_);
@@ -344,85 +460,127 @@ void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* req
     // responded to if we reach here.
     DCHECK_GT(num_remaining_senders_, 0);
     if (UNLIKELY(is_cancelled_)) {
-      Status::OK().ToProto(response->mutable_status());
-      rpc_context->RespondSuccess();
+      TRACE_TO(rpc_context->trace(), "Receiver was cancelled");
+      Status cancel_status = Status::Expected(TErrorCode::DATASTREAM_RECVR_CLOSED,
+          PrintId(recvr_->fragment_instance_id()), recvr_->dest_node_id());
+      DataStreamService::RespondRpc(cancel_status, response, rpc_context);
       return;
     }
 
-    // If there's something in the queue and this batch will push us over the buffer
+    // If there's something in the queue or this batch will push us over the buffer
     // limit we need to wait until the queue gets drained. We store the rpc context
     // so that we can signal it at a later time to resend the batch that we couldn't
     // process here. If there are already deferred RPCs waiting in queue, the new
     // batch needs to line up after the deferred RPCs to avoid starvation of senders
     // in the non-merging case.
-    if (UNLIKELY(!deferred_rpcs_.empty() || !CanEnqueue(batch_size))) {
+    if (UNLIKELY(!deferred_rpcs_.empty() || !CanEnqueue(batch_size, l))) {
+      recvr_->deferred_rpc_tracker()->Consume(rpc_context->GetTransferSize());
       auto payload = make_unique<TransmitDataCtx>(request, response, rpc_context);
-      deferred_rpcs_.push(move(payload));
-      COUNTER_ADD(recvr_->num_deferred_batches_, 1);
+      EnqueueDeferredRpc(move(payload), l);
       return;
     }
 
     // At this point, we are committed to inserting the row batch into 'batch_queue_'.
-    AddBatchWork(batch_size, header, tuple_offsets, tuple_data, &l);
+    status = AddBatchWork(batch_size, header, tuple_offsets, tuple_data, &l, rpc_context);
   }
 
   // Respond to the sender to ack the insertion of the row batches.
-  Status::OK().ToProto(response->mutable_status());
-  rpc_context->RespondSuccess();
+  DataStreamService::RespondRpc(status, response, rpc_context);
 }
 
-void KrpcDataStreamRecvr::SenderQueue::DequeueDeferredRpc() {
+void KrpcDataStreamRecvr::SenderQueue::ProcessDeferredRpc() {
   // Owns the first entry of 'deferred_rpcs_' if it ends up being popped.
   std::unique_ptr<TransmitDataCtx> ctx;
+  Status status;
   {
     unique_lock<SpinLock> l(lock_);
     DCHECK_GT(num_deserialize_tasks_pending_, 0);
     --num_deserialize_tasks_pending_;
 
-    // Returns if the queue has been cancelled or if it's empty.
-    if (UNLIKELY(is_cancelled_) || deferred_rpcs_.empty()) return;
+    if (deferred_rpcs_.empty()) return;
+    // A sender queue cannot be cancelled if there is any deferred RPC.
+    DCHECK(!is_cancelled_);
 
     // Try enqueuing the first entry into 'batch_queue_'.
     ctx.swap(deferred_rpcs_.front());
+    TRACE_TO(ctx->rpc_context->trace(), "Processing deferred RPC");
     kudu::Slice tuple_offsets;
     kudu::Slice tuple_data;
     int64_t batch_size;
-    Status status = UnpackRequest(ctx->request, ctx->rpc_context, &tuple_offsets,
+    status = UnpackRequest(ctx->request, ctx->rpc_context, &tuple_offsets,
         &tuple_data, &batch_size);
     // Reply with error status if the entry cannot be unpacked.
     if (UNLIKELY(!status.ok())) {
-      status.ToProto(ctx->response->mutable_status());
-      ctx->rpc_context->RespondSuccess();
-      deferred_rpcs_.pop();
+      TRACE_TO(ctx->rpc_context->trace(),
+          "Error unpacking deferred RPC: $0", status.GetDetail());
+      MarkErrorStatus(status, l);
+      DataStreamService::RespondAndReleaseRpc(status, ctx->response, ctx->rpc_context,
+          recvr_->deferred_rpc_tracker());
+      DequeueDeferredRpc(l);
       return;
     }
 
     // Stops if inserting the batch causes us to go over the limit.
     // Put 'ctx' back on the queue.
-    if (!CanEnqueue(batch_size)) {
+    if (!CanEnqueue(batch_size, l)) {
+      TRACE_TO(ctx->rpc_context->trace(), "Batch queue is full");
       ctx.swap(deferred_rpcs_.front());
       DCHECK(deferred_rpcs_.front().get() != nullptr);
       return;
     }
 
     // Dequeues the deferred batch and adds it to 'batch_queue_'.
-    deferred_rpcs_.pop();
+    DequeueDeferredRpc(l);
     const RowBatchHeaderPB& header = ctx->request->row_batch_header();
-    AddBatchWork(batch_size, header, tuple_offsets, tuple_data, &l);
+    status = AddBatchWork(
+        batch_size, header, tuple_offsets, tuple_data, &l, ctx->rpc_context);
+    DCHECK(!status.ok() || !batch_queue_.empty());
+
+    // Release to MemTracker while still holding the lock to prevent race with Close().
+    recvr_->deferred_rpc_tracker()->Release(ctx->rpc_context->GetTransferSize());
   }
 
   // Responds to the sender to ack the insertion of the row batches.
-  Status::OK().ToProto(ctx->response->mutable_status());
-  ctx->rpc_context->RespondSuccess();
+  // No need to hold lock when enqueuing the response.
+  DataStreamService::RespondRpc(status, ctx->response, ctx->rpc_context);
+}
+
+int64_t KrpcDataStreamRecvr::SenderQueue::GetSerializedBatchSize(
+    const TransmitDataRequestPB* request, RpcContext* rpc_context) {
+  kudu::Slice tuple_offsets;
+  kudu::Slice tuple_data;
+  int64_t unused;
+  int64_t serialized_size = 0;
+  if (UnpackRequest(request, rpc_context, &tuple_offsets, &tuple_data, &unused,
+          &serialized_size).ok()) {
+    return serialized_size;
+  }
+  return 0;
 }
 
 void KrpcDataStreamRecvr::SenderQueue::TakeOverEarlySender(
     unique_ptr<TransmitDataCtx> ctx) {
+  // TakeOverEarlySender() is called by the same thread which calls Close().
+  // The receiver cannot be closed while this function is in progress so
+  // 'recvr_->mgr_' shouldn't be NULL.
+  DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
+  DCHECK(!recvr_->closed_ && recvr_->mgr_ != nullptr);
+  COUNTER_ADD(recvr_->total_received_batches_counter_, 1);
+  COUNTER_ADD(recvr_->bytes_received_counter_,
+      GetSerializedBatchSize(ctx->request, ctx->rpc_context));
   int sender_id = ctx->request->sender_id();
-  COUNTER_ADD(recvr_->num_deferred_batches_, 1);
   {
-    lock_guard<SpinLock> l(lock_);
-    deferred_rpcs_.push(move(ctx));
+    unique_lock<SpinLock> l(lock_);
+    if (UNLIKELY(is_cancelled_)) {
+      TRACE_TO(ctx->rpc_context->trace(), "Recvr closed");
+      Status cancel_status = Status::Expected(TErrorCode::DATASTREAM_RECVR_CLOSED,
+          PrintId(recvr_->fragment_instance_id()), recvr_->dest_node_id());
+      DataStreamService::RespondRpc(cancel_status, ctx->response, ctx->rpc_context);
+      return;
+    }
+    // Only enqueue a deferred RPC if the sender queue is not yet cancelled.
+    recvr_->deferred_rpc_tracker()->Consume(ctx->rpc_context->GetTransferSize());
+    EnqueueDeferredRpc(move(ctx), l);
     ++num_deserialize_tasks_pending_;
   }
   recvr_->mgr_->EnqueueDeserializeTask(recvr_->fragment_instance_id(),
@@ -434,7 +592,7 @@ void KrpcDataStreamRecvr::SenderQueue::DecrementSenders() {
   DCHECK_GT(num_remaining_senders_, 0);
   num_remaining_senders_ = max(0, num_remaining_senders_ - 1);
   VLOG_FILE << "decremented senders: fragment_instance_id="
-            << recvr_->fragment_instance_id()
+            << PrintId(recvr_->fragment_instance_id())
             << " node_id=" << recvr_->dest_node_id()
             << " #senders=" << num_remaining_senders_;
   if (num_remaining_senders_ == 0) data_arrival_cv_.notify_one();
@@ -442,21 +600,23 @@ void KrpcDataStreamRecvr::SenderQueue::DecrementSenders() {
 
 void KrpcDataStreamRecvr::SenderQueue::Cancel() {
   {
-    lock_guard<SpinLock> l(lock_);
+    unique_lock<SpinLock> l(lock_);
     if (is_cancelled_) return;
     is_cancelled_ = true;
 
     // Respond to deferred RPCs.
     while (!deferred_rpcs_.empty()) {
-      const unique_ptr<TransmitDataCtx>& payload = deferred_rpcs_.front();
-      Status::OK().ToProto(payload->response->mutable_status());
-      payload->rpc_context->RespondSuccess();
-      deferred_rpcs_.pop();
+      const unique_ptr<TransmitDataCtx>& ctx = deferred_rpcs_.front();
+      Status cancel_status = Status::Expected(TErrorCode::DATASTREAM_RECVR_CLOSED,
+          PrintId(recvr_->fragment_instance_id()), recvr_->dest_node_id());
+      DataStreamService::RespondAndReleaseRpc(cancel_status, ctx->response,
+          ctx->rpc_context, recvr_->deferred_rpc_tracker());
+      DequeueDeferredRpc(l);
     }
   }
-  VLOG_QUERY << "cancelled stream: fragment_instance_id_="
-             << recvr_->fragment_instance_id()
-             << " node_id=" << recvr_->dest_node_id();
+  VLOG(2) << "cancelled stream: fragment_instance_id="
+          << PrintId(recvr_->fragment_instance_id())
+          << " node_id=" << recvr_->dest_node_id();
   // Wake up all threads waiting to produce/consume batches. They will all
   // notice that the stream is cancelled and handle it.
   data_arrival_cv_.notify_all();
@@ -470,6 +630,9 @@ void KrpcDataStreamRecvr::SenderQueue::Close() {
   // risk running into a race which can leak row batches. Please see IMPALA-3034.
   DCHECK(is_cancelled_);
 
+  // The deferred RPCs should all have been responded to in Cancel().
+  DCHECK(deferred_rpcs_.empty());
+
   // Wait for any pending insertion to complete first.
   while (num_pending_enqueue_ > 0) data_arrival_cv_.wait(l);
 
@@ -480,6 +643,7 @@ void KrpcDataStreamRecvr::SenderQueue::Close() {
 
 Status KrpcDataStreamRecvr::CreateMerger(const TupleRowComparator& less_than) {
   DCHECK(is_merging_);
+  DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
   vector<SortedRunMerger::RunBatchSupplierFn> input_batch_suppliers;
   input_batch_suppliers.reserve(sender_queues_.size());
 
@@ -498,6 +662,7 @@ Status KrpcDataStreamRecvr::CreateMerger(const TupleRowComparator& less_than) {
 }
 
 void KrpcDataStreamRecvr::TransferAllResources(RowBatch* transfer_batch) {
+  DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
   for (SenderQueue* sender_queue: sender_queues_) {
     if (sender_queue->current_batch() != nullptr) {
       sender_queue->current_batch()->TransferResourceOwnership(transfer_batch);
@@ -507,78 +672,109 @@ void KrpcDataStreamRecvr::TransferAllResources(RowBatch* transfer_batch) {
 
 KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
     MemTracker* parent_tracker, const RowDescriptor* row_desc,
-    const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id, int num_senders,
-    bool is_merging, int64_t total_buffer_limit, RuntimeProfile* profile)
+    const RuntimeState& runtime_state, const TUniqueId& fragment_instance_id,
+    PlanNodeId dest_node_id, int num_senders, bool is_merging,
+    int64_t total_buffer_limit, RuntimeProfile* profile,
+    BufferPool::ClientHandle* client)
   : mgr_(stream_mgr),
+    runtime_state_(runtime_state),
     fragment_instance_id_(fragment_instance_id),
     dest_node_id_(dest_node_id),
     total_buffer_limit_(total_buffer_limit),
     row_desc_(row_desc),
     is_merging_(is_merging),
+    closed_(false),
     num_buffered_bytes_(0),
+    deferred_rpc_tracker_(new MemTracker(-1, "KrpcDeferredRpcs", parent_tracker)),
+    parent_tracker_(parent_tracker),
+    buffer_pool_client_(client),
     profile_(profile),
-    recvr_side_profile_(profile_->CreateChild("RecvrSide")),
-    sender_side_profile_(profile_->CreateChild("SenderSide")) {
-  mem_tracker_.reset(new MemTracker(-1, "KrpcDataStreamRecvr", parent_tracker));
+    dequeue_profile_(RuntimeProfile::Create(&pool_, "Dequeue")),
+    enqueue_profile_(RuntimeProfile::Create(&pool_, "Enqueue")) {
   // Create one queue per sender if is_merging is true.
   int num_queues = is_merging ? num_senders : 1;
   sender_queues_.reserve(num_queues);
   int num_sender_per_queue = is_merging ? 1 : num_senders;
   for (int i = 0; i < num_queues; ++i) {
-    SenderQueue* queue =
-        sender_queue_pool_.Add(new SenderQueue(this, num_sender_per_queue));
+    SenderQueue* queue = pool_.Add(new SenderQueue(this, num_sender_per_queue));
     sender_queues_.push_back(queue);
   }
 
-  // Initialize the counters
-  bytes_received_counter_ =
-      ADD_COUNTER(recvr_side_profile_, "TotalBytesReceived", TUnit::BYTES);
-  bytes_received_time_series_counter_ = ADD_TIME_SERIES_COUNTER(
-      recvr_side_profile_, "BytesReceived", bytes_received_counter_);
-  queue_get_batch_time_ = ADD_TIMER(recvr_side_profile_, "TotalGetBatchTime");
-  data_arrival_timer_ =
-      ADD_CHILD_TIMER(recvr_side_profile_, "DataArrivalTimer", "TotalGetBatchTime");
-  first_batch_wait_total_timer_ =
-      ADD_TIMER(recvr_side_profile_, "FirstBatchArrivalWaitTime");
-  deserialize_row_batch_timer_ =
-      ADD_TIMER(sender_side_profile_, "DeserializeRowBatchTime");
+  // Add the profiles of the dequeuing side (i.e. GetBatch()) and the enqueuing side
+  // (i.e. AddBatchWork()) as children of the owning exchange node's profile.
+  profile_->AddChild(dequeue_profile_);
+  profile_->AddChild(enqueue_profile_);
+
+  // Initialize various counters for measuring dequeuing from queues.
+  bytes_dequeued_counter_ =
+      ADD_COUNTER(dequeue_profile_, "TotalBytesDequeued", TUnit::BYTES);
+  bytes_dequeued_time_series_counter_ = ADD_TIME_SERIES_COUNTER(
+      dequeue_profile_, "BytesDequeued", bytes_dequeued_counter_);
+  queue_get_batch_timer_ = ADD_TIMER(dequeue_profile_, "TotalGetBatchTime");
+  data_wait_timer_ =
+      ADD_CHILD_TIMER(dequeue_profile_, "DataWaitTime", "TotalGetBatchTime");
   inactive_timer_ = profile_->inactive_timer();
-  num_early_senders_ =
-      ADD_COUNTER(sender_side_profile_, "NumEarlySenders", TUnit::UNIT);
-  num_deferred_batches_ =
-      ADD_COUNTER(sender_side_profile_, "NumBatchesDeferred", TUnit::UNIT);
-  num_accepted_batches_ =
-      ADD_COUNTER(sender_side_profile_, "NumBatchesAccepted", TUnit::UNIT);
+  first_batch_wait_total_timer_ =
+      ADD_TIMER(dequeue_profile_, "FirstBatchWaitTime");
+
+  // Initialize various counters for measuring enqueuing into queues.
+  bytes_received_counter_ =
+      ADD_COUNTER(enqueue_profile_, "TotalBytesReceived", TUnit::BYTES);
+  bytes_received_time_series_counter_ = ADD_TIME_SERIES_COUNTER(
+      enqueue_profile_, "BytesReceived", bytes_received_counter_);
+  deserialize_row_batch_timer_ =
+      ADD_TIMER(enqueue_profile_, "DeserializeRowBatchTime");
+  total_eos_received_counter_ =
+      ADD_COUNTER(enqueue_profile_, "TotalEosReceived", TUnit::UNIT);
+  total_early_senders_counter_ =
+      ADD_COUNTER(enqueue_profile_, "TotalEarlySenders", TUnit::UNIT);
+  total_received_batches_counter_ =
+      ADD_COUNTER(enqueue_profile_, "TotalBatchesReceived", TUnit::UNIT);
+  total_enqueued_batches_counter_ =
+      ADD_COUNTER(enqueue_profile_, "TotalBatchesEnqueued", TUnit::UNIT);
+  total_deferred_rpcs_counter_ =
+      ADD_COUNTER(enqueue_profile_, "TotalRPCsDeferred", TUnit::UNIT);
+  deferred_rpcs_time_series_counter_ =
+      enqueue_profile_->AddSamplingTimeSeriesCounter("DeferredQueueSize", TUnit::UNIT,
+      bind<int64_t>(mem_fn(&KrpcDataStreamRecvr::num_deferred_rpcs), this));
+  total_has_deferred_rpcs_timer_ =
+      ADD_TIMER(enqueue_profile_, "TotalHasDeferredRPCsTime");
+  dispatch_timer_ =
+      ADD_SUMMARY_STATS_TIMER(enqueue_profile_, "DispatchTime");
 }
 
 Status KrpcDataStreamRecvr::GetNext(RowBatch* output_batch, bool* eos) {
+  DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
   DCHECK(merger_.get() != nullptr);
   return merger_->GetNext(output_batch, eos);
 }
 
 void KrpcDataStreamRecvr::AddBatch(const TransmitDataRequestPB* request,
     TransmitDataResponsePB* response, RpcContext* rpc_context) {
+  MonoDelta duration(MonoTime::Now().GetDeltaSince(rpc_context->GetTimeReceived()));
+  dispatch_timer_->UpdateCounter(duration.ToNanoseconds());
   int use_sender_id = is_merging_ ? request->sender_id() : 0;
   // Add all batches to the same queue if is_merging_ is false.
   sender_queues_[use_sender_id]->AddBatch(request, response, rpc_context);
 }
 
-void KrpcDataStreamRecvr::DequeueDeferredRpc(int sender_id) {
+void KrpcDataStreamRecvr::ProcessDeferredRpc(int sender_id) {
   int use_sender_id = is_merging_ ? sender_id : 0;
   // Add all batches to the same queue if is_merging_ is false.
-  sender_queues_[use_sender_id]->DequeueDeferredRpc();
+  sender_queues_[use_sender_id]->ProcessDeferredRpc();
 }
 
 void KrpcDataStreamRecvr::TakeOverEarlySender(unique_ptr<TransmitDataCtx> ctx) {
   int use_sender_id = is_merging_ ? ctx->request->sender_id() : 0;
   // Add all batches to the same queue if is_merging_ is false.
   sender_queues_[use_sender_id]->TakeOverEarlySender(move(ctx));
-  COUNTER_ADD(num_early_senders_, 1);
+  COUNTER_ADD(total_early_senders_counter_, 1);
 }
 
 void KrpcDataStreamRecvr::RemoveSender(int sender_id) {
   int use_sender_id = is_merging_ ? sender_id : 0;
   sender_queues_[use_sender_id]->DecrementSenders();
+  COUNTER_ADD(total_eos_received_counter_, 1);
 }
 
 void KrpcDataStreamRecvr::CancelStream() {
@@ -586,17 +782,30 @@ void KrpcDataStreamRecvr::CancelStream() {
 }
 
 void KrpcDataStreamRecvr::Close() {
+  DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
+  DCHECK(!closed_);
+  closed_ = true;
   // Remove this receiver from the KrpcDataStreamMgr that created it.
   // All the sender queues will be cancelled after this call returns.
   const Status status = mgr_->DeregisterRecvr(fragment_instance_id(), dest_node_id());
   if (!status.ok()) {
     LOG(ERROR) << "Error deregistering receiver: " << status.GetDetail();
   }
-  mgr_ = nullptr;
   for (auto& queue: sender_queues_) queue->Close();
   merger_.reset();
-  mem_tracker_->Close();
-  recvr_side_profile_->StopPeriodicCounters();
+
+  // Given all queues have been cancelled and closed already at this point, it's safe to
+  // call Close() on 'deferred_rpc_tracker_' without holding any lock here.
+  deferred_rpc_tracker_->Close();
+  dequeue_profile_->StopPeriodicCounters();
+  enqueue_profile_->StopPeriodicCounters();
+
+  // Remove reference to the unowned resources which may be freed after Close().
+  mgr_ = nullptr;
+  row_desc_ = nullptr;
+  parent_tracker_ = nullptr;
+  buffer_pool_client_ = nullptr;
+  profile_ = nullptr;
 }
 
 KrpcDataStreamRecvr::~KrpcDataStreamRecvr() {

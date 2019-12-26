@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <jni.h>
 
+#include "catalog/catalog-util.h"
 #include "common/logging.h"
 #include "common/init.h"
 #include "exec/hbase-table-scanner.h"
@@ -43,7 +44,6 @@
 #include "service/fe-support.h"
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/ImpalaInternalService.h"
-#include "util/impalad-metrics.h"
 #include "util/thread.h"
 
 #include "common/names.h"
@@ -52,47 +52,47 @@ using namespace impala;
 
 DECLARE_int32(beeswax_port);
 DECLARE_int32(hs2_port);
+DECLARE_int32(hs2_http_port);
 DECLARE_int32(be_port);
-DECLARE_bool(enable_rm);
 DECLARE_bool(is_coordinator);
 
 int ImpaladMain(int argc, char** argv) {
   InitCommonRuntime(argc, argv, true);
 
-  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
   ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm());
   JniUtil::InitLibhdfs();
   ABORT_IF_ERROR(HBaseTableScanner::Init());
   ABORT_IF_ERROR(HBaseTable::InitJNI());
   ABORT_IF_ERROR(HBaseTableWriter::InitJNI());
   ABORT_IF_ERROR(HiveUdfCall::InitEnv());
+  ABORT_IF_ERROR(JniCatalogCacheUpdateIterator::InitJNI());
   InitFeSupport();
-
-  if (FLAGS_enable_rm) {
-    // TODO: Remove in Impala 3.0.
-    LOG(WARNING) << "*****************************************************************";
-    LOG(WARNING) << "Llama support has been deprecated. FLAGS_enable_rm has no effect.";
-    LOG(WARNING) << "*****************************************************************";
-  }
 
   ExecEnv exec_env;
   ABORT_IF_ERROR(exec_env.Init());
   CommonMetrics::InitCommonMetrics(exec_env.metrics());
+
+  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
+  // Add path to time-zone db as a property
+  StringProperty* tzdata_path = exec_env.metrics()->AddProperty<string>(
+      "tzdata-path", "");
+  tzdata_path->SetValue(TimezoneDatabase::GetPath());
+
   ABORT_IF_ERROR(StartMemoryMaintenanceThread()); // Memory metrics are created in Init().
   ABORT_IF_ERROR(
       StartThreadInstrumentation(exec_env.metrics(), exec_env.webserver(), true));
-  InitRpcEventTracing(exec_env.webserver());
+  InitRpcEventTracing(exec_env.webserver(), exec_env.rpc_mgr());
 
   boost::shared_ptr<ImpalaServer> impala_server(new ImpalaServer(&exec_env));
-  Status status =
-      impala_server->Start(FLAGS_be_port, FLAGS_beeswax_port, FLAGS_hs2_port);
+  Status status = impala_server->Start(
+      FLAGS_be_port, FLAGS_beeswax_port, FLAGS_hs2_port, FLAGS_hs2_http_port);
   if (!status.ok()) {
     LOG(ERROR) << "Impalad services did not start correctly, exiting.  Error: "
         << status.GetDetail();
     ShutdownLogging();
     exit(1);
   }
-
+  ABORT_IF_ERROR(StartImpalaShutdownSignalHandlerThread());
   impala_server->Join();
 
   return 0;
